@@ -728,22 +728,39 @@ ls_pinned_read_seq(void)
  * A caller that reaches here with XactLastRecEnd == 0 and no commit/abort
  * of its own (a route_all compute issuing a metadata-only op -- ZEROEXTEND,
  * CREATE -- with no fresh WAL record of its own for this operation) used to
- * fall back to Max(XactLastCommitEnd, XactLastAbortEnd): a stale position
- * left over from whatever this backend last did, possibly long before some
- * branch was forked off the same timeline since.  Stamping that stale, too-
- * low position let the mutation land at or below the branch's cap and leak
- * into it (pagestore Bug B) -- the pagestore daemon now also promotes an
- * admission that lands at or below a live descendant's cap (see
- * timeline_desc_cap[] in pagestore_core.c), but the honest fix here is to
- * not hand it a stale position to begin with.  GetXLogInsertRecPtr() is a
- * safe, fresh upper bound for a WAL-less/unstamped op: it can only be >=
- * XactLastCommitEnd/XactLastAbortEnd (the global insert pointer has already
- * passed any record this backend produced), so it cannot sort a related
- * mutation before a record it must follow, and it cannot understate "now"
- * the way a leftover, possibly ancient session value can.  A non-startup
- * backend in recovery (hot standby) never inserts WAL itself, so use the
- * last replayed position there instead -- the same horizon ls_read_lsn()
- * uses for its own recovery case, just below.
+ * fall back to Max(XactLastCommitEnd, XactLastAbortEnd) unconditionally: a
+ * stale position left over from whatever this backend last did, possibly
+ * long before some branch was forked off the same timeline since.  Stamping
+ * that stale, too-low position let the mutation land at or below the
+ * branch's cap and leak into it (pagestore Bug B) -- the pagestore daemon
+ * now also promotes an admission that collides with an existing record at
+ * or below a live descendant's cap/pin, but the honest fix here is to not
+ * hand it a stale position to begin with.
+ *
+ * The two callers that reach this fallback are NOT interchangeable, though
+ * (Codex review finding 4097536209).  ls_unlink()'s non-redo path runs from
+ * smgrDoPendingDeletes() at end-of-transaction cleanup, AFTER
+ * RecordTransactionCommit()/RecordTransactionAbort() have already reset
+ * XactLastRecEnd -- that is precisely the documented case above
+ * (XactLastCommitEnd/XactLastAbortEnd), not a caller with no WAL record of
+ * its own: the commit/abort record it must sort after already happened, and
+ * GetXLogInsertRecPtr() is not a safe stand-in for it, because unrelated
+ * concurrent WAL insertion can push the global pointer arbitrarily far past
+ * that commit/abort record.  A branch cut between the real transaction end
+ * and that inflated position would then miss the unlink and can expose a
+ * dropped relation, or a relation created by an aborted transaction, to the
+ * branch -- reintroducing a shape of Bug B rather than fixing it.  UNLINK
+ * therefore keeps the original Max(XactLastCommitEnd, XactLastAbortEnd)
+ * fallback.  CREATE and TRUNCATE, by contrast, have no transaction-end
+ * record of their own to fall back to: for them GetXLogInsertRecPtr() is a
+ * safe, fresh upper bound for a WAL-less/unstamped op, since it can only be
+ * >= anything this backend has produced (the global insert pointer has
+ * already passed any record this backend produced), so it cannot sort a
+ * related mutation before a record it must follow, and it cannot understate
+ * "now" the way a leftover, possibly ancient session value can.  A
+ * non-startup backend in recovery (hot standby) never inserts WAL itself,
+ * so use the last replayed position there instead -- the same horizon
+ * ls_read_lsn() uses for its own recovery case, just below.
  */
 static uint64
 ls_op_lsn(bool is_unlink)
