@@ -358,15 +358,50 @@ ps_forkmeta_derive_fences(const PsForkMetaViewFence *views, uint32_t nviews,
 
 	for (uint32_t i = 0; i < nviews; i++)
 	{
+		int			equal_lsn;
+		int			x_binds;
+		uint64_t	strict;
+
 		if (views[i].lsn < cutoff.lsn)
 			continue;			/* already an ordinary in-domain fence */
-		if (views[i].seq == PS_FORKMETA_SEQ_UNBOUNDED)
+
+		/*
+		 * Codex 4114217415: S1.3's "p == L => seq <= X" conjunct is an
+		 * independent, no-escape hard bound at the view's own exact
+		 * position -- it binds regardless of seq (S), which only governs
+		 * positions strictly below L.  A view with L == cutoff.lsn sits
+		 * exactly there, so its strict_seq (X) can be the *sole* reason it
+		 * misses part of what the cutoff folds, even when S alone would
+		 * not: cutoff (20,10), view (L=20,S=20,X=5) sees only seq <= 5 at
+		 * lsn 20, not everything the cutoff folds, yet the old "S >=
+		 * cutoff.admission_seq => sees everything" test skipped this view
+		 * entirely.  A view with L > cutoff.lsn never has this exposure:
+		 * cutoff.lsn is strictly below its own L, so only S applies there,
+		 * exactly as the old test assumed.
+		 */
+		equal_lsn = views[i].lsn == cutoff.lsn;
+		x_binds = equal_lsn &&
+			views[i].strict_seq != PS_FORKMETA_SEQ_UNBOUNDED &&
+			views[i].strict_seq < cutoff.admission_seq;
+
+		if (views[i].seq == PS_FORKMETA_SEQ_UNBOUNDED && !x_binds)
 			continue;			/* positional: nothing to protect at cutoff */
-		if (views[i].seq >= cutoff.admission_seq)
+		if (views[i].seq >= cutoff.admission_seq && !x_binds)
 			continue;			/* sees everything the cutoff folds anyway */
+
+		/*
+		 * ps_forkmeta_prune_plan_capped() requires a fence at
+		 * lsn == cutoff.lsn to carry a finite strict_seq <=
+		 * cutoff.admission_seq.  Use the view's own X when it is the
+		 * tighter bound (x_binds); otherwise fall back to
+		 * cutoff.admission_seq exactly as before -- events past it are
+		 * already unconditionally kept as the future tail regardless of
+		 * any fence, so relaxing X up to that point costs nothing.
+		 */
+		strict = x_binds ? views[i].strict_seq : cutoff.admission_seq;
 		out[n].lsn = cutoff.lsn;
 		out[n].seq = views[i].seq;
-		out[n].strict_seq = cutoff.admission_seq;
+		out[n].strict_seq = strict;
 		n++;
 	}
 	return n;

@@ -155,8 +155,20 @@ extern int ps_forkmeta_prune_plan_capped(const PsForkMetaEvent *events,
  * so its own fence, above, does not reach back to protect the cutoff-time
  * mask).  Emit one extra fence (cutoff.lsn, s, strict = cutoff.admission_seq)
  * per such view, so ps_forkmeta_prune_plan_capped()'s masks at the cutoff
- * still honour it.  out must have room for nviews entries; returns the
- * number written (<= nviews).
+ * still honour it.
+ *
+ * A view with l == cutoff.lsn sits exactly at the cutoff position, where
+ * its own x is an *independent* hard bound (S1.3's "p == l => seq <= x"),
+ * binding regardless of s.  Such a view still needs a derived fence
+ * whenever x is finite and below cutoff.admission_seq, even if s alone
+ * would not trigger one (Codex 4114217415); the derived fence then carries
+ * strict_seq = x instead of cutoff.admission_seq, to actually preserve the
+ * bound the view depends on.  A view with l > cutoff.lsn never has this
+ * exposure: cutoff.lsn is strictly below its own l, so only s applies
+ * there.
+ *
+ * out must have room for nviews entries; returns the number written
+ * (<= nviews).
  */
 extern uint32_t ps_forkmeta_derive_fences(const PsForkMetaViewFence *views,
 										  uint32_t nviews,

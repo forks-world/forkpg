@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "pagestore_admissible.h"
 #include "pagestore_forkmeta_prune.h"
 
 static int checks;
@@ -134,6 +135,167 @@ differential_fuzz(uint64_t seed, uint32_t niter)
 	}
 }
 
+/* Local duplicate of pagestore_forkmeta_prune.c's static event_admit_flags():
+ * SET/DEAD are always META regardless of the stored flags. */
+static unsigned char
+test_event_admit_flags(const PsForkMetaEvent *ev)
+{
+	unsigned char flags = ev->flags;
+
+	if (ev->kind == PS_FORKMETA_SET || ev->kind == PS_FORKMETA_DEAD)
+		flags |= PS_FORKMETA_F_META;
+	return flags;
+}
+
+/*
+ * What a reader applying cap `ac` directly to `events` resolves as the
+ * fork's size: mirrors retain_horizon_capped()'s own two walks (the newest
+ * visible definitive event, then the largest visible GROW strictly after
+ * it, or over the whole prefix when none is visible) but returns the
+ * resolved size instead of a keep mask.  Used as the fuzz oracle below: a
+ * sound planner must resolve the same value before and after pruning.
+ */
+static uint32_t
+test_mask_resolve(const PsForkMetaEvent *events, uint32_t n,
+				  const PsAdmitCap *ac)
+{
+	uint32_t	latest_def = 0;
+	int			have_def = 0;
+	uint32_t	resolved = 0;
+
+	for (uint32_t i = n; i > 0; i--)
+	{
+		uint32_t	idx = i - 1;
+
+		if (ps_event_hidden(events[idx].lsn, events[idx].admission_seq,
+							test_event_admit_flags(&events[idx]), ac, 0, 0))
+			continue;
+		if (events[idx].kind != PS_FORKMETA_SET &&
+			events[idx].kind != PS_FORKMETA_DEAD)
+			continue;
+		latest_def = idx;
+		have_def = 1;
+		break;
+	}
+	resolved = have_def ?
+		(events[latest_def].kind == PS_FORKMETA_DEAD ? 0 :
+		 events[latest_def].nblocks) : 0;
+	for (uint32_t i = have_def ? latest_def + 1 : 0; i < n; i++)
+		if (!ps_event_hidden(events[i].lsn, events[i].admission_seq,
+							 test_event_admit_flags(&events[i]), ac, 0, 0) &&
+			events[i].kind == PS_FORKMETA_GROW &&
+			events[i].nblocks > resolved)
+			resolved = events[i].nblocks;
+	return resolved;
+}
+
+/*
+ * Codex 4114217415 property: a single live view pinned exactly at the
+ * cutoff's own lsn (the specific position the finding is about), with a
+ * randomized finite/unbounded S and X on either side of cutoff.admission_seq,
+ * so X is (at least sometimes) the sole binding constraint regardless of S.
+ * Whatever ps_forkmeta_prune_plan_capped() keeps under the fence(s)
+ * ps_forkmeta_derive_fences() derives for that view, the view must resolve
+ * the identical size from the kept-only events as it does from the full,
+ * unpruned array -- pruning must never change what a live view itself
+ * reads.
+ */
+static void
+derive_fences_equal_lsn_property(uint64_t seed, uint32_t niter)
+{
+	uint64_t	s = seed ? seed : 1;
+	uint32_t	violations = 0;
+
+	for (uint32_t iter = 0; iter < niter; iter++)
+	{
+		PsForkMetaEvent events[MAXN];
+		PsForkMetaEvent kept_events[MAXN];
+		unsigned char keep[MAXN];
+		uint32_t	n = 1 + (uint32_t) (xorshift(&s) % MAXN);
+		uint64_t	lsn = 0,
+					seq = 0;
+		PsForkMetaFence cutoff;
+		PsForkMetaViewFence view;
+		PsForkMetaViewFence derived[1];
+		uint32_t	nderived;
+		uint32_t	nkept = 0;
+		PsAdmitCap	view_cap;
+		int			rc;
+
+		for (uint32_t i = 0; i < n; i++)
+		{
+			if (xorshift(&s) % 3 != 0)
+				lsn += 1 + xorshift(&s) % 10;
+			seq += (xorshift(&s) % 5 == 0) ? 0 : 1 + xorshift(&s) % 10;
+			events[i].lsn = lsn ? lsn : 1;
+			events[i].admission_seq = seq;
+			events[i].nblocks = (uint32_t) (xorshift(&s) % 50);
+			switch (xorshift(&s) % 3)
+			{
+				case 0:
+					events[i].kind = PS_FORKMETA_GROW;
+					break;
+				case 1:
+					events[i].kind = PS_FORKMETA_SET;
+					break;
+				default:
+					events[i].kind = PS_FORKMETA_DEAD;
+					events[i].nblocks = 0;
+			}
+			events[i].flags = 0;
+		}
+		cutoff.lsn = 1 + xorshift(&s) % (lsn + 5);
+		/*
+		 * A real cutoff.admission_seq is the admission clock's value as of
+		 * cutoff.lsn, so (barring PAGE-class GROWs, which ignore S
+		 * entirely, S1.5) it is always >= every SET/DEAD event's seq
+		 * strictly below cutoff.lsn.  Pick it that way here too, so that
+		 * "view.seq >= cutoff.admission_seq" genuinely implies "the view's
+		 * own S already admits everything strictly below the cutoff" --
+		 * an independently random cutoff.admission_seq can defeat that on
+		 * its own (by landing below events the log has already passed at
+		 * a lower lsn), which is a fuzz-generator artifact, not the
+		 * X-vs-S hole this property targets. */
+		{
+			uint64_t	seq_floor = 0;
+
+			for (uint32_t i = 0; i < n; i++)
+				if (events[i].lsn < cutoff.lsn && events[i].admission_seq > seq_floor)
+					seq_floor = events[i].admission_seq;
+			cutoff.admission_seq = seq_floor + 1 + xorshift(&s) % 10;
+		}
+		view.lsn = cutoff.lsn;			/* the exact position this finding is about */
+		view.seq = (xorshift(&s) % 4 == 0) ? PS_FORKMETA_SEQ_UNBOUNDED :
+			xorshift(&s) % (cutoff.admission_seq + 5);
+		view.strict_seq = (xorshift(&s) % 4 == 0) ? PS_FORKMETA_SEQ_UNBOUNDED :
+			1 + xorshift(&s) % (cutoff.admission_seq + 5);
+
+		nderived = ps_forkmeta_derive_fences(&view, 1, cutoff, derived);
+		rc = ps_forkmeta_prune_plan_capped(events, n, cutoff, derived,
+										   nderived, 0, 0, NULL, keep);
+		if (rc < 0)
+			continue;			/* not a valid input for this call; skip */
+		for (uint32_t i = 0; i < n; i++)
+			if (keep[i])
+				kept_events[nkept++] = events[i];
+		view_cap.lsn = view.lsn;
+		view_cap.seq = view.seq;
+		view_cap.strict_seq = view.strict_seq;
+		if (test_mask_resolve(events, n, &view_cap) !=
+			test_mask_resolve(kept_events, nkept, &view_cap))
+			violations++;
+	}
+	{
+		char		name[160];
+
+		snprintf(name, sizeof(name),
+				 "equal-LSN view resolves the same size before and after "
+				 "pruning (seed=%llu, niter=%u, violations=%u)",
+				 (unsigned long long) seed, niter, violations);
+		check(violations == 0, name);
+	}
+}
+
 int
 main(void)
 {
@@ -142,6 +304,8 @@ main(void)
 
 	for (size_t i = 0; i < sizeof(seeds) / sizeof(seeds[0]); i++)
 		differential_fuzz(seeds[i], 4000);
+	for (size_t i = 0; i < sizeof(seeds) / sizeof(seeds[0]); i++)
+		derive_fences_equal_lsn_property(seeds[i], 2000);
 
 	/* --- S3.7 item 2 closure: META_FIRST ---
 	 * Note: the operational cutoff is itself always a positional (S =
@@ -266,6 +430,43 @@ main(void)
 		check(rc == 2 && keep[0] && keep[1],
 			  "the derived fence keeps the first arrival the beyond-cutover "
 			  "view's own S=1 needs, alongside the cutoff's own newest pick");
+	}
+	{
+		/* Codex 4114217415's exact counterexample: a view with L ==
+		 * cutoff.lsn whose own X (5) is stricter than both S (20) and
+		 * cutoff.admission_seq (10).  The old "S >= cutoff.admission_seq =>
+		 * sees everything" test skipped this view entirely, so the capped
+		 * planner kept only the larger, later PAGE GROW (seq 10, size 20) --
+		 * invisible to this view (seq 10 > X 5, no escape for a PAGE-class
+		 * GROW's hard boundary) -- and dropped the one GROW the view can
+		 * actually see (seq 5, size 10). */
+		PsForkMetaEvent ev[] =
+		{
+			{20, 5, 10, PS_FORKMETA_GROW, 0},
+			{20, 10, 20, PS_FORKMETA_GROW, 0},
+		};
+		PsForkMetaViewFence views[] = {{20, 20, 5}};
+		PsForkMetaFence cutoff = {20, 10};
+		PsForkMetaViewFence derived[1];
+		uint32_t	nderived = ps_forkmeta_derive_fences(views, 1, cutoff,
+														 derived);
+		int			rc_nofence;
+		int			rc;
+
+		check(nderived == 1 && derived[0].lsn == 20 && derived[0].seq == 20 &&
+			  derived[0].strict_seq == 5,
+			  "an equal-LSN view derives a fence from its own X even though "
+			  "S alone would not (Codex 4114217415)");
+		rc_nofence = ps_forkmeta_prune_plan_capped(ev, 2, cutoff, NULL, 0,
+												   0, 0, NULL, keep);
+		check(rc_nofence == 1 && !keep[0] && keep[1],
+			  "before the fix: the cutoff alone keeps only the larger, "
+			  "later GROW, which is invisible to the view's own X = 5");
+		rc = ps_forkmeta_prune_plan_capped(ev, 2, cutoff, derived, nderived,
+										   0, 0, NULL, keep);
+		check(rc == 2 && keep[0] && keep[1],
+			  "the derived fence also keeps the GROW the view's X = 5 "
+			  "actually admits (size 10), alongside the cutoff's own pick");
 	}
 
 	printf("pagestore_forkmeta_prune_capped_test: %d checks, %d failed\n",
