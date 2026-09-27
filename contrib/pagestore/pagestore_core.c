@@ -14143,7 +14143,19 @@ wal_reclaim_raw_dependency_floor(uint32_t timeline, uint64_t store_start,
  * grants_out/ngrants_out are optional: when given, the caller takes
  * ownership of the materializer-grant array that records which entries the
  * materializer exception added (needed only by the plan builder's own later
- * walidx_plan_recheck_standing at publish time, not by a one-off query). */
+ * walidx_plan_recheck_standing at publish time, not by a one-off query).
+ *
+ * Design doc S3.7(7) rev 3, S4 ("page prune keeps the base versions the
+ * WAL index depends on"): satisfied by construction, pre-existing and
+ * unchanged by P2.  The protected set here is built directly from
+ * page_prune_fences()'s own fence list (above), the identical fence set
+ * ps_page_prune_plan_capped() consumes for image retention (design doc
+ * S1.3 step 2: the newest admissible version at or below *every* fence it
+ * is given is kept).  So a horizon can only be "protected" -- and only
+ * then may walidx_plan_bases_build() rely on a stored image at or below it
+ * as a base -- when page-level retention is independently already
+ * committed to keeping a version there.  An unprotected horizon never
+ * trusts a stored image and falls back to the FPI-led chain instead. */
 static int
 walidx_protected_horizons_build(uint32_t tl, uint64_t **set_out,
 								uint32_t *n_out, WalIdxMatGrant **grants_out,
@@ -16467,6 +16479,18 @@ fork_meta_required_fences(const ForkEnt *e, const uint32_t *indices,
  * Build the replacement-base table for one timeline.  Caller holds every
  * shard read lock, the WAL-index prune read fence, and map-rd.  Failure
  * leaves no table, which degrades to the FPI-only plan.
+ *
+ * Design doc S3.7(7) rev 3:
+ *   S1 -- every death and image below is computed per horizon's own
+ *         ViewCap (viewcap_lsn_seq(horizons[i], 0), fed straight into
+ *         fork_asof_hop() -- the same admissibility predicate the read
+ *         path uses, pagestore_admissible.h), not a raw LSN comparison, so
+ *         retention and reads can never disagree on what a horizon sees.
+ *   S3 -- fork size (nblocks) is consulted only to recognise a death (a
+ *         SET whose nblocks <= this block, or a DEAD event); it never by
+ *         itself drops a WAL-index record.  Grep confirms every nblocks
+ *         comparison below feeds `deaths[]`, never `keep[]`/`bases[]`
+ *         directly.
  */
 static int
 walidx_plan_bases_build(uint32_t tl)

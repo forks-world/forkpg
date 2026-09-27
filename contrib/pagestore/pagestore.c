@@ -2622,6 +2622,12 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		 * block before lsn.  From that death on the block has no content: the
 		 * base is an all-zero page when the block exists again at lsn, and
 		 * nothing when it does not.
+		 *
+		 * Design doc S3.7(7) rev 3, S2: the replacement base a redo reader
+		 * uses is always max(death, image), never "death if present, else
+		 * image" -- ps_death_supersedes() is exactly that combination, and
+		 * this is the only place base_end/base_seq are consulted, so a
+		 * death can never be silently skipped in favor of an older image.
 		 */
 		if (result != NULL)
 		{
@@ -2918,6 +2924,10 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 * replaces it: an all-zero page, and only the records after the death
 	 * belong to this horizon's chain.  A block that does not exist again at
 	 * lsn has no page at all.
+	 *
+	 * Design doc S3.7(7) rev 3, S2: max(death, image), never "death if
+	 * present, else image" -- the same combination as the single-page
+	 * reader above, through the same ps_death_supersedes().
 	 */
 	{
 		uint64		death_seq = 0;
