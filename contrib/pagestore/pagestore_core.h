@@ -195,6 +195,23 @@ extern int ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 /* Test-only: total scan/bisection steps taken by the fork-event index and
  * its fallback loops on this thread since the process started. */
 extern uint64_t ps_test_fork_event_scan_steps(void);
+/* Phase P1 (BRANCH_SNAPSHOT_SEQ_CAP.md S9.3) differential test: random page
+ * versions and fork-event histories, checked against frozen pre-P1
+ * references at PS_SEQ_UNBOUNDED (must be bit-identical) and against an
+ * independent literal-S1.3/S3.2-rule brute force with finite caps.  Returns
+ * 0 on success or the 1-based number of the first failed check. */
+extern int ps_test_viewcap_differential(uint64_t seed, uint32_t niter);
+/* Phase P1 differential-test extension for artifact reads (Codex finding
+ * 4104937134): checks artifact_visible() against brute_page_select() at
+ * PS_SEQ_UNBOUNDED and at finite caps, over a real pre-first-BEGIN
+ * ("legacy fallback") artifact history the caller has already written on
+ * an open store (see the function body in pagestore_core.c for the exact
+ * arrangement it requires).  Returns 0 on success or the 1-based number of
+ * the first failed check. */
+extern int ps_test_artifact_viewcap_property(uint32_t tl, const PsKey *key,
+											 uint32_t block,
+											 uint64_t lsn_rewrite,
+											 uint64_t lsn_first);
 /* Test-only: event counts for one fork (0 if not found).  nmarkers counts
  * marker_kind != 0, ninert counts kind > FEV_DEAD (never activated). */
 extern int ps_test_fork_event_count(uint32_t timeline, const PsKey *key,

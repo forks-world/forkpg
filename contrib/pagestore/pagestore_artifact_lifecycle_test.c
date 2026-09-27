@@ -308,6 +308,55 @@ test_reader_snapshot_owner_key_split(void)
 }
 
 /*
+ * Codex finding 4104937134 (BRANCH_SNAPSHOT_SEQ_CAP.md S3.3): extends the P1
+ * differential test to artifact reads.  artifact_visible() used to discard
+ * the walk's composed ViewCap.seq and its per-level inherited-range
+ * boundary, rebuilding a (lsn, strict_seq)-only cap with B_k hardcoded to
+ * "root" -- harmless while every cap stays PS_SEQ_UNBOUNDED (P1's only
+ * production case, S9.3), but wrong once P2/P3b/P5 start constructing
+ * finite caps.  This builds a pre-first-BEGIN ("legacy fallback") history --
+ * an older write, a same-LSN rewrite with a larger admission_seq (the
+ * artifact analogue of Bug B), and a fresh-position first arrival -- on a
+ * key that has never gone through BEGIN/COMMIT, then closes it with one
+ * uncommitted BEGIN so artifact_visible()'s no-commit fallback resolves it,
+ * and hands it to ps_test_artifact_viewcap_property(), which checks
+ * artifact_visible() against brute_page_select() -- the same literal-S1.3-
+ * rule oracle ps_test_viewcap_differential() uses -- at PS_SEQ_UNBOUNDED and
+ * at finite caps.  The LSNs are chosen above every other LSN this file uses
+ * (highest elsewhere: 900400) so the page-reclaimed frontier this file's
+ * compaction has already advanced can never make these writes unfenced.
+ */
+static void
+test_viewcap_artifact_property(void)
+{
+	uint32_t	saved_rel = key.relNumber;
+	uint64_t	begin_token = 0;
+	PsArtifactRefuseReason reason = PS_ARTIFACT_REFUSE_NONE;
+
+	key.relNumber = 950;
+
+	check(write_page(950100, 0, 0, 0x70) == 0,
+		  "viewcap property: older write at the shared LSN");
+	check(write_page(950100, 0, 0, 0x71) == 0,
+		  "viewcap property: same-LSN rewrite");
+	check(write_page(950200, 0, 0, 0x72) == 0,
+		  "viewcap property: fresh-position write");
+
+	ps_lock_shard_wr(ps_shard_of(&key));
+	check(ps_artifact_begin(0, &key, 950300, &begin_token, &reason) == 0 &&
+		  begin_token != 0,
+		  "viewcap property: closing BEGIN activates the fallback domain");
+	ps_unlock_shard(ps_shard_of(&key));
+
+	ps_lock_shard_rd(ps_shard_of(&key));
+	check(ps_test_artifact_viewcap_property(0, &key, 0, 950100, 950200) == 0,
+		  "viewcap property: artifact_visible() matches brute_page_select() at every cap");
+	ps_unlock_shard(ps_shard_of(&key));
+
+	key.relNumber = saved_rel;
+}
+
+/*
  * T1: an admission refusal -- a BEGIN (or, on a pre-fix tree, its first data
  * WRITE) at a generation LSN below the durable page-reclaimed frontier --
  * must be reported by name and change no state.  Before the fix it poisoned
@@ -685,6 +734,7 @@ main(int argc, char **argv)
 	check(write_page(600, token, 0, 0x66) == 0 && commit(600, token, 1) == 0 && read_value(0, 600, 0, 0x66), "recreate after drop");
 	test_reader_snapshot_owner_key_split();
 	test_admission_refusal_does_not_poison();
+	test_viewcap_artifact_property();
 	test_io_failure_still_poisons(store);
 	ps_core_close();
 	for (int phase = 1; phase <= 2; phase++)

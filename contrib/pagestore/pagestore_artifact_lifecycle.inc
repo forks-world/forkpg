@@ -88,16 +88,31 @@ artifact_legacy_seq(PageEnt *begins)
 /*
  * 0 = legacy/fallback, 1 = selected complete generation, 2 = explicit absence.
  * Missing blocks in a complete generation never inherit an older page.
+ *
+ * 'cap'/'B'/'has_B' are the caller's full composed ViewCap and its
+ * per-level inherited-range boundary (design doc S1.2/S1.5): the same
+ * triple page_select()/fork_asof_hop() use at this call's TlWalk level,
+ * not a downgraded (lsn, strict_seq) pair.  The COMMIT/DROP selection
+ * below therefore goes through page_select() (the shared S1.3 predicate),
+ * and the no-commit fallback applies the same S/escape rule -- restricted
+ * to the pre-first-BEGIN admission_seq domain ('first') this fallback
+ * exists for -- via page_select_is_smin_below() rather than reinventing a
+ * narrower check (Codex finding 4104937134).  At cap->seq ==
+ * PS_SEQ_UNBOUNDED (every production cap in P1, S9.3) the S/escape
+ * disjunct is trivially true, so this is bit-for-bit today's behaviour;
+ * see ps_test_artifact_viewcap_property() for the finite-cap check against
+ * brute_page_select().
  */
 static int
 artifact_visible(uint32_t tl, const PsKey *key, uint32_t block,
-				 uint64_t horizon, uint64_t seq_cap, PageVer **out, int map_locked)
+				 const ViewCap *cap, uint64_t B, bool has_B, PageVer **out,
+				 int map_locked)
 {
 	PsKey		meta = artifact_meta_key(key);
 	PageEnt    *begins = page_find(tl, &meta, PS_ARTIFACT_BEGIN_BLOCK);
 	PageEnt    *commits = page_find(tl, &meta, PS_ARTIFACT_COMMIT_BLOCK);
 	PageEnt    *pages = page_find(tl, key, block);
-	PageVer    *commit = commits ? page_visible(commits, horizon, seq_cap) : NULL;
+	PageVer    *commit = commits ? page_select(commits, cap, B, has_B) : NULL;
 	uint64_t	first = artifact_legacy_seq(begins);
 	PsArtifactLifecycle record;
 	PageVer    *best = NULL;
@@ -119,14 +134,26 @@ artifact_visible(uint32_t tl, const PsKey *key, uint32_t block,
 		for (int i = 0; i < pages->nver; i++)
 		{
 			PageVer    *v = &pages->vers[i];
-			int			eligible = commit ?
-				(v->lsn == commit->lsn && v->admission_seq > record.begin_seq &&
-				 v->admission_seq < commit->admission_seq) :
-				(v->admission_seq < first && v->lsn <= horizon &&
-				 (seq_cap == 0 || v->lsn < horizon || v->admission_seq <= seq_cap));
+			uint64_t	vseq = v->admission_seq;
+			bool		eligible;
+
+			if (commit)
+				eligible = v->lsn == commit->lsn &&
+					vseq > record.begin_seq && vseq < commit->admission_seq;
+			else if (vseq >= first || v->lsn > cap->lsn)
+				eligible = false;
+			else if (v->lsn == cap->lsn && cap->strict_seq != PS_SEQ_UNBOUNDED &&
+					 vseq != 0 && vseq > cap->strict_seq)
+				eligible = false;
+			else if (vseq == 0 || cap->seq == PS_SEQ_UNBOUNDED || vseq <= cap->seq)
+				eligible = true;
+			else if (!has_B || v->lsn > B)
+				eligible = page_select_is_smin_below(pages, v, first);
+			else
+				eligible = false;
 
 			if (eligible && (!best || v->lsn > best->lsn ||
-							 (v->lsn == best->lsn && v->admission_seq > best->admission_seq)))
+							 (v->lsn == best->lsn && vseq > best->admission_seq)))
 				best = v;
 		}
 	*out = best;
@@ -136,13 +163,24 @@ artifact_visible(uint32_t tl, const PsKey *key, uint32_t block,
 /*
  * Match page visibility for size/existence, including legacy and ancestry.
  * A zero-page COMMIT is an existing empty object; DROP is nonexistence.
+ *
+ * Walks with the request's full composed ViewCap (walk.cap), not a
+ * downgraded (lsn, strict_seq) pair rebuilt via viewcap_lsn_seq(): the
+ * COMMIT selection uses page_select() (the shared S1.3 predicate) with
+ * this level's own inherited-range boundary (walk.inherited_below/
+ * walk.has_inherited_below), and the BEGIN-boundary adjustment below only
+ * ever narrows the *positional* (lsn, strict_seq) part of a per-hop copy
+ * of that cap for the fork fold, leaving its S/escape components exactly
+ * as composed by the walk (Codex finding 4104937134).  At
+ * walk.cap.seq == PS_SEQ_UNBOUNDED (every production cap in P1, S9.3) this
+ * is bit-for-bit today's behaviour.
  */
 static int
 artifact_metadata(uint32_t tl, const PsKey *key, uint64_t horizon,
 				  uint64_t seq_cap, int *exists, uint32_t *nblocks)
 {
 	PsKey		meta = artifact_meta_key(key);
-	TlWalk		walk = tl_walk_first(tl, horizon);
+	TlWalk		walk = tl_walk_first_cap(tl, viewcap_from_request(horizon, seq_cap));
 	int			rc = 0;
 
 	*exists = 0;
@@ -152,10 +190,11 @@ artifact_metadata(uint32_t tl, const PsKey *key, uint64_t horizon,
 	{
 		PageEnt    *commits = page_find(walk.tl, &meta, PS_ARTIFACT_COMMIT_BLOCK);
 		PageEnt    *begins = page_find(walk.tl, &meta, PS_ARTIFACT_BEGIN_BLOCK);
-		uint64_t	cap = walk.lsn == horizon ? seq_cap : 0;
-		uint64_t	lsn = walk.lsn;
-		PageVer    *commit = commits ? page_visible(commits, lsn, cap) : NULL;
+		PageVer    *commit = commits ? page_select(commits, &walk.cap,
+												   walk.inherited_below,
+												   walk.has_inherited_below) : NULL;
 		ForkEnt    *fork = fork_find(walk.tl, key);
+		ViewCap		hop_cap = walk.cap;
 		uint32_t	nb = 0;
 		int			state;
 
@@ -178,6 +217,9 @@ artifact_metadata(uint32_t tl, const PsKey *key, uint64_t horizon,
 		/*
 		 * BEGIN is monotone in LSN. Exclude all subsequent staged growth
 		 * while resolving the legacy fork, including at the same LSN.
+		 * Only the fold's own positional cap is narrowed here (a local
+		 * copy); the commit selection above already ran against the
+		 * unmodified walk.cap, and hop_cap.seq is left untouched.
 		 */
 		if (begins)
 		{
@@ -186,22 +228,28 @@ artifact_metadata(uint32_t tl, const PsKey *key, uint64_t horizon,
 			for (int i = 0; i < begins->nver; i++)
 				if (begins->vers[i].admission_seq == first)
 				{
-					if (lsn >= begins->vers[i].lsn)
+					if (hop_cap.lsn >= begins->vers[i].lsn)
 					{
-						if (lsn > begins->vers[i].lsn || cap == 0 || cap >= first)
+						if (hop_cap.lsn > begins->vers[i].lsn ||
+							hop_cap.strict_seq == PS_SEQ_UNBOUNDED ||
+							hop_cap.strict_seq >= first)
 
 							/*
 							 * BEGIN itself has no data-fork event; using its
 							 * nonzero sequence also handles the first store
 							 * mutation.
 							 */
-							cap = first;
-						lsn = begins->vers[i].lsn;
+							hop_cap.strict_seq = first;
+						hop_cap.lsn = begins->vers[i].lsn;
 					}
 					break;
 				}
 		}
-		state = fork ? fork_asof_hop(fork, lsn, cap, &nb) : FORK_HOP_NONE;
+		if (fork)
+			state = fork_asof_hop(fork, &hop_cap, walk.inherited_below,
+								  walk.has_inherited_below, &nb);
+		else
+			state = FORK_HOP_NONE;
 		if (state == FORK_HOP_DEAD)
 			break;
 		if (state != FORK_HOP_NONE)
