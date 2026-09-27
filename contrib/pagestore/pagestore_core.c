@@ -3340,6 +3340,17 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	uint32_t	obj_nrequired = 0;
 	uint32_t	obj_hi = 0;
 	ArtifactPruneCache *artifact_cache = NULL;
+	/* Codex 4114217409: vfences/closure_protect used to be allocated (and
+	 * vfences converted) once per relation page group below; for a
+	 * relation-heavy compaction that is a heap allocation/free pair per
+	 * input record, plus rebuilding the identical vfences array whenever
+	 * there are more than 8 fences.  Both are sized for the whole
+	 * compaction and built once here instead; each group below still only
+	 * touches its own [0, end - first) prefix, exactly like `keep` already
+	 * does. */
+	PsViewFence	vfences_local[8];
+	PsViewFence *vfences = vfences_local;
+	unsigned char *closure_protect;
 
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return -1;
@@ -3357,8 +3368,12 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	obj_generations = malloc((size_t) *nrec * sizeof(*obj_generations));
 	/* one required generation per fence, plus the floor's */
 	obj_required = malloc(((size_t) nfences + 1) * sizeof(*obj_required));
+	closure_protect = malloc((size_t) *nrec);
+	if (nfences > 8)
+		vfences = malloc((size_t) nfences * sizeof(*vfences));
 	if (!order || !versions || !keep || !selected || !dropped ||
-		!obj_generations || !obj_required)
+		!obj_generations || !obj_required || !closure_protect ||
+		(nfences > 8 && !vfences))
 	{
 		free(order);
 		free(versions);
@@ -3367,11 +3382,16 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		free(dropped);
 		free(obj_generations);
 		free(obj_required);
+		free(closure_protect);
+		if (vfences != vfences_local)
+			free(vfences);
 		free(fences);
 		free(control_fences);
 		artifact_prune_cache_free(artifact_cache);
 		return -1;
 	}
+	for (uint32_t i = 0; i < nfences; i++)
+		vfences[i] = ps_prune_fence_to_view(fences[i]);
 	for (uint32_t i = 0; i < *nrec; i++)
 	{
 		order[i].key = recs[i].key;
@@ -3549,6 +3569,9 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				free(dropped);
 				free(obj_generations);
 				free(obj_required);
+				free(closure_protect);
+				if (vfences != vfences_local)
+					free(vfences);
 				free(fences);
 				free(control_fences);
 				artifact_prune_cache_free(artifact_cache);
@@ -3579,45 +3602,26 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			 * actually triggers yet (no behaviour change: closure_protect
 			 * comes back all-zero) -- this only wires the mechanism through
 			 * for when a finite-S fence source lands (P5 activation).
+			 * vfences and closure_protect are the function-scope buffers
+			 * allocated once above (Codex 4114217409); this group only
+			 * touches their [0, end - first) prefix.
 			 */
-			PsViewFence	vfences_local[8];
-			PsViewFence *vfences = vfences_local;
-			unsigned char *closure_protect = malloc(end - first);
 			int			rc;
 
-			if (nfences > 8)
-				vfences = malloc((size_t) nfences * sizeof(*vfences));
-			if (closure_protect == NULL || vfences == NULL)
-			{
-				free(closure_protect);
-				if (vfences != vfences_local)
-					free(vfences);
-				free(order);
-				free(versions);
-				free(keep);
-				free(selected);
-				free(dropped);
-				free(fences);
-				free(control_fences);
-				artifact_prune_cache_free(artifact_cache);
-				return -1;
-			}
-			for (uint32_t i = 0; i < nfences; i++)
-				vfences[i] = ps_prune_fence_to_view(fences[i]);
 			rc = ps_page_prune_plan_capped(versions, end - first,
 										   (PsPruneFence) {floor, UINT64_MAX},
 										   vfences, nfences, 0, 0, keep,
 										   closure_protect);
-			if (vfences != vfences_local)
-				free(vfences);
 			if (rc < 0)
 			{
-				free(closure_protect);
 				free(order);
 				free(versions);
 				free(keep);
 				free(selected);
 				free(dropped);
+				free(closure_protect);
+				if (vfences != vfences_local)
+					free(vfences);
 				free(fences);
 				free(control_fences);
 				artifact_prune_cache_free(artifact_cache);
@@ -3631,7 +3635,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 										  end - first, i - first, floor,
 										  fences, nfences))
 					keep[i - first] = 0;
-			free(closure_protect);
 		}
 		out = compact_emit_grouped(order, first, end, keep, recs, selected,
 								   out, dropped, &ndropped);
@@ -3644,6 +3647,9 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	free(versions);
 	free(keep);
 	free(selected);
+	free(closure_protect);
+	if (vfences != vfences_local)
+		free(vfences);
 	free(fences);
 	free(control_fences);
 	artifact_prune_cache_free(artifact_cache);
