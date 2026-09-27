@@ -24097,6 +24097,10 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	free_walidx_indexes();
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
 	__atomic_store_n(&next_admission_seq, 1, __ATOMIC_RELAXED);
+	/* The soak epochs are store-scoped too: a stale maximum from the previous
+	 * store would mask every admission of a lower-sequence new store. */
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		__atomic_store_n(&fork_event_admit_seq_by_tl[tl], 0, __ATOMIC_RELAXED);
 	/* A close/open cycle may switch to a store with different timelines.  Drop
 	 * every in-memory flat-WAL catalog before metadata replay selects which
 	 * timelines to recover; resetting only wal_end would leave stale offsets and
