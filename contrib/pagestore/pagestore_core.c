@@ -5724,20 +5724,34 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 }
 
 /*
- * Is v the minimum-admission_seq version at its own lsn within e?  Used
- * only by page_select()'s escape path (v->admission_seq > c->seq), which is
+ * Is v the minimum-admission_seq version at its own lsn within e, counting
+ * only versions with admission_seq < max_seq_exclusive?  Used by
+ * page_select()'s escape path (v->admission_seq > c->seq), which is
  * unreachable in production while every ViewCap stays PS_SEQ_UNBOUNDED
  * (P1); legacy (admission_seq == 0) versions never need it (they always
  * pass the plain seq <= S disjunct, since a ViewCap's seq is never a
- * literal 0).  O(nver) worst case, same bound as page_select() itself.
+ * literal 0).  Also reused, with a finite filter, by artifact_visible()'s
+ * no-commit fallback (pagestore_artifact_lifecycle.inc), which must apply
+ * the same escape rule within the "pre-first-BEGIN" admission_seq domain
+ * rather than the whole entry.  O(nver) worst case, same bound as
+ * page_select() itself.
  */
+static bool
+page_select_is_smin_below(const PageEnt *e, const PageVer *v,
+						  uint64_t max_seq_exclusive)
+{
+	for (int j = 0; j < e->nver; j++)
+		if (e->vers[j].lsn == v->lsn &&
+			e->vers[j].admission_seq < max_seq_exclusive &&
+			e->vers[j].admission_seq < v->admission_seq)
+			return false;
+	return true;
+}
+
 static bool
 page_select_is_smin(const PageEnt *e, const PageVer *v)
 {
-	for (int j = 0; j < e->nver; j++)
-		if (e->vers[j].lsn == v->lsn && e->vers[j].admission_seq < v->admission_seq)
-			return false;
-	return true;
+	return page_select_is_smin_below(e, v, PS_SEQ_UNBOUNDED);
 }
 
 /*
@@ -8678,6 +8692,165 @@ branch_exists_with_metadata(uint32_t tl, int parent, uint64_t branch_lsn)
 #include "pagestore_artifact_lifecycle.inc"
 
 /*
+ * Phase P1 differential-test extension for artifact reads (Codex finding
+ * 4104937134, BRANCH_SNAPSHOT_SEQ_CAP.md S3.3): artifact_visible() must
+ * thread the walk's full ViewCap.seq (S) and per-level inherited-range
+ * boundary (B_k) through to its own admissibility check, rather than a
+ * downgraded (lsn, strict_seq) pair with B_k hardcoded to "root".  P1
+ * itself never constructs a finite S in production (S9.3: only P2/P3b/P5
+ * do), so -- exactly like ps_test_viewcap_differential()'s finite-cap half
+ * -- this test constructs one directly and checks artifact_visible()
+ * against brute_page_select() (the same literal-S1.3-rule oracle used
+ * there), restricted to the pre-first-BEGIN admission_seq domain
+ * ('first') artifact_visible()'s own fallback uses.
+ *
+ * The caller must already have, on an open store with the key's shard
+ * lock held for writing, written three plain (token == 0) versions of
+ * (tl, key, block) before ever calling ps_artifact_begin() on 'key' (so
+ * every one of them lands in artifact_visible()'s no-commit fallback
+ * domain), then issued exactly one ps_artifact_begin() (uncommitted,
+ * undropped) at an LSN above all three, in this order: an older write at
+ * lsn_rewrite, a same-LSN rewrite at lsn_rewrite with a larger
+ * admission_seq, and a third write at a fresh lsn_first > lsn_rewrite
+ * (its position holds only that one version).  See
+ * test_viewcap_artifact_property() in pagestore_artifact_lifecycle_test.c
+ * for the arrangement.
+ *
+ * Checks, at PS_SEQ_UNBOUNDED and at finite caps:
+ *  (a) uncapped: the newest version overall (lsn_first) is selected --
+ *      the "no behaviour change" half, matching every existing artifact
+ *      test's unrestricted expectation;
+ *  (b) S = the older lsn_rewrite write's admission_seq, L = lsn_rewrite:
+ *      the same-LSN rewrite is hidden (its escape fails: it is not the
+ *      first arrival at lsn_rewrite) and the honest pre-S write is
+ *      visible -- Bug B's protection, expressed for the artifact fallback
+ *      domain, and inexpressible through artifact_visible()'s pre-fix
+ *      (lsn, strict_seq)-only signature;
+ *  (c) S just below the lsn_first write's admission_seq, B_k = lsn_first
+ *      (has_B = true): that write's escape requires p > B_k, which now
+ *      fails, so it is hidden -- the pre-fix code hardcoded B = 0/
+ *      has_B = false here and would have shown it regardless;
+ *  (d) the same cap with has_B = false: the escape is available again and
+ *      that write is visible.
+ * Every check is also cross-checked against brute_page_select() itself,
+ * so a wrong expectation in this test cannot pass silently.
+ *
+ * Returns 0 on success, or the 1-based number of the first failed check.
+ */
+int
+ps_test_artifact_viewcap_property(uint32_t tl, const PsKey *key,
+								  uint32_t block, uint64_t lsn_rewrite,
+								  uint64_t lsn_first)
+{
+	PsKey		meta = artifact_meta_key(key);
+	PageEnt    *pages = page_find(tl, key, block);
+	uint64_t	first = artifact_legacy_seq(page_find(tl, &meta,
+													  PS_ARTIFACT_BEGIN_BLOCK));
+	PageVer		filtered[8];
+	PageEnt		tmp;
+	int			nfiltered = 0;
+	int			checkno = 0;
+	int			rc = 0;
+	ViewCap		cap;
+	PageVer    *got;
+	PageVer    *want;
+	int			state;
+
+#define AVC_CHECK(cond) \
+	do { \
+		checkno++; \
+		if (!(cond)) \
+		{ \
+			rc = checkno; \
+			goto done; \
+		} \
+	} while (0)
+
+	AVC_CHECK(pages != NULL && first != 0 && first != PS_SEQ_UNBOUNDED);
+	for (int i = 0; i < pages->nver && nfiltered < 8; i++)
+		if (pages->vers[i].admission_seq < first)
+			filtered[nfiltered++] = pages->vers[i];
+	AVC_CHECK(nfiltered == 3);
+	tmp.vers = filtered;
+	tmp.nver = nfiltered;
+
+	/*
+	 * This key never commits (the closing BEGIN is left open), so
+	 * artifact_visible() always takes its no-commit fallback and returns 0
+	 * ("legacy") regardless of whether it found a version: the answer is
+	 * *out itself, not the return code (see its doc comment).
+	 */
+
+	/* (a) uncapped: the newest overall (lsn_first) wins. */
+	cap = viewcap_from_request(UINT64_MAX, 0);
+	state = artifact_visible(tl, key, block, &cap, 0, false, &got, 1);
+	want = brute_page_select(&tmp, &cap, 0, false);
+	AVC_CHECK(state == 0);
+	AVC_CHECK((got == NULL) == (want == NULL));
+	AVC_CHECK(!want || (got->lsn == want->lsn &&
+						got->admission_seq == want->admission_seq));
+	AVC_CHECK(want && want->lsn == lsn_first);
+
+	/* (b) S caps out the same-LSN rewrite; the honest pre-S write at the
+	 * same position is visible (not the escape: it passes S directly). */
+	{
+		uint64_t	seq_lo = UINT64_MAX;
+
+		for (int i = 0; i < nfiltered; i++)
+			if (filtered[i].lsn == lsn_rewrite && filtered[i].admission_seq < seq_lo)
+				seq_lo = filtered[i].admission_seq;
+		AVC_CHECK(seq_lo != UINT64_MAX);
+		cap.lsn = lsn_rewrite;
+		cap.seq = seq_lo;
+		cap.strict_seq = PS_SEQ_UNBOUNDED;
+		cap.legacy = false;
+		state = artifact_visible(tl, key, block, &cap, 0, false, &got, 1);
+		want = brute_page_select(&tmp, &cap, 0, false);
+		AVC_CHECK(state == 0);
+		AVC_CHECK((got == NULL) == (want == NULL));
+		AVC_CHECK(!want || (got->lsn == want->lsn &&
+							got->admission_seq == want->admission_seq));
+		AVC_CHECK(want && want->lsn == lsn_rewrite &&
+				 want->admission_seq == seq_lo);
+	}
+
+	/* (c)/(d): S just below lsn_first's write; B_k = lsn_first disables its
+	 * escape (hidden), B_k = -infinity (has_B = false) allows it (visible). */
+	{
+		uint64_t	seq_first = 0;
+
+		for (int i = 0; i < nfiltered; i++)
+			if (filtered[i].lsn == lsn_first)
+				seq_first = filtered[i].admission_seq;
+		AVC_CHECK(seq_first != 0 && seq_first != PS_SEQ_UNBOUNDED);
+		cap.lsn = UINT64_MAX;
+		cap.seq = seq_first - 1;
+		cap.strict_seq = PS_SEQ_UNBOUNDED;
+		cap.legacy = false;
+
+		state = artifact_visible(tl, key, block, &cap, lsn_first, true, &got, 1);
+		want = brute_page_select(&tmp, &cap, lsn_first, true);
+		AVC_CHECK(state == 0);
+		AVC_CHECK((got == NULL) == (want == NULL));
+		AVC_CHECK(!want || (got->lsn == want->lsn &&
+							got->admission_seq == want->admission_seq));
+		AVC_CHECK(want && want->lsn != lsn_first);
+
+		state = artifact_visible(tl, key, block, &cap, 0, false, &got, 1);
+		want = brute_page_select(&tmp, &cap, 0, false);
+		AVC_CHECK(state == 0);
+		AVC_CHECK((got == NULL) == (want == NULL));
+		AVC_CHECK(!want || (got->lsn == want->lsn &&
+							got->admission_seq == want->admission_seq));
+		AVC_CHECK(want && want->lsn == lsn_first && want->admission_seq == seq_first);
+	}
+
+#undef AVC_CHECK
+done:
+	return rc;
+}
+
+/*
  * Resolve a read by walking the timeline ancestry: return the newest version of
  * (key, block) visible at read_lsn on 'timeline'; if the timeline never wrote
  * the page (or only after read_lsn), descend to the parent, capping read_lsn at
@@ -8698,8 +8871,6 @@ read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
 	do
 	{
 		ForkEnt    *fe = fork_find(w.tl, key);
-		uint64_t	seq_cap = w.cap.strict_seq == PS_SEQ_UNBOUNDED ?
-			0 : w.cap.strict_seq;
 		uint32_t	nb = 0;
 		int			fork_state = fe ? fork_asof_hop(fe, &w.cap, w.inherited_below,
 											w.has_inherited_below, &nb) :
@@ -8709,7 +8880,9 @@ read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
 										w.has_inherited_below) : NULL;
 		if (artifact_data_key(key))
 		{
-			int state = artifact_visible(w.tl, key, block, w.lsn, seq_cap, &v, 1);
+			int state = artifact_visible(w.tl, key, block, &w.cap,
+										 w.inherited_below,
+										 w.has_inherited_below, &v, 1);
 			if (state < 0)
 				return -1;
 			if (state == 2)
@@ -18737,7 +18910,9 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 								 w.has_inherited_below) : NULL;
 			if (artifact_data_key(key))
 			{
-				int state = artifact_visible(tl, key, block, rl, seq_cap, &pv, 0);
+				int state = artifact_visible(tl, key, block, &cur,
+											 w.inherited_below,
+											 w.has_inherited_below, &pv, 0);
 				if (state < 0)
 					return -1;
 				if (state == 2)
