@@ -17568,20 +17568,6 @@ walidx_snapshot_publish_one(void)
 				retry = 1;
 				goto publish_done;
 			}
-		/*
-		 * Design doc S3.7(7) rev 3: a mismatch here means at least one
-		 * fork-event/PAGE-GROW admission at lsn <= end_lsn landed on this
-		 * timeline since plan_epoch was sampled above.  This is routine
-		 * (materializer redo and writer page evictions routinely lag the
-		 * WAL-index worker) and never invalidates the plan (S1-S4's
-		 * monotonicity argument): a later admission can only add to what
-		 * every reader's view sees, so the bases this plan already
-		 * computed remain sufficient.  Count it for the soak report; never
-		 * gate on it.
-		 */
-		if (!fork_event_plan_epoch_validate(tl, plan_epoch))
-			__atomic_fetch_add(&walidx_publish_plan_epoch_aborts, 1,
-							   __ATOMIC_RELAXED);
 		if (compact)
 		{
 			if (ps_walidx_snapshot_prepare(&prepared, directory, tl, generation,
@@ -17619,13 +17605,16 @@ walidx_snapshot_publish_one(void)
 		 * The non-compact path publishes and selects in one call
 		 * (ps_walidx_snapshot_publish() is exactly ps_walidx_snapshot_
 		 * prepare() + ps_walidx_snapshot_commit(), aborting on a failed
-		 * commit).  Design doc S3.7(7) rev 3: no re-check is needed here,
-		 * or on the compact path above, no matter how long prepare takes --
-		 * a fork-event/PAGE-GROW admission that lands anywhere during this
-		 * publish, at any LSN, cannot invalidate a plan already built,
-		 * because later admissions only add to what a reader's view sees
-		 * (S1-S4's monotonicity argument).  This publish takes no
-		 * admission lock.
+		 * commit).  Design doc S3.7(7) rev 3: no *correctness* re-check is
+		 * needed here, or on the compact path above, no matter how long
+		 * prepare takes -- a fork-event/PAGE-GROW admission that lands
+		 * anywhere during this publish, at any LSN, cannot invalidate a
+		 * plan already built, because later admissions only add to what a
+		 * reader's view sees (S1-S4's monotonicity argument).  This
+		 * publish takes no admission lock.  (The informational epoch
+		 * counter is still sampled once both paths converge, at
+		 * do_generation_switch below, so it also counts admissions from
+		 * this I/O -- Codex 4114217403.)
 		 */
 		if (ps_walidx_snapshot_publish(directory, tl, generation,
 										start_lsn, end_lsn, inputs, ns) != 0)
@@ -17644,6 +17633,22 @@ walidx_snapshot_publish_one(void)
 		}
 
 do_generation_switch:
+		/*
+		 * Codex 4114217403: the plan-epoch observation (design doc
+		 * S3.7(7) rev 3) moved here, the one point both the compact path
+		 * (ps_walidx_snapshot_prepare()/commit(), above) and the
+		 * non-compact path (ps_walidx_snapshot_publish(), just above)
+		 * reach only after successfully switching generations.  Sampled
+		 * before either path's own I/O (right after plan_epoch was
+		 * captured, near the top of this function), the check missed
+		 * every admission that landed during that I/O, undercounting the
+		 * plan-to-publish race it exists to measure.  It stays a pure
+		 * statistic: it neither gates this switch nor takes any new lock,
+		 * exactly as the comments on both paths above already explain.
+		 */
+		if (!fork_event_plan_epoch_validate(tl, plan_epoch))
+			__atomic_fetch_add(&walidx_publish_plan_epoch_aborts, 1,
+							   __ATOMIC_RELAXED);
 		pthread_mutex_lock(&walidx_meta_lock);
 		walidx_snapshot_generation[tl] = generation;
 		walidx_snapshot_start[tl] = start_lsn;
