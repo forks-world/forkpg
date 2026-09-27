@@ -46,6 +46,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pagestore_admissible.h"
 #include "pagestore_artifact_format.h"
 #include "pagestore_compat.h"
 #include "pagestore_core.h"
@@ -941,6 +942,111 @@ admission_seq_observe(uint64_t seq)
 									 false, __ATOMIC_RELAXED,
 									 __ATOMIC_RELAXED))
 		;
+}
+
+/*
+ * WAL-index publish vs. concurrent fork admissions: design doc S3.7(7)
+ * rev 3 (amendment; supersedes the rev 1/rev 2 plan-epoch/lsn-range gates
+ * that PR #300 first landed and then found unworkable -- see that PR's
+ * history for the two liveness regressions, and the design doc amendment
+ * for the proof).  A fork-event/PAGE-GROW admission at or below the
+ * WAL-index progress horizon H is routine traffic (materializer redo and
+ * writer page evictions both routinely lag the writer-side index worker),
+ * so no gate on it -- skip, block, or refuse -- is workable: every one
+ * tried either starved publication under sustained load or introduced its
+ * own correctness regression.
+ *
+ * Rev 3 removes the gate entirely: the WAL-index plan does not need a
+ * stable fork state to stay valid.  For a fixed reader view, a later
+ * admission can only *add* to that view's visible set (S3.7(7)'s
+ * monotonicity lemma), so a reader's replacement base at any horizon --
+ * max(death, image), S2 below -- is non-decreasing over time, and a plan
+ * built from an earlier fork-event snapshot always retains at least what
+ * every later reader needs (S1, S3, S4).  walidx_snapshot_publish_one()
+ * therefore takes no admission lock and gates nothing on this account; see
+ * the property test in pagestore_walidx_prune_test.c.
+ *
+ * What remains is a pure statistic, kept because it is cheap and useful
+ * for a soak report: a per-timeline maximum admission_seq of any fork
+ * event or PAGE GROW admitted for it, sampled once a plan starts depending
+ * on the current fork-event state and re-checked right before the
+ * generation switch, purely to *count* how often a late admission actually
+ * landed in that window -- never to act on it.  fork_event_admit_seq_bump()
+ * is called from fork_event_add()/fork_event_add_seg_marker(), the two
+ * entry points every production fork-event insertion goes through (the
+ * I-ALLOC audit), under the caller's existing key-shard write lock.
+ */
+static uint64_t fork_event_admit_seq_by_tl[MAX_TIMELINES];
+
+static inline void
+fork_event_admit_seq_bump(uint32_t timeline, uint64_t seq)
+{
+	uint64_t	cur;
+
+	if (timeline >= MAX_TIMELINES || seq == 0)
+		return;
+	cur = __atomic_load_n(&fork_event_admit_seq_by_tl[timeline], __ATOMIC_ACQUIRE);
+	while (seq > cur &&
+		   !__atomic_compare_exchange_n(&fork_event_admit_seq_by_tl[timeline],
+										&cur, seq, true, __ATOMIC_RELEASE,
+										__ATOMIC_ACQUIRE))
+		;
+}
+
+/* Sample the current epoch for timeline tl, to be re-checked later under a
+ * stronger lock (fork_event_plan_epoch_validate()) right before publishing
+ * a plan built from this sample. */
+static inline uint64_t
+fork_event_plan_epoch_capture(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return __atomic_load_n(&fork_event_admit_seq_by_tl[timeline], __ATOMIC_ACQUIRE);
+}
+
+/* True iff no fork event/PAGE GROW has been admitted for tl since
+ * `captured` was sampled. */
+static inline bool
+fork_event_plan_epoch_validate(uint32_t timeline, uint64_t captured)
+{
+	if (timeline >= MAX_TIMELINES)
+		return true;
+	return __atomic_load_n(&fork_event_admit_seq_by_tl[timeline],
+						   __ATOMIC_ACQUIRE) == captured;
+}
+
+/* Test-only: observe the current epoch, and force a bump, so a test can
+ * deterministically inject "an admission raced the plan" between a capture
+ * and a validate. */
+uint64_t
+ps_test_plan_epoch(uint32_t timeline)
+{
+	return fork_event_plan_epoch_capture(timeline);
+}
+
+void
+ps_test_plan_epoch_bump(uint32_t timeline, uint64_t seq)
+{
+	fork_event_admit_seq_bump(timeline, seq);
+}
+
+int
+ps_test_plan_epoch_validate(uint32_t timeline, uint64_t captured)
+{
+	return fork_event_plan_epoch_validate(timeline, captured) ? 1 : 0;
+}
+
+/* Design doc S3.7(7) rev 3: a pure soak-report counter of
+ * walidx_snapshot_publish_one() attempts that observed a late admission
+ * (see fork_event_plan_epoch_validate() below) between sampling the plan
+ * epoch and the generation switch.  Never gates publication; the name is
+ * kept for the existing test accessor. */
+static uint64_t walidx_publish_plan_epoch_aborts;
+
+uint64_t
+ps_test_walidx_plan_epoch_aborts(void)
+{
+	return __atomic_load_n(&walidx_publish_plan_epoch_aborts, __ATOMIC_ACQUIRE);
 }
 
 void
@@ -3234,6 +3340,17 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	uint32_t	obj_nrequired = 0;
 	uint32_t	obj_hi = 0;
 	ArtifactPruneCache *artifact_cache = NULL;
+	/* Codex 4114217409: vfences/closure_protect used to be allocated (and
+	 * vfences converted) once per relation page group below; for a
+	 * relation-heavy compaction that is a heap allocation/free pair per
+	 * input record, plus rebuilding the identical vfences array whenever
+	 * there are more than 8 fences.  Both are sized for the whole
+	 * compaction and built once here instead; each group below still only
+	 * touches its own [0, end - first) prefix, exactly like `keep` already
+	 * does. */
+	PsViewFence	vfences_local[8];
+	PsViewFence *vfences = vfences_local;
+	unsigned char *closure_protect;
 
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return -1;
@@ -3251,8 +3368,12 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	obj_generations = malloc((size_t) *nrec * sizeof(*obj_generations));
 	/* one required generation per fence, plus the floor's */
 	obj_required = malloc(((size_t) nfences + 1) * sizeof(*obj_required));
+	closure_protect = malloc((size_t) *nrec);
+	if (nfences > 8)
+		vfences = malloc((size_t) nfences * sizeof(*vfences));
 	if (!order || !versions || !keep || !selected || !dropped ||
-		!obj_generations || !obj_required)
+		!obj_generations || !obj_required || !closure_protect ||
+		(nfences > 8 && !vfences))
 	{
 		free(order);
 		free(versions);
@@ -3261,11 +3382,16 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		free(dropped);
 		free(obj_generations);
 		free(obj_required);
+		free(closure_protect);
+		if (vfences != vfences_local)
+			free(vfences);
 		free(fences);
 		free(control_fences);
 		artifact_prune_cache_free(artifact_cache);
 		return -1;
 	}
+	for (uint32_t i = 0; i < nfences; i++)
+		vfences[i] = ps_prune_fence_to_view(fences[i]);
 	for (uint32_t i = 0; i < *nrec; i++)
 	{
 		order[i].key = recs[i].key;
@@ -3443,6 +3569,9 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				free(dropped);
 				free(obj_generations);
 				free(obj_required);
+				free(closure_protect);
+				if (vfences != vfences_local)
+					free(vfences);
 				free(fences);
 				free(control_fences);
 				artifact_prune_cache_free(artifact_cache);
@@ -3462,24 +3591,45 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			free(plan.kept);
 			free(plan.pending);
 		}
-		else if (ps_page_prune_plan(versions, end - first,
-								(PsPruneFence) {floor, UINT64_MAX}, fences,
-									 nfences, keep) < 0)
-		{
-			free(order);
-			free(versions);
-			free(keep);
-			free(selected);
-			free(dropped);
-			free(fences);
-			free(control_fences);
-			artifact_prune_cache_free(artifact_cache);
-			return -1;
-		}
 		else
 		{
+			/*
+			 * P2 (design doc S3.5, checklist item 8): route relation pages
+			 * through the closure-aware planner so a position closure
+			 * requires cannot be dropped by the forkmeta-invalidation check
+			 * below.  Every fence here still carries S = PS_PRUNE_SEQ_
+			 * UNBOUNDED (ps_prune_fence_to_view()), so closure never
+			 * actually triggers yet (no behaviour change: closure_protect
+			 * comes back all-zero) -- this only wires the mechanism through
+			 * for when a finite-S fence source lands (P5 activation).
+			 * vfences and closure_protect are the function-scope buffers
+			 * allocated once above (Codex 4114217409); this group only
+			 * touches their [0, end - first) prefix.
+			 */
+			int			rc;
+
+			rc = ps_page_prune_plan_capped(versions, end - first,
+										   (PsPruneFence) {floor, UINT64_MAX},
+										   vfences, nfences, 0, 0, keep,
+										   closure_protect);
+			if (rc < 0)
+			{
+				free(order);
+				free(versions);
+				free(keep);
+				free(selected);
+				free(dropped);
+				free(closure_protect);
+				if (vfences != vfences_local)
+					free(vfences);
+				free(fences);
+				free(control_fences);
+				artifact_prune_cache_free(artifact_cache);
+				return -1;
+			}
 			for (uint32_t i = first; i < end; i++)
 				if (keep[i - first] && order[i].version.lsn < floor &&
+					!closure_protect[i - first] &&
 					!prune_version_needed(timeline, &order[first].key,
 										  order[first].block, versions,
 										  end - first, i - first, floor,
@@ -3497,6 +3647,9 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	free(versions);
 	free(keep);
 	free(selected);
+	free(closure_protect);
+	if (vfences != vfences_local)
+		free(vfences);
 	free(fences);
 	free(control_fences);
 	artifact_prune_cache_free(artifact_cache);
@@ -4189,6 +4342,11 @@ _Static_assert(sizeof(ForkEvent) == 40, "ForkEvent grew past its padding");
 #define FEV_F_SNAPSHOT_DROPPED	0x01	/* former snapshot_dropped byte */
 #define FEV_F_META				0x02	/* SET/DEAD, or a ZEROEXTEND-origin GROW */
 #define FEV_F_META_FIRST		0x04	/* the min-seq META event at its own lsn */
+_Static_assert(FEV_F_META == PS_ADM_F_META &&
+			   FEV_F_META_FIRST == PS_ADM_F_META_FIRST,
+			   "FEV_F_* must track pagestore_admissible.h's PS_ADM_F_* "
+			   "bit for bit -- fork_event_hidden() passes ForkEvent.flags "
+			   "straight through with no translation");
 #define FEV_F_UNSTAMPED			0x08	/* a WAL-less (req_lsn == 0) op's event.
 										 * No setter yet in P1: the classifier
 										 * (fork_event_hidden()) and tests
@@ -4200,6 +4358,8 @@ _Static_assert(sizeof(ForkEvent) == 40, "ForkEvent grew past its padding");
 										 * flag and the client's req_lsn == 0 +
 										 * req_floor_lsn switch (design doc
 										 * S5). */
+_Static_assert(FEV_F_UNSTAMPED == PS_ADM_F_UNSTAMPED,
+			   "FEV_F_UNSTAMPED must track PS_ADM_F_UNSTAMPED");
 
 typedef struct ForkEnt
 {
@@ -5777,27 +5937,44 @@ static PageVer *
 page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
 {
 	PageVer    *best = NULL;
+	PsAdmitCap	ac;
 
+	ac.lsn = c->lsn;
+	ac.seq = c->seq;
+	ac.strict_seq = c->strict_seq;
 	for (int i = 0; i < e->nver; i++)
 	{
 		PageVer    *v = &e->vers[i];
 		uint64_t	vseq = v->admission_seq;
-		bool		ok;
+		bool		is_smin;
 
-		if (v->lsn > c->lsn)
+		/*
+		 * Codex 4104350506: check the L/X boundary (the cheap, O(1) part
+		 * of ps_version_admissible()) *before* even considering
+		 * page_select_is_smin(), which is O(nver).  page_select() has no
+		 * sort order to break out of early, unlike the planner's fence
+		 * loop, so without this a page with many versions past L, under a
+		 * finite S, would pay an O(nver) is_smin scan for every one of
+		 * them, only to have ps_version_admissible() reject each on the
+		 * boundary anyway -- O(nver^2) for no reason. Restores the
+		 * pre-refactor ordering (boundary first, escape computed only when
+		 * it could still matter).
+		 */
+		if (!ps_admit_boundary_ok(v->lsn, vseq, &ac))
 			continue;
-		if (v->lsn == c->lsn && c->strict_seq != PS_SEQ_UNBOUNDED &&
-			vseq != 0 && vseq > c->strict_seq)
-			continue;
+		/*
+		 * page_select_is_smin() is O(nver) per call; skip it unless the
+		 * boundary test already passed and the plain seq <= S disjunct
+		 * already failed, exactly as the pre-refactor inline logic did (the
+		 * escape is unreachable in P1 production, where c->seq stays
+		 * PS_SEQ_UNBOUNDED -- see ps_version_admissible()'s own short
+		 * circuit on that same condition).
+		 */
+		is_smin = (vseq != 0 && c->seq != PS_SEQ_UNBOUNDED &&
+				   vseq > c->seq) ?
+			page_select_is_smin(e, v) : false;
 
-		if (vseq == 0 || c->seq == PS_SEQ_UNBOUNDED || vseq <= c->seq)
-			ok = true;
-		else if (!has_B || v->lsn > B)
-			ok = page_select_is_smin(e, v);
-		else
-			ok = false;
-
-		if (!ok)
+		if (!ps_version_admissible(v->lsn, vseq, is_smin, &ac, B, has_B))
 			continue;
 		if (!best || v->lsn > best->lsn ||
 			(v->lsn == best->lsn && vseq >= best->admission_seq))
@@ -5996,25 +6173,14 @@ fork_event_hidden(const ForkEnt *e, uint32_t i, const ViewCap *c,
 				  uint64_t B, bool has_B)
 {
 	const ForkEvent *v = &e->ev[i];
-	uint64_t	vseq = v->admission_seq;
+	PsAdmitCap	ac;
 
-	if (v->lsn > c->lsn)
-		return true;
-	if (v->lsn == c->lsn && c->strict_seq != PS_SEQ_UNBOUNDED &&
-		vseq != 0 && vseq > c->strict_seq)
-		return true;
-
-	if (vseq == 0 || c->seq == PS_SEQ_UNBOUNDED || vseq <= c->seq)
-		return false;
-
-	/* vseq > S: only a class-appropriate escape can still admit it. */
-	if (v->flags & FEV_F_UNSTAMPED)
-		return true;
-	if (has_B && v->lsn <= B)
-		return true;			/* inherited range: no escape (S1.5) */
-	if (v->flags & FEV_F_META)
-		return !(v->flags & FEV_F_META_FIRST);
-	return false;				/* PAGE-class GROW: lsn > B_k is enough */
+	ac.lsn = c->lsn;
+	ac.seq = c->seq;
+	ac.strict_seq = c->strict_seq;
+	/* PS_ADM_F_* is defined bit-for-bit identical to FEV_F_* (see
+	 * pagestore_admissible.h); v->flags is passed straight through. */
+	return ps_event_hidden(v->lsn, v->admission_seq, v->flags, &ac, B, has_B);
 }
 
 /*
@@ -6638,8 +6804,16 @@ fork_event_recompute_meta_first(ForkEnt *e)
  * self-tests build a throwaway ForkEnt on the stack that is never inserted
  * into any shard's index, so no shard lock is meaningful for it.
  * fork_event_add() itself asserts I-ALLOC and calls this.
+ *
+ * Returns whether an event was actually inserted (Codex 4104350482).  For
+ * an idempotent GROW whose requested size is already visible (the early
+ * return just below), nothing about the fork's state changes, so the
+ * caller must not bump any admission-observation counter for it: a
+ * replayed no-op growth at or below a WAL-index horizon must not
+ * manufacture a "late admission" observation when fork metadata never
+ * actually changed.
  */
-static void
+static bool
 fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 			   uint32_t nblocks, uint8_t kind, bool meta)
 {
@@ -6648,7 +6822,7 @@ fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 
 	if (!fork_event_cache_defer && kind == FEV_GROW &&
 		fork_size_asof_hop(e, lsn, admission_seq) >= nblocks)
-		return;
+		return false;
 	if (kind != FEV_GROW && lsn > e->last_def_lsn)
 		e->last_def_lsn = lsn;
 	if (e->nev == e->evcap)
@@ -6691,7 +6865,7 @@ fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	else
 		fork_late_meta_shift(e, i);
 	if (fork_event_cache_defer)
-		return;
+		return true;
 	fork_event_cache_from(e, i);
 
 	/*
@@ -6716,12 +6890,13 @@ fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	{
 		for (uint32_t j = e->nev - 1; j > i; j--)
 			if (e->ev[j].kind == FEV_SET || e->ev[j].kind == FEV_DEAD)
-				return;			/* covered by a newer definitive event */
+				return true;	/* covered by a newer definitive event */
 		if (nblocks > e->nblocks)
 			e->nblocks = nblocks;
 	}
 	else
 		e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
+	return true;
 }
 
 static void
@@ -6729,7 +6904,11 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 			   uint32_t nblocks, uint8_t kind, bool meta)
 {
 	ps_assert_shard_held_for_key(&e->key);
-	fork_event_add_unchecked(e, lsn, admission_seq, nblocks, kind, meta);
+	/* Only an actual insert changes what any reader or planner sees, so
+	 * only bump the (now purely informational) admission-observation
+	 * counter on one (Codex 4104350482). */
+	if (fork_event_add_unchecked(e, lsn, admission_seq, nblocks, kind, meta))
+		fork_event_admit_seq_bump(e->timeline, admission_seq);
 }
 
 /*
@@ -6779,6 +6958,7 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	ps_assert_shard_held_for_key(&e->key);
 	fork_event_add_seg_marker_unchecked(e, lsn, nblocks, kind, order_id,
 										admission_seq);
+	fork_event_admit_seq_bump(e->timeline, admission_seq);
 }
 
 static int
@@ -11697,6 +11877,27 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	int preserve_survivors;
 	int overflow_cutover;
 	int rc = 0;
+#ifdef PAGESTORE_ASSERT_CHECKING
+	/*
+	 * P2 plan-epoch validation (design doc S3.7(7), checklist item 5).  The
+	 * caller (the forkmeta-cutover branch of the maintenance loop) already
+	 * holds admission-wr *and* every shard's write lock across this entire
+	 * call, which excludes fork_event_add()/fork_event_add_seg_marker() on
+	 * every timeline, not just this one -- so no fork-event admission can
+	 * race this function at all, and the epoch sampled here can never
+	 * change before freeze_seq is taken below.  This assertion is the
+	 * epoch-comparison checklist asks for, placed "inside its existing
+	 * admission-wr section and before its switch"; it is a proof-carrying
+	 * no-op today (never trips) rather than new error-handling, because the
+	 * existing, coarser lock already makes it unconditionally true.
+	 */
+	uint64_t	plan_epoch_snapshot[MAX_TIMELINES];
+	uint32_t	plan_epoch_ei;
+
+	for (plan_epoch_ei = 0; plan_epoch_ei < MAX_TIMELINES; plan_epoch_ei++)
+		plan_epoch_snapshot[plan_epoch_ei] =
+			fork_event_plan_epoch_capture(plan_epoch_ei);
+#endif
 
 	if (fork_meta_pending_load(&fork_meta_snapshot_gc_pending))
 	{
@@ -11839,6 +12040,11 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	 * allocator through that selected position before freezing the snapshot. */
 	if (force_deleting)
 		admission_seq_observe(cutoff.admission_seq);
+#ifdef PAGESTORE_ASSERT_CHECKING
+	for (plan_epoch_ei = 0; plan_epoch_ei < MAX_TIMELINES; plan_epoch_ei++)
+		PS_ASSERT(fork_event_plan_epoch_validate(plan_epoch_ei,
+												 plan_epoch_snapshot[plan_epoch_ei]));
+#endif
 	freeze_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	if (freeze_seq <= 1)
 		goto retry;
@@ -14143,7 +14349,19 @@ wal_reclaim_raw_dependency_floor(uint32_t timeline, uint64_t store_start,
  * grants_out/ngrants_out are optional: when given, the caller takes
  * ownership of the materializer-grant array that records which entries the
  * materializer exception added (needed only by the plan builder's own later
- * walidx_plan_recheck_standing at publish time, not by a one-off query). */
+ * walidx_plan_recheck_standing at publish time, not by a one-off query).
+ *
+ * Design doc S3.7(7) rev 3, S4 ("page prune keeps the base versions the
+ * WAL index depends on"): satisfied by construction, pre-existing and
+ * unchanged by P2.  The protected set here is built directly from
+ * page_prune_fences()'s own fence list (above), the identical fence set
+ * ps_page_prune_plan_capped() consumes for image retention (design doc
+ * S1.3 step 2: the newest admissible version at or below *every* fence it
+ * is given is kept).  So a horizon can only be "protected" -- and only
+ * then may walidx_plan_bases_build() rely on a stored image at or below it
+ * as a base -- when page-level retention is independently already
+ * committed to keeping a version there.  An unprotected horizon never
+ * trusts a stored image and falls back to the FPI-led chain instead. */
 static int
 walidx_protected_horizons_build(uint32_t tl, uint64_t **set_out,
 								uint32_t *n_out, WalIdxMatGrant **grants_out,
@@ -16467,6 +16685,18 @@ fork_meta_required_fences(const ForkEnt *e, const uint32_t *indices,
  * Build the replacement-base table for one timeline.  Caller holds every
  * shard read lock, the WAL-index prune read fence, and map-rd.  Failure
  * leaves no table, which degrades to the FPI-only plan.
+ *
+ * Design doc S3.7(7) rev 3:
+ *   S1 -- every death and image below is computed per horizon's own
+ *         ViewCap (viewcap_lsn_seq(horizons[i], 0), fed straight into
+ *         fork_asof_hop() -- the same admissibility predicate the read
+ *         path uses, pagestore_admissible.h), not a raw LSN comparison, so
+ *         retention and reads can never disagree on what a horizon sees.
+ *   S3 -- fork size (nblocks) is consulted only to recognise a death (a
+ *         SET whose nblocks <= this block, or a DEAD event); it never by
+ *         itself drops a WAL-index record.  Grep confirms every nblocks
+ *         comparison below feeds `deaths[]`, never `keep[]`/`bases[]`
+ *         directly.
  */
 static int
 walidx_plan_bases_build(uint32_t tl)
@@ -17278,6 +17508,15 @@ walidx_snapshot_publish_one(void)
 	int candidate = -1;
 	int retry = 0;
 	int rc = 0;
+	/* P2 plan-epoch observation (design doc S3.7(7)): sampled once the
+	 * candidate timeline is fixed and the plan starts depending on the
+	 * current fork-event state (walidx_plan_bases_build(), the
+	 * compaction plan and the per-shard payload all read it), re-checked
+	 * immediately before the generation switch below.  See the detailed
+	 * amendment at both call sites: this is currently an observation, not
+	 * a hard gate. */
+	uint64_t plan_epoch = 0;
+
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 		if (__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
@@ -17375,6 +17614,17 @@ walidx_snapshot_publish_one(void)
 		walidx_plan_bases_free();
 	for (uint32_t shard = ns; shard > 0; shard--)
 		ps_unlock_shard(shard - 1);
+	/*
+	 * Design doc S3.7(7) rev 3: sample the plan epoch once every shard
+	 * write lock this function's own read locks could conflict with is
+	 * released (every fork-event admission this counter tracks needs its
+	 * key's shard write lock, which was held rd above through
+	 * walidx_plan_bases_build()).  This is a pure soak-report observation
+	 * of "did anything land in the window from here to the switch below" --
+	 * it never gates: rev 3's monotonicity argument (S1-S4) is what makes
+	 * publication correct regardless of what lands in that window.
+	 */
+	plan_epoch = fork_event_plan_epoch_capture((uint32_t) candidate);
 	walidx_publish_wrlock();
 	walidx_plan_recheck_standing((uint32_t) candidate);
 	{
@@ -17522,9 +17772,25 @@ walidx_snapshot_publish_one(void)
 				goto publish_done;
 			}
 			walidx_prune_memory(tl, end_lsn, fences, nfences);
+			goto do_generation_switch;
 		}
-		else if (ps_walidx_snapshot_publish(directory, tl, generation,
-											start_lsn, end_lsn, inputs, ns) != 0)
+		/*
+		 * The non-compact path publishes and selects in one call
+		 * (ps_walidx_snapshot_publish() is exactly ps_walidx_snapshot_
+		 * prepare() + ps_walidx_snapshot_commit(), aborting on a failed
+		 * commit).  Design doc S3.7(7) rev 3: no *correctness* re-check is
+		 * needed here, or on the compact path above, no matter how long
+		 * prepare takes -- a fork-event/PAGE-GROW admission that lands
+		 * anywhere during this publish, at any LSN, cannot invalidate a
+		 * plan already built, because later admissions only add to what a
+		 * reader's view sees (S1-S4's monotonicity argument).  This
+		 * publish takes no admission lock.  (The informational epoch
+		 * counter is still sampled once both paths converge, at
+		 * do_generation_switch below, so it also counts admissions from
+		 * this I/O -- Codex 4114217403.)
+		 */
+		if (ps_walidx_snapshot_publish(directory, tl, generation,
+										start_lsn, end_lsn, inputs, ns) != 0)
 		{
 			int discard = ps_walidx_snapshot_discard_generation(directory, tl,
 															generation, ns);
@@ -17534,7 +17800,28 @@ walidx_snapshot_publish_one(void)
 				retry = 1;
 				goto publish_done;
 			}
+			/* discard == 1: this generation was already selected by an
+			 * earlier, previously-crashed attempt.  Fall through to
+			 * reconcile the in-memory pointer with that durable fact. */
 		}
+
+do_generation_switch:
+		/*
+		 * Codex 4114217403: the plan-epoch observation (design doc
+		 * S3.7(7) rev 3) moved here, the one point both the compact path
+		 * (ps_walidx_snapshot_prepare()/commit(), above) and the
+		 * non-compact path (ps_walidx_snapshot_publish(), just above)
+		 * reach only after successfully switching generations.  Sampled
+		 * before either path's own I/O (right after plan_epoch was
+		 * captured, near the top of this function), the check missed
+		 * every admission that landed during that I/O, undercounting the
+		 * plan-to-publish race it exists to measure.  It stays a pure
+		 * statistic: it neither gates this switch nor takes any new lock,
+		 * exactly as the comments on both paths above already explain.
+		 */
+		if (!fork_event_plan_epoch_validate(tl, plan_epoch))
+			__atomic_fetch_add(&walidx_publish_plan_epoch_aborts, 1,
+							   __ATOMIC_RELAXED);
 		pthread_mutex_lock(&walidx_meta_lock);
 		walidx_snapshot_generation[tl] = generation;
 		walidx_snapshot_start[tl] = start_lsn;
@@ -23810,6 +24097,10 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	free_walidx_indexes();
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
 	__atomic_store_n(&next_admission_seq, 1, __ATOMIC_RELAXED);
+	/* The soak epochs are store-scoped too: a stale maximum from the previous
+	 * store would mask every admission of a lower-sequence new store. */
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		__atomic_store_n(&fork_event_admit_seq_by_tl[tl], 0, __ATOMIC_RELAXED);
 	/* A close/open cycle may switch to a store with different timelines.  Drop
 	 * every in-memory flat-WAL catalog before metadata replay selects which
 	 * timelines to recover; resetting only wal_end would leave stale offsets and

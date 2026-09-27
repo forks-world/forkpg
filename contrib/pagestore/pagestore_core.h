@@ -221,6 +221,22 @@ extern int ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
  * returns 1 if a frontier has been published for this timeline's current
  * incarnation, 0 if not (both out values are 0 in that case). */
 extern int ps_test_page_frontier(uint32_t timeline, uint64_t *lsn, uint64_t *seq);
+/* Test-only: P2 plan-epoch (design doc S3.7(7)).  ps_test_plan_epoch()
+ * samples the current fork_event_admit_seq epoch for a timeline, exactly as
+ * a real planner would before doing its analysis.  ps_test_plan_epoch_bump()
+ * forces the epoch forward without a real fork-event admission, so a test
+ * can deterministically inject "an admission raced the plan" between a
+ * capture and a later validation. */
+extern uint64_t ps_test_plan_epoch(uint32_t timeline);
+extern void ps_test_plan_epoch_bump(uint32_t timeline, uint64_t seq);
+extern int ps_test_plan_epoch_validate(uint32_t timeline, uint64_t captured);
+/* Test-only: design doc S3.7(7) rev 3.  This is now a pure soak-report
+ * statistic (no gate): the count of walidx_snapshot_publish_one() attempts
+ * that observed at least one fork-event/PAGE-GROW admission on the
+ * candidate timeline between sampling the plan epoch and the generation
+ * switch.  Late admissions of this kind are routine and never block or
+ * invalidate publication -- see the S1-S4 monotonicity argument. */
+extern uint64_t ps_test_walidx_plan_epoch_aborts(void);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_reclaim_due(uint32_t timeline);
 extern uint32_t ps_test_wal_reclaim_watch_count(uint32_t timeline);
