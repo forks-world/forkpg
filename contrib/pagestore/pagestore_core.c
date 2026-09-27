@@ -5926,7 +5926,22 @@ page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
 	{
 		PageVer    *v = &e->vers[i];
 		uint64_t	vseq = v->admission_seq;
+		bool		is_smin;
 
+		/*
+		 * Codex 4104350506: check the L/X boundary (the cheap, O(1) part
+		 * of ps_version_admissible()) *before* even considering
+		 * page_select_is_smin(), which is O(nver).  page_select() has no
+		 * sort order to break out of early, unlike the planner's fence
+		 * loop, so without this a page with many versions past L, under a
+		 * finite S, would pay an O(nver) is_smin scan for every one of
+		 * them, only to have ps_version_admissible() reject each on the
+		 * boundary anyway -- O(nver^2) for no reason. Restores the
+		 * pre-refactor ordering (boundary first, escape computed only when
+		 * it could still matter).
+		 */
+		if (!ps_admit_boundary_ok(v->lsn, vseq, &ac))
+			continue;
 		/*
 		 * page_select_is_smin() is O(nver) per call; skip it unless the
 		 * boundary test already passed and the plain seq <= S disjunct
@@ -5935,8 +5950,8 @@ page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
 		 * PS_SEQ_UNBOUNDED -- see ps_version_admissible()'s own short
 		 * circuit on that same condition).
 		 */
-		bool		is_smin = (vseq != 0 && c->seq != PS_SEQ_UNBOUNDED &&
-							   vseq > c->seq) ?
+		is_smin = (vseq != 0 && c->seq != PS_SEQ_UNBOUNDED &&
+				   vseq > c->seq) ?
 			page_select_is_smin(e, v) : false;
 
 		if (!ps_version_admissible(v->lsn, vseq, is_smin, &ac, B, has_B))
@@ -6769,8 +6784,16 @@ fork_event_recompute_meta_first(ForkEnt *e)
  * self-tests build a throwaway ForkEnt on the stack that is never inserted
  * into any shard's index, so no shard lock is meaningful for it.
  * fork_event_add() itself asserts I-ALLOC and calls this.
+ *
+ * Returns whether an event was actually inserted (Codex 4104350482).  For
+ * an idempotent GROW whose requested size is already visible (the early
+ * return just below), nothing about the fork's state changes, so the
+ * caller must not bump any admission-observation counter for it: a
+ * replayed no-op growth at or below a WAL-index horizon must not
+ * manufacture a "late admission" observation when fork metadata never
+ * actually changed.
  */
-static void
+static bool
 fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 			   uint32_t nblocks, uint8_t kind, bool meta)
 {
@@ -6779,7 +6802,7 @@ fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 
 	if (!fork_event_cache_defer && kind == FEV_GROW &&
 		fork_size_asof_hop(e, lsn, admission_seq) >= nblocks)
-		return;
+		return false;
 	if (kind != FEV_GROW && lsn > e->last_def_lsn)
 		e->last_def_lsn = lsn;
 	if (e->nev == e->evcap)
@@ -6822,7 +6845,7 @@ fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	else
 		fork_late_meta_shift(e, i);
 	if (fork_event_cache_defer)
-		return;
+		return true;
 	fork_event_cache_from(e, i);
 
 	/*
@@ -6847,12 +6870,13 @@ fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	{
 		for (uint32_t j = e->nev - 1; j > i; j--)
 			if (e->ev[j].kind == FEV_SET || e->ev[j].kind == FEV_DEAD)
-				return;			/* covered by a newer definitive event */
+				return true;	/* covered by a newer definitive event */
 		if (nblocks > e->nblocks)
 			e->nblocks = nblocks;
 	}
 	else
 		e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
+	return true;
 }
 
 static void
@@ -6860,8 +6884,11 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 			   uint32_t nblocks, uint8_t kind, bool meta)
 {
 	ps_assert_shard_held_for_key(&e->key);
-	fork_event_add_unchecked(e, lsn, admission_seq, nblocks, kind, meta);
-	fork_event_admit_seq_bump(e->timeline, admission_seq);
+	/* Only an actual insert changes what any reader or planner sees, so
+	 * only bump the (now purely informational) admission-observation
+	 * counter on one (Codex 4104350482). */
+	if (fork_event_add_unchecked(e, lsn, admission_seq, nblocks, kind, meta))
+		fork_event_admit_seq_bump(e->timeline, admission_seq);
 }
 
 /*

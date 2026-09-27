@@ -434,6 +434,27 @@ main(void)
 			  "(20,1)/(20,5) under S=3: s_min(20,1) is closure-protected");
 	}
 	{
+		/* Codex 4104350489: an exact (lsn, admission_seq) duplicate pair at
+		 * the tied minimum seq (indices 0 and 1, both (20,1)), plus a
+		 * higher-seq sibling (20,5) that fails S=3 and is not s_min.  Step
+		 * 2's fence selection already breaks the (20,1)/(20,1) tie toward
+		 * the *last* input element (index 1, via its own >= comparison),
+		 * so closure's position_min_seq_index() must resolve to the same
+		 * index for consistency -- the design's "last append is
+		 * authoritative" convention applies uniformly. Before the fix, a
+		 * strict "<" left closure pointing at index 0 instead, which this
+		 * asserts against directly. */
+		PsPruneVersion v[] = {{20, 1}, {20, 1}, {20, 5}};
+		PsViewFence f[] = {{20, 3, PS_PRUNE_SEQ_UNBOUNDED}};
+		int rc = ps_page_prune_plan_capped(v, 3, (PsPruneFence) {20, 5}, f, 1,
+										   0, 0, keep, closure);
+
+		check(rc == 2 && !keep[0] && keep[1] && keep[2] &&
+			  !closure[0] && closure[1],
+			  "exact (lsn,seq) duplicates: closure protects the last tied "
+			  "minimum-seq element, not the first");
+	}
+	{
 		/* post-S-only keeps the min: every version at the position is
 		 * post-S under the fence; only the min-seq one is admissible (the
 		 * escape).  The floor is set above lsn 20 (30) so its own base

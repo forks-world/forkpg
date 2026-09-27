@@ -23,7 +23,17 @@ version_is_smin(const PsPruneVersion *versions, uint32_t n, uint32_t idx)
 
 /* The index of the minimum-admission_seq version at this lsn, or n if none
  * exists (the caller only calls this for a position it already knows is
- * occupied). */
+ * occupied).
+ *
+ * Codex 4104350489: an exact (lsn, admission_seq) tie is a duplicate tuple
+ * whose *last* input element is authoritative (the same convention step 1's
+ * exact-duplicate skip and step 2's best-selection tie-break both use, via
+ * their own >= comparisons) -- the last append is what the stored bytes at
+ * that identity actually resolve to.  A strict "<" here would instead keep
+ * the *first* of a tied run, so closure could protect a stale duplicate's
+ * index while the real payload the identity resolves to (the last one) is
+ * left unprotected and can be pruned.  "<=" makes a later duplicate at the
+ * same minimum seq win, matching that convention. */
 static uint32_t
 position_min_seq_index(const PsPruneVersion *versions, uint32_t n, uint64_t lsn)
 {
@@ -31,7 +41,7 @@ position_min_seq_index(const PsPruneVersion *versions, uint32_t n, uint64_t lsn)
 
 	for (uint32_t j = 0; j < n; j++)
 		if (versions[j].lsn == lsn &&
-			(best == n || versions[j].admission_seq < versions[best].admission_seq))
+			(best == n || versions[j].admission_seq <= versions[best].admission_seq))
 			best = j;
 	return best;
 }
