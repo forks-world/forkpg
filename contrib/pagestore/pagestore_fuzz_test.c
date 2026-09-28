@@ -75,10 +75,10 @@
  *
  *-------------------------------------------------------------------------
  */
-#include <errno.h>
+#include "pagestore_test_client.h"
+
 #include <limits.h>
 
-#include "pagestore_test_client.h"
 #include "pagestore_artifact_format.h"
 
 /* ===================== configuration ==================================== */
