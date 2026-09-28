@@ -239,6 +239,17 @@ typedef struct FzArtifact
 	uint64_t	token;			/* begin_seq; valid while OPEN or COMMITTED */
 	uint64_t	max_begin_lsn;	/* highest lsn any successful BEGIN has ever
 								 * used for this key, settled or not */
+	uint64_t	max_begin_lsn_at_drop;	/* max_begin_lsn as of the last
+								 * successful DROP; unlike COMMIT (which
+								 * reuses its own BEGIN's lsn in art->lsn),
+								 * DROP always stamps a fresh, unrelated lsn
+								 * into art->lsn, so "art->lsn ==
+								 * max_begin_lsn" never holds for a DROPPED
+								 * generation and cannot serve as "no BEGIN
+								 * happened after the drop" the way it does
+								 * for COMMITTED; compare against this
+								 * snapshot instead (see act_artifact_begin/
+								 * drop()'s retry-dropped probes) */
 	/*
 	 * Shadow of (state, lsn, token) as of just before the *current* open
 	 * attempt's own BEGIN overwrote them -- i.e. the last settled (COMMITTED
@@ -2296,11 +2307,12 @@ act_retention_reserve_adv(void)
 		 * no record yet simply proceeds -- not stale -- so this only fires
 		 * meaningfully once a reader has cycled at least once). */
 		uint64_t	seq = 0;
+		uint64_t	gen = g_reader[0].generation > 1 ?
+			g_reader[0].generation - 1 : g_reader[0].generation;
 		int			status = psc_op_retention_reserve(0,
 													   PS_RETENTION_OWNER_READER,
 													   g_reader[0].owner_id,
-													   g_reader[0].generation == 0 ? 1 :
-													   g_reader[0].generation,
+													   gen,
 													   PS_RETENTION_RESOURCE_ALL,
 													   0, &seq);
 
@@ -2697,12 +2709,24 @@ act_artifact_begin(void)
 		record_cov(PS_OP_ARTIFACT_BEGIN, (uint32_t) status, reason);
 		return;
 	}
-	if (art->state == FZ_ART_DROPPED && art->lsn == art->max_begin_lsn &&
+	if (art->state == FZ_ART_DROPPED &&
+		art->max_begin_lsn == art->max_begin_lsn_at_drop &&
 		rng_pct(30))
 	{
 		/* Exact-lsn retry of an already-dropped generation: refused.
-		 * lsn==max_begin_lsn guard: see the COMMITTED case above -- the
-		 * same BEGIN_NEWER-before-DROPPED ordering applies here. */
+		 * max_begin_lsn_at_drop guard: no BEGIN has happened since this
+		 * drop (see the FzArtifact comment) -- ps_artifact_begin() still
+		 * checks BEGIN_NEWER before the DROPPED refusal, so a later BEGIN
+		 * would otherwise take that path instead.
+		 *
+		 * WEAK ORACLE (reason only, refusal itself is MUST): the same
+		 * HORIZON preemption documented for the "older than max_begin_lsn"
+		 * probe applies here too -- ps_artifact_begin()'s up-front
+		 * artifact_lsn_fenced() check runs before the DROPPED-specific
+		 * ordering check and can independently refuse HORIZON whenever
+		 * this retry's lsn also falls below the data fork's own last
+		 * written page lsn, a value this model does not track separately;
+		 * see g_weak_oracle_ops. */
 		uint32_t	reason = 0;
 		uint64_t	token = 0;
 		int			status = psc_op_artifact_begin(tl, g_tl[tl].incarnation,
@@ -2711,9 +2735,11 @@ act_artifact_begin(void)
 
 		ring_note("ARTIFACT_BEGIN retry-dropped tl=%u akind=%u rel=%u "
 				  "lsn=%llu", tl, akind, rel, (unsigned long long) art->lsn);
-		ck(status != PS_STATUS_OK && reason == PS_ARTIFACT_REFUSE_DROPPED,
+		ck(status == PS_STATUS_ERROR &&
+		   (reason == PS_ARTIFACT_REFUSE_DROPPED ||
+			reason == PS_ARTIFACT_REFUSE_HORIZON),
 		   "ARTIFACT_BEGIN exact retry of dropped generation lsn=%llu "
-		   "expected DROPPED, got status=%d reason=%u",
+		   "expected DROPPED (or HORIZON), got status=%d reason=%u",
 		   (unsigned long long) art->lsn, status, reason);
 		record_cov(PS_OP_ARTIFACT_BEGIN, (uint32_t) status, reason);
 		return;
@@ -3243,12 +3269,23 @@ act_artifact_drop(void)
 		record_cov(PS_OP_ARTIFACT_DROP, (uint32_t) status, reason);
 		return;
 	}
-	if (art->state == FZ_ART_DROPPED && art->lsn == art->max_begin_lsn &&
+	if (art->state == FZ_ART_DROPPED &&
+		art->max_begin_lsn == art->max_begin_lsn_at_drop &&
 		rng_pct(30))
 	{
 		/* Exact-lsn retry of an already-dropped generation: idempotent.
-		 * lsn==max_begin_lsn guard: ps_artifact_drop() also checks
-		 * BEGIN_NEWER before the same-lsn-dropped short circuit. */
+		 * max_begin_lsn_at_drop guard: no BEGIN has happened since this
+		 * drop (see the FzArtifact comment) -- ps_artifact_drop() also
+		 * checks BEGIN_NEWER before the same-lsn-dropped short circuit.
+		 *
+		 * WEAK ORACLE (reason only when refused; OK is still the primary
+		 * expectation): the same HORIZON preemption documented for
+		 * ARTIFACT_BEGIN's sibling retry-dropped probe applies here too --
+		 * ps_artifact_drop()'s up-front lsn fencing can independently
+		 * refuse HORIZON before the same-lsn-dropped short circuit runs,
+		 * whenever this retry's lsn falls below the data fork's own last
+		 * written page lsn, a value this model does not track separately;
+		 * see g_weak_oracle_ops. */
 		uint32_t	reason = 0;
 		int			status = psc_op_artifact_drop(tl, g_tl[tl].incarnation,
 												   klass, rel, art->lsn, 0,
@@ -3256,9 +3293,11 @@ act_artifact_drop(void)
 
 		ring_note("ARTIFACT_DROP retry-dropped tl=%u akind=%u rel=%u "
 				  "lsn=%llu", tl, akind, rel, (unsigned long long) art->lsn);
-		ck(status == PS_STATUS_OK, "ARTIFACT_DROP exact retry of an "
-		   "already-dropped generation lsn=%llu must succeed idempotently, "
-		   "got %d (reason %u)", (unsigned long long) art->lsn, status,
+		ck(status == PS_STATUS_OK ||
+		   (status == PS_STATUS_ERROR && reason == PS_ARTIFACT_REFUSE_HORIZON),
+		   "ARTIFACT_DROP exact retry of an already-dropped generation "
+		   "lsn=%llu must succeed idempotently (or HORIZON), got %d "
+		   "(reason %u)", (unsigned long long) art->lsn, status,
 		   reason);
 		record_cov(PS_OP_ARTIFACT_DROP, (uint32_t) status, reason);
 		return;
@@ -3311,6 +3350,7 @@ act_artifact_drop(void)
 		{
 			art->state = FZ_ART_DROPPED;
 			art->lsn = lsn;
+			art->max_begin_lsn_at_drop = art->max_begin_lsn;
 			memset(&art->visible, 0, sizeof(art->visible));
 
 			{
@@ -3552,6 +3592,21 @@ env_branch_create(void)
 				{
 					ca->state = pa->state;
 					ca->lsn = pa->lsn;
+					ca->visible = pa->visible;
+				}
+				else if (pa->state == FZ_ART_OPEN)
+				{
+					/*
+					 * An unfinished attempt doesn't hide the parent's prior
+					 * committed/dropped generation until it COMMITs/DROPs:
+					 * prev_state/prev_lsn shadow exactly that last-settled
+					 * generation (see the FzArtifact comment above), and
+					 * visible only ever changes on COMMIT/DROP -- never on
+					 * a still-open attempt -- so it is still that settled
+					 * generation's data even while pa->state == OPEN.
+					 */
+					ca->state = pa->prev_state;
+					ca->lsn = pa->prev_lsn;
 					ca->visible = pa->visible;
 				}
 			}
