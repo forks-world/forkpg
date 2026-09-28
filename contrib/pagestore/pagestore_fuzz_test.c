@@ -414,6 +414,7 @@ static PsWalRec fz_walidx_get_recs[FZ_WALIDX_GET_CAP];
 #define FZ_NREASON		9		/* 0..7 exact, 8 = "8+" */
 
 static long long g_cov[FZ_MAX_OPCODE][FZ_NSTATUS][FZ_NREASON];
+static long long g_retention_set_update_count;
 
 typedef struct FzOpInfo
 {
@@ -511,12 +512,11 @@ static const char *g_weak_oracle_ops[] = {
 	"LSN is ordered after the snapshot and may be promoted by durable "
 	"forkmeta/page-retention fences, so those blocks use the known branch-floor "
 	"lower bound.",
-	"RETENTION_PIN_SET: only two sub-cases are strongly checked (an exact "
-	"(lsn,seq) retry of a held pin -> OK; generation 0 -> refused); moving a "
-	"pin to a genuinely new LSN is exercised but its exact accept/refuse "
-	"boundary (page/WAL/WAL-index frontier ancestry) is not independently "
-	"re-derived here, so that sub-case only checks {no crash, status in "
-	"{OK,ERROR,STALE}}.",
+	"RETENTION_PIN_SET: exact retries and generation-zero refusal are "
+	"checked. A constrained, known-frontier state-changing update also must "
+	"succeed and is checked by LOOKUP; arbitrary moves outside that prepared "
+	"point (including sparse/pending WAL-index frontier cases) are not "
+	"attempted.",
 	"CREATE/TRUNCATE/UNLINK/ZEROEXTEND with an adversarial *content* LSN "
 	"(as opposed to a bad timeline/incarnation): fork_op_lsn() clamps to the "
 	"newest definitive event rather than refusing, and predicting the "
@@ -2454,6 +2454,8 @@ act_retention_floor(void)
 	}
 }
 
+static void env_materialize(void);
+
 static void
 act_retention_set(void)
 {
@@ -2463,7 +2465,70 @@ act_retention_set(void)
 	if (r == NULL)
 		return;					/* nothing held to exercise SET against */
 
-	if (rng_pct(70))
+	if (rng_below(3) == 0)
+	{
+		uint64_t	lsn;
+		uint64_t	seq = 0;
+		uint64_t	old_lsn = r->lsn;
+		uint64_t	old_seq = r->seq;
+		PsRetentionPin pin = {0};
+		int			status;
+		int			found;
+
+		/* Establish a concrete legal point beyond the reader's old point and
+		 * publish the matching WAL-index frontier.  Do not RESERVE this reader
+		 * again: SET itself must perform the owner mutation. */
+		ship_wal(0);
+		env_materialize();
+		lsn = g_tl[0].wal_end;
+		ck(lsn > old_lsn, "RETENTION_PIN_SET update point %llu must advance "
+		   "reader %llu from %llu", (unsigned long long) lsn,
+		   (unsigned long long) r->owner_id, (unsigned long long) old_lsn);
+		status = psc_op_admission_barrier(&seq);
+		ck(status == PS_STATUS_OK && seq > old_seq,
+		   "RETENTION_PIN_SET update barrier must advance reader %llu sequence "
+		   "from %llu (status %d, seq %llu)",
+		   (unsigned long long) r->owner_id, (unsigned long long) old_seq,
+		   status, (unsigned long long) seq);
+		if (status != PS_STATUS_OK || lsn <= old_lsn || seq <= old_seq)
+			return;
+
+		status = psc_op_retention_set(0, PS_RETENTION_OWNER_READER,
+									  r->owner_id, r->generation,
+									  PS_RETENTION_RESOURCE_ALL, lsn, seq);
+		ring_note("RETENTION_PIN_SET advance owner=%llu from=%llu/%llu to=%llu/%llu",
+				  (unsigned long long) r->owner_id,
+				  (unsigned long long) old_lsn, (unsigned long long) old_seq,
+				  (unsigned long long) lsn, (unsigned long long) seq);
+		ck(status == PS_STATUS_OK, "RETENTION_PIN_SET valid update owner=%llu "
+		   "from %llu/%llu to %llu/%llu must succeed, got %d",
+		   (unsigned long long) r->owner_id, (unsigned long long) old_lsn,
+		   (unsigned long long) old_seq, (unsigned long long) lsn,
+		   (unsigned long long) seq, status);
+		record_cov(PS_OP_RETENTION_PIN_SET, (uint32_t) status, 0);
+		if (status != PS_STATUS_OK)
+			return;
+
+		r->lsn = lsn;
+		r->seq = seq;
+		memcpy(r->snap, g_tl[0].rel, sizeof(r->snap));
+		g_retention_set_update_count++;
+		found = psc_op_retention_lookup(0, 0, PS_RETENTION_OWNER_READER,
+										 r->owner_id, &pin);
+		status = psc_chan_ptr()->status;
+		ck(status == PS_STATUS_OK && found &&
+		   pin.timeline == 0 &&
+		   pin.owner_kind == PS_RETENTION_OWNER_READER &&
+		   pin.resources == PS_RETENTION_RESOURCE_ALL &&
+		   pin.generation == r->generation && pin.owner_id == r->owner_id &&
+		   pin.lsn == r->lsn && pin.admission_seq == r->seq,
+		   "RETENTION_PIN_SET update owner=%llu LOOKUP mismatch (status %d, "
+		   "found %d, resources %u, generation %u, lsn %llu, seq %llu)",
+		   (unsigned long long) r->owner_id, status, found, pin.resources,
+		   pin.generation, (unsigned long long) pin.lsn,
+		   (unsigned long long) pin.admission_seq);
+	}
+	else if (rng_pct(70))
 	{
 		/* Exact retry of a held pin at its own (lsn, seq): must succeed even
 		 * if the frontier has since moved past it (see the exact-retry
@@ -4566,7 +4631,9 @@ verify_after_restart(const char *phase)
 		if (g_reader[i].held)
 			ck(found && pin.lsn == g_reader[i].lsn &&
 			   pin.admission_seq == g_reader[i].seq &&
-			   pin.generation == g_reader[i].generation, "%s: reader %llu pin "
+			   pin.generation == g_reader[i].generation &&
+			   pin.resources == PS_RETENTION_RESOURCE_ALL,
+			   "%s: reader %llu pin "
 			   "survives restart", phase,
 			   (unsigned long long) g_reader[i].owner_id);
 		else
@@ -4579,7 +4646,10 @@ verify_after_restart(const char *phase)
 
 		ck(psc_op_retention_lookup(0, 0, PS_RETENTION_OWNER_MATERIALIZER, 1,
 								   &pin) && pin.lsn == g_tl[0].mat_lsn &&
-		   pin.admission_seq == g_tl[0].mat_seq, "%s: materializer pin "
+		   pin.admission_seq == g_tl[0].mat_seq &&
+		   pin.resources == (PS_RETENTION_RESOURCE_WAL |
+							 PS_RETENTION_RESOURCE_WAL_INDEX),
+		   "%s: materializer pin "
 		   "survives restart", phase);
 	}
 	/* Every known timeline, not just LIVE ones: a clean/crash recovery that
@@ -5320,6 +5390,14 @@ print_coverage_and_check(void)
 					g_env_names[e]);
 			missing++;
 		}
+	}
+	fprintf(stderr, "RETENTION_PIN_SET state-changing successful updates=%lld\n",
+			g_retention_set_update_count);
+	if (g_retention_set_update_count == 0)
+	{
+		fprintf(stderr, "  MISSING: no successful state-changing "
+				"RETENTION_PIN_SET observed\n");
+		missing++;
 	}
 
 	fprintf(stderr, "\n==== opcodes using the weak oracle in this stage ====\n");
