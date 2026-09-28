@@ -459,7 +459,25 @@ test('pagestore_soak',
 # combinations against one real daemon in a short, fixed-seed CI run (see
 # pagestore_fuzz_test.c's header for the full design).  PAGESTORE_FUZZ_SEED /
 # PAGESTORE_FUZZ_OPS raise the seed count / op budget for exploration runs
-# outside CI.
+# outside CI; direct invocation without PAGESTORE_FUZZ_OPS uses the
+# binary's own FZ_DEFAULT_OPS (4000).  CI overrides it down to 2000 below
+# (env, not FZ_DEFAULT_OPS) to keep this test's own wall time bounded; 2000
+# ops still reaches 0 missing coverage cells for the fixed default seed.
+#
+# Timing measured 2026-09-28, default seed, PAGESTORE_FUZZ_BUGB_WORKAROUND=1,
+# unloaded box, both the cassert meson build and a standalone `cc -O2 -Wall
+# -Wextra -Werror` build (matching the CI workflow's compile flags):
+#   4000 ops (FZ_DEFAULT_OPS): ~16-18s in both builds.  This is the config
+#     PR #302's Codex P2 finding measured as *not finishing* inside an
+#     external 100s timeout on an -O2 build -- CI hardware is evidently
+#     substantially slower than this measurement box for this IPC-heavy
+#     workload (high syscall/context-switch volume: ~130k voluntary context
+#     switches per run), so the ratio below is not just this box's 3x.
+#   2000 ops: ~9-10s in both builds.
+# timeout is set for >=3x headroom over a conservative estimate of the CI
+# worst case (assuming CI is up to ~8x slower than this box for this
+# workload, consistent with the 4000-op discrepancy above): 10s * 8 = 80s;
+# 3x that is 240s; rounded up to 300s.
 pagestore_fuzz_test = executable('pagestore_fuzz_test',
   files('pagestore_fuzz_test.c'),
   install: false,
@@ -469,7 +487,7 @@ test('pagestore_op_fuzz',
   args: [pagestore_daemon],
   depends: [pagestore_daemon],
   suite: ['pagestore'],
-  timeout: 90,
+  timeout: 300,
   # TODO(remove with seq-cap P3b): "Bug B" (a parent admission after a
   # branch's fork point leaks through the child's read-through) is fixed by
   # the read-side seq cap (BRANCH_SNAPSHOT_SEQ_CAP.md), which only takes
@@ -478,7 +496,7 @@ test('pagestore_op_fuzz',
   # unset, but CI must stay green against the not-yet-fixed daemon, so force
   # the avoidance workaround on here; once P3b lands, drop this env entry so
   # CI exercises the real race by default.
-  env: ['PAGESTORE_FUZZ_BUGB_WORKAROUND=1'],
+  env: ['PAGESTORE_FUZZ_BUGB_WORKAROUND=1', 'PAGESTORE_FUZZ_OPS=2000'],
 )
 
 # Deterministic page/WAL lag-controller and admission-wait coverage.
