@@ -684,6 +684,7 @@ ck(int cond, const char *fmt, ...)
 	if (log_fp != NULL)
 		fflush(log_fp);
 	psc_kill_daemon();
+	ps_shm_unlink(psc_shm_name);
 	if (!keep_store)
 		psc_remove_tree(psc_store_dir);
 	else
@@ -4195,6 +4196,7 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 	char		capture_path[600];
 	char		cand_shm_name[64];
 	char		cand_store_dir[600];
+	char		cand_opseq_path[616];
 	pid_t		pid;
 	int			status;
 	int			ok = 0;
@@ -4249,6 +4251,11 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 	snprintf(cand_shm_name, sizeof(cand_shm_name), "/psfuzz_%d", (int) pid);
 	snprintf(cand_store_dir, sizeof(cand_store_dir), "%s/pagestore-fuzz-%d",
 			 g_store_base, (int) pid);
+	/* ck() (see above) names this file "%s.opseq" off its own psc_store_dir,
+	 * which in the candidate is cand_store_dir; it is a sibling of the store
+	 * directory, so psc_remove_tree(cand_store_dir) does not remove it. */
+	snprintf(cand_opseq_path, sizeof(cand_opseq_path), "%s.opseq",
+			 cand_store_dir);
 
 	start = psc_now_ns();
 	while (psc_now_ns() - start < 90ull * 1000000000ull)
@@ -4274,6 +4281,7 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 									 * left in the group, if any */
 		ps_shm_unlink(cand_shm_name);
 		psc_remove_tree(cand_store_dir);
+		unlink(cand_opseq_path);
 		unlink(capture_path);
 		return 0;				/* candidate replay hung: not a clean repro */
 	}
@@ -4295,6 +4303,7 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 			fclose(f);
 		}
 	}
+	unlink(cand_opseq_path);
 	unlink(capture_path);
 	return ok;
 }
