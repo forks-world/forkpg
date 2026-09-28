@@ -75,6 +75,128 @@ get_le64(const unsigned char *p)
 	return (uint64_t) get_le32(p) | (uint64_t) get_le32(p + 4) << 32;
 }
 
+/*
+ * Mirrors of pagestore_manifest.c's private PsManifestRecord/
+ * PsManifestKeyDisk/PsManifestLocationDisk/PsManifestLayerDisk -- not
+ * exported, so reproduced by field-for-field struct layout (sizeof()/
+ * offsetof() do the layout-sensitive work, same convention as every other
+ * mirrored struct in this file) rather than hand-computed byte offsets.
+ */
+#define PS_MANIFEST_HEADER_BYTES_LOCAL 20u		/* magic,version,type,len,crc */
+#define PS_MANIFEST_ADD_LAYER_LOCAL 1u
+#define PS_LAYER_URI_MAX_LOCAL 512u
+#define PS_LAYER_MAX_LOCATIONS_LOCAL 3u
+#define PS_LAYER_TIER_LOCAL_HOT_LOCAL 1u
+#define PS_LAYER_TIER_LOCAL_COLD_LOCAL 2u
+/* This harness's one local image-layer target file (fuzz_common.c's
+ * ps_fuzz_targets table: {"image_layer", "layer_0_000000000000000a"}) --
+ * matched by basename, the same way canonicalize_local_layer_uri()
+ * (pagestore_layer_store.c) itself matches a recorded location's uri
+ * against the store's own layer directory. */
+#define PS_FUZZ_IMAGE_LAYER_BASENAME "layer_0_000000000000000a"
+/* Bound on the sibling layers.manifest this harness ever writes -- well
+ * above round-4's manifest target -max_len (49152; largest checked-in
+ * seed 21852), read/patched/written whole like the other cross-file
+ * fixups' sibling manifests. */
+#define PS_FUZZ_MANIFEST_BUF_BYTES_LOCAL 65536u
+
+typedef struct FuzzManifestKeyDisk
+{
+	uint32_t	spcOid;
+	uint32_t	dbOid;
+	uint32_t	relNumber;
+	int32_t		forkNum;
+	uint32_t	klass;
+} FuzzManifestKeyDisk;
+
+typedef struct FuzzManifestLocationDisk
+{
+	uint32_t	tier;
+	char		uri[PS_LAYER_URI_MAX_LOCAL];
+	uint64_t	size;
+	uint32_t	generation;
+	uint8_t		available;
+	uint8_t		pad[3];
+} FuzzManifestLocationDisk;
+
+typedef struct FuzzManifestLayerDisk
+{
+	uint64_t	layer_id;
+	uint32_t	kind;
+	uint32_t	timeline;
+	FuzzManifestKeyDisk start_key;
+	FuzzManifestKeyDisk end_key;
+	uint32_t	start_block;
+	uint32_t	end_block;
+	uint64_t	lsn_start;
+	uint64_t	lsn_end;
+	uint32_t	location_count;
+	FuzzManifestLocationDisk locations[PS_LAYER_MAX_LOCATIONS_LOCAL];
+	uint64_t	created_at_lsn;
+	uint64_t	remote_uploaded_lsn;
+	uint8_t		remote_durable;
+	uint8_t		local_pinned;
+	uint8_t		deleting;
+	uint8_t		pad;
+} FuzzManifestLayerDisk;
+
+/*
+ * Round-6 coordinator review, full-audit finding: local_recover_local_
+ * layers() (pagestore_layer_store.c) rejects the whole open if *any*
+ * ADD_LAYER location's recorded size disagrees with its real on-disk
+ * file's actual length -- the same gate fixup_manifest_layer_size() below
+ * already satisfies from the image_layer target's side (patching the
+ * manifest to match a mutated layer file), but nothing previously kept
+ * the *manifest* target's own mutations of a location's `size` field in
+ * sync with the real, unmutated layer file it names. Since layer_0_...0a/
+ * _0b never change size for this target (only layers.manifest itself is
+ * the fuzzed file), the real length is just a template lookup by
+ * basename -- no live-directory I/O needed, unlike the cross-file fixups
+ * that patch a *different* file. */
+static void
+manifest_sync_add_layer_location_sizes(uint8_t *buf, size_t record_off,
+										uint32_t declared_len)
+{
+	FuzzManifestLayerDisk layer;
+	uint32_t	j;
+
+	if (declared_len != sizeof(FuzzManifestLayerDisk))
+		return;
+	memcpy(&layer, buf + record_off + PS_MANIFEST_HEADER_BYTES_LOCAL,
+		   sizeof(layer));
+	for (j = 0; j < layer.location_count && j < PS_LAYER_MAX_LOCATIONS_LOCAL;
+		 j++)
+	{
+		const FuzzManifestLocationDisk *loc = &layer.locations[j];
+		const uint8_t *tmpl;
+		size_t		tmpl_len;
+		char		basename[PS_LAYER_URI_MAX_LOCAL];
+		size_t		urilen;
+		const char *slash;
+		size_t		loc_off;
+		unsigned	i;
+
+		if (loc->tier != PS_LAYER_TIER_LOCAL_HOT_LOCAL &&
+			loc->tier != PS_LAYER_TIER_LOCAL_COLD_LOCAL)
+			continue;
+		urilen = strnlen(loc->uri, sizeof(loc->uri));
+		if (urilen == 0 || urilen >= sizeof(basename))
+			continue;
+		memcpy(basename, loc->uri, urilen);
+		basename[urilen] = '\0';
+		slash = strrchr(basename, '/');
+		tmpl = ps_fuzz_template_lookup(slash ? slash + 1 : basename, &tmpl_len);
+		if (tmpl == NULL)
+			continue;			/* not a real template file: leave as-is */
+		loc_off = record_off + PS_MANIFEST_HEADER_BYTES_LOCAL +
+			offsetof(FuzzManifestLayerDisk, locations) +
+			(size_t) j * sizeof(FuzzManifestLocationDisk) +
+			offsetof(FuzzManifestLocationDisk, size);
+		for (i = 0; i < 8; i++)
+			buf[loc_off + i] = (unsigned char) ((uint64_t) tmpl_len >> (i * 8));
+	}
+}
+
 /* ---- manifest: layers.manifest (pagestore_manifest.c) -----------------
  * Sequence of [PsManifestRecord header (20 bytes: magic,version,type,len,
  * crc) | 'len' bytes of payload].  crc = FNV-1a over the header's first 16
@@ -89,12 +211,15 @@ fixup_manifest(uint8_t *buf, size_t len)
 
 	while (off + 20 <= len)
 	{
+		uint32_t	type = get_le32(buf + off + 8);
 		uint32_t	declared_len = get_le32(buf + off + 12);
 		size_t		payload_len = declared_len;
 		uint32_t	crc;
 
 		if (payload_len > len - off - 20)
 			payload_len = len - off - 20;
+		else if (type == PS_MANIFEST_ADD_LAYER_LOCAL)
+			manifest_sync_add_layer_location_sizes(buf, off, declared_len);
 		crc = fnv1a_step(FNV1A_INIT, buf + off, 16);
 		if (payload_len > 0)
 			crc = fnv1a_step(crc, buf + off + 20, payload_len);
@@ -150,8 +275,18 @@ crc24_openpgp(const unsigned char *bytes, size_t n)
 	return crc & 0xFFFFFFu;
 }
 
+/* Recompute every FKM3 record's crc-24 in a buffer of fixed 64-byte
+ * ForkMetaRecV2 records -- the shared loop fixup_forkmeta() (the "forkmeta"
+ * target's own top-level fixup, below) and fixup_forkmeta_snapshot_part()
+ * (the checkpoint/tail targets, whose payload is framed records with no
+ * "record 0 is the snapshot-base marker" meaning) both need, but only the
+ * former also owns record-0 identity-pinning: applying that to a
+ * checkpoint/tail payload's first record would be wrong -- it is an
+ * ordinary event record, not a marker, and pinning it to marker identity
+ * would just make fork_meta_snapshot_record_valid()'s ordering/semantic
+ * checks fail instead. */
 static void
-fixup_forkmeta(uint8_t *buf, size_t len)
+fixup_forkmeta_records(uint8_t *buf, size_t len)
 {
 	size_t		stride = sizeof(FuzzForkMetaRecV2);
 	size_t		crc_off = offsetof(FuzzForkMetaRecV2, pad);
@@ -169,10 +304,56 @@ fixup_forkmeta(uint8_t *buf, size_t len)
 	}
 }
 
+/*
+ * Round-6 coordinator review, full-audit finding, investigated and
+ * deliberately *not* bypassed: whenever a forkmeta snapshot manifest
+ * exists (always true in this harness's fixture),
+ * fork_meta_snapshot_reconcile_source() (pagestore_core.c) requires this
+ * log's very first record to be an exact-field match for the selected
+ * snapshot's FEV_SNAPSHOT_BASE marker (fork_meta_snapshot_marker_matches():
+ * timeline, key, lsn, admission_seq, order_id, nblocks, kind), or it falls
+ * back to fork_meta_source_conflicts_with_snapshot() and, finding none (an
+ * ordinary early event's lsn/admission_seq predates the freeze), silently
+ * *rewrites the whole log to just the marker* -- ps_core_open() then
+ * carries on through every later open step regardless.
+ *
+ * An earlier version of this fixup pinned record 0's identity fields to
+ * the real marker whenever it declared FKM3, to make the "already
+ * matches" fast path exercise fork_meta_selected_suffix_valid() on the
+ * rest of the log instead of being discarded. Measured with before/after
+ * -runs=0 on the real corpus, this made things *worse*: three of this
+ * target's four seeds are real FKM3 FEV_GROW records (an ordinary event,
+ * not a marker) with lsn/admission_seq values that predate any snapshot
+ * cutoff, so once record 0 matched, fork_meta_selected_suffix_valid()
+ * immediately rejected record 1 for not being "future" relative to the
+ * cutoff -- failing the *entire* ps_core_open() right here and cutting off
+ * every later open step this target used to reach via the silent-rewrite
+ * path (cov 1925/ft 2018 -> cov 1911/ft 1916 on the unmodified corpus).
+ * Left alone: the discard-and-rewrite fallback already lets the open
+ * succeed and explore everything downstream; that is worth more than
+ * exercising this one gate's suffix-validation branch. */
+static void
+fixup_forkmeta(uint8_t *buf, size_t len)
+{
+	fixup_forkmeta_records(buf, len);
+}
+
 /* ---- retention.meta (pagestore_retention.c PsRetentionRecord) ---------
  * Fixed-size records: magic,version,type,len (16 bytes) + PsRetentionPin
  * (40 bytes, shared type) + crc(4) + pad(4) = 64 bytes.  crc = FNV-1a over
- * offsetof(crc) = 56 leading bytes (retention_record_crc()). */
+ * offsetof(crc) = 56 leading bytes (retention_record_crc()).
+ *
+ * Round-6 coordinator review: ps_retention_open() (pagestore_retention.c)
+ * replays every complete record here, folding an FNV-1a hash across them
+ * (retention_fnv1a(), same constants as fnv1a_step()/FNV1A_INIT below) and
+ * counting them, then requires that (count, hash) to equal the sibling
+ * retention.state's committed (nrecords, log_hash) *exactly* -- any
+ * mismatch is a hard "state nrecords != log" failure, independent of
+ * whether every individual record's own crc (fixed above) and semantic
+ * fields are otherwise fine. retention_meta_derive_state() computes what
+ * the mutated log's (nrecords, log_hash) actually are and patches the
+ * live retention.state to match, the same cross-file shape used
+ * throughout this file. */
 typedef struct FuzzRetentionRecord
 {
 	uint32_t	magic;
@@ -183,20 +364,6 @@ typedef struct FuzzRetentionRecord
 	uint32_t	crc;
 	uint32_t	pad;
 } FuzzRetentionRecord;
-
-static void
-fixup_retention_meta(uint8_t *buf, size_t len)
-{
-	size_t		stride = sizeof(FuzzRetentionRecord);
-	size_t		crc_off = offsetof(FuzzRetentionRecord, crc);
-
-	for (size_t off = 0; off + stride <= len; off += stride)
-	{
-		uint32_t	crc = fnv1a_step(FNV1A_INIT, buf + off, crc_off);
-
-		put_le32(buf + off + crc_off, crc);
-	}
-}
 
 /* ---- retention.state (pagestore_retention.c PsRetentionState) ---------
  * Single fixed struct: magic,version(8) + nrecords(8) + log_hash(4) +
@@ -211,13 +378,114 @@ typedef struct FuzzRetentionState
 	uint32_t	crc;
 } FuzzRetentionState;
 
+/*
+ * Replay a retention.meta-shaped buffer exactly the way
+ * ps_retention_open()'s read loop does, just to compute the (nrecords,
+ * log_hash) its sibling retention.state needs to describe it: every
+ * complete FuzzRetentionRecord-sized stride, hashed in as FNV-1a chained
+ * from FNV1A_INIT over the *whole* record (crc field included, matching
+ * retention_fnv1a(retention_log_hash, &rec, sizeof(rec)) in the product's
+ * loop -- it hashes whatever crc ended up on disk, which fixup_retention_
+ * meta() has already made self-consistent by the time this runs on that
+ * side). A trailing partial record is simply not counted, same as the
+ * product's own `off + sizeof(rec) <= st.st_size` loop bound. This does
+ * not replicate retention_record_valid()'s semantic field checks (owner
+ * kind/resources/lsn/...) -- a record that fails those still hard-fails
+ * ps_retention_open() regardless of what (nrecords, log_hash) says, the
+ * same "give up, still a valid fuzz input" case used everywhere else in
+ * this file.
+ */
+static void
+retention_meta_derive_state(const uint8_t *buf, size_t len,
+							 uint64_t *nrecords_out, uint32_t *hash_out)
+{
+	size_t		stride = sizeof(FuzzRetentionRecord);
+	uint64_t	nrecords = 0;
+	uint32_t	hash = FNV1A_INIT;
+	size_t		off;
+
+	for (off = 0; off + stride <= len; off += stride)
+	{
+		hash = fnv1a_step(hash, buf + off, stride);
+		nrecords++;
+	}
+	*nrecords_out = nrecords;
+	*hash_out = hash;
+}
+
+static void
+fixup_retention_meta(const char *work_dir, uint8_t *buf, size_t len)
+{
+	size_t		stride = sizeof(FuzzRetentionRecord);
+	size_t		crc_off = offsetof(FuzzRetentionRecord, crc);
+	uint64_t	nrecords;
+	uint32_t	hash;
+	char		path[4096];
+	unsigned char state[sizeof(FuzzRetentionState)];
+	int			fd;
+
+	for (size_t off = 0; off + stride <= len; off += stride)
+	{
+		uint32_t	crc = fnv1a_step(FNV1A_INIT, buf + off, crc_off);
+
+		put_le32(buf + off + crc_off, crc);
+	}
+
+	retention_meta_derive_state(buf, len, &nrecords, &hash);
+	if (snprintf(path, sizeof(path), "%s/retention.state", work_dir) >=
+		(int) sizeof(path))
+		return;
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return;
+	if (read(fd, state, sizeof(state)) != (ssize_t) sizeof(state))
+	{
+		close(fd);
+		return;
+	}
+	for (unsigned i = 0; i < 8; i++)
+		state[offsetof(FuzzRetentionState, nrecords) + i] =
+			(unsigned char) (nrecords >> (i * 8));
+	put_le32(state + offsetof(FuzzRetentionState, log_hash), hash);
+	put_le32(state + offsetof(FuzzRetentionState, crc),
+			 fnv1a_step(FNV1A_INIT, state, offsetof(FuzzRetentionState, crc)));
+	if (pwrite(fd, state, sizeof(state), 0) != (ssize_t) sizeof(state))
+	{
+		/* best-effort: an iteration that fails this write just runs
+		 * without the cross-file fixup, same as
+		 * fixup_forkmeta_snapshot_part() */
+	}
+	close(fd);
+}
+
 static void
 fixup_retention_state(uint8_t *buf, size_t len)
 {
 	size_t		crc_off = offsetof(FuzzRetentionState, crc);
+	const uint8_t *meta_tmpl;
+	size_t		meta_tmpl_len;
 
 	if (len < sizeof(FuzzRetentionState))
 		return;
+	/* The sibling retention.meta is not the file this target mutates, so
+	 * its pristine template bytes are exactly what a live open would
+	 * replay -- derive the (nrecords, log_hash) it actually implies and
+	 * pin them here, the same "pin identity fields to real captured
+	 * values, leave the rest fuzzer-controlled" shape
+	 * fixup_walidx_snapshot_shard() uses. */
+	meta_tmpl = ps_fuzz_template_lookup("retention.meta", &meta_tmpl_len);
+	if (meta_tmpl != NULL)
+	{
+		uint64_t	nrecords;
+		uint32_t	hash;
+		unsigned	i;
+
+		retention_meta_derive_state(meta_tmpl, meta_tmpl_len, &nrecords, &hash);
+		for (i = 0; i < 8; i++)
+			buf[offsetof(FuzzRetentionState, nrecords) + i] =
+				(unsigned char) (nrecords >> (i * 8));
+		put_le32(buf + offsetof(FuzzRetentionState, log_hash), hash);
+	}
 	put_le32(buf + crc_off, fnv1a_step(FNV1A_INIT, buf, crc_off));
 }
 
@@ -362,6 +630,7 @@ fixup_walidx_log(uint8_t *buf, size_t len)
  * PosixWalIdxWatermark) -- fixed 24 bytes: magic(8),length(8),crc(4),
  * reserved(4).  crc = FNV-1a over the whole struct with crc zeroed
  * (posix_walidx_watermark_crc()). */
+#define POSIX_WALIDX_WATERMARK_MAGIC_LOCAL UINT64_C(0x31524b4d58444957)
 typedef struct FuzzWalIdxWatermark
 {
 	uint64_t	magic;
@@ -380,6 +649,65 @@ fixup_walidx_watermark(uint8_t *buf, size_t len)
 	put_le32(buf + crc_off, 0);
 	put_le32(buf + crc_off,
 			 fnv1a_step(FNV1A_INIT, buf, sizeof(FuzzWalIdxWatermark)));
+}
+
+/*
+ * Round-6 coordinator review: for an epoch (nonzero) log,
+ * posix_walidx_epoch_reconcile_locked() (storage_posix.c) is on every read
+ * path a store open takes to this file (posix_walidx_read(), used by
+ * walidx_recover_one() in pagestore_core.c) -- it reads the sibling
+ * <logname>.size watermark and, if the log's actual on-disk length exceeds
+ * the watermark's recorded length, silently ftruncate()s the log down to
+ * that length *before* a single byte is parsed. This harness's one epoch
+ * log fixture (walidx_0_0_e00000000000000000001) starts empty, so its
+ * watermark already records length 0: every mutation that grows the log
+ * (which is most of them, since the seed itself is empty) was reconciled
+ * straight back down to zero bytes, and fixup_walidx_log() above never got
+ * a single record in front of the reader. This patches the sibling
+ * watermark's length (and crc) to the mutated log's actual length so the
+ * reconcile is a no-op and the mutated bytes actually reach
+ * walidx_recover_one()'s record loop. walidx_log_legacy (epoch 0) is not
+ * touched by this at all -- posix_walidx_read()/_append() special-case
+ * epoch 0 to skip reconcile entirely (it is the pre-epoch lazily-created
+ * log), so that target has no sibling watermark to keep in sync.
+ */
+static void
+fixup_walidx_log_epoch_watermark(const char *work_dir, uint64_t new_length)
+{
+	char		path[4096];
+	unsigned char watermark[sizeof(FuzzWalIdxWatermark)];
+	int			fd;
+
+	if (snprintf(path, sizeof(path),
+				 "%s/walidx_0_0_e00000000000000000001.size", work_dir) >=
+		(int) sizeof(path))
+		return;
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return;
+	memset(watermark, 0, sizeof(watermark));
+	for (unsigned i = 0; i < 8; i++)
+		watermark[offsetof(FuzzWalIdxWatermark, magic) + i] =
+			(unsigned char) (POSIX_WALIDX_WATERMARK_MAGIC_LOCAL >> (i * 8));
+	for (unsigned i = 0; i < 8; i++)
+		watermark[offsetof(FuzzWalIdxWatermark, length) + i] =
+			(unsigned char) (new_length >> (i * 8));
+	put_le32(watermark + offsetof(FuzzWalIdxWatermark, crc),
+			 fnv1a_step(FNV1A_INIT, watermark, sizeof(watermark)));
+	if (pwrite(fd, watermark, sizeof(watermark), 0) != (ssize_t) sizeof(watermark))
+	{
+		/* best-effort: an iteration that fails this write just runs
+		 * without the cross-file fixup, same as
+		 * fixup_forkmeta_snapshot_part() */
+	}
+	close(fd);
+}
+
+static void
+fixup_walidx_log_epoch(const char *work_dir, uint8_t *buf, size_t len)
+{
+	fixup_walidx_log(buf, len);
+	fixup_walidx_log_epoch_watermark(work_dir, (uint64_t) len);
 }
 
 /* ---- wal_segments_<tl>/wal_store_identity_v1 (pagestore_wal_store.c) --
@@ -486,71 +814,6 @@ typedef struct FuzzImgFooter
 	uint32_t	data_crc;
 	uint32_t	index_crc;
 } FuzzImgFooter;
-
-/*
- * Mirrors of pagestore_manifest.c's private PsManifestRecord/
- * PsManifestKeyDisk/PsManifestLocationDisk/PsManifestLayerDisk -- not
- * exported, so reproduced by field-for-field struct layout (sizeof()/
- * offsetof() do the layout-sensitive work, same convention as every other
- * mirrored struct in this file) rather than hand-computed byte offsets.
- */
-#define PS_MANIFEST_HEADER_BYTES_LOCAL 20u		/* magic,version,type,len,crc */
-#define PS_MANIFEST_ADD_LAYER_LOCAL 1u
-#define PS_LAYER_URI_MAX_LOCAL 512u
-#define PS_LAYER_MAX_LOCATIONS_LOCAL 3u
-#define PS_LAYER_TIER_LOCAL_HOT_LOCAL 1u
-#define PS_LAYER_TIER_LOCAL_COLD_LOCAL 2u
-/* This harness's one local image-layer target file (fuzz_common.c's
- * ps_fuzz_targets table: {"image_layer", "layer_0_000000000000000a"}) --
- * matched by basename, the same way canonicalize_local_layer_uri()
- * (pagestore_layer_store.c) itself matches a recorded location's uri
- * against the store's own layer directory. */
-#define PS_FUZZ_IMAGE_LAYER_BASENAME "layer_0_000000000000000a"
-/* Bound on the sibling layers.manifest this harness ever writes -- well
- * above round-4's manifest target -max_len (49152; largest checked-in
- * seed 21852), read/patched/written whole like the other cross-file
- * fixups' sibling manifests. */
-#define PS_FUZZ_MANIFEST_BUF_BYTES_LOCAL 65536u
-
-typedef struct FuzzManifestKeyDisk
-{
-	uint32_t	spcOid;
-	uint32_t	dbOid;
-	uint32_t	relNumber;
-	int32_t		forkNum;
-	uint32_t	klass;
-} FuzzManifestKeyDisk;
-
-typedef struct FuzzManifestLocationDisk
-{
-	uint32_t	tier;
-	char		uri[PS_LAYER_URI_MAX_LOCAL];
-	uint64_t	size;
-	uint32_t	generation;
-	uint8_t		available;
-	uint8_t		pad[3];
-} FuzzManifestLocationDisk;
-
-typedef struct FuzzManifestLayerDisk
-{
-	uint64_t	layer_id;
-	uint32_t	kind;
-	uint32_t	timeline;
-	FuzzManifestKeyDisk start_key;
-	FuzzManifestKeyDisk end_key;
-	uint32_t	start_block;
-	uint32_t	end_block;
-	uint64_t	lsn_start;
-	uint64_t	lsn_end;
-	uint32_t	location_count;
-	FuzzManifestLocationDisk locations[PS_LAYER_MAX_LOCATIONS_LOCAL];
-	uint64_t	created_at_lsn;
-	uint64_t	remote_uploaded_lsn;
-	uint8_t		remote_durable;
-	uint8_t		local_pinned;
-	uint8_t		deleting;
-	uint8_t		pad;
-} FuzzManifestLayerDisk;
 
 /*
  * Find the ADD_LAYER record in the (pristine, in-memory-cached) template
@@ -748,8 +1011,8 @@ fixup_forkmeta_snapshot_part(const char *work_dir, uint8_t *buf, size_t len,
 	size_t		crc_off = is_tail ? 60 : 48;
 
 	if (len > FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL)
-		fixup_forkmeta(buf + FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL,
-						len - FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL);
+		fixup_forkmeta_records(buf + FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL,
+							   len - FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL);
 
 	if (snprintf(path, sizeof(path),
 				 "%s/forkmeta_snapshots/forkmeta_manifest_v1", work_dir) >=
@@ -782,23 +1045,6 @@ fixup_forkmeta_snapshot_part(const char *work_dir, uint8_t *buf, size_t len,
 	close(fd);
 }
 
-/* ---- walidx_snapshots_<tl>/walidx_manifest_v1 (pagestore_walidx_
- * snapshot.c encode_manifest()) -- header_bytes(64) + nshards*entry_bytes
- * (16) bytes, whatever the buffer's actual (possibly fuzzer-resized)
- * length is; crc@48 = FNV-1a over the whole buffer with crc zeroed
- * (read_prepared() checks stored_crc against fnv1a(...) over the buffer's
- * declared expected_len, but hashing "whatever is actually here" is the
- * only definition that make sense once nshards itself may have been
- * mutated -- see the file's own comment on this). */
-static void
-fixup_walidx_snapshot_manifest(uint8_t *buf, size_t len)
-{
-	if (len < 52)
-		return;					/* need through the crc field itself */
-	put_le32(buf + 48, 0);
-	put_le32(buf + 48, fnv1a_step(FNV1A_INIT, buf, len));
-}
-
 /*
  * sizeof(WalIdxRec) (pagestore_core.c) and the byte offset of its own `crc`
  * field within that fixed-size record -- see walidx_rec_crc(): FNV-1a over
@@ -813,6 +1059,85 @@ fixup_walidx_snapshot_manifest(uint8_t *buf, size_t len)
 #define WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL 64u
 #define WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL 16u
 #define WALIDX_SNAPSHOT_MANIFEST_MAX_SHARDS_LOCAL 128u
+
+/* ---- walidx_snapshots_<tl>/walidx_manifest_v1 (pagestore_walidx_
+ * snapshot.c encode_manifest()) -- header_bytes(64) + nshards*entry_bytes
+ * (16) bytes, whatever the buffer's actual (possibly fuzzer-resized)
+ * length is; crc@48 = FNV-1a over the whole buffer with crc zeroed
+ * (read_prepared() checks stored_crc against fnv1a(...) over the buffer's
+ * declared expected_len, but hashing "whatever is actually here" is the
+ * only definition that make sense once nshards itself may have been
+ * mutated -- see the file's own comment on this).
+ *
+ * Round-6 coordinator review, full-audit finding: validate_shard()
+ * (pagestore_walidx_snapshot.c, via ps_walidx_snapshot_open()) rejects the
+ * whole snapshot if *any* shard entry's recorded (len, crc) disagrees with
+ * its real on-disk shard file -- the same gate fixup_walidx_snapshot_
+ * shard() below already satisfies from the shard file's side. Nothing
+ * previously kept *this* target's own mutations of an entry's len/crc in
+ * sync with the real, unmutated shard file(s) it names. shard_name()
+ * (product code) builds that filename from this manifest's own
+ * `generation` field, so a fuzzed generation would send the real reader
+ * looking for a shard file that does not exist -- this pins generation to
+ * the template's real value first (same "pin identity, leave the rest
+ * fuzzer-controlled" shape fixup_walidx_snapshot_shard() uses for its own
+ * header), then syncs whichever shard entries name a real template file
+ * (this harness has exactly one: shard 0), all without any live-directory
+ * I/O -- the real shard's bytes are already in the in-memory template
+ * cache under the same relpath fixup_walidx_snapshot_shard() reads. */
+static void
+fixup_walidx_snapshot_manifest(uint8_t *buf, size_t len)
+{
+	const uint8_t *manifest_tmpl;
+	size_t		manifest_tmpl_len;
+
+	if (len < 52)
+		return;					/* need through the crc field itself */
+
+	manifest_tmpl = ps_fuzz_template_lookup(
+		"walidx_snapshots_0/walidx_manifest_v1", &manifest_tmpl_len);
+	if (manifest_tmpl != NULL && manifest_tmpl_len >= 32)
+	{
+		uint64_t	generation = get_le64(manifest_tmpl + 24);
+		uint32_t	nshards = get_le32(buf + 20);
+		uint32_t	i;
+
+		for (i = 0; i < 8; i++)
+			buf[24 + i] = (unsigned char) (generation >> (i * 8));
+
+		for (i = 0; i < nshards && i < WALIDX_SNAPSHOT_MANIFEST_MAX_SHARDS_LOCAL;
+			 i++)
+		{
+			char		relpath[128];
+			const uint8_t *shard_tmpl;
+			size_t		shard_tmpl_len;
+			size_t		entry_off;
+			uint32_t	shard_crc;
+			unsigned	b;
+
+			if (snprintf(relpath, sizeof(relpath),
+						 "walidx_snapshots_0/walidxg1_%020llu_%03u",
+						 (unsigned long long) generation, i) >=
+				(int) sizeof(relpath))
+				continue;
+			shard_tmpl = ps_fuzz_template_lookup(relpath, &shard_tmpl_len);
+			if (shard_tmpl == NULL)
+				continue;		/* not a real shard file: leave as-is */
+			entry_off = WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL +
+				(size_t) i * WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL;
+			if (entry_off + WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL > len)
+				break;
+			shard_crc = fnv1a_step(FNV1A_INIT, shard_tmpl, shard_tmpl_len);
+			put_le32(buf + entry_off + 4, shard_crc);
+			for (b = 0; b < 8; b++)
+				buf[entry_off + 8 + b] =
+					(unsigned char) ((uint64_t) shard_tmpl_len >> (b * 8));
+		}
+	}
+
+	put_le32(buf + 48, 0);
+	put_le32(buf + 48, fnv1a_step(FNV1A_INIT, buf, len));
+}
 
 /*
  * walidx_snapshots_<tl>/walidxg1_<generation>_<shard> (pagestore_core.c
@@ -979,7 +1304,7 @@ ps_fuzz_crc_fixup(const char *target_name, const char *work_dir,
 	else if (strcmp(target_name, "forkmeta") == 0)
 		fixup_forkmeta(buf, len);
 	else if (strcmp(target_name, "retention_meta") == 0)
-		fixup_retention_meta(buf, len);
+		fixup_retention_meta(work_dir, buf, len);
 	else if (strcmp(target_name, "retention_state") == 0)
 		fixup_retention_state(buf, len);
 	else if (strcmp(target_name, "timelines") == 0)
@@ -988,8 +1313,9 @@ ps_fuzz_crc_fixup(const char *target_name, const char *work_dir,
 		fixup_page_frontier(buf, len);
 	else if (strcmp(target_name, "walidx_frontier") == 0)
 		fixup_walidx_frontier(buf, len);
-	else if (strcmp(target_name, "walidx_log_epoch") == 0 ||
-			 strcmp(target_name, "walidx_log_legacy") == 0)
+	else if (strcmp(target_name, "walidx_log_epoch") == 0)
+		fixup_walidx_log_epoch(work_dir, buf, len);
+	else if (strcmp(target_name, "walidx_log_legacy") == 0)
 		fixup_walidx_log(buf, len);
 	else if (strcmp(target_name, "walidx_watermark") == 0)
 		fixup_walidx_watermark(buf, len);

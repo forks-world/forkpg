@@ -60,6 +60,27 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
   TARGETS=("${ALL_TARGETS[@]}")
 fi
 
+# Reject anything not in ALL_TARGETS *before* the target loop below ever
+# builds a path from it: "$OUT_DIR/$tgt" is `rm -rf`'d to start each
+# target's working corpus fresh, and an unvalidated tgt containing "../" (or
+# an absolute path) lets that `rm -rf` walk outside $OUT_DIR -- e.g. a
+# tgt of "../corpus" with the default $OUT_DIR resolves to fuzz/corpus
+# itself, deleting the checked-in corpus before the following `cp -r` from
+# that same (now-gone) directory fails.
+for tgt in "${TARGETS[@]}"; do
+  valid=0
+  for allowed in "${ALL_TARGETS[@]}"; do
+    if [[ "$tgt" == "$allowed" ]]; then
+      valid=1
+      break
+    fi
+  done
+  if [[ $valid -eq 0 ]]; then
+    echo "run_fuzz.sh: unknown target '$tgt' (not in ALL_TARGETS)" >&2
+    exit 2
+  fi
+done
+
 # Per-target -max_len: roughly 2x the largest checked-in seed, since a
 # mutated file should be allowed to grow past what any fixture happened to
 # record. Every case below was checked against `du -sb` on fuzz/corpus/<target>
