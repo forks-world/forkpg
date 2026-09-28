@@ -340,50 +340,50 @@ typedef struct FzOpInfo
 	int			refusal_possible;
 	const char *refusal_note;
 	/*
-	 * Stage-1 initializers below list only the first four fields; C zero-
-	 * fills the rest, so skip_ok_check defaults to 0 (OK cell required) for
-	 * every one of them without touching a single existing line.  Only the
-	 * stage-2 additions that can never legally return OK (PS_OP_NONE) set
-	 * this explicitly.
+	 * Every initializer below lists all five fields explicitly (skip_ok_check
+	 * is 0, i.e. "OK cell required", for all but the stage-2 additions that
+	 * can never legally return OK): -Wextra's -Wmissing-field-initializers
+	 * flags a partial aggregate initializer even when C's own zero-fill rule
+	 * makes it unambiguous, and the standalone CI compile uses -Werror.
 	 */
 	int			skip_ok_check;
 } FzOpInfo;
 
 static const FzOpInfo g_stage1_ops[] = {
-	{PS_OP_CREATE, "CREATE", 1, NULL},
-	{PS_OP_EXISTS, "EXISTS", 1, NULL},
-	{PS_OP_NBLOCKS, "NBLOCKS", 1, NULL},
-	{PS_OP_EXTEND, "EXTEND", 1, NULL},
-	{PS_OP_ZEROEXTEND, "ZEROEXTEND", 1, NULL},
-	{PS_OP_WRITEV, "WRITEV", 1, NULL},
-	{PS_OP_READV, "READV", 1, NULL},
-	{PS_OP_READ_AT, "READ_AT", 1, NULL},
-	{PS_OP_TRUNCATE, "TRUNCATE", 1, NULL},
-	{PS_OP_UNLINK, "UNLINK", 1, NULL},
+	{PS_OP_CREATE, "CREATE", 1, NULL, 0},
+	{PS_OP_EXISTS, "EXISTS", 1, NULL, 0},
+	{PS_OP_NBLOCKS, "NBLOCKS", 1, NULL, 0},
+	{PS_OP_EXTEND, "EXTEND", 1, NULL, 0},
+	{PS_OP_ZEROEXTEND, "ZEROEXTEND", 1, NULL, 0},
+	{PS_OP_WRITEV, "WRITEV", 1, NULL, 0},
+	{PS_OP_READV, "READV", 1, NULL, 0},
+	{PS_OP_READ_AT, "READ_AT", 1, NULL, 0},
+	{PS_OP_TRUNCATE, "TRUNCATE", 1, NULL, 0},
+	{PS_OP_UNLINK, "UNLINK", 1, NULL, 0},
 	{PS_OP_IMMEDSYNC, "IMMEDSYNC", 0,
 		"ps_handle_meta's only refusal path is ps_storage->sync() failing; "
-		"not reachable via malformed IPC args in this harness"},
-	{PS_OP_BLOCK_DEATH, "BLOCK_DEATH", 1, NULL},
-	{PS_OP_WAL_APPEND, "WAL_APPEND", 1, NULL},
-	{PS_OP_WAL_SIZE, "WAL_SIZE", 1, NULL},
-	{PS_OP_WAL_READ, "WAL_READ", 1, NULL},
-	{PS_OP_WAL_INDEX_ADD, "WAL_INDEX_ADD", 1, NULL},
-	{PS_OP_WAL_INDEX_ADD_BATCH, "WAL_INDEX_ADD_BATCH", 1, NULL},
-	{PS_OP_WAL_INDEX_GET, "WAL_INDEX_GET", 1, NULL},
-	{PS_OP_WAL_INDEX_PROGRESS, "WAL_INDEX_PROGRESS", 1, NULL},
-	{PS_OP_WAL_RETAIN_FLOOR, "WAL_RETAIN_FLOOR", 1, NULL},
-	{PS_OP_CREATE_BRANCH, "CREATE_BRANCH", 1, NULL},
-	{PS_OP_CHECK_BRANCH, "CHECK_BRANCH", 1, NULL},
-	{PS_OP_REQUIRE_BRANCH, "REQUIRE_BRANCH", 1, NULL},
-	{PS_OP_TIMELINE_STATE, "TIMELINE_STATE", 1, NULL},
-	{PS_OP_TIMELINE_INFO, "TIMELINE_INFO", 1, NULL},
-	{PS_OP_BEGIN_DELETE, "BEGIN_DELETE", 1, NULL},
-	{PS_OP_RETENTION_PIN_RESERVE, "RETENTION_PIN_RESERVE", 1, NULL},
-	{PS_OP_RETENTION_PIN_SET, "RETENTION_PIN_SET", 1, NULL},
-	{PS_OP_RETENTION_PIN_GET, "RETENTION_PIN_GET", 1, NULL},
-	{PS_OP_RETENTION_PIN_LOOKUP, "RETENTION_PIN_LOOKUP", 1, NULL},
-	{PS_OP_RETENTION_PIN_DROP, "RETENTION_PIN_DROP", 1, NULL},
-	{PS_OP_RETENTION_FLOOR, "RETENTION_FLOOR", 1, NULL},
+		"not reachable via malformed IPC args in this harness", 0},
+	{PS_OP_BLOCK_DEATH, "BLOCK_DEATH", 1, NULL, 0},
+	{PS_OP_WAL_APPEND, "WAL_APPEND", 1, NULL, 0},
+	{PS_OP_WAL_SIZE, "WAL_SIZE", 1, NULL, 0},
+	{PS_OP_WAL_READ, "WAL_READ", 1, NULL, 0},
+	{PS_OP_WAL_INDEX_ADD, "WAL_INDEX_ADD", 1, NULL, 0},
+	{PS_OP_WAL_INDEX_ADD_BATCH, "WAL_INDEX_ADD_BATCH", 1, NULL, 0},
+	{PS_OP_WAL_INDEX_GET, "WAL_INDEX_GET", 1, NULL, 0},
+	{PS_OP_WAL_INDEX_PROGRESS, "WAL_INDEX_PROGRESS", 1, NULL, 0},
+	{PS_OP_WAL_RETAIN_FLOOR, "WAL_RETAIN_FLOOR", 1, NULL, 0},
+	{PS_OP_CREATE_BRANCH, "CREATE_BRANCH", 1, NULL, 0},
+	{PS_OP_CHECK_BRANCH, "CHECK_BRANCH", 1, NULL, 0},
+	{PS_OP_REQUIRE_BRANCH, "REQUIRE_BRANCH", 1, NULL, 0},
+	{PS_OP_TIMELINE_STATE, "TIMELINE_STATE", 1, NULL, 0},
+	{PS_OP_TIMELINE_INFO, "TIMELINE_INFO", 1, NULL, 0},
+	{PS_OP_BEGIN_DELETE, "BEGIN_DELETE", 1, NULL, 0},
+	{PS_OP_RETENTION_PIN_RESERVE, "RETENTION_PIN_RESERVE", 1, NULL, 0},
+	{PS_OP_RETENTION_PIN_SET, "RETENTION_PIN_SET", 1, NULL, 0},
+	{PS_OP_RETENTION_PIN_GET, "RETENTION_PIN_GET", 1, NULL, 0},
+	{PS_OP_RETENTION_PIN_LOOKUP, "RETENTION_PIN_LOOKUP", 1, NULL, 0},
+	{PS_OP_RETENTION_PIN_DROP, "RETENTION_PIN_DROP", 1, NULL, 0},
+	{PS_OP_RETENTION_FLOOR, "RETENTION_FLOOR", 1, NULL, 0},
 
 	/* ----- stage 2 additions: the remaining 5 of 37 opcodes ----- */
 	{PS_OP_NONE, "NONE(unknown-opcode)", 1, NULL, 1 /* skip_ok_check: never OK */},
@@ -391,10 +391,10 @@ static const FzOpInfo g_stage1_ops[] = {
 		"served by the daemon's request dispatcher before any per-timeline "
 		"validation (no ps_handle_meta/timeline_op_allowed call on this "
 		"path) and only fails if ps_admission_barrier() itself returns 0; "
-		"not reachable via malformed IPC args in this harness"},
-	{PS_OP_ARTIFACT_BEGIN, "ARTIFACT_BEGIN", 1, NULL},
-	{PS_OP_ARTIFACT_COMMIT, "ARTIFACT_COMMIT", 1, NULL},
-	{PS_OP_ARTIFACT_DROP, "ARTIFACT_DROP", 1, NULL},
+		"not reachable via malformed IPC args in this harness", 0},
+	{PS_OP_ARTIFACT_BEGIN, "ARTIFACT_BEGIN", 1, NULL, 0},
+	{PS_OP_ARTIFACT_COMMIT, "ARTIFACT_COMMIT", 1, NULL, 0},
+	{PS_OP_ARTIFACT_DROP, "ARTIFACT_DROP", 1, NULL, 0},
 };
 #define FZ_NSTAGE1_OPS ((int) (sizeof(g_stage1_ops) / sizeof(g_stage1_ops[0])))
 
