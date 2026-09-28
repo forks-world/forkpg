@@ -50,5 +50,14 @@ supervisor retry loop), which is exactly the repeated-open/close-in-one-
 process pattern pagestore_core.c's own ps_core_open_impl() comment says is
 supported ("A test or embedding process may reopen without a fresh daemon").
 
-not fixed: per task instructions, product code (pagestore_core.c and
-friends) was not modified. This is reported as a finding, not patched.
+fixed: round-5 coordinator review accepted this as a real product leak (not
+just a fuzz-harness artifact -- any embedding process that retries
+ps_core_open() after a failed open accumulates it too) and had it patched
+in product code, commit "pagestore: free the memtable when ps_core_open()
+fails after allocating it": ps_core_open()'s failure-unwind path now frees
+every g_shards[i].memtable and calls ps_pgcache_free() before returning,
+without flushing (the store just failed to open, so its in-memory state may
+be incomplete). lsan_suppressions.txt's ps_memtable_create/ps_pgcache_init
+entries are removed accordingly. See check_leak_regression.sh for the
+regression check: this reproducer replayed 5000 times with LeakSanitizer on
+and no suppression, with a clean exit.
