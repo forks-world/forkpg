@@ -144,6 +144,7 @@ typedef struct FzRel
 	uint32_t	nblocks;
 	unsigned char tag[FZ_MAXBLK];
 	uint64_t	lsn[FZ_MAXBLK];
+	uint64_t	version_floor[FZ_MAXBLK]; /* lower bound for clamped local writes */
 } FzRel;
 
 typedef struct FzReaderPin
@@ -174,6 +175,7 @@ typedef struct FzTimeline
 								 * (empty log) until that actually happens,
 								 * not the parent's fork LSN. */
 	uint64_t	walidx_progress;
+	int			walidx_progress_committed; /* own-WAL init vs explicit commit */
 	uint64_t	mat_lsn;
 	uint64_t	mat_seq;
 	int			mat_registered;
@@ -190,6 +192,17 @@ typedef struct FzTimeline
 static FzTimeline g_tl[FZ_NTL];
 static FzReaderPin g_reader[FZ_NREADERS];	/* readers only ever pin timeline 0 */
 static uint64_t g_branch_last_incarnation[FZ_NTL];	/* for id reuse after delete */
+
+/* A child write whose page LSN is at or below the fork point is stored after
+ * the snapshot boundary. The core stamps that ordered record at least at the
+ * first child-visible LSN; other durable fences may promote it further. */
+static uint64_t
+fz_local_version_floor(uint32_t tl, uint64_t page_lsn)
+{
+	if (g_tl[tl].has_parent && page_lsn <= g_tl[tl].branch_lsn)
+		return g_tl[tl].branch_lsn + 1;
+	return 0;
+}
 
 /*
  * Artifact lifecycle model (stage 2).  Derived directly from
@@ -480,6 +493,13 @@ static const char *g_weak_oracle_ops[] = {
 	"merged-ancestry result set for arbitrary *older* records queried much "
 	"later, which would need a full per-block version/death history this "
 	"model does not keep -- that broader case remains unchecked, not weak.",
+	"READ_AT: successful found reads with an explicit horizon must resolve at "
+	"or below that horizon. For newest-alias and exact reader-pin reads, the "
+	"page content is checked against the snapshot model. The resolved LSN is "
+	"exact for ordinary page versions; a child-local write at/below its fork "
+	"LSN is ordered after the snapshot and may be promoted by durable "
+	"forkmeta/page-retention fences, so those blocks use the known branch-floor "
+	"lower bound.",
 	"RETENTION_PIN_SET: only two sub-cases are strongly checked (an exact "
 	"(lsn,seq) retry of a held pin -> OK; generation 0 -> refused); moving a "
 	"pin to a genuinely new LSN is exercised but its exact accept/refuse "
@@ -948,6 +968,7 @@ act_create(void)
 				m->nblocks = 0;
 				memset(m->tag, 0, sizeof(m->tag));
 				memset(m->lsn, 0, sizeof(m->lsn));
+				memset(m->version_floor, 0, sizeof(m->version_floor));
 			}
 		}
 	}
@@ -996,6 +1017,7 @@ act_unlink(void)
 			m->nblocks = 0;
 			memset(m->tag, 0, sizeof(m->tag));
 			memset(m->lsn, 0, sizeof(m->lsn));
+			memset(m->version_floor, 0, sizeof(m->version_floor));
 		}
 	}
 	else
@@ -1123,7 +1145,8 @@ act_zeroextend(void)
 			else
 			{
 				for (uint32_t b = m->nblocks; b < block + n; b++)
-					m->tag[b] = 0, m->lsn[b] = 0;
+					m->tag[b] = 0, m->lsn[b] = 0,
+						m->version_floor[b] = 0;
 				m->nblocks = block + n;
 			}
 		}
@@ -1176,6 +1199,7 @@ act_extend(void)
 		{
 			m->tag[m->nblocks] = tag;
 			m->lsn[m->nblocks] = lsn;
+			m->version_floor[m->nblocks] = fz_local_version_floor(tl, lsn);
 			m->nblocks++;
 		}
 	}
@@ -1244,7 +1268,11 @@ act_writev(void)
 		record_cov(PS_OP_WRITEV, (uint32_t) status, 0);
 		if (status == PS_STATUS_OK)
 			for (uint32_t i = 0; i < n; i++)
-				m->tag[block + i] = tags[i], m->lsn[block + i] = lsn;
+			{
+				m->tag[block + i] = tags[i];
+				m->lsn[block + i] = lsn;
+				m->version_floor[block + i] = fz_local_version_floor(tl, lsn);
+			}
 	}
 	else
 	{
@@ -1398,9 +1426,10 @@ act_readv(void)
 	}
 }
 
-/* READ_AT: level 1 for req_lsn=UINT64_MAX (newest alias, exact) and for a
- * currently-held reader pin's exact (lsn,seq).  A random as-of LSN with no
- * pin is level 3: never wrong content, but OK-vs-refused is not asserted. */
+/* READ_AT: req_lsn=UINT64_MAX is the newest alias. Newest-alias and exact
+ * reader-pin reads strongly check content; random as-of reads may be
+ * unavailable, but every successful found read has a resolved LSN at or
+ * below its explicit horizon. */
 static void
 act_read_at(void)
 {
@@ -1424,7 +1453,8 @@ act_read_at(void)
 		uint32_t	b = rng_below(m->nblocks);
 		int			mode = rng_below(3);	/* 0=newest-alias 1=pin 2=random */
 		uint64_t	req_lsn,
-					req_seq = 0;
+					req_seq = 0,
+					resolved_lsn = 0;
 		int			found;
 		int			status;
 		int			strong = 1;
@@ -1452,11 +1482,16 @@ act_read_at(void)
 			strong = 0;
 		}
 		status = psc_op_read_at(tl, target_inc, PS_KLASS_RELATION, rel, b,
-								req_lsn, req_seq, read_buf, &found, NULL,
+								req_lsn, req_seq, read_buf, &found, &resolved_lsn,
 								NULL);
 		ring_note("READ_AT tl=%u rel=%u block=%u mode=%d strong=%d", tl, rel,
 				  b, mode, strong);
 		observe(PS_OP_READ_AT, status, 0, "READ_AT", 0);
+		if (status == PS_STATUS_OK && found && req_lsn != UINT64_MAX)
+			ck(resolved_lsn <= req_lsn, "READ_AT horizon tl=%u rel=%u "
+			   "block=%u resolved_lsn=%llu exceeds requested horizon=%llu",
+			   tl, rel, b, (unsigned long long) resolved_lsn,
+			   (unsigned long long) req_lsn);
 		if (strong)
 		{
 			ck(status == PS_STATUS_OK, "READ_AT (strong) tl=%u rel=%u "
@@ -1464,15 +1499,28 @@ act_read_at(void)
 			if (status == PS_STATUS_OK)
 			{
 				if (m->tag[b] == 0)
-					ck(!found || psc_page_lsn(read_buf) == 0, "READ_AT "
-					   "(strong) tl=%u rel=%u block=%u: unwritten block has "
-					   "content", tl, rel, b);
+					ck(!found || (psc_page_lsn(read_buf) == 0 &&
+								  resolved_lsn == 0), "READ_AT (strong) tl=%u rel=%u "
+					   "block=%u: unwritten block has version/content", tl, rel, b);
 				else
+				{
 					ck(found && psc_page_has_tag(read_buf, m->tag[b]) &&
 					   psc_page_lsn(read_buf) == m->lsn[b], "READ_AT "
 					   "(strong) tl=%u rel=%u block=%u: expected tag=%u "
 					   "lsn=%llu, content/found-ness does not match", tl,
 					   rel, b, m->tag[b], (unsigned long long) m->lsn[b]);
+					if (m->version_floor[b] == 0)
+						ck(resolved_lsn == m->lsn[b], "READ_AT (strong) tl=%u "
+						   "rel=%u block=%u expected resolved LSN=%llu got %llu",
+						   tl, rel, b, (unsigned long long) m->lsn[b],
+						   (unsigned long long) resolved_lsn);
+					else
+						ck(resolved_lsn >= m->version_floor[b], "READ_AT (strong) "
+						   "tl=%u rel=%u block=%u resolved LSN=%llu is below the "
+						   "clamped-version floor %llu", tl, rel, b,
+						   (unsigned long long) resolved_lsn,
+						   (unsigned long long) m->version_floor[b]);
+				}
 			}
 		}
 	}
@@ -1870,39 +1918,29 @@ act_walidx_progress(void)
 			ring_note("WAL_INDEX_PROGRESS(read) tl=%u", tl);
 			ck(status == PS_STATUS_OK, "WAL_INDEX_PROGRESS read tl=%u "
 			   "(status %d)", tl, status);
-			/*
-			 * TODO(item 386 follow-up): only the status is checked here,
-			 * not the returned progress value against g_tl[tl].
-			 * walidx_progress -- that comparison was added, then reverted
-			 * (both here and in the after-restart verifier), because it is
-			 * unreliable specifically for a branch timeline: a 20-seed x
-			 * 20000-op run found the model's value (seeded at
-			 * branch-creation time from the parent's mat_lsn --
-			 * env_branch_create()'s "g_tl[slot].walidx_progress =
-			 * g_tl[0].mat_lsn") reads back as ahead of what a real query
-			 * returns, and this happens even on a plain *live* read here,
-			 * not only after a restart. That branch-seeded value is a
-			 * bookkeeping convenience, not something this model has ever
-			 * confirmed via a real WAL_INDEX_PROGRESS(commit) on the
-			 * branch itself, so before re-adding the comparison the model
-			 * needs to track per-timeline durability (whether a commit
-			 * has actually happened) rather than assume the inherited
-			 * starting value stays valid indefinitely; only then can this
-			 * distinguish "model needs a durability flag" from "the
-			 * daemon dropped a real committed progress value" and decide
-			 * which one it is.
-			 */
+			if (status == PS_STATUS_OK)
+			{
+				uint64_t expected = g_tl[tl].walidx_progress_committed ?
+					g_tl[tl].walidx_progress :
+					(g_tl[tl].wal_shipped ? g_tl[tl].wal_start : 0);
+
+				ck(progress == expected, "WAL_INDEX_PROGRESS read tl=%u "
+				   "expected durable progress=%llu got %llu (committed=%d "
+				   "wal_shipped=%d)", tl, (unsigned long long) expected,
+				   (unsigned long long) progress,
+				   g_tl[tl].walidx_progress_committed, g_tl[tl].wal_shipped);
+			}
 			record_cov(PS_OP_WAL_INDEX_PROGRESS, (uint32_t) status, 0);
 		}
 		else if (g_tl[tl].wal_end > g_tl[tl].walidx_progress)
 		{
 			uint64_t	end = g_tl[tl].wal_end;
 			int			status = psc_op_walidx_progress_commit(tl, target_inc,
-																 g_tl[tl].walidx_progress,
-																 end);
+															 g_tl[tl].walidx_progress,
+															 end);
 
 			ring_note("WAL_INDEX_PROGRESS(commit) tl=%u [%llu,%llu)", tl,
-					  (unsigned long long) g_tl[tl].walidx_progress,
+				  (unsigned long long) g_tl[tl].walidx_progress,
 					  (unsigned long long) end);
 			ck(status == PS_STATUS_OK, "WAL_INDEX_PROGRESS commit tl=%u "
 			   "[%llu,%llu) (status %d)", tl,
@@ -1910,7 +1948,10 @@ act_walidx_progress(void)
 			   (unsigned long long) end, status);
 			record_cov(PS_OP_WAL_INDEX_PROGRESS, (uint32_t) status, 0);
 			if (status == PS_STATUS_OK)
+			{
 				g_tl[tl].walidx_progress = end;
+				g_tl[tl].walidx_progress_committed = 1;
+			}
 		}
 	}
 	else
@@ -1946,6 +1987,7 @@ act_walidx_get(void)
 		uint32_t	blocks[1] = {block};
 		int			n = 0;
 		int			status;
+		PsWalRec   *rec = NULL;
 		uint64_t	end = lsn + FZ_WAL_PAYLOAD;
 
 		ck(psc_op_walidx_add_batch(tl, target_inc, PS_KLASS_RELATION, rel,
@@ -1963,6 +2005,7 @@ act_walidx_get(void)
 		   PS_STATUS_OK, "setup WAL_INDEX_PROGRESS commit for GET tl=%u", tl);
 		if (end > g_tl[tl].walidx_progress)
 			g_tl[tl].walidx_progress = end;
+		g_tl[tl].walidx_progress_committed = 1;
 		status = psc_op_walidx_get(tl, target_inc, PS_KLASS_RELATION, rel,
 								   block, UINT64_MAX, fz_walidx_get_recs,
 								   FZ_WALIDX_GET_CAP, &n);
@@ -1999,11 +2042,19 @@ act_walidx_get(void)
 			FzRel	   *m = &g_tl[tl].rel[rel];
 			int			dead = !m->exists || block >= m->nblocks;
 			int			found = 0;
-
 			for (int i = 0; i < n; i++)
 				if (fz_walidx_get_recs[i].lsn == lsn &&
 					fz_walidx_get_recs[i].timeline == tl)
-					found = 1;
+					found = 1, rec = &fz_walidx_get_recs[i];
+			if (found)
+				ck(rec->end_lsn == end && rec->flags ==
+				   (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI),
+				   "WAL_INDEX_GET tl=%u rel=%u block=%u record lsn=%llu has "
+				   "end_lsn=%llu flags=%u, expected end_lsn=%llu flags=%u", tl,
+				   rel, block, (unsigned long long) lsn,
+				   (unsigned long long) rec->end_lsn, rec->flags,
+				   (unsigned long long) end,
+				   PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI);
 			if (!found)
 				ck(dead, "WAL_INDEX_GET tl=%u rel=%u block=%u: the record "
 				   "just added at lsn=%llu is missing, but the block is "
@@ -2093,8 +2144,14 @@ act_timeline_state(void)
 		ck(status == PS_STATUS_OK, "TIMELINE_STATE tl=%u (status %d)", tl,
 		   status);
 		if (status == PS_STATUS_OK)
+		{
 			ck(state == g_tl[tl].state, "TIMELINE_STATE tl=%u expected state "
 			   "%d got %d", tl, g_tl[tl].state, state);
+			ck(inc == g_tl[tl].incarnation, "TIMELINE_STATE tl=%u expected "
+			   "incarnation=%llu got %llu", tl,
+			   (unsigned long long) g_tl[tl].incarnation,
+			   (unsigned long long) inc);
+		}
 		record_cov(PS_OP_TIMELINE_STATE, (uint32_t) status, state);
 	}
 	else
@@ -2144,11 +2201,15 @@ act_timeline_info(void)
 			   "has_parent expected %d got %d", tl, g_tl[tl].has_parent,
 			   has_parent);
 			if (g_tl[tl].has_parent)
-				ck(parent == g_tl[tl].parent && branch_lsn == g_tl[tl].branch_lsn,
+				ck(parent == g_tl[tl].parent && branch_lsn == g_tl[tl].branch_lsn &&
+				   parent_inc == g_tl[g_tl[tl].parent].incarnation,
 				   "TIMELINE_INFO tl=%u expected parent=%u branch_lsn=%llu "
-				   "got parent=%u branch_lsn=%llu", tl, g_tl[tl].parent,
-				   (unsigned long long) g_tl[tl].branch_lsn, parent,
-				   (unsigned long long) branch_lsn);
+				   "parent_inc=%llu got parent=%u branch_lsn=%llu parent_inc=%llu",
+				   tl, g_tl[tl].parent,
+				   (unsigned long long) g_tl[tl].branch_lsn,
+				   (unsigned long long) g_tl[g_tl[tl].parent].incarnation, parent,
+				   (unsigned long long) branch_lsn,
+				   (unsigned long long) parent_inc);
 		}
 		record_cov(PS_OP_TIMELINE_INFO, (uint32_t) status, has_parent);
 	}
@@ -2225,18 +2286,81 @@ static void
 act_retention_get(void)
 {
 	uint64_t	epoch = 0;
-	PsRetentionPin pin;
+	PsRetentionPin pin, expected[FZ_NREADERS + 1];
 	uint32_t	count = 0;
-	int			expected = (g_reader[0].held ? 1 : 0) +
-		(g_reader[1].held ? 1 : 0) + (g_tl[0].mat_registered ? 1 : 0);
-	int			rc = psc_op_retention_get(0, &epoch, &pin, &count);
-	int			status = psc_chan_ptr()->status;
+	int			nexpected = 0;
+	int			status;
+	int			rc;
+	int			seen[FZ_NREADERS + 1] = {0};
 
-	ring_note("RETENTION_PIN_GET index=0");
-	observe(PS_OP_RETENTION_PIN_GET, status, 0, "RETENTION_PIN_GET", 1);
-	if (rc >= 0)
-		ck((int) count == expected, "RETENTION_PIN_GET count expected %d "
-		   "got %u", expected, count);
+	for (uint32_t i = 0; i < FZ_NREADERS; i++)
+		if (g_reader[i].held)
+		{
+			PsRetentionPin *p = &expected[nexpected++];
+
+			memset(p, 0, sizeof(*p));
+			p->timeline = 0;
+			p->owner_kind = PS_RETENTION_OWNER_READER;
+			p->resources = PS_RETENTION_RESOURCE_ALL;
+			p->generation = g_reader[i].generation;
+			p->owner_id = g_reader[i].owner_id;
+			p->lsn = g_reader[i].lsn;
+			p->admission_seq = g_reader[i].seq;
+		}
+	if (g_tl[0].mat_registered)
+	{
+		PsRetentionPin *p = &expected[nexpected++];
+
+		memset(p, 0, sizeof(*p));
+		p->timeline = 0;
+		p->owner_kind = PS_RETENTION_OWNER_MATERIALIZER;
+		p->resources = PS_RETENTION_RESOURCE_WAL |
+			PS_RETENTION_RESOURCE_WAL_INDEX;
+		p->generation = 1;
+		p->owner_id = 1;
+		p->lsn = g_tl[0].mat_lsn;
+		p->admission_seq = g_tl[0].mat_seq;
+	}
+
+	for (uint32_t index = 0; index <= (uint32_t) nexpected; index++)
+	{
+		int idx;
+
+		rc = psc_op_retention_get(index, &epoch, &pin, &count);
+		status = psc_chan_ptr()->status;
+		ring_note("RETENTION_PIN_GET index=%u", index);
+		observe(PS_OP_RETENTION_PIN_GET, status, 0, "RETENTION_PIN_GET", 1);
+		ck(status == PS_STATUS_OK, "RETENTION_PIN_GET index=%u (status %d)",
+		   index, status);
+		ck(rc == (index < (uint32_t) nexpected), "RETENTION_PIN_GET index=%u "
+		   "expected found=%d got rc=%d", index,
+		   index < (uint32_t) nexpected, rc);
+		ck((int) count == nexpected, "RETENTION_PIN_GET count expected %d got %u",
+		   nexpected, count);
+		if (rc > 0)
+		{
+			for (idx = 0; idx < nexpected; idx++)
+				if (pin.timeline == expected[idx].timeline &&
+					pin.owner_kind == expected[idx].owner_kind &&
+					pin.resources == expected[idx].resources &&
+					pin.generation == expected[idx].generation &&
+					pin.owner_id == expected[idx].owner_id &&
+					pin.lsn == expected[idx].lsn &&
+					pin.admission_seq == expected[idx].admission_seq)
+					break;
+			ck(idx < nexpected, "RETENTION_PIN_GET index=%u returned unknown "
+			   "or incorrect pin metadata", index);
+			if (idx < nexpected)
+			{
+				ck(!seen[idx], "RETENTION_PIN_GET index=%u duplicated modeled "
+				   "pin %d",
+				   index, idx);
+				seen[idx] = 1;
+			}
+		}
+	}
+	for (int i = 0; i < nexpected; i++)
+		ck(seen[i], "RETENTION_PIN_GET omitted modeled pin %d", i);
 
 	if (rng_pct(30) && epoch != 0)
 	{
@@ -3183,8 +3307,7 @@ act_artifact_commit(void)
 						   "post-COMMIT NBLOCKS tl=%u akind=%u rel=%u "
 						   "expected %u got %u (status %d)", tl, akind, rel,
 						   art->visible.nblocks, nb, st2);
-						for (uint32_t b = 0; b < art->visible.nblocks &&
-											 b < 4; b++)
+						for (uint32_t b = 0; b < art->visible.nblocks; b++)
 						{
 							int			rst = psc_op_readv(tl,
 															   g_tl[tl].incarnation,
@@ -3470,7 +3593,10 @@ env_materialize(void)
 	status = psc_op_walidx_progress_commit(0, 0, g_tl[0].walidx_progress, lsn);
 	ok = ok && status == PS_STATUS_OK;
 	if (ok)
+	{
 		g_tl[0].walidx_progress = lsn;
+		g_tl[0].walidx_progress_committed = 1;
+	}
 	status = psc_op_retention_reserve(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 									  PS_RETENTION_RESOURCE_WAL |
 									  PS_RETENTION_RESOURCE_WAL_INDEX, lsn,
@@ -3626,6 +3752,7 @@ env_branch_create(void)
 		g_tl[slot].wal_start = g_tl[0].mat_lsn;
 		g_tl[slot].wal_end = g_tl[0].mat_lsn;
 		g_tl[slot].walidx_progress = g_tl[0].mat_lsn;
+		g_tl[slot].walidx_progress_committed = 0;
 		g_tl[slot].wal_shipped = 0;	/* the *new* incarnation's own WAL log is empty */
 		g_tl[slot].mat_registered = 0;
 		memcpy(g_tl[slot].rel, g_tl[parent].rel, sizeof(g_tl[slot].rel));
@@ -3756,7 +3883,10 @@ env_branch_write(void)
 	record_env(ENV_BRANCH_WRITE, status == PS_STATUS_OK);
 	record_cov(PS_OP_WRITEV, (uint32_t) status, 0);
 	if (status == PS_STATUS_OK)
+	{
 		m->tag[block] = tag, m->lsn[block] = lsn;
+		m->version_floor[block] = fz_local_version_floor(slot, lsn);
+	}
 }
 
 /* Verify a branch timeline's current model (own writes else the parent's
@@ -3950,24 +4080,22 @@ verify_latest_all(const char *phase)
 {
 	for (uint32_t tl = 0; tl < FZ_NTL; tl++)
 	{
+		uint64_t	progress = 0;
+		uint64_t	expected_progress;
+		int			progress_status;
+
 		if (!g_tl[tl].known || g_tl[tl].state != PS_TIMELINE_LIVE)
 			continue;
-		/*
-		 * NOT checking WAL_INDEX_PROGRESS here (i.e. after a restart): a
-		 * branch's walidx_progress is seeded from the parent's mat_lsn at
-		 * branch-creation time (see env_branch_create()) purely as a model
-		 * bookkeeping convenience, without necessarily ever having gone
-		 * through a real WAL_INDEX_PROGRESS(commit) on that branch -- an
-		 * initial 20-seed x 20000-op validation run hit "expected X got 0"
-		 * for such branches after a clean restart, and there was not
-		 * enough time in this round to determine whether that 0 reflects
-		 * the daemon not yet having a durable progress record for a branch
-		 * that never explicitly committed one (a model gap: this model
-		 * would need to track per-timeline durability, not just the
-		 * inherited starting value) or a real daemon bug. The *live*
-		 * (non-restart) check in act_walidx_progress() is unaffected and
-		 * stays in place.
-		 */
+		expected_progress = g_tl[tl].walidx_progress_committed ?
+			g_tl[tl].walidx_progress :
+			(g_tl[tl].wal_shipped ? g_tl[tl].wal_start : 0);
+		progress_status = psc_op_walidx_progress_read(tl,
+													 g_tl[tl].incarnation,
+													 &progress);
+		ck(progress_status == PS_STATUS_OK && progress == expected_progress,
+		   "%s: tl=%u WAL_INDEX_PROGRESS expected=%llu got=%llu status=%d",
+		   phase, tl, (unsigned long long) expected_progress,
+		   (unsigned long long) progress, progress_status);
 		for (uint32_t rel = 0; rel < FZ_NREL; rel++)
 		{
 			FzRel	   *m = &g_tl[tl].rel[rel];
@@ -3989,7 +4117,10 @@ verify_latest_all(const char *phase)
 				ck(psc_op_readv(tl, g_tl[tl].incarnation, PS_KLASS_RELATION,
 								rel, b, 0, 0, read_buf, 1) == PS_STATUS_OK,
 				   "%s: tl=%u rel=%u block=%u read", phase, tl, rel, b);
-				if (m->tag[b] != 0)
+				if (m->tag[b] == 0)
+					ck(psc_page_is_zero(read_buf), "%s: tl=%u rel=%u block=%u "
+					   "zero-filled hole contains nonzero data", phase, tl, rel, b);
+				else
 					ck(psc_page_has_tag(read_buf, m->tag[b]) &&
 					   psc_page_lsn(read_buf) == m->lsn[b],
 					   "%s: tl=%u rel=%u block=%u content", phase, tl, rel,
@@ -4076,10 +4207,18 @@ verify_artifacts(const char *phase)
 				uint32_t	nb = 0;
 				int			est;
 
-				if (art->state == FZ_ART_NONE)
-					continue;		/* never begun: nothing to check */
+				if (art->state == FZ_ART_NONE && art->max_begin_lsn == 0)
+					continue;		/* never touched: nothing to check */
 				est = psc_op_exists(tl, g_tl[tl].incarnation, klass, rel, 0,
 									&exists);
+				if (art->state == FZ_ART_NONE)
+				{
+					ck(est == PS_STATUS_OK && !exists,
+					   "%s: abandoned first artifact tl=%u akind=%u rel=%u "
+					   "must remain invisible (EXISTS status %d, exists %d)",
+					   phase, tl, akind, rel, est, exists);
+					continue;
+				}
 				/*
 				 * WEAK ORACLE (art->dropped_exists_daemon_bug only): known
 				 * daemon bug, see the PR #302 round-2 report evidence dir
@@ -4131,7 +4270,7 @@ verify_artifacts(const char *phase)
 					   "%u got %u (status %d)", phase, tl, akind, rel,
 					   art->visible.nblocks, nb, nbstatus);
 				}
-				for (uint32_t b = 0; b < art->visible.nblocks && b < 4; b++)
+				for (uint32_t b = 0; b < art->visible.nblocks; b++)
 				{
 					if (art->visible.tag[b] == 0)
 					{
@@ -4156,20 +4295,94 @@ verify_artifacts(const char *phase)
 static void
 verify_after_restart(const char *phase)
 {
+	for (uint32_t tl = 0; tl < FZ_NTL; tl++)
+		if (g_tl[tl].known && g_tl[tl].state == PS_TIMELINE_LIVE)
+		{
+			uint64_t	end = 0;
+			uint64_t	expected_end = g_tl[tl].wal_shipped ?
+				g_tl[tl].wal_end : 0;
+			int			status = psc_op_wal_size(tl, g_tl[tl].incarnation, &end);
+
+			ring_note("verify_after_restart WAL_SIZE tl=%u", tl);
+			ck(status == PS_STATUS_OK && end == expected_end,
+			   "%s: WAL_SIZE tl=%u expected %llu got %llu (status %d)",
+			   phase, tl, (unsigned long long) expected_end,
+			   (unsigned long long) end, status);
+			if (g_tl[tl].wal_shipped)
+			{
+				uint64_t	start = g_tl[tl].wal_end - FZ_WAL_PAYLOAD;
+				uint64_t	floor = 0;
+				int			proven = 0;
+
+				status = psc_op_retention_floor(tl, g_tl[tl].incarnation,
+											 PS_RETENTION_RESOURCE_WAL,
+											 &floor, &proven);
+				ck(status == PS_STATUS_OK || status == PS_STATUS_ERROR,
+				   "%s: WAL retention floor tl=%u unexpected status %d",
+				   phase, tl, status);
+				/* WAL reclaim removes only a complete prefix up to the aligned-
+				 * down minimum of its retention, durable-progress, raw-index, and
+				 * branch limits (pagestore_core.c:wal_segment_reclaim_one).  A
+				 * record beginning at or after the effective WAL retention floor
+				 * cannot be in that reclaimed prefix.  Older tail records may
+				 * legitimately have been reclaimed, so only read the latest one
+				 * when it is still inside the retained range. */
+				if (status == PS_STATUS_OK && (floor == 0 || start >= floor))
+				{
+					unsigned char expected[FZ_WAL_PAYLOAD];
+					unsigned char got[FZ_WAL_PAYLOAD];
+					uint32_t	nread = 0;
+					int			read_status = psc_op_wal_read(tl,
+													 g_tl[tl].incarnation,
+													 start, FZ_WAL_PAYLOAD,
+													 got, &nread);
+
+					ring_note("verify_after_restart WAL_READ tl=%u start=%llu",
+							  tl, (unsigned long long) start);
+					ck(read_status == PS_STATUS_OK &&
+					   nread == FZ_WAL_PAYLOAD, "%s: latest WAL record tl=%u "
+					   "start=%llu read (status %d, nread %u)", phase, tl,
+					   (unsigned long long) start, read_status, nread);
+					if (read_status == PS_STATUS_OK && nread == FZ_WAL_PAYLOAD)
+					{
+						fz_wal_fill(start, expected);
+						ck(memcmp(expected, got, FZ_WAL_PAYLOAD) == 0,
+						   "%s: latest WAL record tl=%u start=%llu content mismatch",
+						   phase, tl, (unsigned long long) start);
+					}
+				}
+				else
+					ring_note("verify_after_restart WAL tail may be reclaimed tl=%u "
+						  "or floor unavailable: start=%llu floor=%llu proven=%d "
+						  "status=%d", tl,
+						  (unsigned long long) start,
+						  (unsigned long long) floor, proven, status);
+			}
+		}
 	verify_latest_all(phase);
 	artifact_restart_reset(phase);
 	verify_artifacts(phase);
 	for (uint32_t i = 0; i < FZ_NREADERS; i++)
 	{
 		PsRetentionPin pin;
+		int			found;
+		int			status;
 
-		if (!g_reader[i].held)
-			continue;
-		ck(psc_op_retention_lookup(0, 0, PS_RETENTION_OWNER_READER,
-								   g_reader[i].owner_id, &pin) &&
-		   pin.lsn == g_reader[i].lsn && pin.admission_seq == g_reader[i].seq &&
-		   pin.generation == g_reader[i].generation, "%s: reader %llu pin "
-		   "survives restart", phase, (unsigned long long) g_reader[i].owner_id);
+		found = psc_op_retention_lookup(0, 0, PS_RETENTION_OWNER_READER,
+										g_reader[i].owner_id, &pin);
+		status = psc_chan_ptr()->status;
+		ck(status == PS_STATUS_OK, "%s: reader %llu pin lookup (status %d)",
+		   phase, (unsigned long long) g_reader[i].owner_id, status);
+
+		if (g_reader[i].held)
+			ck(found && pin.lsn == g_reader[i].lsn &&
+			   pin.admission_seq == g_reader[i].seq &&
+			   pin.generation == g_reader[i].generation, "%s: reader %llu pin "
+			   "survives restart", phase,
+			   (unsigned long long) g_reader[i].owner_id);
+		else
+			ck(!found, "%s: dropped reader %llu pin remains after restart", phase,
+			   (unsigned long long) g_reader[i].owner_id);
 	}
 	if (g_tl[0].mat_registered)
 	{
