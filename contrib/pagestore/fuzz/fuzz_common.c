@@ -20,8 +20,9 @@
  *   - fsync()/fdatasync()/sync_file_range() are neutralized for the
  *     instrumented binary only, via linker --wrap (fuzz_nosync.c); this
  *     file never calls or overrides them itself.
- *   - stdout/stderr are muted for the open/close window using fds opened
- *     once at init, not per iteration (see mute_output()).
+ *   - stdout is muted for the open/close window using an fd opened once at
+ *     init; stderr stays attached so sanitizer, assertion, and libFuzzer
+ *     diagnostics survive a fatal exit (see mute_output()).
  *
  *-------------------------------------------------------------------------
  */
@@ -641,7 +642,6 @@ bounded_reads(void)
 /* ---- output muting (fds opened once, not per iteration) ----------------- */
 
 static int	saved_stdout = -1;
-static int	saved_stderr = -1;
 static int	devnull_fd = -1;
 
 static int
@@ -670,13 +670,9 @@ mute_output(void)
 	if (devnull_fd < 0)
 		return;
 	fflush(stdout);
-	fflush(stderr);
 	if (saved_stdout < 0)
 		saved_stdout = dup(1);
-	if (saved_stderr < 0)
-		saved_stderr = dup(2);
 	dup2(devnull_fd, 1);
-	dup2(devnull_fd, 2);
 }
 
 static void
@@ -685,11 +681,8 @@ unmute_output(void)
 	if (muting_disabled())
 		return;
 	fflush(stdout);
-	fflush(stderr);
 	if (saved_stdout >= 0)
 		dup2(saved_stdout, 1);
-	if (saved_stderr >= 0)
-		dup2(saved_stderr, 2);
 }
 
 /* ---- CRC-fixup sampling --------------------------------------------------

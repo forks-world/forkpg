@@ -978,6 +978,12 @@ foreach fuzz_target : [
     timeout: 60,
   )
 endforeach
+test('pagestore_fuzz_runner_regressions',
+  find_program(meson.current_source_dir() / 'fuzz' / 'tests' /
+               'check_runner_regression.sh'),
+  suite: ['pagestore', 'pagestore-fuzz'],
+  timeout: 30,
+)
 # The JSON artifacts of the branch controller and the materializer
 # supervisor (pagestore_artifact_schema.py): the tools' identities must
 # match the fixture, every captured artifact must load through the shared

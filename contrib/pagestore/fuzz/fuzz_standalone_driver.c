@@ -23,6 +23,7 @@
  *-------------------------------------------------------------------------
  */
 #include <dirent.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +33,14 @@
 #include "fuzz_common.h"
 
 static long total_files = 0;
+static int replay_failed = 0;
+
+static void
+replay_error(const char *operation, const char *path)
+{
+	fprintf(stderr, "%s: %s: %s\n", operation, path, strerror(errno));
+	replay_failed = 1;
+}
 
 static void
 replay_file(const char *target, const char *path)
@@ -41,32 +50,56 @@ replay_file(const char *target, const char *path)
 	uint8_t    *buf;
 
 	if (f == NULL)
+	{
+		replay_error("fopen", path);
 		return;
+	}
 	if (fseek(f, 0, SEEK_END) != 0)
 	{
+		replay_error("fseek", path);
 		fclose(f);
 		return;
 	}
 	len = ftell(f);
 	if (len < 0)
 	{
+		replay_error("ftell", path);
 		fclose(f);
 		return;
 	}
-	rewind(f);
+	if (fseek(f, 0, SEEK_SET) != 0)
+	{
+		replay_error("fseek", path);
+		fclose(f);
+		return;
+	}
 	buf = malloc((size_t) len > 0 ? (size_t) len : 1);
 	if (buf == NULL)
 	{
+		errno = ENOMEM;
+		replay_error("malloc", path);
 		fclose(f);
 		return;
 	}
 	if (len > 0 && fread(buf, 1, (size_t) len, f) != (size_t) len)
 	{
+		if (ferror(f))
+			replay_error("fread", path);
+		else
+		{
+			errno = EIO;
+			replay_error("short read", path);
+		}
 		free(buf);
 		fclose(f);
 		return;
 	}
-	fclose(f);
+	if (fclose(f) != 0)
+	{
+		replay_error("fclose", path);
+		free(buf);
+		return;
+	}
 
 	fprintf(stderr, "replay: %s (%ld bytes)\n", path, len);
 	ps_fuzz_run_one(target, buf, (size_t) len);
@@ -79,26 +112,54 @@ replay_dir(const char *target, const char *dirpath)
 {
 	DIR		   *d = opendir(dirpath);
 	struct dirent *ent;
+	long		files_before = total_files;
 
 	if (d == NULL)
+	{
+		replay_error("opendir", dirpath);
 		return;
-	while ((ent = readdir(d)) != NULL)
+	}
+	for (;;)
 	{
 		char		path[4096];
 		struct stat st;
+		int			pathlen;
 
+		errno = 0;
+		ent = readdir(d);
+		if (ent == NULL)
+		{
+			if (errno != 0)
+				replay_error("readdir", dirpath);
+			break;
+		}
 		if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
 			continue;
 		if (strcmp(ent->d_name, "known-crashes") == 0)
 			continue;
-		if (snprintf(path, sizeof(path), "%s/%s", dirpath, ent->d_name) >=
-			(int) sizeof(path))
+		pathlen = snprintf(path, sizeof(path), "%s/%s", dirpath, ent->d_name);
+		if (pathlen < 0 || pathlen >= (int) sizeof(path))
+		{
+			errno = ENAMETOOLONG;
+			replay_error("path too long", dirpath);
 			continue;
-		if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+		}
+		if (stat(path, &st) != 0)
+		{
+			replay_error("stat", path);
+			continue;
+		}
+		if (!S_ISREG(st.st_mode))
 			continue;
 		replay_file(target, path);
 	}
-	closedir(d);
+	if (closedir(d) != 0)
+		replay_error("closedir", dirpath);
+	if (total_files == files_before)
+	{
+		fprintf(stderr, "no corpus files: %s\n", dirpath);
+		replay_failed = 1;
+	}
 }
 
 int
@@ -122,5 +183,5 @@ main(int argc, char **argv)
 
 	fprintf(stderr, "replayed %ld corpus file(s) for target '%s'\n",
 			total_files, target);
-	return 0;
+	return replay_failed ? 1 : 0;
 }

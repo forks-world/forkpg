@@ -80,6 +80,14 @@ for tgt in "${TARGETS[@]}"; do
     exit 2
   fi
 done
+for ((i = 0; i < ${#TARGETS[@]}; i++)); do
+  for ((j = i + 1; j < ${#TARGETS[@]}; j++)); do
+    if [[ "${TARGETS[i]}" == "${TARGETS[j]}" ]]; then
+      echo "run_fuzz.sh: duplicate target '${TARGETS[i]}'" >&2
+      exit 2
+    fi
+  done
+done
 
 # Per-target -max_len: roughly 2x the largest checked-in seed, since a
 # mutated file should be allowed to grow past what any fixture happened to
@@ -116,6 +124,66 @@ fi
 
 mkdir -p "$OUT_DIR"
 pids=()
+fail=0
+
+cleanup_workers() {
+  local i pid attempt found
+  local -a running=()
+
+  # jobs -pr excludes workers that already exited, so a completed PID can
+  # never be signalled again after the OS has had a chance to reuse it.
+  mapfile -t running < <(jobs -pr; jobs -ps)
+  for pid in "${running[@]}"; do
+    for i in "${!pids[@]}"; do
+      if [[ "$pid" == "${pids[i]}" ]]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        break
+      fi
+    done
+  done
+
+  # A worker can be stuck in one input or ignore TERM. Give it a short grace
+  # period, then force-stop only the still-running PIDs owned by this script.
+  for ((attempt = 0; attempt < 10; attempt++)); do
+    mapfile -t running < <(jobs -pr; jobs -ps)
+    found=0
+    for pid in "${running[@]}"; do
+      for i in "${!pids[@]}"; do
+        if [[ "$pid" == "${pids[i]}" ]]; then
+          found=1
+          break
+        fi
+      done
+    done
+    [[ $found -eq 1 ]] || break
+    sleep 0.1
+  done
+  mapfile -t running < <(jobs -pr; jobs -ps)
+  for pid in "${running[@]}"; do
+    for i in "${!pids[@]}"; do
+      if [[ "$pid" == "${pids[i]}" ]]; then
+        kill -KILL "$pid" 2>/dev/null || true
+        break
+      fi
+    done
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+}
+
+on_exit() {
+  local status=$?
+
+  trap - EXIT INT TERM
+  cleanup_workers
+  exit "$status"
+}
+
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 for tgt in "${TARGETS[@]}"; do
   work="$OUT_DIR/$tgt"
   rm -rf "$work"
@@ -123,26 +191,32 @@ for tgt in "${TARGETS[@]}"; do
   cp -r "$FUZZ_DIR/corpus/$tgt" "$work/corpus"
   (
     cd "$work"
-    PS_FUZZ_TARGET="$tgt" \
-    PS_FUZZ_CRC_FIXUP="$CRC_FIXUP" \
-    TMPDIR="${TMPDIR:-/tmp}" \
-    ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1:allocator_may_return_null=1" \
-    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-    LSAN_OPTIONS="suppressions=$FUZZ_DIR/lsan_suppressions.txt" \
-    "$BIN" -max_total_time="$DURATION" -max_len="$(max_len_for "$tgt")" \
+    exec env \
+      PS_FUZZ_TARGET="$tgt" \
+      PS_FUZZ_CRC_FIXUP="$CRC_FIXUP" \
+      TMPDIR="${TMPDIR:-/tmp}" \
+      ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1:allocator_may_return_null=1" \
+      UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+      LSAN_OPTIONS="suppressions=$FUZZ_DIR/lsan_suppressions.txt" \
+      "$BIN" -max_total_time="$DURATION" -max_len="$(max_len_for "$tgt")" \
       -timeout="$PER_INPUT_TIMEOUT" \
       -rss_limit_mb=4096 -artifact_prefix=crashes/ \
       corpus/ > run.log 2>&1
-    echo "exit_code=$?" >> run.log
   ) &
   pids+=($!)
   echo "started $tgt (pid $!) -> $work"
 done
 
 echo "waiting for ${#pids[@]} target(s), duration ${DURATION}s each..."
-fail=0
-for pid in "${pids[@]}"; do
-  wait "$pid" || fail=1
+for i in "${!pids[@]}"; do
+  pid="${pids[i]}"
+  if wait "$pid"; then
+    status=0
+  else
+    status=$?
+    fail=1
+  fi
+  echo "exit_code=$status" >> "$OUT_DIR/${TARGETS[i]}/run.log"
 done
 echo "all targets finished (some background jobs may report nonzero exit on found crashes; see run.log per target)"
 # Propagate a worker's nonzero exit (ASan/UBSan/libFuzzer abort on a crash

@@ -26,17 +26,18 @@
  * (mirrored locally the way the existing pagestore_*_test.c files already
  * do for formats whose struct is private to one .c file, or included
  * directly where the type is public, e.g. PsKey, PsRetentionPin,
- * PsPruneFence). Only checksum fields are touched; every other byte stays
- * exactly what libFuzzer produced, so the checksum gate stops being the
- * first thing every mutation trips over without weakening any other
- * structural check.
+ * PsPruneFence). Checksums are recomputed for the mutated bytes. Where a
+ * format has a required cross-file relationship, the fixed-up half also
+ * synchronizes only the linked fields (for example a manifest identity/hash
+ * with sibling payloads, or a watermark length with its sibling log). The
+ * raw half skips this function, preserving malformed-field coverage.
  *
- * work_dir is the live store directory for this iteration: two targets
- * (forkmeta_snapshot_checkpoint, forkmeta_snapshot_tail) have no checksum
- * of their own -- their length+FNV-1a are recorded in the sibling
- * forkmeta_snapshots/forkmeta_manifest_v1 file instead -- so fixing them up
- * means patching that sibling file in the live directory to match the
- * mutated payload; every other target only touches buf/len.
+ * work_dir is the live store directory for this iteration. Some targets
+ * need sibling reads or writes to keep cross-file checks valid: forkmeta
+ * snapshot parts patch forkmeta_manifest_v1, the forkmeta manifest target
+ * reads the pristine part templates, walidx_watermark reads its epoch log,
+ * and walidx snapshot shard fixup updates its sibling manifest. Other
+ * targets only touch buf/len.
  */
 extern void ps_fuzz_crc_fixup(const char *target_name, const char *work_dir,
 							   uint8_t *buf, size_t len);

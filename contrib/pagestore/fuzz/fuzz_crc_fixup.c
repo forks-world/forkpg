@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "pagestore_core.h"
@@ -640,12 +641,30 @@ typedef struct FuzzWalIdxWatermark
 } FuzzWalIdxWatermark;
 
 static void
-fixup_walidx_watermark(uint8_t *buf, size_t len)
+fixup_walidx_watermark(const char *work_dir, uint8_t *buf, size_t len)
 {
+	char		path[4096];
+	struct stat st;
+	int			fd;
 	size_t		crc_off = offsetof(FuzzWalIdxWatermark, crc);
 
 	if (len < sizeof(FuzzWalIdxWatermark))
 		return;
+	if (snprintf(path, sizeof(path), "%s/walidx_0_0_e00000000000000000001",
+				 work_dir) >= (int) sizeof(path))
+		return;
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return;
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0)
+	{
+		close(fd);
+		return;
+	}
+	close(fd);
+	for (unsigned i = 0; i < 8; i++)
+		buf[offsetof(FuzzWalIdxWatermark, length) + i] =
+			(unsigned char) ((uint64_t) st.st_size >> (i * 8));
 	put_le32(buf + crc_off, 0);
 	put_le32(buf + crc_off,
 			 fnv1a_step(FNV1A_INIT, buf, sizeof(FuzzWalIdxWatermark)));
@@ -969,8 +988,46 @@ fixup_image_layer(const char *work_dir, uint8_t *buf, size_t len)
 static void
 fixup_forkmeta_snapshot_manifest(uint8_t *buf, size_t len)
 {
+	static const char *const part_paths[2] = {
+		"forkmeta_snapshots/forkmeta_checkpoint_v1_00000000000000000001",
+		"forkmeta_snapshots/forkmeta_tail_v1_00000000000000000001"
+	};
+	const uint8_t *parts[2];
+	size_t		part_lens[2];
+	uint64_t	generation;
+	uint64_t	cutoff_lsn;
+	uint64_t	cutoff_seq;
+
 	if (len != FORKMETA_SNAPSHOT_HEADER_BYTES_LOCAL)
 		return;
+	for (unsigned i = 0; i < 2; i++)
+	{
+		parts[i] = ps_fuzz_template_lookup(part_paths[i], &part_lens[i]);
+		if (parts[i] == NULL ||
+			part_lens[i] < FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL)
+			return;
+	}
+	/* Bind the mutated manifest back to the fixture payloads.  The raw half
+	 * still exercises arbitrary identity/length/hash corruption; in the fixup
+	 * half these cross-file fields must agree so loading reaches payload and
+	 * record validation.  Both payload headers carry the same snapshot identity. */
+	generation = get_le64(parts[0] + 16);
+	cutoff_lsn = get_le64(parts[0] + 24);
+	cutoff_seq = get_le64(parts[0] + 32);
+	if (get_le64(parts[1] + 16) != generation ||
+		get_le64(parts[1] + 24) != cutoff_lsn ||
+		get_le64(parts[1] + 32) != cutoff_seq)
+		return;
+	for (unsigned i = 0; i < 8; i++)
+	{
+		buf[16 + i] = (uint8_t) (generation >> (i * 8));
+		buf[24 + i] = (uint8_t) (cutoff_lsn >> (i * 8));
+		buf[32 + i] = (uint8_t) (cutoff_seq >> (i * 8));
+		buf[40 + i] = (uint8_t) ((uint64_t) part_lens[0] >> (i * 8));
+		buf[52 + i] = (uint8_t) ((uint64_t) part_lens[1] >> (i * 8));
+	}
+	put_le32(buf + 48, fnv1a_step(FNV1A_INIT, parts[0], part_lens[0]));
+	put_le32(buf + 60, fnv1a_step(FNV1A_INIT, parts[1], part_lens[1]));
 	put_le32(buf + 64, 0);
 	put_le32(buf + 64, fnv1a_step(FNV1A_INIT, buf, len));
 }
@@ -1318,7 +1375,7 @@ ps_fuzz_crc_fixup(const char *target_name, const char *work_dir,
 	else if (strcmp(target_name, "walidx_log_legacy") == 0)
 		fixup_walidx_log(buf, len);
 	else if (strcmp(target_name, "walidx_watermark") == 0)
-		fixup_walidx_watermark(buf, len);
+		fixup_walidx_watermark(work_dir, buf, len);
 	else if (strcmp(target_name, "wal_store_identity") == 0)
 		fixup_wal_store_identity(buf, len);
 	else if (strcmp(target_name, "wal_segment") == 0)
