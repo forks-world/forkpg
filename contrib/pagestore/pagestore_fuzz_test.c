@@ -292,11 +292,47 @@ static FILE *log_fp;
 static int	g_bugb_workaround;
 
 /* For the ddmin shrinker (shrink_on_failure()): the original argv (to
- * re-exec this same binary via /proc/self/exe for each candidate) and the
- * store base directory (where candidate sequence files and captured child
- * output are staged; the same directory psc_store_dir itself is under). */
+ * re-exec this same binary for each candidate) and the store base directory
+ * (where candidate sequence files and captured child output are staged; the
+ * same directory psc_store_dir itself is under). */
 static char **g_argv;
 static const char *g_store_base;
+
+/*
+ * Executable path for the shrinker's re-exec of this same binary, resolved
+ * once at startup by resolve_self_exe() rather than hard-coded as
+ * "/proc/self/exe": that path only exists under Linux's procfs, so it
+ * silently fails execv() (child exits 127) on macOS, the BSDs, or a Linux
+ * sandbox without /proc mounted, and every shrink candidate is then
+ * misreported as "not reproduced" -- see shrink_try_candidate().
+ */
+#define FZ_SELF_EXE_MAX	4096
+static char g_self_exe[FZ_SELF_EXE_MAX];
+static int	g_self_exe_ok;
+
+/*
+ * Resolves the running binary's path for later re-exec, preferring the
+ * portable realpath(argv[0]) (works whenever argv[0] carries a path, as it
+ * does for every invocation this harness documents: meson test, the CI
+ * workflow, and direct "./pagestore_fuzz_test" runs) and falling back to
+ * Linux's /proc/self/exe.  Leaves g_self_exe_ok false, rather than guessing,
+ * when neither resolves.
+ */
+static void
+resolve_self_exe(const char *argv0)
+{
+	if (argv0 != NULL && realpath(argv0, g_self_exe) != NULL)
+	{
+		g_self_exe_ok = 1;
+		return;
+	}
+	if (realpath("/proc/self/exe", g_self_exe) != NULL)
+	{
+		g_self_exe_ok = 1;
+		return;
+	}
+	g_self_exe_ok = 0;
+}
 
 typedef struct FzRingEntry
 {
@@ -4128,23 +4164,40 @@ write_seq_subset(const char *path, const int *seq, long long n)
 
 /*
  * Replay one candidate sequence as a fresh child process of this same
- * binary (re-exec via /proc/self/exe: robust regardless of how argv[0] was
- * spelled) against its own fresh daemon/store, with a bounded wait.
- * Returns 1 iff the child exits non-zero AND its captured output contains
- * an "ORACLE_SITE: <orig_fmt>" line -- i.e. it failed at the *same* ck()
- * call site as the original failure, not merely "failed somehow" (a
- * shrunk-too-far candidate can legitimately hit a different, earlier
- * assertion; that is not "the same bug" and must not be accepted).
+ * binary (re-exec via g_self_exe, resolved once at startup by
+ * resolve_self_exe()) against its own fresh daemon/store, with a bounded
+ * wait.  Returns 1 iff the child exits non-zero AND its captured output
+ * contains an "ORACLE_SITE: <orig_fmt>" line -- i.e. it failed at the
+ * *same* ck() call site as the original failure, not merely "failed
+ * somehow" (a shrunk-too-far candidate can legitimately hit a different,
+ * earlier assertion; that is not "the same bug" and must not be accepted).
+ *
+ * The candidate runs in its own process group (setpgid(), set from both
+ * sides to close the fork/exec race): on a hang, killing only the replay
+ * process would leave the pagestore_daemon it spawned running, since that
+ * daemon is a separate child merely reparented when the replay process
+ * dies, not a descendant we can reap.  Signaling the whole group reaches
+ * the daemon directly instead.
  */
 static int
 shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 {
 	char		capture_path[600];
+	char		cand_shm_name[64];
+	char		cand_store_dir[600];
 	pid_t		pid;
 	int			status;
 	int			ok = 0;
 	uint64_t	start;
 	int			done = 0;
+
+	if (!g_self_exe_ok)
+	{
+		fprintf(stderr, "shrink: cannot resolve this binary's own executable "
+				"path (tried realpath(argv[0]) and /proc/self/exe); "
+				"shrinking is unavailable, not just timing-sensitive\n");
+		return 0;
+	}
 
 	snprintf(capture_path, sizeof(capture_path), "%s/psfuzz_shrink_%d_%d.out",
 			 g_store_base, (int) getpid(), rng_below(1000000000u));
@@ -4156,8 +4209,12 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 	}
 	if (pid == 0)
 	{
-		int			cfd = open(capture_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		int			cfd;
 
+		/* Best-effort; the parent's matching call below covers the case
+		 * where the child execs before this runs. */
+		setpgid(0, 0);
+		cfd = open(capture_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 		if (cfd >= 0)
 		{
 			dup2(cfd, 1);
@@ -4170,9 +4227,18 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 		unsetenv("PAGESTORE_FUZZ_KEEP");
 		unsetenv("PAGESTORE_FUZZ_TRACE");
 		unsetenv("PAGESTORE_FUZZ_LOG");
-		execv("/proc/self/exe", g_argv);
+		execv(g_self_exe, g_argv);
 		_exit(127);				/* exec failed */
 	}
+	/* Parent side of the same race: pid is also the intended pgid. */
+	setpgid(pid, pid);
+
+	/* The candidate re-derives its shm name and store directory from its
+	 * own pid exactly as main() does; matches psc_shm_name/psc_store_dir's
+	 * formats there. */
+	snprintf(cand_shm_name, sizeof(cand_shm_name), "/psfuzz_%d", (int) pid);
+	snprintf(cand_store_dir, sizeof(cand_store_dir), "%s/pagestore-fuzz-%d",
+			 g_store_base, (int) pid);
 
 	start = psc_now_ns();
 	while (psc_now_ns() - start < 90ull * 1000000000ull)
@@ -4188,8 +4254,16 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 	}
 	if (!done)
 	{
-		kill(pid, SIGKILL);
+		/* Kill the whole group -- the replay process and the daemon it
+		 * spawned -- then reap our direct child and clean up the daemon's
+		 * shm/store the way psc_fatal() does for a normal run. */
+		kill(-pid, SIGKILL);
 		waitpid(pid, &status, 0);
+		while (waitpid(-pid, &status, WNOHANG) > 0)
+			;						/* reap any other of our own children
+									 * left in the group, if any */
+		ps_shm_unlink(cand_shm_name);
+		psc_remove_tree(cand_store_dir);
 		unlink(capture_path);
 		return 0;				/* candidate replay hung: not a clean repro */
 	}
@@ -4523,6 +4597,7 @@ main(int argc, char **argv)
 
 	g_argv = argv;
 	g_store_base = base;
+	resolve_self_exe(argv[0]);
 
 	if ((env = getenv("PAGESTORE_FUZZ_REPLAY")) != NULL)
 	{
