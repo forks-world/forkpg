@@ -691,14 +691,24 @@ ck(int cond, const char *fmt, ...)
 	exit(1);
 }
 
-/* status in {OK,ERROR,STALE} and always records coverage; the caller has
- * already decided whether OK or refusal was legal to observe here. */
+/*
+ * status in {OK,ERROR} plus STALE when allow_stale, and always records
+ * coverage; the caller has already decided whether OK or refusal was legal
+ * to observe here.  PS_STATUS_STALE is an ownership-fencing result the
+ * daemon only emits from its retention-pin handlers (PS_OP_RETENTION_PIN_
+ * SET/RESERVE/DROP/GET; see pagestore_core.c); every other opcode's caller
+ * must pass allow_stale=0 so a regression that leaks STALE out of an
+ * unrelated opcode fails the run instead of being counted as an ordinary
+ * refusal.
+ */
 static void
-observe(uint32_t opcode, int status, uint32_t reason, const char *what)
+observe(uint32_t opcode, int status, uint32_t reason, const char *what,
+		int allow_stale)
 {
 	ck(status == PS_STATUS_OK || status == PS_STATUS_ERROR ||
-	   status == PS_STATUS_STALE, "%s: status %d is not in {OK,ERROR,STALE}",
-	   what, status);
+	   (allow_stale && status == PS_STATUS_STALE),
+	   "%s: status %d is not in {OK,ERROR%s}",
+	   what, status, allow_stale ? ",STALE" : "");
 	record_cov(opcode, (uint32_t) status, reason);
 }
 
@@ -1383,7 +1393,7 @@ act_read_at(void)
 								NULL);
 		ring_note("READ_AT tl=%u rel=%u block=%u mode=%d strong=%d", tl, rel,
 				  b, mode, strong);
-		observe(PS_OP_READ_AT, status, 0, "READ_AT");
+		observe(PS_OP_READ_AT, status, 0, "READ_AT", 0);
 		if (strong)
 		{
 			ck(status == PS_STATUS_OK, "READ_AT (strong) tl=%u rel=%u "
@@ -1524,7 +1534,7 @@ act_block_death(void)
 
 		ring_note("BLOCK_DEATH tl=%u rel=%u block=%u", tl, rel, b);
 		(void) m;
-		observe(PS_OP_BLOCK_DEATH, status, 0, "BLOCK_DEATH");
+		observe(PS_OP_BLOCK_DEATH, status, 0, "BLOCK_DEATH", 0);
 	}
 	else
 	{
@@ -1958,7 +1968,7 @@ act_wal_retain_floor(void)
 		/* A floor may legitimately be unprovable before any materializer
 		 * publication ever ran on this timeline: accept OK either way, but
 		 * a provable floor must never exceed what we have shipped. */
-		observe(PS_OP_WAL_RETAIN_FLOOR, status, 0, "WAL_RETAIN_FLOOR");
+		observe(PS_OP_WAL_RETAIN_FLOOR, status, 0, "WAL_RETAIN_FLOOR", 0);
 		if (status == PS_STATUS_OK && proven)
 			ck(floor <= g_tl[tl].wal_end, "WAL_RETAIN_FLOOR tl=%u floor=%llu"
 			   " exceeds shipped tail %llu", tl, (unsigned long long) floor,
@@ -2090,7 +2100,7 @@ act_retention_lookup(void)
 
 	ring_note("RETENTION_PIN_LOOKUP kind=%u owner=%llu", kind,
 			  (unsigned long long) owner_id);
-	observe(PS_OP_RETENTION_PIN_LOOKUP, status, found, "RETENTION_PIN_LOOKUP");
+	observe(PS_OP_RETENTION_PIN_LOOKUP, status, found, "RETENTION_PIN_LOOKUP", 0);
 	if (status == PS_STATUS_OK && kind == PS_RETENTION_OWNER_READER)
 	{
 		FzReaderPin *r = g_reader[0].held && g_reader[0].owner_id == owner_id ?
@@ -2138,7 +2148,7 @@ act_retention_get(void)
 	int			status = psc_chan_ptr()->status;
 
 	ring_note("RETENTION_PIN_GET index=0");
-	observe(PS_OP_RETENTION_PIN_GET, status, 0, "RETENTION_PIN_GET");
+	observe(PS_OP_RETENTION_PIN_GET, status, 0, "RETENTION_PIN_GET", 1);
 	if (rc >= 0)
 		ck((int) count == expected, "RETENTION_PIN_GET count expected %d "
 		   "got %u", expected, count);
@@ -2192,7 +2202,7 @@ act_retention_floor(void)
 		 * write of its own yet can legitimately fail closed rather than
 		 * return a fabricated floor.
 		 */
-		observe(PS_OP_RETENTION_FLOOR, status, 0, "RETENTION_FLOOR");
+		observe(PS_OP_RETENTION_FLOOR, status, 0, "RETENTION_FLOOR", 0);
 		(void) proven;
 	}
 	else if (adv == ADV_UNDEFINED_TIMELINE)
@@ -2296,7 +2306,7 @@ act_retention_reserve_adv(void)
 		ring_note("RETENTION_PIN_RESERVE adv=stale-or-zero-lsn owner=%llu",
 				  (unsigned long long) g_reader[0].owner_id);
 		observe(PS_OP_RETENTION_PIN_RESERVE, status, 0,
-				"RETENTION_PIN_RESERVE adversarial generation/lsn");
+				"RETENTION_PIN_RESERVE adversarial generation/lsn", 1);
 	}
 	else
 	{
@@ -2416,7 +2426,7 @@ act_check_branch(void)
 		{
 			/* Slot is LIVE or DELETING: not a valid target for a brand-new
 			 * branch definition, so only check status-domain sanity. */
-			observe(PS_OP_CHECK_BRANCH, status, 0, "CHECK_BRANCH");
+			observe(PS_OP_CHECK_BRANCH, status, 0, "CHECK_BRANCH", 0);
 		}
 	}
 	else
