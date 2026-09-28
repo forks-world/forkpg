@@ -959,7 +959,7 @@ pagestore_format_fuzz_replay = executable('pagestore_format_fuzz_replay',
   include_directories: include_directories('.'),
   c_args: ['-DPS_FUZZ_FIXTURE_TGZ="' +
            (meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline' / 'store.tar.gz') +
-           '"'],
+           '"'] + pagestore_cassert_c_args,
   dependencies: [dependency('threads')],
   install: false,
 )

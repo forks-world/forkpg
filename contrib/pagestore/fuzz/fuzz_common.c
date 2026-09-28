@@ -138,6 +138,25 @@ static int	template_ready = 0;
 static const char *scratch_root;
 static char work_dir[PATH_MAX];
 
+/* Round-4 coordinator review: the persistent work_dir (see the file header
+ * above) was never removed, so every process -- 21 of them for one
+ * `meson test --suite pagestore-fuzz` run, plus however many a fuzz
+ * campaign forks -- abandoned a full fixture-sized directory in TMPDIR.
+ * Remove it on a normal exit via atexit(); a crash (abort()/a signal) skips
+ * atexit handlers entirely, so a crashing run's work_dir is deliberately
+ * left behind for post-mortem inspection instead of raced with cleanup. */
+static void
+cleanup_work_dir(void)
+{
+	char		rm_cmd[PATH_MAX + 16];
+
+	if (work_dir[0] == '\0')
+		return;
+	if (snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", work_dir) <
+		(int) sizeof(rm_cmd))
+		(void) system(rm_cmd);
+}
+
 static const char *
 skip_root(const char *fpath, size_t root_len)
 {
@@ -533,6 +552,7 @@ ps_fuzz_global_init(void)
 		fprintf(stderr, "ps_fuzz_global_init: mkdtemp (work_dir) failed\n");
 		abort();
 	}
+	atexit(cleanup_work_dir);
 	populate_work_dir();
 
 	/* The extracted template tree is no longer needed once cached and
@@ -676,10 +696,19 @@ unmute_output(void)
  * PS_FUZZ_CRC_FIXUP unset/"0": never fix up (round-1 behavior, the "cov/ft
  * without fixup" baseline).  "always"/"1": every iteration.  Anything else
  * (including the default when the variable is set but not recognized) and
- * the documented default once the feature is on at all: alternate
- * deterministically so exactly half of iterations get the fixed-up
- * checksum and half stay pure mutation -- reproducible corpus minimization
- * and a mix of "past the gate" and "at the gate" inputs in the same run. */
+ * the documented default once the feature is on at all: split so roughly
+ * half of iterations get the fixed-up checksum and half stay pure mutation
+ * -- a mix of "past the gate" and "at the gate" inputs in the same run.
+ *
+ * Round-4 coordinator review: the split used to be a per-process iteration
+ * counter, so the identical input alternated between fixed-up and raw
+ * bytes depending on which call number it happened to land on -- replay
+ * and crash minimization (which re-run the same unit outside of any
+ * particular sequence) could not reproduce whichever coverage or crash the
+ * original run saw.  Hashing the input bytes themselves makes the choice a
+ * pure function of the unit: the same bytes always take the same path,
+ * however many times or in what order they are replayed, while still
+ * landing close to a 50/50 split across a corpus of distinct inputs. */
 typedef enum FixupMode
 {
 	FIXUP_OFF,
@@ -708,11 +737,27 @@ fixup_mode(void)
 	return mode;
 }
 
-static int
-should_fixup_this_iteration(void)
+/* FNV-1a over the input bytes, same constants used by every checksum in
+ * fuzz_crc_fixup.c (and by the product formats it mirrors) -- not chosen
+ * for that reason, just a convenient, already-proven-good, already-in-use
+ * hash to key the split on. */
+static uint32_t
+fixup_sample_hash(const uint8_t *data, size_t size)
 {
-	static uint64_t counter = 0;
+	uint32_t	h = 2166136261u;
+	size_t		i;
 
+	for (i = 0; i < size; i++)
+	{
+		h ^= data[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+static int
+should_fixup_this_iteration(const uint8_t *data, size_t size)
+{
 	switch (fixup_mode())
 	{
 		case FIXUP_OFF:
@@ -721,7 +766,7 @@ should_fixup_this_iteration(void)
 			return 1;
 		case FIXUP_HALF:
 		default:
-			return (counter++ & 1) == 0;
+			return (fixup_sample_hash(data, size) & 1) == 0;
 	}
 }
 
@@ -777,7 +822,7 @@ ps_fuzz_run_one(const char *target_name, const uint8_t *data, size_t size)
 	if (content_len > 0)
 		memcpy(content, data, content_len);
 
-	if (should_fixup_this_iteration())
+	if (should_fixup_this_iteration(content, content_len))
 		ps_fuzz_crc_fixup(resolved_target_name, work_dir, content, content_len);
 
 	if (snprintf(target_path, sizeof(target_path), "%s/%s", work_dir,

@@ -60,16 +60,22 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
   TARGETS=("${ALL_TARGETS[@]}")
 fi
 
-# Per-target -max_len: roughly 2x the largest seed, since a mutated file
-# should be allowed to grow past what any fixture happened to record.
+# Per-target -max_len: roughly 2x the largest checked-in seed, since a
+# mutated file should be allowed to grow past what any fixture happened to
+# record. Every case below was checked against `du -sb` on fuzz/corpus/<target>
+# (round-4 coordinator review: manifest, wal_segment, wal_log, and
+# walidx_frontier were below their own 2x-largest-seed line and are fixed
+# here; everything else already had headroom, including the ones that fall
+# through to the 16384 default).
 max_len_for() {
   case "$1" in
-    image_layer) echo 786432 ;;
-    wal_segment) echo 2097152 ;;
-    page_segment) echo 131072 ;;
-    page_frontier) echo 131072 ;;
-    wal_log) echo 131072 ;;
-    walidx_frontier) echo 65536 ;;
+    image_layer) echo 786432 ;;      # largest seed 388816
+    wal_segment) echo 2359296 ;;     # largest seed 1048640 (2x = 2097280)
+    page_segment) echo 131072 ;;     # largest seed 57744
+    page_frontier) echo 131072 ;;    # largest seed 49168
+    wal_log) echo 262144 ;;          # largest seed 65552 (2x = 131104)
+    walidx_frontier) echo 131072 ;;  # largest seed 32784 (2x = 65568)
+    manifest) echo 49152 ;;          # largest seed 21852 (2x = 43704)
     *) echo 16384 ;;
   esac
 }
@@ -104,3 +110,7 @@ for pid in "${pids[@]}"; do
   wait "$pid" || fail=1
 done
 echo "all targets finished (some background jobs may report nonzero exit on found crashes; see run.log per target)"
+# Propagate a worker's nonzero exit (ASan/UBSan/libFuzzer abort on a crash
+# or timeout) as this script's own exit status -- an automated campaign
+# must be able to tell a clean run from one that found something.
+exit "$fail"

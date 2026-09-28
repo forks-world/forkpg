@@ -505,6 +505,17 @@ fixup_image_layer(uint8_t *buf, size_t len)
  * bytes with crc zeroed. */
 #define FORKMETA_SNAPSHOT_HEADER_BYTES_LOCAL 80u
 
+/*
+ * sizeof(ForkMetaSnapshotPayloadHeader) (pagestore_core.c): magic(4) +
+ * version(2) + header_bytes(2) + part(4) + record_bytes(4) = 16, then eight
+ * uint64_t fields (generation, cutoff_lsn, cutoff_admission_seq,
+ * freeze_admission_seq, checkpoint_records, tail_records, checkpoint_bytes,
+ * tail_bytes) = 64, total 80 -- coincidentally the same number as the
+ * *outer* forkmeta_manifest_v1 record size above, but a different struct in
+ * a different file; kept as its own constant so the two are never confused.
+ */
+#define FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL 80u
+
 static void
 fixup_forkmeta_snapshot_manifest(uint8_t *buf, size_t len)
 {
@@ -516,15 +527,27 @@ fixup_forkmeta_snapshot_manifest(uint8_t *buf, size_t len)
 
 /*
  * forkmeta_snapshots/forkmeta_checkpoint_v1_* and .../forkmeta_tail_v1_*:
- * these payload files carry no checksum of their own -- open_validated_part()
- * in pagestore_forkmeta_snapshot.c hashes the raw file bytes against the
- * (len, crc) the sibling forkmeta_manifest_v1 record keeps for that part.
- * So the only way a mutated payload here reaches anything past "length or
- * checksum mismatch, part rejected" is to patch the sibling manifest's
- * record to match -- same fixed 80-byte layout as
- * fixup_forkmeta_snapshot_manifest() above, this time read from and
- * written back to the live directory, since the manifest is a different
- * file from the one this target mutates.
+ * each is an 80-byte ForkMetaSnapshotPayloadHeader (pagestore_core.c;
+ * magic/version/header_bytes/part/record_bytes(16) +
+ * generation/cutoff_lsn/cutoff_admission_seq/freeze_admission_seq/
+ * checkpoint_records/tail_records/checkpoint_bytes/tail_bytes(8 each) = 80,
+ * no padding) followed by a run of fixed 64-byte ForkMetaRecV2 records --
+ * the exact same wire record fixup_forkmeta() already knows how to fix up.
+ *
+ * Two checksum layers gate this target, both bypassed by round-3's fixup:
+ *   - open_validated_part() in pagestore_forkmeta_snapshot.c hashes the raw
+ *     file bytes against the (len, crc) the sibling forkmeta_manifest_v1
+ *     record keeps for that part, so a mutated payload must also patch that
+ *     record to match -- same fixed 80-byte layout as
+ *     fixup_forkmeta_snapshot_manifest() above, this time read from and
+ *     written back to the live directory, since the manifest is a
+ *     different file from the one this target mutates.
+ *   - fork_meta_snapshot_record_valid() in pagestore_core.c then checks
+ *     every FKM3 record's own CRC-24 (round-4 coordinator review: this was
+ *     missing entirely, so a mutation inside a record body passed the
+ *     outer manifest checksum only to fail immediately on its own stale
+ *     inner checksum, never reaching the semantic/ordering checks the
+ *     record parser is supposed to see).
  */
 static void
 fixup_forkmeta_snapshot_part(const char *work_dir, uint8_t *buf, size_t len,
@@ -536,6 +559,10 @@ fixup_forkmeta_snapshot_part(const char *work_dir, uint8_t *buf, size_t len,
 	uint32_t	part_crc;
 	size_t		len_off = is_tail ? 52 : 40;
 	size_t		crc_off = is_tail ? 60 : 48;
+
+	if (len > FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL)
+		fixup_forkmeta(buf + FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL,
+						len - FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL);
 
 	if (snprintf(path, sizeof(path),
 				 "%s/forkmeta_snapshots/forkmeta_manifest_v1", work_dir) >=
@@ -586,39 +613,83 @@ fixup_walidx_snapshot_manifest(uint8_t *buf, size_t len)
 }
 
 /*
+ * sizeof(WalIdxRec) (pagestore_core.c) and the byte offset of its own `crc`
+ * field within that fixed-size record -- see walidx_rec_crc(): FNV-1a over
+ * the whole 64-byte record with crc temporarily zeroed. */
+#define WALIDX_REC_BYTES_LOCAL 64u
+#define WALIDX_REC_CRC_OFF_LOCAL 8u
+
+/* Mirrors pagestore_walidx_snapshot.c's private WALIDX_SNAPSHOT_HEADER_BYTES/
+ * WALIDX_SNAPSHOT_ENTRY_BYTES/PS_WALIDX_SNAPSHOT_MAX_SHARDS (from
+ * pagestore_walidx_snapshot.h) -- not exported, so reproduced numerically
+ * like every other cross-file layout in this file. */
+#define WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL 64u
+#define WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL 16u
+#define WALIDX_SNAPSHOT_MANIFEST_MAX_SHARDS_LOCAL 128u
+
+/*
  * walidx_snapshots_<tl>/walidxg1_<generation>_<shard> (pagestore_core.c
  * walidx_snapshot_encode_header(), WALIDX_SNAPSHOT_PAYLOAD_BYTES == 72):
- * fixed 72-byte header + a WalIdxRec array payload.  decode_header() (the
- * reader) checks the header's crc *and* five identity fields (timeline,
- * shard, generation, start_lsn, end_lsn) against values the caller already
- * trusts from elsewhere (the sibling manifest's generation/start_lsn/
- * end_lsn plus which shard/timeline is being recovered) -- getting only
- * the crc right still means instant rejection on an identity mismatch, so
- * the mutated payload's record bytes (after the header) never get parsed.
- * To actually reach that record-parsing loop, this pins the header's
- * identity fields to the *template* fixture's real values (read from this
- * harness's in-memory template cache -- real captured values, not
- * invented ones) for timeline 0/shard 0, which is what every corpus seed
- * here already is, and leaves nrecords / the record payload entirely
- * fuzzer-controlled before recomputing the header crc. */
+ * fixed 72-byte header + a WalIdxRec array payload.  Three checksum layers
+ * gate this target, all bypassed by round-3's fixup save for the first:
+ *   - decode_header() (the reader) checks the header's crc *and* five
+ *     identity fields (timeline, shard, generation, start_lsn, end_lsn)
+ *     against values the caller already trusts from elsewhere (the sibling
+ *     manifest's generation/start_lsn/end_lsn plus which shard/timeline is
+ *     being recovered) -- getting only the crc right still means instant
+ *     rejection on an identity mismatch, so this pins the header's identity
+ *     fields to the *template* fixture's real values (read from this
+ *     harness's in-memory template cache -- real captured values, not
+ *     invented ones) for timeline 0/shard 0, which is what every corpus
+ *     seed here already is, before recomputing the header crc.
+ *   - round-4 coordinator review: ps_walidx_snapshot_open()'s
+ *     validate_shard() (pagestore_walidx_snapshot.c) compares this file's
+ *     whole-file length and FNV-1a checksum against the sibling
+ *     walidx_manifest_v1's per-shard entry *before* decode_header() is even
+ *     reached -- a payload mutation that only fixed the 72-byte header
+ *     above still failed here every time, so this now also patches that
+ *     entry (length + FNV-1a checksum) in the live manifest file, same
+ *     read/modify/pwrite-back shape as fixup_forkmeta_snapshot_part() uses
+ *     for its own sibling manifest.
+ *   - round-4 coordinator review: once both of those pass, the reader's
+ *     record-parsing loop (pagestore_core.c) still checks each WalIdxRec's
+ *     own crc (walidx_rec_crc()) -- this now recomputes it for every fixed
+ *     64-byte record after the 72-byte header, the same "zero the crc
+ *     field, FNV-1a the record, write it back" shape fixup_forkmeta()/
+ *     fixup_timelines() already use for their own framed records.
+ * nrecords / the record payload otherwise stay entirely fuzzer-controlled.
+ */
 static void
-fixup_walidx_snapshot_shard(uint8_t *buf, size_t len)
+fixup_walidx_snapshot_shard(const char *work_dir, uint8_t *buf, size_t len)
 {
-	const uint8_t *manifest;
-	size_t		manifest_len;
+	const uint8_t *manifest_tmpl;
+	size_t		manifest_tmpl_len;
 	uint64_t	generation;
 	uint64_t	start_lsn;
 	uint64_t	end_lsn;
+	size_t		off;
+	char		path[4096];
+	unsigned char manifest[WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL +
+		WALIDX_SNAPSHOT_MANIFEST_MAX_SHARDS_LOCAL *
+		WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL];
+	uint32_t	nshards;
+	size_t		manifest_len;
+	size_t		entry_off;
+	int			entry_found;
+	int			fd;
+	uint32_t	shard_crc;
 
 	if (len < 72)
 		return;
-	manifest = ps_fuzz_template_lookup(
-		"walidx_snapshots_0/walidx_manifest_v1", &manifest_len);
-	if (manifest == NULL || manifest_len < 48)
+	manifest_tmpl = ps_fuzz_template_lookup(
+		"walidx_snapshots_0/walidx_manifest_v1", &manifest_tmpl_len);
+	if (manifest_tmpl == NULL ||
+		manifest_tmpl_len < WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL +
+			WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL)
 		return;
-	generation = get_le64(manifest + 24);
-	start_lsn = get_le64(manifest + 32);
-	end_lsn = get_le64(manifest + 40);
+	generation = get_le64(manifest_tmpl + 24);
+	start_lsn = get_le64(manifest_tmpl + 32);
+	end_lsn = get_le64(manifest_tmpl + 40);
 
 	put_le32(buf + 12, 0);		/* timeline 0 */
 	put_le32(buf + 16, 0);		/* shard 0 */
@@ -632,6 +703,76 @@ fixup_walidx_snapshot_shard(uint8_t *buf, size_t len)
 	memset(buf + 48, 0, 8);		/* source_offset must be 0 */
 	put_le32(buf + 64, 0);
 	put_le32(buf + 64, fnv1a_step(FNV1A_INIT, buf, 72));
+
+	/* Every framed WalIdxRec after the header, regardless of magic (this
+	 * harness's corpus only ever contains the current fixed-size shape). */
+	for (off = 72; off + WALIDX_REC_BYTES_LOCAL <= len;
+		 off += WALIDX_REC_BYTES_LOCAL)
+	{
+		uint32_t	crc;
+
+		put_le32(buf + off + WALIDX_REC_CRC_OFF_LOCAL, 0);
+		crc = fnv1a_step(FNV1A_INIT, buf + off, WALIDX_REC_BYTES_LOCAL);
+		put_le32(buf + off + WALIDX_REC_CRC_OFF_LOCAL, crc);
+	}
+
+	/* Patch the sibling manifest's shard-0 entry (length + FNV-1a checksum
+	 * of this whole file) so validate_shard() lets the header above ever
+	 * get read at all. */
+	nshards = get_le32(manifest_tmpl + 20);
+	if (nshards == 0 || nshards > WALIDX_SNAPSHOT_MANIFEST_MAX_SHARDS_LOCAL)
+		return;
+	manifest_len = WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL +
+		(size_t) nshards * WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL;
+	if (manifest_len != manifest_tmpl_len || manifest_len > sizeof(manifest))
+		return;
+
+	if (snprintf(path, sizeof(path),
+				 "%s/walidx_snapshots_0/walidx_manifest_v1", work_dir) >=
+		(int) sizeof(path))
+		return;
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return;
+	if (read(fd, manifest, manifest_len) != (ssize_t) manifest_len)
+	{
+		close(fd);
+		return;
+	}
+
+	entry_found = 0;
+	entry_off = 0;
+	for (uint32_t i = 0; i < nshards; i++)
+	{
+		size_t		e = WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL +
+			(size_t) i * WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL;
+
+		if (get_le32(manifest + e) == 0)	/* shard 0's entry */
+		{
+			entry_off = e;
+			entry_found = 1;
+			break;
+		}
+	}
+	if (!entry_found)
+	{
+		close(fd);
+		return;
+	}
+
+	shard_crc = fnv1a_step(FNV1A_INIT, buf, len);
+	put_le32(manifest + entry_off + 4, shard_crc);
+	for (unsigned i = 0; i < 8; i++)
+		manifest[entry_off + 8 + i] = (unsigned char) ((uint64_t) len >> (i * 8));
+	put_le32(manifest + 48, 0);
+	put_le32(manifest + 48, fnv1a_step(FNV1A_INIT, manifest, manifest_len));
+	if (pwrite(fd, manifest, manifest_len, 0) != (ssize_t) manifest_len)
+	{
+		/* best-effort: an iteration that fails this write just runs
+		 * without the cross-file fixup, same as
+		 * fixup_forkmeta_snapshot_part() */
+	}
+	close(fd);
 }
 
 /* ---- dispatch ----------------------------------------------------------
@@ -682,7 +823,7 @@ ps_fuzz_crc_fixup(const char *target_name, const char *work_dir,
 	else if (strcmp(target_name, "walidx_snapshot_manifest") == 0)
 		fixup_walidx_snapshot_manifest(buf, len);
 	else if (strcmp(target_name, "walidx_snapshot_shard") == 0)
-		fixup_walidx_snapshot_shard(buf, len);
+		fixup_walidx_snapshot_shard(work_dir, buf, len);
 	/* wal_log, page_segment, and any other/unknown target: no checksum to
 	 * fix up; left untouched. */
 }
