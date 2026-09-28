@@ -461,7 +461,21 @@ fixup_store_config(uint8_t *buf, size_t len)
  * off (in the footer, left as whatever the fuzzer produced) is the
  * boundary between them.  Only fixed up when index_off is in range --
  * exactly the "give up, still a valid fuzz input" fallback used
- * everywhere else in this file. */
+ * everywhere else in this file.
+ *
+ * Round-5 coordinator review: ps_image_layer_read_index()/
+ * ps_image_layer_verify_data() (pagestore_layer.c) never stat() this file
+ * -- they read the trailing footer at a computed offset of
+ * "loc->size - sizeof(footer)", where loc->size is the *manifest's*
+ * recorded PsLayerLocation.size for this layer, not this file's actual
+ * length.  libFuzzer inserting or removing bytes changes this file's real
+ * length without touching that manifest record, so the footer read above
+ * lands at the wrong offset (or the length precondition
+ * "loc->size < sizeof(footer)" trips) before any of the fixed-up
+ * data_crc/index_crc bytes are ever looked at.  fixup_manifest_layer_size()
+ * below patches the sibling layers.manifest record to match, the same
+ * cross-file shape fixup_forkmeta_snapshot_part()/
+ * fixup_walidx_snapshot_shard() already use for their own manifests. */
 typedef struct FuzzImgFooter
 {
 	uint32_t	magic;
@@ -473,14 +487,187 @@ typedef struct FuzzImgFooter
 	uint32_t	index_crc;
 } FuzzImgFooter;
 
+/*
+ * Mirrors of pagestore_manifest.c's private PsManifestRecord/
+ * PsManifestKeyDisk/PsManifestLocationDisk/PsManifestLayerDisk -- not
+ * exported, so reproduced by field-for-field struct layout (sizeof()/
+ * offsetof() do the layout-sensitive work, same convention as every other
+ * mirrored struct in this file) rather than hand-computed byte offsets.
+ */
+#define PS_MANIFEST_HEADER_BYTES_LOCAL 20u		/* magic,version,type,len,crc */
+#define PS_MANIFEST_ADD_LAYER_LOCAL 1u
+#define PS_LAYER_URI_MAX_LOCAL 512u
+#define PS_LAYER_MAX_LOCATIONS_LOCAL 3u
+#define PS_LAYER_TIER_LOCAL_HOT_LOCAL 1u
+#define PS_LAYER_TIER_LOCAL_COLD_LOCAL 2u
+/* This harness's one local image-layer target file (fuzz_common.c's
+ * ps_fuzz_targets table: {"image_layer", "layer_0_000000000000000a"}) --
+ * matched by basename, the same way canonicalize_local_layer_uri()
+ * (pagestore_layer_store.c) itself matches a recorded location's uri
+ * against the store's own layer directory. */
+#define PS_FUZZ_IMAGE_LAYER_BASENAME "layer_0_000000000000000a"
+/* Bound on the sibling layers.manifest this harness ever writes -- well
+ * above round-4's manifest target -max_len (49152; largest checked-in
+ * seed 21852), read/patched/written whole like the other cross-file
+ * fixups' sibling manifests. */
+#define PS_FUZZ_MANIFEST_BUF_BYTES_LOCAL 65536u
+
+typedef struct FuzzManifestKeyDisk
+{
+	uint32_t	spcOid;
+	uint32_t	dbOid;
+	uint32_t	relNumber;
+	int32_t		forkNum;
+	uint32_t	klass;
+} FuzzManifestKeyDisk;
+
+typedef struct FuzzManifestLocationDisk
+{
+	uint32_t	tier;
+	char		uri[PS_LAYER_URI_MAX_LOCAL];
+	uint64_t	size;
+	uint32_t	generation;
+	uint8_t		available;
+	uint8_t		pad[3];
+} FuzzManifestLocationDisk;
+
+typedef struct FuzzManifestLayerDisk
+{
+	uint64_t	layer_id;
+	uint32_t	kind;
+	uint32_t	timeline;
+	FuzzManifestKeyDisk start_key;
+	FuzzManifestKeyDisk end_key;
+	uint32_t	start_block;
+	uint32_t	end_block;
+	uint64_t	lsn_start;
+	uint64_t	lsn_end;
+	uint32_t	location_count;
+	FuzzManifestLocationDisk locations[PS_LAYER_MAX_LOCATIONS_LOCAL];
+	uint64_t	created_at_lsn;
+	uint64_t	remote_uploaded_lsn;
+	uint8_t		remote_durable;
+	uint8_t		local_pinned;
+	uint8_t		deleting;
+	uint8_t		pad;
+} FuzzManifestLayerDisk;
+
+/*
+ * Find the ADD_LAYER record in the (pristine, in-memory-cached) template
+ * layers.manifest whose local location names PS_FUZZ_IMAGE_LAYER_BASENAME,
+ * then patch that same record's `size` field -- and the record's own crc
+ * -- in the *live* layers.manifest in work_dir to new_size.  A miss at any
+ * step (no such record, a struct-size mismatch against a differently
+ * shaped seed, a manifest larger than this harness ever produces) is the
+ * same "give up, still a valid fuzz input" fallback used everywhere else
+ * in this file.
+ */
 static void
-fixup_image_layer(uint8_t *buf, size_t len)
+fixup_manifest_layer_size(const char *work_dir, uint64_t new_size)
+{
+	const uint8_t *manifest_tmpl;
+	size_t		manifest_tmpl_len;
+	size_t		off;
+	size_t		record_off = 0;
+	size_t		loc_size_off = 0;
+	int			found = 0;
+	char		path[4096];
+	unsigned char manifest[PS_FUZZ_MANIFEST_BUF_BYTES_LOCAL];
+	int			fd;
+	uint32_t	crc;
+
+	manifest_tmpl = ps_fuzz_template_lookup("layers.manifest", &manifest_tmpl_len);
+	if (manifest_tmpl == NULL || manifest_tmpl_len > sizeof(manifest))
+		return;
+
+	off = 0;
+	while (!found && off + PS_MANIFEST_HEADER_BYTES_LOCAL <= manifest_tmpl_len)
+	{
+		uint32_t	type = get_le32(manifest_tmpl + off + 8);
+		uint32_t	declared_len = get_le32(manifest_tmpl + off + 12);
+
+		if (declared_len > manifest_tmpl_len - off - PS_MANIFEST_HEADER_BYTES_LOCAL)
+			break;
+		if (type == PS_MANIFEST_ADD_LAYER_LOCAL &&
+			declared_len == sizeof(FuzzManifestLayerDisk))
+		{
+			FuzzManifestLayerDisk layer;
+			uint32_t	j;
+
+			memcpy(&layer, manifest_tmpl + off + PS_MANIFEST_HEADER_BYTES_LOCAL,
+				   sizeof(layer));
+			for (j = 0; j < layer.location_count &&
+				 j < PS_LAYER_MAX_LOCATIONS_LOCAL; j++)
+			{
+				const FuzzManifestLocationDisk *loc = &layer.locations[j];
+				size_t		urilen;
+				size_t		baselen = strlen(PS_FUZZ_IMAGE_LAYER_BASENAME);
+
+				if (loc->tier != PS_LAYER_TIER_LOCAL_HOT_LOCAL &&
+					loc->tier != PS_LAYER_TIER_LOCAL_COLD_LOCAL)
+					continue;
+				urilen = strnlen(loc->uri, sizeof(loc->uri));
+				if (urilen >= baselen &&
+					strcmp(loc->uri + urilen - baselen,
+						   PS_FUZZ_IMAGE_LAYER_BASENAME) == 0)
+				{
+					record_off = off;
+					loc_size_off = PS_MANIFEST_HEADER_BYTES_LOCAL +
+						offsetof(FuzzManifestLayerDisk, locations) +
+						(size_t) j * sizeof(FuzzManifestLocationDisk) +
+						offsetof(FuzzManifestLocationDisk, size);
+					found = 1;
+					break;
+				}
+			}
+		}
+		off += PS_MANIFEST_HEADER_BYTES_LOCAL + declared_len;
+	}
+	if (!found)
+		return;
+
+	if (snprintf(path, sizeof(path), "%s/layers.manifest", work_dir) >=
+		(int) sizeof(path))
+		return;
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return;
+	if (read(fd, manifest, manifest_tmpl_len) != (ssize_t) manifest_tmpl_len)
+	{
+		close(fd);
+		return;
+	}
+
+	for (unsigned i = 0; i < 8; i++)
+		manifest[record_off + loc_size_off + i] =
+			(unsigned char) (new_size >> (i * 8));
+	crc = fnv1a_step(FNV1A_INIT, manifest + record_off, 16);
+	crc = fnv1a_step(crc, manifest + record_off + PS_MANIFEST_HEADER_BYTES_LOCAL,
+					  get_le32(manifest + record_off + 12));
+	put_le32(manifest + record_off + 16, crc);
+
+	if (pwrite(fd, manifest, manifest_tmpl_len, 0) != (ssize_t) manifest_tmpl_len)
+	{
+		/* best-effort: an iteration that fails this write just runs without
+		 * the cross-file fixup, same as fixup_forkmeta_snapshot_part() */
+	}
+	close(fd);
+}
+
+static void
+fixup_image_layer(const char *work_dir, uint8_t *buf, size_t len)
 {
 	size_t		footer_bytes = sizeof(FuzzImgFooter);
 	uint8_t    *footer;
 	uint64_t	index_off;
 	uint32_t	data_crc;
 	uint32_t	index_crc;
+
+	/* Sync the manifest's recorded size to this mutated file's actual
+	 * length regardless of whether the footer below gets fixed up too --
+	 * a length change libFuzzer made on its own (insert/delete bytes) is
+	 * exactly what needs this, not just a change this function makes. */
+	fixup_manifest_layer_size(work_dir, (uint64_t) len);
 
 	if (len < footer_bytes)
 		return;
@@ -813,7 +1000,7 @@ ps_fuzz_crc_fixup(const char *target_name, const char *work_dir,
 	else if (strcmp(target_name, "store_config") == 0)
 		fixup_store_config(buf, len);
 	else if (strcmp(target_name, "image_layer") == 0)
-		fixup_image_layer(buf, len);
+		fixup_image_layer(work_dir, buf, len);
 	else if (strcmp(target_name, "forkmeta_snapshot_manifest") == 0)
 		fixup_forkmeta_snapshot_manifest(buf, len);
 	else if (strcmp(target_name, "forkmeta_snapshot_checkpoint") == 0)

@@ -80,6 +80,19 @@ max_len_for() {
   esac
 }
 
+# Per-input -timeout: libFuzzer's own -max_total_time is only checked
+# between executions, so a single hung input (stuck in open/maintenance/
+# close) can run past it -- its documented default (-timeout, 1200s) is far
+# longer than any campaign duration this script runs with. Cap each input
+# well under the campaign's own duration so a hang still produces a timeout
+# artifact and moves on instead of silently eating the whole run.
+PER_INPUT_TIMEOUT=$((DURATION / 4))
+if [[ $PER_INPUT_TIMEOUT -gt 60 ]]; then
+  PER_INPUT_TIMEOUT=60
+elif [[ $PER_INPUT_TIMEOUT -lt 1 ]]; then
+  PER_INPUT_TIMEOUT=1
+fi
+
 mkdir -p "$OUT_DIR"
 pids=()
 for tgt in "${TARGETS[@]}"; do
@@ -96,6 +109,7 @@ for tgt in "${TARGETS[@]}"; do
     UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     LSAN_OPTIONS="suppressions=$FUZZ_DIR/lsan_suppressions.txt" \
     "$BIN" -max_total_time="$DURATION" -max_len="$(max_len_for "$tgt")" \
+      -timeout="$PER_INPUT_TIMEOUT" \
       -rss_limit_mb=4096 -artifact_prefix=crashes/ \
       corpus/ > run.log 2>&1
     echo "exit_code=$?" >> run.log
