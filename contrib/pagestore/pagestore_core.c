@@ -1968,7 +1968,21 @@ segment_order_id_observe(uint64_t order_id)
  * (block- and timeline-independent), so a key's blocks and all its timelines
  * stay on one shard.
  */
+/*
+ * Overridable at compile time (must stay a power of two -- IDX_MASK below
+ * assumes it) for the throughput-sensitive fuzz/build.sh binaries: every
+ * ps_core_open()/ps_core_close() unconditionally sweeps all MAX_SHARDS *
+ * IDX_BUCKETS buckets in free_page_fork_indexes()/free_walidx_indexes() to
+ * reset these hash tables, regardless of how many entries (if any) they
+ * hold.  That sweep is pure bucket-array bookkeeping -- it has no bearing on
+ * any persisted format or validation bound -- so a fuzz binary whose fixture
+ * only ever populates a handful of entries can shrink it without changing
+ * any code path's semantics.  Ordinary builds are unaffected (no -D, same
+ * 65536 as before).
+ */
+#ifndef IDX_BUCKETS
 #define IDX_BUCKETS		(1 << 16)
+#endif
 #define IDX_MASK		(IDX_BUCKETS - 1)
 
 struct PageEnt;

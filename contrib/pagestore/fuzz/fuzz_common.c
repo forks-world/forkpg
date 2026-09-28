@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "pagestore_core.h"
@@ -93,6 +94,19 @@ typedef struct TemplateEntry
 	uint8_t    *data;			/* NULL for a directory */
 	size_t		len;
 	int			is_dir;
+	/* mtime the file had immediately after we last wrote pristine template
+	 * bytes to it (populate_work_dir() or a prior reset_work_dir()).  Since
+	 * this driver is the only writer of the work_dir tree between resets
+	 * (ps_core_open()/maintenance()/close() run synchronously, in-process,
+	 * with no background threads started outside the daemon proper -- see
+	 * fuzz_common.c's header), an unchanged mtime is a reliable, cheap
+	 * (fstat only, from the nftw walk we already do) proof that a file
+	 * still holds pristine bytes and the O(file size) rewrite below can be
+	 * skipped.  This is what makes reset cheap for the multi-hundred-KB to
+	 * ~1MB template files (a WAL segment, an image layer, ...) that almost
+	 * never change: most iterations fail validation on the one mutated
+	 * target file long before product code would touch anything else. */
+	struct timespec mtime;
 } TemplateEntry;
 
 static TemplateEntry *template_entries;
@@ -139,6 +153,7 @@ cache_entry(const char *fpath, const struct stat *sb, int typeflag,
 	e->is_dir = (typeflag == FTW_D);
 	e->data = NULL;
 	e->len = 0;
+	memset(&e->mtime, 0, sizeof(e->mtime));	/* filled in by populate_work_dir() */
 	if (typeflag == FTW_F)
 	{
 		e->len = (size_t) sb->st_size;
@@ -178,7 +193,7 @@ cache_entry(const char *fpath, const struct stat *sb, int typeflag,
 	return 0;
 }
 
-static const TemplateEntry *
+static TemplateEntry *
 template_find(const char *relpath)
 {
 	for (int i = 0; i < template_entry_count; i++)
@@ -199,11 +214,16 @@ ps_fuzz_template_lookup(const char *relpath, size_t *len_out)
 	return e->data;
 }
 
+/* mtime_out, if non-NULL, is filled from an fstat() of the just-written fd
+ * (one syscall, piggybacked on the write instead of a separate stat() call)
+ * -- see TemplateEntry.mtime's comment for why the caller wants this. */
 static void
-write_file(const char *path, const uint8_t *data, size_t len)
+write_file_mtime(const char *path, const uint8_t *data, size_t len,
+				  struct timespec *mtime_out)
 {
 	int			fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	size_t		off = 0;
+	struct stat st;
 
 	if (fd < 0)
 	{
@@ -221,7 +241,20 @@ write_file(const char *path, const uint8_t *data, size_t len)
 		}
 		off += (size_t) n;
 	}
+	if (mtime_out != NULL)
+	{
+		if (fstat(fd, &st) == 0)
+			*mtime_out = st.st_mtim;
+		else
+			memset(mtime_out, 0, sizeof(*mtime_out));
+	}
 	close(fd);
+}
+
+static void
+write_file(const char *path, const uint8_t *data, size_t len)
+{
+	write_file_mtime(path, data, len, NULL);
 }
 
 /* One-time population of the persistent work_dir from the template cache
@@ -242,20 +275,27 @@ populate_work_dir(void)
 		if (e->is_dir)
 			(void) mkdir(path, 0700);
 		else
-			write_file(path, e->data, e->len);
+			write_file_mtime(path, e->data, e->len, &e->mtime);
 	}
 }
 
 /* ---- resetting the persistent work directory between iterations -------- */
+
+/* True when a and b are the same second/nanosecond -- i.e. nothing has
+ * written to the file since we last recorded its mtime. */
+static int
+mtime_eq(const struct timespec *a, const struct timespec *b)
+{
+	return a->tv_sec == b->tv_sec && a->tv_nsec == b->tv_nsec;
+}
 
 static int
 reset_entry(const char *fpath, const struct stat *sb, int typeflag,
 			struct FTW *ftwbuf)
 {
 	const char *rel;
-	const TemplateEntry *e;
+	TemplateEntry *e;
 
-	(void) sb;
 	(void) ftwbuf;
 	rel = skip_root(fpath, strlen(work_dir));
 	if (*rel == '\0')
@@ -264,7 +304,16 @@ reset_entry(const char *fpath, const struct stat *sb, int typeflag,
 	if (typeflag == FTW_F)
 	{
 		if (e != NULL && !e->is_dir)
-			write_file(fpath, e->data, e->len);
+		{
+			/* sb is this very fstat(), already paid for by the nftw() walk
+			 * we have to do anyway to find product-code-created/removed
+			 * paths below -- comparing it against the mtime recorded the
+			 * last time *we* wrote this file costs nothing extra, and lets
+			 * every file product code did not touch this iteration skip
+			 * its rewrite entirely (see TemplateEntry.mtime). */
+			if (!mtime_eq(&sb->st_mtim, &e->mtime))
+				write_file_mtime(fpath, e->data, e->len, &e->mtime);
+		}
 		else
 			unlink(fpath);		/* a file open()/maintenance() created */
 	}
@@ -297,7 +346,7 @@ reset_work_dir(void)
 		if (e->is_dir)
 			(void) mkdir(path, 0700);
 		else
-			write_file(path, e->data, e->len);
+			write_file_mtime(path, e->data, e->len, &e->mtime);
 	}
 }
 

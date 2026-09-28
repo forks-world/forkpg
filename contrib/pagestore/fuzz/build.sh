@@ -60,6 +60,19 @@ COMMON_ARGS=(
   -I"$SRC_DIR"
   -DPAGESTORE_ASSERT_CHECKING
   -DPS_FUZZ_FIXTURE_TGZ="\"$FIXTURE_TGZ\""
+  # Round 3 (throughput): free_page_fork_indexes()/free_walidx_indexes() run
+  # on every ps_core_open()/ps_core_close() and unconditionally sweep all
+  # MAX_SHARDS * IDX_BUCKETS hash buckets to reset them, whether or not they
+  # hold anything -- profiling showed that sweep alone was >90% of an
+  # iteration's wall time (128 shards * 65536 buckets, three tables, twice
+  # per iteration) even for a trivial single-file target like store_config.
+  # IDX_BUCKETS is a pure in-memory hash-table sizing knob (see its #ifndef
+  # in pagestore_core.c) with no bearing on any persisted format or
+  # validation bound, so shrinking it here does not change which code paths
+  # a target exercises -- only how many empty buckets get swept.  The
+  # fixture never has more than a few dozen live entries per table, so 64
+  # buckets is still collision-light.
+  -DIDX_BUCKETS=64
   -pthread
 )
 
