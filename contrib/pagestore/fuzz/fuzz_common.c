@@ -94,20 +94,43 @@ typedef struct TemplateEntry
 	uint8_t    *data;			/* NULL for a directory */
 	size_t		len;
 	int			is_dir;
-	/* mtime the file had immediately after we last wrote pristine template
-	 * bytes to it (populate_work_dir() or a prior reset_work_dir()).  Since
-	 * this driver is the only writer of the work_dir tree between resets
-	 * (ps_core_open()/maintenance()/close() run synchronously, in-process,
-	 * with no background threads started outside the daemon proper -- see
-	 * fuzz_common.c's header), an unchanged mtime is a reliable, cheap
-	 * (fstat only, from the nftw walk we already do) proof that a file
-	 * still holds pristine bytes and the O(file size) rewrite below can be
-	 * skipped.  This is what makes reset cheap for the multi-hundred-KB to
-	 * ~1MB template files (a WAL segment, an image layer, ...) that almost
-	 * never change: most iterations fail validation on the one mutated
-	 * target file long before product code would touch anything else. */
-	struct timespec mtime;
 } TemplateEntry;
+
+/*
+ * Every "this file is pristine" write (populate_work_dir(), a reset
+ * rewrite) stamps the file's mtime to this fixed, far-in-the-past sentinel
+ * via futimens() -- see write_pristine_file() -- overwriting whatever value
+ * the write() itself produced.  reset_entry() then treats "mtime ==
+ * sentinel" as proof the file is still pristine and skips rewriting it.
+ *
+ * An earlier version of this recorded each write's own resulting ("now")
+ * mtime per file and compared against *that*, which is unsound: kernel
+ * mtimes on some configurations come from a coarse periodic clock (single-
+ * digit milliseconds of granularity is common), while one fuzz iteration
+ * now completes in a couple of milliseconds. A product-code write landing
+ * in the same coarse tick as our own preceding write would read back with
+ * an unchanged mtime, and reset_entry() would wrongly conclude the file was
+ * never touched and skip restoring it -- leaving dirty bytes in place for
+ * the next iteration (a nondeterministic, unreproducible false crash or
+ * missed one, depending on what the dirty bytes happen to be).
+ *
+ * Comparing against a fixed sentinel instead of a recent "now" timestamp
+ * has no such collision risk: any write that does not explicitly request
+ * this exact sentinel -- i.e. every write product code makes, and the
+ * fuzz-content write of the target file itself (see write_file(), which
+ * deliberately does *not* set this) -- gets the real current time, which
+ * cannot equal a fixed point in 1970 regardless of clock coarseness.
+ *
+ * The three ways a file can actually change are all still handled
+ * correctly: a file product code deletes is recreated by reset_work_dir()'s
+ * second pass (a missing file trivially fails any mtime comparison); a file
+ * product code adds new (not in the template) is unconditionally unlinked
+ * by reset_entry(), independent of mtime; and a same-name file replaced via
+ * rename() lands with a fresh "now" mtime like any other write (rename()
+ * does not preserve or fabricate our sentinel), so it is rewritten like any
+ * other dirty file. See PS_FUZZ_VERIFY_RESET below for a runtime proof.
+ */
+static const struct timespec pristine_mtime = {1, 0};
 
 static TemplateEntry *template_entries;
 static int	template_entry_count;
@@ -153,7 +176,6 @@ cache_entry(const char *fpath, const struct stat *sb, int typeflag,
 	e->is_dir = (typeflag == FTW_D);
 	e->data = NULL;
 	e->len = 0;
-	memset(&e->mtime, 0, sizeof(e->mtime));	/* filled in by populate_work_dir() */
 	if (typeflag == FTW_F)
 	{
 		e->len = (size_t) sb->st_size;
@@ -214,16 +236,15 @@ ps_fuzz_template_lookup(const char *relpath, size_t *len_out)
 	return e->data;
 }
 
-/* mtime_out, if non-NULL, is filled from an fstat() of the just-written fd
- * (one syscall, piggybacked on the write instead of a separate stat() call)
- * -- see TemplateEntry.mtime's comment for why the caller wants this. */
+/* Plain write: the file ends up with whatever mtime the kernel gives a
+ * fresh write ("now"). Used only for the fuzz-content write of the target
+ * file itself (see ps_fuzz_run_one()) -- that content is deliberately not
+ * pristine, so it must not carry the sentinel mtime below. */
 static void
-write_file_mtime(const char *path, const uint8_t *data, size_t len,
-				  struct timespec *mtime_out)
+write_file(const char *path, const uint8_t *data, size_t len)
 {
 	int			fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	size_t		off = 0;
-	struct stat st;
 
 	if (fd < 0)
 	{
@@ -241,20 +262,36 @@ write_file_mtime(const char *path, const uint8_t *data, size_t len,
 		}
 		off += (size_t) n;
 	}
-	if (mtime_out != NULL)
-	{
-		if (fstat(fd, &st) == 0)
-			*mtime_out = st.st_mtim;
-		else
-			memset(mtime_out, 0, sizeof(*mtime_out));
-	}
 	close(fd);
 }
 
+/* Write pristine template bytes and stamp the result with the fixed
+ * sentinel mtime (see pristine_mtime's comment above) instead of whatever
+ * "now" the write() itself produced -- this is what makes a later
+ * mtime_eq(sb->st_mtim, pristine_mtime) a sound "still pristine" test. */
 static void
-write_file(const char *path, const uint8_t *data, size_t len)
+write_pristine_file(const char *path, const uint8_t *data, size_t len)
 {
-	write_file_mtime(path, data, len, NULL);
+	int			fd;
+	struct timespec times[2];
+
+	write_file(path, data, len);
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+	{
+		fprintf(stderr, "ps_fuzz: reopen %s: %s\n", path, strerror(errno));
+		abort();
+	}
+	times[0].tv_sec = 0;
+	times[0].tv_nsec = UTIME_OMIT;	/* leave atime alone */
+	times[1] = pristine_mtime;
+	if (futimens(fd, times) != 0)
+	{
+		fprintf(stderr, "ps_fuzz: futimens %s: %s\n", path, strerror(errno));
+		abort();
+	}
+	close(fd);
 }
 
 /* One-time population of the persistent work_dir from the template cache
@@ -275,7 +312,7 @@ populate_work_dir(void)
 		if (e->is_dir)
 			(void) mkdir(path, 0700);
 		else
-			write_file_mtime(path, e->data, e->len, &e->mtime);
+			write_pristine_file(path, e->data, e->len);
 	}
 }
 
@@ -307,12 +344,12 @@ reset_entry(const char *fpath, const struct stat *sb, int typeflag,
 		{
 			/* sb is this very fstat(), already paid for by the nftw() walk
 			 * we have to do anyway to find product-code-created/removed
-			 * paths below -- comparing it against the mtime recorded the
-			 * last time *we* wrote this file costs nothing extra, and lets
-			 * every file product code did not touch this iteration skip
-			 * its rewrite entirely (see TemplateEntry.mtime). */
-			if (!mtime_eq(&sb->st_mtim, &e->mtime))
-				write_file_mtime(fpath, e->data, e->len, &e->mtime);
+			 * paths below -- comparing it against the fixed pristine
+			 * sentinel costs nothing extra, and lets every file product
+			 * code did not touch this iteration skip its rewrite entirely
+			 * (see pristine_mtime's comment above). */
+			if (!mtime_eq(&sb->st_mtim, &pristine_mtime))
+				write_pristine_file(fpath, e->data, e->len);
 		}
 		else
 			unlink(fpath);		/* a file open()/maintenance() created */
@@ -346,7 +383,103 @@ reset_work_dir(void)
 		if (e->is_dir)
 			(void) mkdir(path, 0700);
 		else
-			write_file_mtime(path, e->data, e->len, &e->mtime);
+			write_pristine_file(path, e->data, e->len);
+	}
+}
+
+/* ---- optional post-reset self-check (fuzz-build only) -------------------- */
+
+/*
+ * PS_FUZZ_VERIFY_RESET=1: after every reset_work_dir(), read every template
+ * file back from work_dir and memcmp() it against the cached pristine
+ * bytes, aborting immediately on the first mismatch.  This is the sentinel-
+ * mtime optimization's own correctness proof: if the sentinel comparison
+ * were ever wrong (e.g. some future change reintroduced a "compare against
+ * a recent real timestamp" pattern, or a filesystem/kernel combination
+ * behaved unexpectedly), this turns "the next iteration silently runs
+ * against dirty bytes" into a hard, immediately-attributable abort instead
+ * of a nondeterministic, hard-to-reproduce crash several iterations later.
+ * Costs an O(total fixture size) read-and-compare every iteration, so it is
+ * off by default; none of this driver's throughput numbers include it.
+ */
+static int
+verify_reset_enabled(void)
+{
+	static int	checked = 0;
+	static int	enabled = 0;
+
+	if (!checked)
+	{
+		const char *v = getenv("PS_FUZZ_VERIFY_RESET");
+
+		enabled = (v != NULL && v[0] != '\0' && strcmp(v, "0") != 0);
+		checked = 1;
+	}
+	return enabled;
+}
+
+static void
+verify_reset(void)
+{
+	for (int i = 0; i < template_entry_count; i++)
+	{
+		TemplateEntry *e = &template_entries[i];
+		char		path[PATH_MAX];
+		struct stat st;
+		int			fd;
+		uint8_t    *buf;
+		size_t		off = 0;
+
+		if (e->is_dir)
+			continue;
+		if (snprintf(path, sizeof(path), "%s/%s", work_dir, e->relpath) >=
+			(int) sizeof(path))
+			continue;
+
+		fd = open(path, O_RDONLY);
+		if (fd < 0)
+		{
+			fprintf(stderr,
+					"ps_fuzz: PS_FUZZ_VERIFY_RESET: %s missing after reset: %s\n",
+					path, strerror(errno));
+			abort();
+		}
+		if (fstat(fd, &st) != 0 || (size_t) st.st_size != e->len)
+		{
+			fprintf(stderr,
+					"ps_fuzz: PS_FUZZ_VERIFY_RESET: %s size %lld != template %zu\n",
+					path, (long long) st.st_size, e->len);
+			abort();
+		}
+		buf = e->len > 0 ? malloc(e->len) : malloc(1);
+		if (buf == NULL)
+		{
+			fprintf(stderr, "ps_fuzz: PS_FUZZ_VERIFY_RESET: out of memory\n");
+			abort();
+		}
+		while (off < e->len)
+		{
+			ssize_t		n = read(fd, buf + off, e->len - off);
+
+			if (n <= 0)
+			{
+				fprintf(stderr,
+						"ps_fuzz: PS_FUZZ_VERIFY_RESET: read %s failed\n",
+						path);
+				abort();
+			}
+			off += (size_t) n;
+		}
+		close(fd);
+		if (e->len > 0 && memcmp(buf, e->data, e->len) != 0)
+		{
+			fprintf(stderr,
+					"ps_fuzz: PS_FUZZ_VERIFY_RESET: %s content mismatch after "
+					"reset -- the mtime-skip let dirty bytes through\n", path);
+			free(buf);
+			abort();
+		}
+		free(buf);
 	}
 }
 
@@ -666,4 +799,6 @@ ps_fuzz_run_one(const char *target_name, const uint8_t *data, size_t size)
 	unmute_output();
 
 	reset_work_dir();
+	if (verify_reset_enabled())
+		verify_reset();
 }
