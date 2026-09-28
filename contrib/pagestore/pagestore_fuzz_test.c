@@ -1510,7 +1510,7 @@ act_read_at(void)
 			if (status == PS_STATUS_OK)
 			{
 				if (m->tag[b] == 0)
-					ck(!found || (psc_page_lsn(read_buf) == 0 &&
+					ck(!found || (psc_page_is_zero(read_buf) &&
 								  resolved_lsn == 0), "READ_AT (strong) tl=%u rel=%u "
 					   "block=%u: unwritten block has version/content", tl, rel, b);
 				else
@@ -3771,6 +3771,15 @@ act_artifact_drop(void)
 				   "akind=%u rel=%u expected false (status %d)", tl, akind,
 				   rel, st);
 			}
+			{
+				uint32_t	nblocks = 0;
+				int			st = psc_op_nblocks(tl, g_tl[tl].incarnation, klass,
+											 rel, 0, 0, &nblocks);
+
+				ck(st == PS_STATUS_OK && nblocks == 0, "post-DROP NBLOCKS "
+				   "tl=%u akind=%u rel=%u expected 0 got %u (status %d)",
+				   tl, akind, rel, nblocks, st);
+			}
 		}
 	}
 }
@@ -4494,6 +4503,16 @@ verify_artifacts(const char *phase)
 				   "%s: artifact tl=%u akind=%u rel=%u astate=%d exists "
 				   "expected %d got %d (EXISTS status %d)", phase, tl, akind,
 				   rel, art->state, art->visible.exists, exists, est);
+				if (art->state == FZ_ART_DROPPED)
+				{
+					int			nbstatus = psc_op_nblocks(tl,
+												 g_tl[tl].incarnation,
+												 klass, rel, 0, 0, &nb);
+
+					ck(nbstatus == PS_STATUS_OK && nb == 0, "%s: DROPPED "
+					   "artifact tl=%u akind=%u rel=%u NBLOCKS expected 0 got %u "
+					   "(status %d)", phase, tl, akind, rel, nb, nbstatus);
+				}
 				if (!art->visible.exists)
 					continue;		/* including the weak-oracle case above:
 									 * the model's belief is what subsequent
