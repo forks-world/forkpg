@@ -470,13 +470,14 @@ test('pagestore_op_fuzz',
   depends: [pagestore_daemon],
   suite: ['pagestore'],
   timeout: 90,
-  # TODO(remove after pagestore PR #294 merges): #294 fixes "Bug B" (a
-  # parent write stamped exactly at a branch's fork LSN leaks through the
-  # child's read-through). Stage 2's verify_branch_frozen() oracle catches
-  # this deterministically once PAGESTORE_FUZZ_BUGB_WORKAROUND is unset, but
-  # CI must stay green against the not-yet-fixed daemon, so force the
-  # stage-1-style avoidance workaround on here; once #294 lands, drop this
-  # env entry so CI exercises the real, now-fixed race by default.
+  # TODO(remove with seq-cap P3b): "Bug B" (a parent admission after a
+  # branch's fork point leaks through the child's read-through) is fixed by
+  # the read-side seq cap (BRANCH_SNAPSHOT_SEQ_CAP.md), which only takes
+  # effect at P3b activation.  Stage 2's verify_branch_frozen() oracle
+  # catches Bug B deterministically once PAGESTORE_FUZZ_BUGB_WORKAROUND is
+  # unset, but CI must stay green against the not-yet-fixed daemon, so force
+  # the avoidance workaround on here; once P3b lands, drop this env entry so
+  # CI exercises the real race by default.
   env: ['PAGESTORE_FUZZ_BUGB_WORKAROUND=1'],
 )
 
