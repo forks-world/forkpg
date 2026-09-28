@@ -304,6 +304,10 @@ typedef struct FzArtifact
 	int			dropped_exists_daemon_bug;
 	int			touched;		/* this key had a successful BEGIN locally or in an ancestor */
 	int			locally_dropped;	/* a successful DROP on this timeline, not inherited */
+	int			locally_settled;	/* this timeline settled its own generation */
+	int			inherited_open_pending;
+	uint64_t	inherited_open_lsn;
+	uint64_t	inherited_open_token;
 } FzArtifact;
 
 #define FZ_NAKLASS	2			/* 0 = PS_KLASS_SLRU, 1 = PS_KLASS_READER_SNAPSHOT.
@@ -2787,6 +2791,129 @@ enum
 	FZ_ART_DROPPED = 3,
 };
 
+/* Verify the child view immediately after a parent's pre-fork OPEN attempt
+ * becomes complete.  The page image is checked against the source attempt's
+ * committed model, including zero-filled holes. */
+static void
+verify_artifact_entry(const char *phase, uint32_t tl, uint32_t akind,
+					  uint32_t rel)
+{
+	FzArtifact *art = &g_artifact[tl][akind][rel];
+	uint32_t	klass = g_artifact_klass[akind];
+	int			exists = 0;
+	uint32_t	nblocks = 0;
+	int			status;
+
+	status = psc_op_exists(tl, g_tl[tl].incarnation, klass, rel, 0, &exists);
+	ck(status == PS_STATUS_OK && exists == art->visible.exists,
+	   "%s: inherited artifact tl=%u akind=%u rel=%u EXISTS expected %d "
+	   "got %d (status %d)", phase, tl, akind, rel,
+	   art->visible.exists, exists, status);
+	if (status != PS_STATUS_OK || !exists)
+		return;
+	status = psc_op_nblocks(tl, g_tl[tl].incarnation, klass, rel, 0, 0,
+						   &nblocks);
+	ck(status == PS_STATUS_OK && nblocks == art->visible.nblocks,
+	   "%s: inherited artifact tl=%u akind=%u rel=%u NBLOCKS expected %u "
+	   "got %u (status %d)", phase, tl, akind, rel,
+	   art->visible.nblocks, nblocks, status);
+	if (status != PS_STATUS_OK || nblocks != art->visible.nblocks)
+		return;
+	for (uint32_t block = 0; block < art->visible.nblocks; block++)
+	{
+		status = psc_op_readv(tl, g_tl[tl].incarnation, klass, rel, block,
+						  0, 0, read_buf, 1);
+		if (art->visible.tag[block] == 0)
+			ck(status == PS_STATUS_OK && psc_page_is_zero(read_buf),
+			   "%s: inherited artifact tl=%u akind=%u rel=%u block=%u "
+			   "expected zero page (status %d)", phase, tl, akind, rel,
+			   block, status);
+		else
+			ck(status == PS_STATUS_OK &&
+			   psc_page_has_tag(read_buf, art->visible.tag[block]) &&
+			   psc_page_lsn(read_buf) == art->visible.lsn[block],
+			   "%s: inherited artifact tl=%u akind=%u rel=%u block=%u "
+			   "content mismatch (status %d)", phase, tl, akind, rel,
+			   block, status);
+	}
+}
+
+/* Pending inheritance is modeled only for branches directly from timeline 0.
+ * A later first COMMIT of the inherited attempt is visible at an existing
+ * branch horizon when that generation's BEGIN LSN is at or below the fork. */
+static void
+artifact_propagate_parent_commit(uint32_t parent, uint32_t akind,
+								 uint32_t rel, uint64_t lsn, uint64_t token,
+								 const FzRel *visible)
+{
+	if (parent != 0)
+		return;
+	for (uint32_t child = 1; child < FZ_NTL; child++)
+	{
+		FzArtifact *ca;
+
+		if (!g_tl[child].known || g_tl[child].state != PS_TIMELINE_LIVE ||
+			!g_tl[child].has_parent || g_tl[child].parent != parent ||
+			lsn > g_tl[child].branch_lsn)
+			continue;
+		ca = &g_artifact[child][akind][rel];
+		if (!ca->inherited_open_pending ||
+			ca->inherited_open_lsn != lsn ||
+			ca->inherited_open_token != token)
+			continue;
+		ca->inherited_open_pending = 0;
+		ca->inherited_open_lsn = 0;
+		ca->inherited_open_token = 0;
+		if (ca->locally_settled)
+			continue;
+		if (ca->state == FZ_ART_OPEN)
+		{
+			/* A local OPEN remains pending, but now shadows this completed
+			 * inherited generation so restart restores the right visible state. */
+			ca->prev_state = FZ_ART_COMMITTED;
+			ca->prev_lsn = lsn;
+			ca->prev_token = token;
+		}
+		else
+		{
+			ca->state = FZ_ART_COMMITTED;
+			ca->lsn = lsn;
+			ca->token = token;
+		}
+		ca->visible = *visible;
+		ca->dropped_exists_daemon_bug = 0;
+		ring_note("artifact_inherit_commit child=%u akind=%u rel=%u "
+				  "lsn=%llu", child, akind, rel,
+				  (unsigned long long) lsn);
+		verify_artifact_entry("after parent COMMIT", child, akind, rel);
+	}
+}
+
+static void
+artifact_cancel_pending(uint32_t parent, uint32_t akind, uint32_t rel,
+						uint64_t lsn, uint64_t token, int all_attempts)
+{
+	if (parent != 0)
+		return;
+	for (uint32_t child = 1; child < FZ_NTL; child++)
+	{
+		FzArtifact *ca;
+
+		if (!g_tl[child].known || !g_tl[child].has_parent ||
+			g_tl[child].parent != parent)
+			continue;
+		ca = &g_artifact[child][akind][rel];
+		if (ca->inherited_open_pending &&
+			(all_attempts || (ca->inherited_open_lsn == lsn &&
+							 ca->inherited_open_token == token)))
+		{
+			ca->inherited_open_pending = 0;
+			ca->inherited_open_lsn = 0;
+			ca->inherited_open_token = 0;
+		}
+	}
+}
+
 /*
  * PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF ("growth not future of the forkmeta
  * snapshot cutoff") is documented (ARTIFACT_LIFECYCLE.md) as a legitimate,
@@ -3008,6 +3135,8 @@ act_artifact_begin(void)
 		record_cov(PS_OP_ARTIFACT_BEGIN, (uint32_t) status, reason);
 		if (status == PS_STATUS_OK)
 		{
+			if (art->state == FZ_ART_OPEN)
+				artifact_cancel_pending(tl, akind, rel, art->lsn, art->token, 0);
 			/* Shadow the last settled state before overwriting it -- see the
 			 * FzArtifact.prev_* comment.  A fresh BEGIN can itself be issued
 			 * while an *older* attempt was still open (superseding it, never
@@ -3289,6 +3418,7 @@ act_artifact_commit(void)
 					memcpy(art->visible.lsn, art->open_block_lsn,
 						   sizeof(art->open_block_lsn));
 					art->state = FZ_ART_COMMITTED;
+					art->locally_settled = 1;
 					art->dropped_exists_daemon_bug = 0;
 
 					/*
@@ -3343,6 +3473,8 @@ act_artifact_commit(void)
 								   rst);
 						}
 					}
+					artifact_propagate_parent_commit(tl, akind, rel, use_lsn,
+												 use_token, &art->visible);
 				}
 			}
 			else
@@ -3556,10 +3688,12 @@ act_artifact_drop(void)
 		record_cov(PS_OP_ARTIFACT_DROP, (uint32_t) status, reason);
 		if (status == PS_STATUS_OK)
 		{
+			artifact_cancel_pending(tl, akind, rel, 0, 0, 1);
 			art->state = FZ_ART_DROPPED;
 			art->lsn = lsn;
 			art->max_begin_lsn_at_drop = art->max_begin_lsn;
 			art->locally_dropped = 1;
+			art->locally_settled = 1;
 			art->dropped_exists_daemon_bug = 0;
 			memset(&art->visible, 0, sizeof(art->visible));
 
@@ -3777,10 +3911,10 @@ env_branch_create(void)
 		 * incarnation): reads on this brand-new incarnation see, at most,
 		 * the parent's ancestry (artifact_metadata()/artifact_visible()
 		 * walk tl_walk_first/next the same way ordinary page reads do), so
-		 * copy the parent's *current settled* visible state (COMMITTED or
-		 * DROPPED only -- an in-flight open attempt on the parent is not
-		 * visible to the parent's own reads either, so it is correctly
-		 * "nothing to inherit", not a case this needs to special-case).
+		 * copy the parent's settled visible state. An in-flight OPEN itself is
+		 * not visible at the fork, but its identity is remembered below: if
+		 * that generation later COMMITs at an LSN within the fork horizon, it
+		 * becomes visible to the child's horizon too.
 		 *
 		 * Deliberately NOT copied: max_begin_lsn (left 0) and token.  The
 		 * BEGIN/DROP exact-lsn-retry probes' begin-block/commit-block
@@ -3823,8 +3957,29 @@ env_branch_create(void)
 					ca->state = pa->prev_state;
 					ca->lsn = pa->prev_lsn;
 					ca->visible = pa->visible;
+					if (pa->lsn <= g_tl[slot].branch_lsn)
+					{
+						ca->inherited_open_pending = 1;
+						ca->inherited_open_lsn = pa->lsn;
+						ca->inherited_open_token = pa->token;
+					}
 					if (pa->prev_state == FZ_ART_DROPPED)
 						ca->dropped_exists_daemon_bug = 1;
+					if (pa->prev_state == FZ_ART_NONE &&
+						ca->inherited_open_pending)
+					{
+						int exists = 0;
+						int est = psc_op_exists(slot, new_inc,
+											g_artifact_klass[ak], r, 0, &exists);
+
+						ring_note("artifact_inherit_open_pending_absent child=%u "
+								  "akind=%u rel=%u lsn=%llu", slot, ak, r,
+								  (unsigned long long) pa->lsn);
+						ck(est == PS_STATUS_OK && !exists,
+						   "branch %u must not see inherited uncommitted artifact "
+						   "akind=%u rel=%u before parent COMMIT (status %d, "
+						   "exists %d)", slot, ak, r, est, exists);
+					}
 				}
 			}
 		g_branch_last_incarnation[slot] = new_inc;
@@ -4201,6 +4356,8 @@ artifact_restart_reset(const char *phase)
 				   "must not be committable afterward, got OK", phase, tl,
 				   akind, rel, (unsigned long long) art->token);
 				record_cov(PS_OP_ARTIFACT_COMMIT, (uint32_t) status, reason);
+				artifact_cancel_pending(tl, akind, rel, art->lsn, art->token,
+										0);
 				art->state = art->prev_state;
 				art->lsn = art->prev_lsn;
 				art->token = art->prev_token;
