@@ -133,6 +133,17 @@ psc_page_lsn(const unsigned char *buf)
 	return ((uint64_t) hi << 32) | lo;
 }
 
+/* An unwritten block (no psc_fill_page() ever ran on it) must read back as
+ * all-zero rather than inheriting bytes from an older generation/ancestor. */
+static int
+psc_page_is_zero(const unsigned char *buf)
+{
+	for (uint32_t i = 0; i < PSC_PAGE_SIZE; i++)
+		if (buf[i] != 0)
+			return 0;
+	return 1;
+}
+
 /* ===================== daemon lifecycle ================================ */
 
 static void
