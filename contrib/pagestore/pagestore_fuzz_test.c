@@ -4486,6 +4486,7 @@ main(int argc, char **argv)
 	long long	ops = FZ_DEFAULT_OPS;
 	int			missing;
 	int			skip_known = 0;
+	int			final_stop_ok;
 
 	if (argc < 2)
 	{
@@ -4631,10 +4632,20 @@ main(int argc, char **argv)
 
 	missing = print_coverage_and_check();
 
+	/* Checked (not discarded) so a shutdown/recovery defect surfacing only
+	 * after this final crash-restart workload fails the run, the same way
+	 * env_clean_restart() already treats an intermediate shutdown. */
+	final_stop_ok = psc_stop_daemon_clean();
+	if (!final_stop_ok)
+	{
+		failed++;
+		fprintf(stderr, "FAIL: daemon did not exit cleanly (status 0) on "
+				"final SIGTERM\n");
+	}
+
 	fprintf(stderr, "\n%lld checks, %lld failures, %d missing coverage "
 			"cells\n", checks, failed, missing);
 
-	psc_stop_daemon_clean();
 	if (log_fp != NULL)
 		fclose(log_fp);
 	if (!keep_store)
