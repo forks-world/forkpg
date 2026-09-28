@@ -2949,6 +2949,70 @@ test_deleting_timeline_wal_cleanup(void)
 	remove_tree(store);
 }
 
+/*
+ * Design doc S3.7(7) rev 3 (amendment, superseding the rev 1/rev 2
+ * plan-epoch/lsn-range gates previously tested here): no gate remains on
+ * the WAL-index snapshot publish switch.  A fork-event/PAGE-GROW admission
+ * at or below the plan's horizon H, landing at any point up to and
+ * including the generation switch, never blocks or invalidates
+ * publication -- see the design doc's monotonicity argument (S1-S4) and
+ * the dedicated property test in pagestore_walidx_prune_test.c, which is
+ * the merge-blocking correctness proof for this.  This test only confirms
+ * the baseline liveness case in-process: with no concurrent admission,
+ * publication succeeds on its first try and the (now purely informational)
+ * plan-epoch-mismatch counter never fires.
+ */
+static void
+test_walidx_publish_no_race_publishes_once(void)
+{
+	char		store[] = "/tmp/pagestore-walidx-plan-epoch-norace-XXXXXX";
+	PsChannel	channel;
+	uint32_t	timeline = 503;
+	uint64_t	aborts_before;
+
+	check(mkdtemp(store) != NULL, "create walidx plan-epoch no-race store");
+	configure_timeline_core();
+	check(ps_core_open(store) == 0 && create_branch(timeline, 0, 100),
+		  "open store for the walidx no-race control case");
+	walidx_snapshot_trigger_option_bytes = 1;
+
+	check(append_wal(timeline, 100,
+					 (const unsigned char[4]) {0x11, 0x22, 0x33, 0x44}, 4),
+		  "append real WAL bytes so wal_log_start() is defined");
+	memset(&channel, 0, sizeof(channel));
+	channel.timeline = timeline;
+	channel.opcode = PS_OP_WAL_INDEX_ADD;
+	channel.blocknum = 1;
+	channel.req_lsn = 100;
+	channel.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+		  "append a WAL-index tail entry to make the control timeline due");
+	check(ps_backpressure_configure_all(0, 0, 0, 0, 1, 0) == 0,
+		  "configure a minimal walidx reclaim high-water mark");
+	ps_backpressure_refresh();
+	check(ps_test_walidx_force_due(timeline) != 0,
+		  "tail-only debt marks the control timeline force-eligible");
+
+	/* No concurrent admission ever races the plan, so
+	 * walidx_snapshot_publish_one() must never observe a plan-epoch
+	 * mismatch -- every attempted publication succeeds on its first try. */
+	aborts_before = ps_test_walidx_plan_epoch_aborts();
+	for (int i = 0; i < 16; i++)
+	{
+		ps_backpressure_refresh();
+		(void) ps_core_maintenance();
+	}
+	check(ps_test_walidx_plan_epoch_aborts() == aborts_before,
+		  "no plan-epoch mismatch statistic ever fires without a racing "
+		  "admission");
+
+	check(ps_backpressure_configure_all(0, 0, 0, 0, 0, 0) == 0,
+		  "clear the reclaim high-water mark before the next test");
+	walidx_snapshot_trigger_option_bytes = 0;
+	close_store();
+	remove_tree(store);
+}
+
 static void
 test_v2_and_mixed_lifecycle(void)
 {
@@ -4324,6 +4388,7 @@ main(void)
 	test_legacy_migration_and_parser_fail_closed();
 	test_delete_discards_unflushed_memtable();
 	test_deleting_timeline_wal_cleanup();
+	test_walidx_publish_no_race_publishes_once();
 	test_deletion_requires_durable_forkmeta();
 	test_deletion_state_append_failure();
 	test_timeline_incarnation_reuse();

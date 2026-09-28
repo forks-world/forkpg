@@ -350,6 +350,30 @@ test('pagestore_timeline',
   timeout: 60,
 )
 
+# Focused POSIX-only unit test for the Bug B read-side seq-cap machinery
+# (BRANCH_SNAPSHOT_SEQ_CAP.md), phase P1: ViewCap/page_select/fork_asof_hop
+# differential tests against frozen pre-P1 references and an independent
+# literal-rule brute force.  Links the shared core directly; no daemon.
+pagestore_viewcap_test = executable('pagestore_viewcap_test',
+  files('pagestore_viewcap_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: ['-DPAGESTORE_RETENTION_TEST', '-DPAGESTORE_RELATION_INSPECTION_TEST']
+          + pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_viewcap',
+  pagestore_viewcap_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Focused shared-core tests for the conservative POSIX WAL reclaim policy.
 pagestore_wal_reclaim_core_test = executable('pagestore_wal_reclaim_core_test',
   files('pagestore_wal_reclaim_core_test.c', 'pagestore_core.c',
@@ -505,12 +529,30 @@ test('pagestore_manifest',
 
 # Unit test for durable retention pins, replay and churn compaction.
 pagestore_retention_test = executable('pagestore_retention_test',
-  files('pagestore_retention_test.c', 'pagestore_retention.c'),
+  files('pagestore_retention_test.c', 'pagestore_retention.c',
+        'pagestore_fault.c'),
   dependencies: [dependency('threads')],
   install: false,
 )
 test('pagestore_retention',
   pagestore_retention_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Deterministic process-abort regression for Bug C: a crash during retention
+# log compaction (or a plain in-place append) must not leave the store
+# unable to open.  Forks directly against pagestore_retention.c/pagestore_fault.c;
+# no daemon, no pagestore_core.c.
+pagestore_retention_crash_test = executable('pagestore_retention_crash_test',
+  files('pagestore_retention_crash_test.c', 'pagestore_retention.c',
+        'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_retention_crash',
+  pagestore_retention_crash_test,
   suite: ['pagestore'],
   timeout: 60,
 )
@@ -539,6 +581,19 @@ test('pagestore_prune',
   timeout: 30,
 )
 
+# P2: ps_page_prune_plan_capped() property tests (design doc S3.5/S8.2,
+# merge blockers) -- differential against a frozen pre-P2 reference, and
+# read/prune consistency over random histories/views/rounds.
+pagestore_prune_capped_test = executable('pagestore_prune_capped_test',
+  files('pagestore_prune_capped_test.c', 'pagestore_prune.c'),
+  install: false,
+)
+test('pagestore_prune_capped',
+  pagestore_prune_capped_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Pure replacement-base chain selection for WAL-index compaction.
 pagestore_walidx_prune_test = executable('pagestore_walidx_prune_test',
   files('pagestore_walidx_prune_test.c', 'pagestore_walidx_prune.c'),
@@ -559,6 +614,18 @@ test('pagestore_forkmeta_prune',
   pagestore_forkmeta_prune_test,
   suite: ['pagestore'],
   timeout: 30,
+)
+
+# P2: ps_forkmeta_prune_plan_capped() property tests (design doc S3.7/S8.2,
+# merge blockers).
+pagestore_forkmeta_prune_capped_test = executable('pagestore_forkmeta_prune_capped_test',
+  files('pagestore_forkmeta_prune_capped_test.c', 'pagestore_forkmeta_prune.c'),
+  install: false,
+)
+test('pagestore_forkmeta_prune_capped',
+  pagestore_forkmeta_prune_capped_test,
+  suite: ['pagestore'],
+  timeout: 60,
 )
 
 # Persisted immutable shipped-WAL segment header and checksum contract.

@@ -26,6 +26,9 @@
 static int run = 0,
 			failed = 0;
 static void check(int cond, const char *msg);
+static int append_page_locked(uint32_t timeline, const PsKey *key,
+							  uint32_t block, const unsigned char *page,
+							  uint64_t version, uint64_t *out_admission_seq);
 
 typedef struct BlockingGate
 {
@@ -77,6 +80,19 @@ mock_layer_failed_open(const char *path)
 	return -1;
 }
 
+/* Bug finding #3: models a callee that fails without setting errno at all,
+ * exactly what OPEN_STEP()'s errno=0-before-each-step reset exists to make
+ * safe -- without it, whatever unrelated errno was last left lying around
+ * (here, a prior op's ENOSPC) would be reported as if it explained this
+ * failure. */
+static int
+mock_storage_failed_open_no_errno(const char *path, uint64_t size)
+{
+	(void) path;
+	(void) size;
+	return -1;
+}
+
 static void
 test_core_provider_lifecycle(void)
 {
@@ -123,6 +139,16 @@ test_core_provider_lifecycle(void)
 	ps_core_close();
 	check(mock_close_calls == 1, "close after late startup failure does not close again");
 	ps_layer_store = &PsLayerStoreLocal;
+	mock.open = mock_storage_failed_open_no_errno;
+	ps_storage = &mock;
+	errno = ENOSPC;				/* a stale, unrelated errno from a prior op */
+	rc = ps_core_open(dir);
+	check(rc != 0 && errno == EIO,
+		  "a storage-open failure that never sets errno is reported as EIO, "
+		  "not whatever unrelated errno happened to be lying around");
+	ps_core_close();
+	ps_core_close();
+	mock.open = PsStoragePosix.open;
 	mock_close_calls = 0;
 	check(ps_core_open(dir) == 0, "reopen after failed provider initialization");
 	ps_core_close();
@@ -132,7 +158,7 @@ test_core_provider_lifecycle(void)
 
 	ps_storage = &PsStoragePosix;
 	check(ps_core_open(dir) == 0, "POSIX core reopens after caller teardown");
-	check(append_page(0, &key, 0, page, 1, NULL) == 0,
+	check(append_page_locked(0, &key, 0, page, 1, NULL) == 0,
 		  "buffer a parent page before fork");
 	pid = fork();
 	if (pid == 0)
@@ -165,7 +191,7 @@ test_core_provider_lifecycle(void)
 	check(pid > 0 && waitpid(pid, &status, 0) == pid &&
 		  WIFEXITED(status) && WEXITSTATUS(status) == 0,
 		  "forked core cannot flush, mutate, or reopen inherited state");
-	check(append_page(0, &key, 1, page, 2, NULL) == 0,
+	check(append_page_locked(0, &key, 1, page, 2, NULL) == 0,
 		  "parent remains writable after child rejects inherited core");
 	ps_core_close();
 	ps_core_close();
@@ -210,7 +236,7 @@ test_legacy_local_uri_reopen(void)
 	memset(page, 0x5a, sizeof(page));
 	flush_pages = 1;
 	check(ps_core_open(store) == 0 &&
-		  append_page(0, &key, 0, page, 1, NULL) == 0,
+		  append_page_locked(0, &key, 0, page, 1, NULL) == 0,
 		  "persist a page for legacy path upgrade");
 	ps_core_close();
 	check(symlink("store", "alias") == 0, "create legacy store alias");
@@ -470,6 +496,29 @@ check(int cond, const char *msg)
 		failed++;
 		fprintf(stderr, "  FAIL: %s\n", msg);
 	}
+}
+
+/*
+ * append_page() and other core entry points assume the caller holds the
+ * key's shard write lock and admission-rd, exactly as pagestore_daemon.c's
+ * run_request()/run_request_admitted() do for a live client before
+ * dispatching to handle_request() (I-ALLOC, BRANCH_SNAPSHOT_SEQ_CAP.md
+ * S2).  This test drives append_page() directly, bypassing the daemon's
+ * own request loop, so it takes both locks itself, in the daemon's order.
+ */
+static int
+append_page_locked(uint32_t timeline, const PsKey *key, uint32_t block,
+				   const unsigned char *page, uint64_t version,
+				   uint64_t *out_admission_seq)
+{
+	int			rc;
+
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(key));
+	rc = append_page(timeline, key, block, page, version, out_admission_seq);
+	ps_unlock_shard(ps_shard_of(key));
+	ps_admission_read_unlock();
+	return rc;
 }
 
 /* finish_upload() publishes descriptor fields under map-wr.  Copy the
