@@ -57,7 +57,9 @@
  *                           at the same ck() call site, writing
  *                           <store-dir>.opseq (full) and
  *                           <store-dir>.opseq.min (minimized)
- *   PAGESTORE_FUZZ_SHRINK_BUDGET_S  shrink wall-clock budget (default 300)
+ *   PAGESTORE_FUZZ_SHRINK_BUDGET_S  budget for starting candidates (default 300)
+ *   PAGESTORE_FUZZ_SHRINK_TIMEOUT_S per-candidate replay timeout at 4000 ops
+ *                           (default/minimum 180; scales with replay length)
  *   PAGESTORE_FUZZ_BUGB_WORKAROUND   ship a throwaway parent WAL record
  *                           right after every CREATE_BRANCH, dodging the
  *                           still-unfixed Bug B race (PR #294) instead of
@@ -73,6 +75,9 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
+#include <limits.h>
+
 #include "pagestore_test_client.h"
 #include "pagestore_artifact_format.h"
 
@@ -297,6 +302,8 @@ typedef struct FzArtifact
 	 * ordinary direct DROP, so this does not weaken the common case.
 	 */
 	int			dropped_exists_daemon_bug;
+	int			touched;		/* this key had a successful BEGIN locally or in an ancestor */
+	int			locally_dropped;	/* a successful DROP on this timeline, not inherited */
 } FzArtifact;
 
 #define FZ_NAKLASS	2			/* 0 = PS_KLASS_SLRU, 1 = PS_KLASS_READER_SNAPSHOT.
@@ -2906,7 +2913,7 @@ act_artifact_begin(void)
 		record_cov(PS_OP_ARTIFACT_BEGIN, (uint32_t) status, reason);
 		return;
 	}
-	if (art->state == FZ_ART_DROPPED &&
+	if (art->state == FZ_ART_DROPPED && art->locally_dropped &&
 		art->max_begin_lsn == art->max_begin_lsn_at_drop &&
 		rng_pct(30))
 	{
@@ -3017,6 +3024,7 @@ act_artifact_begin(void)
 			art->lsn = lsn;
 			art->token = token;
 			art->max_begin_lsn = lsn;
+			art->touched = 1;
 			art->dropped_exists_daemon_bug = 0;
 			art->open_count = 0;
 			art->open_nblocks = 0;
@@ -3469,7 +3477,7 @@ act_artifact_drop(void)
 		record_cov(PS_OP_ARTIFACT_DROP, (uint32_t) status, reason);
 		return;
 	}
-	if (art->state == FZ_ART_DROPPED &&
+	if (art->state == FZ_ART_DROPPED && art->locally_dropped &&
 		art->max_begin_lsn == art->max_begin_lsn_at_drop &&
 		rng_pct(30))
 	{
@@ -3551,6 +3559,7 @@ act_artifact_drop(void)
 			art->state = FZ_ART_DROPPED;
 			art->lsn = lsn;
 			art->max_begin_lsn_at_drop = art->max_begin_lsn;
+			art->locally_dropped = 1;
 			art->dropped_exists_daemon_bug = 0;
 			memset(&art->visible, 0, sizeof(art->visible));
 
@@ -3792,6 +3801,7 @@ env_branch_create(void)
 				FzArtifact *ca = &g_artifact[slot][ak][r];
 
 				memset(ca, 0, sizeof(*ca));
+				ca->touched = pa->touched || pa->state != FZ_ART_NONE;
 				if (pa->state == FZ_ART_COMMITTED ||
 					pa->state == FZ_ART_DROPPED)
 				{
@@ -3915,14 +3925,16 @@ verify_branch(uint32_t slot, const char *phase)
 						  &nb) == PS_STATUS_OK && nb == m->nblocks,
 		   "%s: branch %u rel %u nblocks expected %u got %u", phase, slot,
 		   rel, m->nblocks, nb);
-		for (uint32_t bl = 0; bl < m->nblocks && bl < 3; bl++)
+		for (uint32_t bl = 0; bl < m->nblocks; bl++)
 		{
-			if (m->tag[bl] == 0)
-				continue;
-			ck(psc_op_readv(slot, b->incarnation, PS_KLASS_RELATION, rel, bl,
-							0, 0, read_buf, 1) == PS_STATUS_OK &&
-			   psc_page_has_tag(read_buf, m->tag[bl]) &&
-			   psc_page_lsn(read_buf) == m->lsn[bl],
+			int status = psc_op_readv(slot, b->incarnation, PS_KLASS_RELATION,
+								  rel, bl, 0, 0, read_buf, 1);
+			int content_ok = status == PS_STATUS_OK &&
+				(m->tag[bl] == 0 ? psc_page_is_zero(read_buf) :
+				psc_page_has_tag(read_buf, m->tag[bl]) &&
+				psc_page_lsn(read_buf) == m->lsn[bl]);
+
+			ck(content_ok,
 			   "%s: branch %u rel %u block %u content mismatch", phase, slot,
 			   rel, bl);
 		}
@@ -3956,7 +3968,7 @@ verify_branch_frozen(uint32_t slot)
 	for (uint32_t rel = 0; rel < FZ_NREL; rel++)
 	{
 		FzRel	   *m = &b->frozen[rel];
-		uint32_t	nblk = m->nblocks < 3 ? m->nblocks : 3;
+		uint32_t	nblk = m->nblocks;
 
 		for (uint32_t bl = 0; bl < nblk; bl++)
 		{
@@ -3987,10 +3999,10 @@ verify_branch_frozen(uint32_t slot)
 			if (!found)
 				continue;
 			if (m->tag[bl] == 0)
-				ck(psc_page_lsn(read_buf) == 0, "BRANCH VIEW NOT FROZEN: "
+				ck(psc_page_is_zero(read_buf), "BRANCH VIEW NOT FROZEN: "
 				   "branch %u's frozen parent %u rel %u block %u was "
-				   "unwritten at the fork point (lsn=%llu), but an as-of "
-				   "read there now returns content (suspected Bug B: a "
+				   "unwritten at the fork point (lsn=%llu), but an as-of read "
+				   "there now returns nonzero content (suspected Bug B: a "
 				   "later parent write landed at/under branch_lsn and leaked "
 				   "through)", slot, parent, rel, bl,
 				   (unsigned long long) b->branch_lsn);
@@ -4041,24 +4053,44 @@ env_wait_deleted(void)
 	uint64_t	start = psc_now_ns();
 	int			ok = 0;
 
-	if (!b->known || b->state != PS_TIMELINE_DELETING)
+	if (!b->known || (b->state != PS_TIMELINE_DELETING &&
+					  b->state != PS_TIMELINE_DELETED))
 		return;
-	while (psc_now_ns() - start < 20ull * 1000000000ull)
+	if (b->state == PS_TIMELINE_DELETED)
 	{
-		PsTimelineState state;
-		uint64_t	inc;
+		PsTimelineState state = PS_TIMELINE_LIVE;
+		uint64_t	inc = 0;
 
-		if (psc_op_timeline_state(slot, &state, &inc) == PS_STATUS_OK &&
-			state == PS_TIMELINE_DELETED)
+		int status = psc_op_timeline_state(slot, &state, &inc);
+
+		ck(status == PS_STATUS_OK && state == PS_TIMELINE_DELETED,
+		   "branch %u already modeled DELETED, got state=%d status=%d", slot,
+		   state, status);
+		ck(inc == b->incarnation, "deleted branch %u keeps its incarnation "
+		   "(expected %llu got %llu)", slot,
+		   (unsigned long long) b->incarnation, (unsigned long long) inc);
+		ok = status == PS_STATUS_OK && state == PS_TIMELINE_DELETED &&
+			inc == b->incarnation;
+	}
+	else
+	{
+		while (psc_now_ns() - start < 20ull * 1000000000ull)
 		{
-			ck(inc == b->incarnation, "deleted branch %u keeps its "
-			   "incarnation (expected %llu got %llu)", slot,
-			   (unsigned long long) b->incarnation, (unsigned long long) inc);
-			b->state = PS_TIMELINE_DELETED;
-			ok = 1;
-			break;
+			PsTimelineState state;
+			uint64_t	inc;
+
+			if (psc_op_timeline_state(slot, &state, &inc) == PS_STATUS_OK &&
+				state == PS_TIMELINE_DELETED)
+			{
+				ck(inc == b->incarnation, "deleted branch %u keeps its "
+				   "incarnation (expected %llu got %llu)", slot,
+				   (unsigned long long) b->incarnation, (unsigned long long) inc);
+				b->state = PS_TIMELINE_DELETED;
+				ok = 1;
+				break;
+			}
+			psc_sleep_ms(20);
 		}
-		psc_sleep_ms(20);
 	}
 	ring_note("wait_deleted slot=%u ok=%d", slot, ok);
 	ck(ok, "branch %u did not reach DELETED within 20s", slot);
@@ -4207,7 +4239,7 @@ verify_artifacts(const char *phase)
 				uint32_t	nb = 0;
 				int			est;
 
-				if (art->state == FZ_ART_NONE && art->max_begin_lsn == 0)
+				if (art->state == FZ_ART_NONE && !art->touched)
 					continue;		/* never touched: nothing to check */
 				est = psc_op_exists(tl, g_tl[tl].incarnation, klass, rel, 0,
 									&exists);
@@ -4659,8 +4691,82 @@ write_seq_subset(const char *path, const int *seq, long long n)
  * dies, not a descendant we can reap.  Signaling the whole group reaches
  * the daemon directly instead.
  */
-static int
-shrink_try_candidate(const char *cand_path, const char *orig_fmt)
+typedef enum FzShrinkCandidateResult
+{
+	FZ_SHRINK_NOT_REPRODUCED,
+	FZ_SHRINK_REPRODUCED,
+	FZ_SHRINK_TIMED_OUT
+} FzShrinkCandidateResult;
+
+#define FZ_SHRINK_TIMEOUT_MARGIN_S 60ull
+#define FZ_SHRINK_MIN_TIMEOUT_S \
+	((PSC_EXEC_TIMEOUT_NS + 999999999ull) / 1000000000ull + \
+	 FZ_SHRINK_TIMEOUT_MARGIN_S)
+#define FZ_SHRINK_MAX_TIMEOUT_S (24ull * 60ull * 60ull)
+
+static uint64_t
+shrink_seconds_env(const char *name, uint64_t default_s, uint64_t min_s)
+{
+	const char *env = getenv(name);
+	char	   *end = NULL;
+	unsigned long long parsed;
+
+	if (env == NULL || env[0] == '\0')
+		return default_s;
+	for (const char *p = env; *p != '\0'; p++)
+		if (*p < '0' || *p > '9')
+			goto invalid;
+	errno = 0;
+	parsed = strtoull(env, &end, 10);
+	if (end == env || *end != '\0' || errno == ERANGE ||
+		parsed == 0 || parsed > FZ_SHRINK_MAX_TIMEOUT_S)
+	{
+	invalid:
+		fprintf(stderr, "shrink: ignoring invalid %s=%s (expected integer "
+				"seconds in [1,%llu])\n", name, env,
+				(unsigned long long) FZ_SHRINK_MAX_TIMEOUT_S);
+		return default_s;
+	}
+	if (parsed < min_s)
+	{
+		fprintf(stderr, "shrink: raising %s=%llu to %llu seconds to cover "
+				"the %llu-second IPC timeout plus startup/cleanup margin\n",
+				name, parsed, (unsigned long long) min_s,
+				(unsigned long long) (PSC_EXEC_TIMEOUT_NS / 1000000000ull));
+		return min_s;
+	}
+	return (uint64_t) parsed;
+}
+
+static uint64_t
+shrink_candidate_timeout_s(long long candidate_ops, uint64_t base_timeout_s)
+{
+	uint64_t	ops = candidate_ops > 0 ? (uint64_t) candidate_ops : 1;
+	uint64_t	scaled;
+
+	/* Scale the base timeout (which covers 4000 operations) without allowing
+	 * the multiplication or rounding addition to wrap. */
+	if (ops > UINT64_MAX / base_timeout_s)
+		scaled = FZ_SHRINK_MAX_TIMEOUT_S;
+	else
+	{
+		uint64_t product = ops * base_timeout_s;
+
+		if (product > UINT64_MAX - (FZ_DEFAULT_OPS - 1))
+			scaled = FZ_SHRINK_MAX_TIMEOUT_S;
+		else
+			scaled = (product + FZ_DEFAULT_OPS - 1) / FZ_DEFAULT_OPS;
+	}
+	if (scaled < base_timeout_s)
+		scaled = base_timeout_s;
+	if (scaled > FZ_SHRINK_MAX_TIMEOUT_S)
+		scaled = FZ_SHRINK_MAX_TIMEOUT_S;
+	return scaled;
+}
+
+static FzShrinkCandidateResult
+shrink_try_candidate(const char *cand_path, const char *orig_fmt,
+						 long long candidate_ops, uint64_t base_timeout_s)
 {
 	char		capture_path[600];
 	char		cand_shm_name[64];
@@ -4670,6 +4776,8 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 	int			status;
 	int			ok = 0;
 	uint64_t	start;
+	uint64_t	timeout_s = shrink_candidate_timeout_s(candidate_ops,
+														 base_timeout_s);
 	int			done = 0;
 
 	if (!g_self_exe_ok)
@@ -4677,7 +4785,7 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 		fprintf(stderr, "shrink: cannot resolve this binary's own executable "
 				"path (tried realpath(argv[0]) and /proc/self/exe); "
 				"shrinking is unavailable, not just timing-sensitive\n");
-		return 0;
+		return FZ_SHRINK_NOT_REPRODUCED;
 	}
 
 	snprintf(capture_path, sizeof(capture_path), "%s/psfuzz_shrink_%d_%d.out",
@@ -4686,7 +4794,7 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 	if (pid < 0)
 	{
 		fprintf(stderr, "shrink: fork failed: %s\n", strerror(errno));
-		return 0;
+		return FZ_SHRINK_NOT_REPRODUCED;
 	}
 	if (pid == 0)
 	{
@@ -4727,7 +4835,7 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 			 cand_store_dir);
 
 	start = psc_now_ns();
-	while (psc_now_ns() - start < 90ull * 1000000000ull)
+	while (psc_now_ns() - start < timeout_s * 1000000000ull)
 	{
 		pid_t		r = waitpid(pid, &status, WNOHANG);
 
@@ -4752,7 +4860,10 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 		psc_remove_tree(cand_store_dir);
 		unlink(cand_opseq_path);
 		unlink(capture_path);
-		return 0;				/* candidate replay hung: not a clean repro */
+		fprintf(stderr, "shrink: candidate replay timed out after %llus "
+				"(%lld steps); outcome is inconclusive\n",
+				(unsigned long long) timeout_s, candidate_ops);
+		return FZ_SHRINK_TIMED_OUT;
 	}
 	if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
 	{
@@ -4774,7 +4885,7 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
 	}
 	unlink(cand_opseq_path);
 	unlink(capture_path);
-	return ok;
+	return ok ? FZ_SHRINK_REPRODUCED : FZ_SHRINK_NOT_REPRODUCED;
 }
 
 /*
@@ -4787,7 +4898,9 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt)
  */
 static void
 ddmin_run(int *cur, long long *len_io, const char *orig_fmt,
-		  long long budget_s)
+		  uint64_t budget_s, uint64_t candidate_base_timeout_s,
+		  long long *timeouts_out, int *budget_expired_out,
+		  int *attempt_cap_hit_out)
 {
 	long long	len = *len_io;
 	int		   *cand = malloc((size_t) (len > 0 ? len : 1) * sizeof(int));
@@ -4796,6 +4909,9 @@ ddmin_run(int *cur, long long *len_io, const char *orig_fmt,
 	char		cand_path[600];
 	long long	attempts = 0;
 	const long long max_attempts = 20000;
+	long long	candidate_timeouts = 0;
+	int			budget_expired = 0;
+	int			attempt_cap_hit = 0;
 
 	if (cand == NULL)
 		return;
@@ -4814,14 +4930,23 @@ ddmin_run(int *cur, long long *len_io, const char *orig_fmt,
 		{
 			long long	end = start + chunk < len ? start + chunk : len;
 			long long	m = 0;
+			FzShrinkCandidateResult result;
 
 			if (end - start >= len)
 			{
 				start = end;
 				continue;		/* never try removing everything */
 			}
-			if (psc_now_ns() > deadline || attempts >= max_attempts)
+			if (psc_now_ns() > deadline)
+			{
+				budget_expired = 1;
 				goto done;
+			}
+			if (attempts >= max_attempts)
+			{
+				attempt_cap_hit = 1;
+				goto done;
+			}
 
 			for (long long i = 0; i < start; i++)
 				cand[m++] = cur[i];
@@ -4830,7 +4955,11 @@ ddmin_run(int *cur, long long *len_io, const char *orig_fmt,
 
 			write_seq_subset(cand_path, cand, m);
 			attempts++;
-			if (shrink_try_candidate(cand_path, orig_fmt))
+			result = shrink_try_candidate(cand_path,
+													 orig_fmt, m,
+													 candidate_base_timeout_s);
+
+			if (result == FZ_SHRINK_REPRODUCED)
 			{
 				memcpy(cur, cand, (size_t) m * sizeof(int));
 				len = m;
@@ -4840,7 +4969,11 @@ ddmin_run(int *cur, long long *len_io, const char *orig_fmt,
 				/* keep scanning from the same offset in the now-shorter seq */
 			}
 			else
+			{
+				if (result == FZ_SHRINK_TIMED_OUT)
+					candidate_timeouts++;
 				start = end;
+			}
 		}
 		if (!removed_any)
 		{
@@ -4853,9 +4986,15 @@ done:
 	unlink(cand_path);
 	free(cand);
 	*len_io = len;
-	if (attempts >= max_attempts)
+	if (attempt_cap_hit)
 		fprintf(stderr, "shrink: hit the %lld-attempt cap; result may not be "
 				"fully minimal\n", max_attempts);
+	if (timeouts_out != NULL)
+		*timeouts_out = candidate_timeouts;
+	if (budget_expired_out != NULL)
+		*budget_expired_out = budget_expired;
+	if (attempt_cap_hit_out != NULL)
+		*attempt_cap_hit_out = attempt_cap_hit;
 }
 
 /*
@@ -4874,11 +5013,16 @@ shrink_on_failure(const char *orig_fmt)
 	int		   *cur;
 	char		min_path[600];
 	uint64_t	t0 = psc_now_ns();
-	long long	budget_s = 300;
-	const char *env = getenv("PAGESTORE_FUZZ_SHRINK_BUDGET_S");
+	uint64_t	budget_s = shrink_seconds_env("PAGESTORE_FUZZ_SHRINK_BUDGET_S",
+													 300, 1);
+	uint64_t	candidate_timeout_s = shrink_seconds_env(
+												"PAGESTORE_FUZZ_SHRINK_TIMEOUT_S",
+												FZ_SHRINK_MIN_TIMEOUT_S,
+												FZ_SHRINK_MIN_TIMEOUT_S);
+	long long	candidate_timeouts = 0;
+	int			budget_expired = 0;
+	int			attempt_cap_hit = 0;
 
-	if (env != NULL && atoll(env) > 0)
-		budget_s = atoll(env);
 	if (orig_len <= 0)
 		return;
 	cur = malloc((size_t) orig_len * sizeof(int));
@@ -4886,20 +5030,32 @@ shrink_on_failure(const char *orig_fmt)
 		return;
 	memcpy(cur, g_seq_actions, (size_t) orig_len * sizeof(int));
 
-	fprintf(stderr, "\nshrinking a %lld-step failing sequence (budget %llds, "
-			"same-site match required)...\n", orig_len,
-			(long long) budget_s);
-	ddmin_run(cur, &len, orig_fmt, budget_s);
+	fprintf(stderr, "\nshrinking a %lld-step failing sequence (budget %llus, "
+			"candidate timeout %llus at 4000 steps, same-site match "
+			"required)...\n", orig_len, (unsigned long long) budget_s,
+			(unsigned long long) candidate_timeout_s);
+	ddmin_run(cur, &len, orig_fmt, budget_s, candidate_timeout_s,
+			  &candidate_timeouts, &budget_expired, &attempt_cap_hit);
 
 	snprintf(min_path, sizeof(min_path), "%s.opseq.min", psc_store_dir);
 	write_seq_subset(min_path, cur, len);
-	if (len == orig_len)
+	if (candidate_timeouts > 0 || budget_expired || attempt_cap_hit)
+		fprintf(stderr, "shrink: inconclusive after %.1fs (%s%s%s); %s: %s\n",
+				(double) (psc_now_ns() - t0) / 1e9,
+				candidate_timeouts > 0 ? "candidate timeout(s)" : "",
+				budget_expired && candidate_timeouts > 0 ? ", " : "",
+				budget_expired ? "budget exhausted" :
+				(candidate_timeouts > 0 ? "" : "attempt cap reached"),
+				len == orig_len ? "sequence unchanged" : "best reduction",
+				min_path);
+	if (len == orig_len && candidate_timeouts == 0 && !budget_expired &&
+		!attempt_cap_hit)
 		fprintf(stderr, "shrink: no reduction found in %.1fs -- likely "
 				"timing-sensitive (background maintenance timing, not the "
 				"op sequence itself, may be what triggers this); minimal "
 				"sequence file is just a copy of the original "
 				"(%s)\n", (double) (psc_now_ns() - t0) / 1e9, min_path);
-	else
+	else if (len < orig_len)
 		fprintf(stderr, "shrink: %lld -> %lld steps in %.1fs -> %s\n",
 				orig_len, len, (double) (psc_now_ns() - t0) / 1e9, min_path);
 	free(cur);
@@ -4998,8 +5154,16 @@ print_coverage_and_check(void)
 
 	fprintf(stderr, "\n==== environment-action coverage ====\n");
 	for (int e = 0; e < ENV_COUNT; e++)
+	{
 		fprintf(stderr, "%-24s happened=%lld skipped=%lld\n", g_env_names[e],
 				g_env_cov[e][0], g_env_cov[e][1]);
+		if (g_env_cov[e][0] == 0)
+		{
+			fprintf(stderr, "  MISSING: no successful %s action observed\n",
+					g_env_names[e]);
+			missing++;
+		}
+	}
 
 	fprintf(stderr, "\n==== opcodes using the weak oracle in this stage ====\n");
 	for (int i = 0; i < FZ_NWEAK; i++)
