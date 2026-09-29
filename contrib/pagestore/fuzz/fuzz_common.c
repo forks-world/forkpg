@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -139,6 +140,39 @@ static int	template_ready = 0;
 static const char *scratch_root;
 static char work_dir[PATH_MAX];
 
+static int
+remove_entry(const char *fpath, const struct stat *sb, int typeflag,
+			 struct FTW *ftwbuf)
+{
+	(void) sb;
+	(void) ftwbuf;
+	if (typeflag == FTW_DP)
+		(void) rmdir(fpath);
+	else
+		(void) unlink(fpath);
+	return 0;
+}
+
+/*
+ * Codex finding on PR #303 (c959796): work_dir/extract_dir (both built from
+ * TMPDIR, so their bytes are outside this program's control) used to be
+ * interpolated into a single-quoted `rm -rf '...'` string and handed to
+ * system(), i.e. /bin/sh -c "...": a single quote anywhere in the path
+ * breaks out of the quoting and either fails outright or, worse, runs
+ * whatever shell-active bytes follow it. nftw() removes the tree directly,
+ * with no shell parsing of the path at all. Best-effort like the
+ * system("rm -rf ...") calls this replaces: a path nftw() cannot fully walk
+ * or remove (e.g. a permission error) is left behind rather than aborting
+ * the run over cleanup.
+ */
+static void
+remove_tree(const char *path)
+{
+	if (path == NULL || path[0] == '\0')
+		return;
+	nftw(path, remove_entry, 32, FTW_DEPTH | FTW_PHYS);
+}
+
 /* Round-4 coordinator review: the persistent work_dir (see the file header
  * above) was never removed, so every process -- 21 of them for one
  * `meson test --suite pagestore-fuzz` run, plus however many a fuzz
@@ -149,13 +183,7 @@ static char work_dir[PATH_MAX];
 static void
 cleanup_work_dir(void)
 {
-	char		rm_cmd[PATH_MAX + 16];
-
-	if (work_dir[0] == '\0')
-		return;
-	if (snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", work_dir) <
-		(int) sizeof(rm_cmd))
-		(void) system(rm_cmd);
+	remove_tree(work_dir);
 }
 
 static const char *
@@ -503,14 +531,48 @@ verify_reset(void)
 	}
 }
 
+/*
+ * Codex finding on PR #303 (c959796): PS_FUZZ_FIXTURE_TGZ (a compile-time
+ * path baked in by build.sh/meson.build) and extract_dir (built from
+ * TMPDIR) used to be interpolated into a single-quoted
+ * `tar xzf '...' -C '...'` string and handed to system(), i.e.
+ * /bin/sh -c "...": a single quote anywhere in either path breaks out of
+ * the quoting and either aborts the fuzz run's startup with a shell syntax
+ * error or, worse, runs whatever shell-active bytes follow it.
+ * fork()+execlp() runs the tar binary directly with each path as its own
+ * argv element, so neither path's bytes are ever parsed by a shell.
+ */
+static int
+run_tar_extract(const char *tgz_path, const char *dest_dir)
+{
+	pid_t		pid;
+	int			status;
+
+	pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0)
+	{
+		execlp("tar", "tar", "xzf", tgz_path, "-C", dest_dir, (char *) NULL);
+		perror("ps_fuzz_global_init: execlp tar");
+		_exit(127);
+	}
+	while (waitpid(pid, &status, 0) < 0)
+	{
+		if (errno != EINTR)
+			return -1;
+	}
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return -1;
+	return 0;
+}
+
 /* ---- one-time global setup ---------------------------------------------- */
 
 void
 ps_fuzz_global_init(void)
 {
-	char		cmd[PATH_MAX * 2];
 	char		extract_dir[PATH_MAX];
-	int			rc;
 
 	if (template_ready)
 		return;
@@ -527,18 +589,11 @@ ps_fuzz_global_init(void)
 		fprintf(stderr, "ps_fuzz_global_init: mkdtemp (extract) failed\n");
 		abort();
 	}
-	if (snprintf(cmd, sizeof(cmd), "tar xzf '%s' -C '%s'",
-				 PS_FUZZ_FIXTURE_TGZ, extract_dir) >= (int) sizeof(cmd))
-	{
-		fprintf(stderr, "ps_fuzz_global_init: command too long\n");
-		abort();
-	}
-	rc = system(cmd);
-	if (rc != 0)
+	if (run_tar_extract(PS_FUZZ_FIXTURE_TGZ, extract_dir) != 0)
 	{
 		fprintf(stderr,
-				"ps_fuzz_global_init: failed to extract fixture "
-				"(rc=%d): %s\n", rc, cmd);
+				"ps_fuzz_global_init: failed to extract fixture %s into %s\n",
+				PS_FUZZ_FIXTURE_TGZ, extract_dir);
 		abort();
 	}
 
@@ -559,13 +614,7 @@ ps_fuzz_global_init(void)
 	/* The extracted template tree is no longer needed once cached and
 	 * copied into work_dir; free the disk space, especially with many
 	 * parallel target processes sharing /tmp. */
-	{
-		char		rm_cmd[PATH_MAX + 16];
-
-		if (snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", extract_dir) <
-			(int) sizeof(rm_cmd))
-			(void) system(rm_cmd);
-	}
+	remove_tree(extract_dir);
 
 	/* Matches fixtures/posix-mvp-baseline/fixture.json's daemon_env. */
 	setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1);
@@ -763,6 +812,43 @@ should_fixup_this_iteration(const uint8_t *data, size_t size)
 	}
 }
 
+/*
+ * Codex finding on PR #303 (c959796): a target name that matches nothing in
+ * ps_fuzz_targets (a typo'd PS_FUZZ_TARGET, or a bad replay-CLI argument)
+ * used to fall through ps_fuzz_run_one()'s lookup below and just return,
+ * having done nothing -- a direct libFuzzer campaign or a replay run then
+ * "succeeds" having never exercised a single line of pagestore code. NULL,
+ * "", and "all" are the documented ways to ask for the data[0]-selected
+ * "every target" mode (see ps_fuzz_run_one()) and are always valid; every
+ * other name must be one of ps_fuzz_targets's own. Every caller that
+ * accepts a target name from outside this program (PS_FUZZ_TARGET, a CLI
+ * argument) must call this once, before the first ps_fuzz_run_one(), and
+ * exit nonzero on failure -- see fuzz_target.c's LLVMFuzzerInitialize() and
+ * fuzz_standalone_driver.c's main().
+ */
+int
+ps_fuzz_target_is_valid(const char *target_name)
+{
+	int			i;
+
+	if (target_name == NULL || target_name[0] == '\0' ||
+		strcmp(target_name, "all") == 0)
+		return 1;
+
+	for (i = 0; i < ps_fuzz_target_count; i++)
+	{
+		if (strcmp(ps_fuzz_targets[i].name, target_name) == 0)
+			return 1;
+	}
+
+	fprintf(stderr, "ps_fuzz: unknown target \"%s\"; valid targets are"
+			" \"all\"", target_name);
+	for (i = 0; i < ps_fuzz_target_count; i++)
+		fprintf(stderr, ", \"%s\"", ps_fuzz_targets[i].name);
+	fprintf(stderr, "\n");
+	return 0;
+}
+
 /* ---- the per-iteration driver -------------------------------------------- */
 
 void
@@ -792,7 +878,16 @@ ps_fuzz_run_one(const char *target_name, const uint8_t *data, size_t size)
 			}
 		}
 		if (relpath == NULL)
-			return;				/* unknown PS_FUZZ_TARGET: nothing to do */
+		{
+			/* Every caller must validate with ps_fuzz_target_is_valid()
+			 * before calling here (see its comment); reaching this with an
+			 * unknown name is that contract broken, not a normal input to
+			 * shrug off -- fail loudly instead of silently doing nothing. */
+			fprintf(stderr,
+					"ps_fuzz_run_one: unvalidated unknown target \"%s\"\n",
+					target_name);
+			abort();
+		}
 	}
 	else
 	{

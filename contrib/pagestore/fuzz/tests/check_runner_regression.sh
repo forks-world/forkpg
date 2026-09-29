@@ -53,6 +53,8 @@ trap 'exit 143' TERM
 cat > "$TMP_DIR/fuzz_stub.c" <<'EOF'
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 void
 ps_fuzz_global_init(void)
@@ -65,6 +67,20 @@ ps_fuzz_run_one(const char *target, const uint8_t *data, size_t size)
 	(void) target;
 	(void) data;
 	(void) size;
+}
+
+/* Stands in for fuzz_common.c's real ps_fuzz_targets table with a single
+ * entry ("manifest"), just enough for the driver-level "unknown target is
+ * rejected before any corpus is touched" regression below. */
+int
+ps_fuzz_target_is_valid(const char *target)
+{
+	if (target == NULL || target[0] == '\0' || strcmp(target, "all") == 0 ||
+		strcmp(target, "manifest") == 0)
+		return 1;
+	fprintf(stderr, "ps_fuzz: unknown target \"%s\"; valid targets are"
+			" \"all\", \"manifest\"\n", target);
+	return 0;
 }
 EOF
 cc -Wall -Wextra -Werror -I"$FUZZ_DIR" \
@@ -126,6 +142,20 @@ touch "$TMP_DIR/valid/empty-seed"
 "$TMP_DIR/replay_driver" manifest "$TMP_DIR/valid" >"$TMP_DIR/valid.log" 2>&1
 grep -q "replayed 2 corpus file" "$TMP_DIR/valid.log"
 
+# Codex finding on PR #303: an unknown target must be rejected up front,
+# with a nonzero exit and no corpus files "replayed", instead of silently
+# reporting success without ever calling ps_fuzz_run_one().
+if "$TMP_DIR/replay_driver" typo "$TMP_DIR/valid" \
+  >"$TMP_DIR/bad-target.log" 2>&1; then
+  echo "replay driver accepted an unknown target" >&2
+  exit 1
+fi
+grep -q 'unknown target "typo"' "$TMP_DIR/bad-target.log"
+if grep -q 'replayed' "$TMP_DIR/bad-target.log"; then
+  echo "replay driver ran corpus files for an unknown target" >&2
+  exit 1
+fi
+
 RUNNER_DIR="$TMP_DIR/fuzz"
 mkdir -p "$RUNNER_DIR/build" "$RUNNER_DIR/corpus/manifest"
 cp "$FUZZ_DIR/run_fuzz.sh" "$RUNNER_DIR/run_fuzz.sh"
@@ -156,6 +186,23 @@ if "$RUNNER_DIR/run_fuzz.sh" -o "$TMP_DIR/out" manifest manifest \
 fi
 grep -q 'duplicate target' "$TMP_DIR/duplicate.log"
 [[ "$(cat "$TMP_DIR/out/manifest/sentinel")" == keep ]]
+
+# Codex finding on PR #303: -d 0, a negative value, or a non-integer must be
+# rejected before any worker is launched, instead of being forwarded
+# straight to libFuzzer's -max_total_time (which only bounds a campaign
+# "if positive" per its own -help=1) and then running unbounded.
+for bad_duration in 0 -5 abc 3.5; do
+  if "$RUNNER_DIR/run_fuzz.sh" -d "$bad_duration" -o "$TMP_DIR/bad-duration-out" \
+    manifest >"$TMP_DIR/bad-duration.log" 2>&1; then
+    echo "runner accepted -d $bad_duration" >&2
+    exit 1
+  fi
+  grep -q 'positive integer' "$TMP_DIR/bad-duration.log"
+  if [[ -e "$TMP_DIR/bad-duration-out" ]]; then
+    echo "runner touched the out-dir before validating -d $bad_duration" >&2
+    exit 1
+  fi
+done
 
 export STUB_PID_FILE="$TMP_DIR/worker.pid"
 export STUB_MODE=fail

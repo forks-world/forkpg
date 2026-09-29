@@ -39,6 +39,17 @@ extern const int ps_fuzz_target_count;
  * LLVMFuzzerInitialize() or a plain main(). */
 extern void ps_fuzz_global_init(void);
 
+/* Validate a target name accepted from outside this program (PS_FUZZ_TARGET,
+ * a CLI argument): NULL, "", and "all" are always valid (the data[0]-
+ * selected "every target" mode); anything else must name an entry in
+ * ps_fuzz_targets. Returns 1 if valid; on failure, prints the invalid name
+ * and the list of valid names to stderr and returns 0 -- the caller must
+ * treat that as fatal (exit nonzero) and must not call ps_fuzz_run_one()
+ * with it, since an unknown target reaching that function is a silent,
+ * successful no-op (see its own abort() on this exact contract). Call this
+ * once, before the first ps_fuzz_run_one(). */
+extern int ps_fuzz_target_is_valid(const char *target_name);
+
 /* Run one fuzz iteration: copy the template store, replace the target file
  * (selected by name, or by data[0] when target_name is NULL, empty, or
  * "all" -- the "single target picks the file kind from the first byte"

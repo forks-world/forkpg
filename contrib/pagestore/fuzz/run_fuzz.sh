@@ -42,6 +42,16 @@ while getopts "d:o:f:" opt; do
 done
 shift $((OPTIND - 1))
 
+# Codex finding on PR #303 (c959796): DURATION is forwarded straight to
+# -max_total_time, whose own -help=1 applies it "if positive" -- 0, a
+# negative value, or anything non-numeric silently drops the campaign's
+# total-time bound instead of failing, and the script then waits on
+# workers that never stop on their own. Reject before launching any worker.
+if ! [[ "$DURATION" =~ ^[0-9]+$ ]] || [[ "$DURATION" -eq 0 ]]; then
+  echo "run_fuzz.sh: -d duration must be a positive integer (got '$DURATION')" >&2
+  exit 2
+fi
+
 if [[ ! -x "$BIN" ]]; then
   echo "run_fuzz.sh: $BIN not found; run fuzz/build.sh first" >&2
   exit 1

@@ -177,6 +177,13 @@ main(int argc, char **argv)
 	}
 	target = argv[1];
 
+	/* Codex finding on PR #303: validate the target once, before touching
+	 * any corpus directory, rather than letting a bad target argument
+	 * silently turn the whole replay into a no-op that still reports
+	 * success (see ps_fuzz_target_is_valid()'s comment in fuzz_common.h). */
+	if (!ps_fuzz_target_is_valid(target))
+		return 2;
+
 	ps_fuzz_global_init();
 	for (i = 2; i < argc; i++)
 		replay_dir(target, argv[i]);

@@ -35,6 +35,7 @@
 
 #include "pagestore_core.h"
 #include "pagestore_prune.h"
+#include "pagestore_wal_segment.h"
 #include "fuzz_crc_fixup.h"
 #include "fuzz_common.h"
 
@@ -68,6 +69,13 @@ put_le32(unsigned char *p, uint32_t v)
 	p[1] = (unsigned char) (v >> 8);
 	p[2] = (unsigned char) (v >> 16);
 	p[3] = (unsigned char) (v >> 24);
+}
+
+static void
+put_le16(unsigned char *p, uint16_t v)
+{
+	p[0] = (unsigned char) v;
+	p[1] = (unsigned char) (v >> 8);
 }
 
 static uint64_t
@@ -744,20 +752,52 @@ fixup_wal_store_identity(uint8_t *buf, size_t len)
 	put_le32(buf + 48, fnv1a_step(FNV1A_INIT, copy, 64));
 }
 
-/* ---- wal_segments_<tl>/walv1_* (pagestore_wal_segment.c
+/*
+ * ---- wal_segments_<tl>/walv1_* (pagestore_wal_segment.c
  * PsWalSegmentHeader) -- 64-byte header (offsets from encode_fields():
- * payload_crc@40, header_crc@44) + payload.  payload_crc = FNV-1a over the
- * payload (payload_crc()); header_crc = FNV-1a over the 64-byte header
- * with header_crc zeroed (header_crc()). */
+ * payload_len@20, payload_crc@40, header_crc@44, xlp_magic@56, xlp_info@58,
+ * xlp_seg_size@60) + payload.  payload_crc = FNV-1a over the payload
+ * (payload_crc()); header_crc = FNV-1a over the 64-byte header with
+ * header_crc zeroed (header_crc()).
+ *
+ * Codex finding on PR #303 (c959796): a length-changing mutation of the
+ * payload leaves payload_len and the payload's own recorded PostgreSQL page-
+ * header identity (xlp_magic/xlp_info/xlp_seg_size) stale.
+ * ps_wal_segment_validate() checks header->payload_len == payload_len and
+ * payload_identity_matches() (both in pagestore_wal_segment.c) before ever
+ * looking at header_crc, so those two rejects ran ahead of the CRC gate and
+ * a mutation that only broke them (not the checksums) never reached later
+ * WAL parsing. This now derives both from the actual (possibly resized)
+ * payload with ps_wal_segment_payload_identity() -- the same exported
+ * helper ps_wal_segment_seal_with_crc() uses to seal a real segment -- so
+ * the encoded envelope always matches its own payload, the same invariant
+ * the product's own writer maintains. A version-1 (legacy) header always
+ * records a zero identity regardless of payload (payload_identity_matches()'s
+ * version_known() special case), which the zero-initialized locals already
+ * give it.
+ */
 static void
 fixup_wal_segment(uint8_t *buf, size_t len)
 {
 	unsigned char header[64];
 	uint32_t	payload_crc;
 	uint32_t	header_crc;
+	uint32_t	payload_len;
+	uint16_t	xlp_magic = 0;
+	uint16_t	xlp_info = 0;
+	uint32_t	xlp_seg_size = 0;
 
 	if (len < 64)
 		return;
+	payload_len = (uint32_t) (len - 64);
+	put_le32(buf + 20, payload_len);
+	if (get_le32(buf + 4) != PS_WAL_SEGMENT_LEGACY_VERSION)
+		(void) ps_wal_segment_payload_identity(buf + 64, payload_len,
+												&xlp_magic, &xlp_info,
+												&xlp_seg_size);
+	put_le16(buf + 56, xlp_magic);
+	put_le16(buf + 58, xlp_info);
+	put_le32(buf + 60, xlp_seg_size);
 	payload_crc = fnv1a_step(FNV1A_INIT, buf + 64, len - 64);
 	put_le32(buf + 40, payload_crc);
 	memcpy(header, buf, 64);
@@ -1153,14 +1193,32 @@ fixup_walidx_snapshot_manifest(uint8_t *buf, size_t len)
 
 	manifest_tmpl = ps_fuzz_template_lookup(
 		"walidx_snapshots_0/walidx_manifest_v1", &manifest_tmpl_len);
-	if (manifest_tmpl != NULL && manifest_tmpl_len >= 32)
+	if (manifest_tmpl != NULL && manifest_tmpl_len >= 48)
 	{
 		uint64_t	generation = get_le64(manifest_tmpl + 24);
+		uint64_t	start_lsn = get_le64(manifest_tmpl + 32);
+		uint64_t	end_lsn = get_le64(manifest_tmpl + 40);
 		uint32_t	nshards = get_le32(buf + 20);
 		uint32_t	i;
 
+		/*
+		 * Codex finding on PR #303 (c959796): walidx_snapshot_decode_header()
+		 * (pagestore_core.c) checks the shard header's generation, start_lsn,
+		 * *and* end_lsn against this manifest's own fields before a single
+		 * record is read -- pinning only generation left start_lsn/end_lsn
+		 * fuzzer-controlled, so a mutation of either still failed against
+		 * the untouched (pristine, template-matching) shard file every
+		 * time. All three cross-file identity fields are pinned to the
+		 * template's real values now, the same "pin identity, leave the
+		 * rest fuzzer-controlled" shape fixup_walidx_snapshot_shard() below
+		 * already uses for the shard header's own identity fields.
+		 */
 		for (i = 0; i < 8; i++)
+		{
 			buf[24 + i] = (unsigned char) (generation >> (i * 8));
+			buf[32 + i] = (unsigned char) (start_lsn >> (i * 8));
+			buf[40 + i] = (unsigned char) (end_lsn >> (i * 8));
+		}
 
 		for (i = 0; i < nshards && i < WALIDX_SNAPSHOT_MANIFEST_MAX_SHARDS_LOCAL;
 			 i++)

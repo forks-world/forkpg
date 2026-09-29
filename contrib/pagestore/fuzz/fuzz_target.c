@@ -26,6 +26,11 @@ LLVMFuzzerInitialize(int *argc, char ***argv)
 	(void) argc;
 	(void) argv;
 	ps_fuzz_global_init();
+	/* Codex finding on PR #303: validate PS_FUZZ_TARGET once, here, rather
+	 * than letting a typo silently turn every iteration into a no-op (see
+	 * ps_fuzz_target_is_valid()'s comment in fuzz_common.h). */
+	if (!ps_fuzz_target_is_valid(getenv("PS_FUZZ_TARGET")))
+		exit(1);
 	return 0;
 }
 
