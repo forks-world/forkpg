@@ -1458,42 +1458,135 @@ act_readv(void)
 
 	if (adv == ADV_NONE)
 	{
-		uint32_t	n = 1 + rng_below(3);
-		uint32_t	block;
-		uint64_t	req_lsn = rng_pct(15) ? UINT64_MAX : 0;
-		int			status;
+		/*
+		 * Pinned-reader mode: exercise the admission-sequence fence
+		 * through READV the same way act_read_at()'s mode==1 already does
+		 * for single-block reads -- PS_OP_READV's handler
+		 * (pagestore_daemon.c) passes ch->req_seq straight to
+		 * read_resolve() as the same cap read_resolve_version() enforces
+		 * for READ_AT, but until now only READ_AT ever supplied a nonzero
+		 * one.  Validate against the reader's own snapshot
+		 * (g_reader[0].snap), not the live model: a write after the pin
+		 * must not become visible here.
+		 */
+		if (rng_pct(20) && g_reader[0].held && tl == 0)
+		{
+			FzRel	   *snap = &g_reader[0].snap[rel];
+			uint64_t	req_lsn = g_reader[0].lsn;
+			uint64_t	req_seq = g_reader[0].seq;
+			uint32_t	n;
+			uint32_t	block;
+			int			status;
 
-		if (n > m->nblocks)
-			n = m->nblocks;
-		block = rng_below(m->nblocks - n + 1);
-		status = psc_op_readv(tl, target_inc, PS_KLASS_RELATION, rel, block,
-							  req_lsn, 0, read_buf, n);
-		ring_note("READV tl=%u rel=%u block=%u n=%u", tl, rel, block, n);
-		ck(status == PS_STATUS_OK, "READV tl=%u rel=%u block=%u n=%u "
-		   "(status %d)", tl, rel, block, n, status);
-		record_cov(PS_OP_READV, (uint32_t) status, 0);
-		if (status == PS_STATUS_OK)
-			for (uint32_t i = 0; i < n; i++)
+			if (snap->nblocks == 0)
 			{
-				const unsigned char *pg = read_buf + (size_t) i * PSC_PAGE_SIZE;
-				uint32_t	b = block + i;
-
-				if (m->tag[b] == 0)
+				/*
+				 * Empty at pin time: block 0 must read as zero-filled
+				 * through the pinned horizon, exactly like any other
+				 * unwritten block -- READV has no "found" flag, so unlike
+				 * READ_AT's pinned-empty probe there is no separate found/
+				 * absent distinction to check here, only the content.
+				 */
+				status = psc_op_readv(tl, target_inc, PS_KLASS_RELATION,
+									  rel, 0, req_lsn, req_seq, read_buf, 1);
+				ring_note("READV tl=%u rel=%u block=0 n=1 pinned-empty", tl,
+						  rel);
+				ck(status == PS_STATUS_OK, "READV (pinned-empty) tl=%u "
+				   "rel=%u block=0 (status %d)", tl, rel, status);
+				if (status == PS_STATUS_OK)
 				{
 					int			zero = 1;
 
 					for (uint32_t k = 0; k < PSC_PAGE_SIZE && zero; k++)
-						zero = pg[k] == 0;
-					ck(zero, "READV tl=%u rel=%u block=%u: unwritten block "
-					   "is not all-zero", tl, rel, b);
+						zero = read_buf[k] == 0;
+					ck(zero, "READV (pinned-empty) tl=%u rel=%u block=0: "
+					   "relation was empty at the pinned snapshot (lsn=%llu "
+					   "seq=%llu) but block 0 is nonzero there now", tl, rel,
+					   (unsigned long long) req_lsn,
+					   (unsigned long long) req_seq);
 				}
-				else
-					ck(psc_page_has_tag(pg, m->tag[b]) &&
-					   psc_page_lsn(pg) == m->lsn[b],
-					   "READV tl=%u rel=%u block=%u: expected tag=%u lsn=%llu"
-					   ", content does not match", tl, rel, b, m->tag[b],
-					   (unsigned long long) m->lsn[b]);
+				record_cov(PS_OP_READV, (uint32_t) status, 0);
+				return;
 			}
+
+			n = 1 + rng_below(3);
+			if (n > snap->nblocks)
+				n = snap->nblocks;
+			block = rng_below(snap->nblocks - n + 1);
+			status = psc_op_readv(tl, target_inc, PS_KLASS_RELATION, rel,
+								  block, req_lsn, req_seq, read_buf, n);
+			ring_note("READV tl=%u rel=%u block=%u n=%u pinned", tl, rel,
+					  block, n);
+			ck(status == PS_STATUS_OK, "READV (pinned) tl=%u rel=%u "
+			   "block=%u n=%u (status %d)", tl, rel, block, n, status);
+			record_cov(PS_OP_READV, (uint32_t) status, 0);
+			if (status == PS_STATUS_OK)
+				for (uint32_t i = 0; i < n; i++)
+				{
+					const unsigned char *pg = read_buf +
+						(size_t) i * PSC_PAGE_SIZE;
+					uint32_t	b = block + i;
+
+					if (snap->tag[b] == 0)
+					{
+						int			zero = 1;
+
+						for (uint32_t k = 0; k < PSC_PAGE_SIZE && zero; k++)
+							zero = pg[k] == 0;
+						ck(zero, "READV (pinned) tl=%u rel=%u block=%u: "
+						   "unwritten-at-pin block is not all-zero", tl,
+						   rel, b);
+					}
+					else
+						ck(psc_page_has_tag(pg, snap->tag[b]) &&
+						   psc_page_lsn(pg) == snap->lsn[b],
+						   "READV (pinned) tl=%u rel=%u block=%u: expected "
+						   "tag=%u lsn=%llu, content does not match", tl,
+						   rel, b, snap->tag[b],
+						   (unsigned long long) snap->lsn[b]);
+				}
+			return;
+		}
+
+		{
+			uint32_t	n = 1 + rng_below(3);
+			uint32_t	block;
+			uint64_t	req_lsn = rng_pct(15) ? UINT64_MAX : 0;
+			int			status;
+
+			if (n > m->nblocks)
+				n = m->nblocks;
+			block = rng_below(m->nblocks - n + 1);
+			status = psc_op_readv(tl, target_inc, PS_KLASS_RELATION, rel,
+								  block, req_lsn, 0, read_buf, n);
+			ring_note("READV tl=%u rel=%u block=%u n=%u", tl, rel, block, n);
+			ck(status == PS_STATUS_OK, "READV tl=%u rel=%u block=%u n=%u "
+			   "(status %d)", tl, rel, block, n, status);
+			record_cov(PS_OP_READV, (uint32_t) status, 0);
+			if (status == PS_STATUS_OK)
+				for (uint32_t i = 0; i < n; i++)
+				{
+					const unsigned char *pg = read_buf +
+						(size_t) i * PSC_PAGE_SIZE;
+					uint32_t	b = block + i;
+
+					if (m->tag[b] == 0)
+					{
+						int			zero = 1;
+
+						for (uint32_t k = 0; k < PSC_PAGE_SIZE && zero; k++)
+							zero = pg[k] == 0;
+						ck(zero, "READV tl=%u rel=%u block=%u: unwritten "
+						   "block is not all-zero", tl, rel, b);
+					}
+					else
+						ck(psc_page_has_tag(pg, m->tag[b]) &&
+						   psc_page_lsn(pg) == m->lsn[b],
+						   "READV tl=%u rel=%u block=%u: expected tag=%u "
+						   "lsn=%llu, content does not match", tl, rel, b,
+						   m->tag[b], (unsigned long long) m->lsn[b]);
+				}
+		}
 	}
 	else if (adv == ADV_UNDEFINED_TIMELINE || adv == ADV_BAD_INCARNATION ||
 			 adv == ADV_DELETED_TIMELINE)
@@ -3623,8 +3716,21 @@ act_artifact_begin(void)
 													&token, &reason);
 
 		ring_note("ARTIFACT_BEGIN adv=%d tl=%u", adv, target_tl);
-		ck(status == PS_STATUS_ERROR, "ARTIFACT_BEGIN with adversarial target "
-		   "must be refused (adv=%d tl=%u), got %d", adv, target_tl, status);
+		/*
+		 * Every "adversarial target" probe (bad incarnation, undefined, or
+		 * deleted timeline) is intercepted by ps_handle_meta()'s generic
+		 * timeline_op_allowed() gate (pagestore_core.c) before dispatch
+		 * ever reaches ps_artifact_begin() -- unlike PS_OP_TIMELINE_STATE/
+		 * PS_OP_BEGIN_DELETE, that gate does not special-case any
+		 * PS_OP_ARTIFACT_* opcode's ch->result, and handle_request()
+		 * zeroes ch->result before ps_handle_meta() ever runs, so the
+		 * reason reads back as PS_ARTIFACT_REFUSE_NONE (0) here every
+		 * time.
+		 */
+		ck(status == PS_STATUS_ERROR && reason == PS_ARTIFACT_REFUSE_NONE,
+		   "ARTIFACT_BEGIN with adversarial target must be refused with "
+		   "reason=NONE (adv=%d tl=%u), got status=%d reason=%u", adv,
+		   target_tl, status, reason);
 		record_cov(PS_OP_ARTIFACT_BEGIN, (uint32_t) status, reason);
 		return;
 	}
@@ -3889,9 +3995,19 @@ act_artifact_write(void)
 			status = psc_op_extend(target_tl, target_inc, klass, rel, 0,
 								   page_buf, art->lsn, art->token, NULL);
 			ring_note("ARTIFACT_WRITE adv=%d tl=%u", adv, target_tl);
-			ck(status == PS_STATUS_ERROR, "ARTIFACT_WRITE with adversarial "
-			   "target must be refused (adv=%d tl=%u), got %d", adv,
-			   target_tl, status);
+			/*
+			 * Same reasoning as ARTIFACT_BEGIN's adversarial-target probe:
+			 * handle_request()'s own PS_OP_EXTEND-specific
+			 * ps_timeline_request_allowed() gate (pagestore_daemon.c)
+			 * intercepts every adv case before ps_artifact_write() ever
+			 * runs, and ch->result was zeroed at the top of
+			 * handle_request() and never touched on this path.
+			 */
+			ck(status == PS_STATUS_ERROR &&
+			   psc_chan_ptr()->result == PS_ARTIFACT_REFUSE_NONE,
+			   "ARTIFACT_WRITE with adversarial target must be refused "
+			   "with reason=NONE (adv=%d tl=%u), got status=%d reason=%u",
+			   adv, target_tl, status, psc_chan_ptr()->result);
 			record_cov(PS_OP_EXTEND, (uint32_t) status,
 					  psc_chan_ptr()->result);
 			return;
@@ -3906,6 +4022,8 @@ act_artifact_write(void)
 			int			expect_ok = 1;
 			int			status;
 			uint32_t	reason;
+
+			uint64_t	seq = 0;
 
 			psc_fill_page(page_buf, art->lsn, tag);
 			if (probe == 0)
@@ -3925,7 +4043,7 @@ act_artifact_write(void)
 			}
 
 			status = psc_op_extend(tl, g_tl[tl].incarnation, klass, rel,
-								   block, page_buf, use_lsn, use_token, NULL);
+								   block, page_buf, use_lsn, use_token, &seq);
 			reason = psc_chan_ptr()->result;
 			ring_note("ARTIFACT_WRITE tl=%u akind=%u rel=%u block=%u "
 					  "probe=%d", tl, akind, rel, block, probe);
@@ -3964,6 +4082,19 @@ act_artifact_write(void)
 				record_cov(PS_OP_EXTEND, (uint32_t) status, reason);
 				if (status == PS_STATUS_OK)
 				{
+					/*
+					 * ps_artifact_write()'s open-attempt path
+					 * (pagestore_artifact_lifecycle.inc) allocates this
+					 * append's own admission sequence via
+					 * append_page_raw_outcome() -> append_page_impl() and
+					 * stamps it back through ch->req_seq -- a fresh value
+					 * distinct from art->token (BEGIN's own sequence,
+					 * already tracked).  Feed it into the barrier's
+					 * high-water mark too, or a restart that rolls the
+					 * allocator back below this acknowledged write but
+					 * above the BEGIN token would pass unnoticed.
+					 */
+					note_mutation_seq(seq);
 					if (!art->open_written[block])
 					{
 						art->open_count++;
@@ -4050,9 +4181,13 @@ act_artifact_commit(void)
 														 &reason);
 
 			ring_note("ARTIFACT_COMMIT adv=%d tl=%u", adv, target_tl);
-			ck(status == PS_STATUS_ERROR, "ARTIFACT_COMMIT with adversarial "
-			   "target must be refused (adv=%d tl=%u), got %d", adv,
-			   target_tl, status);
+			/* Same ps_handle_meta() generic-gate reasoning as
+			 * ARTIFACT_BEGIN's adversarial-target probe: reason reads back
+			 * as PS_ARTIFACT_REFUSE_NONE every time. */
+			ck(status == PS_STATUS_ERROR && reason == PS_ARTIFACT_REFUSE_NONE,
+			   "ARTIFACT_COMMIT with adversarial target must be refused "
+			   "with reason=NONE (adv=%d tl=%u), got status=%d reason=%u",
+			   adv, target_tl, status, reason);
 			record_cov(PS_OP_ARTIFACT_COMMIT, (uint32_t) status, reason);
 			return;
 		}
@@ -4176,9 +4311,24 @@ act_artifact_commit(void)
 			}
 			else
 			{
-				ck(status == PS_STATUS_ERROR, "ARTIFACT_COMMIT probe=%d "
-				   "(tl=%u akind=%u rel=%u) must be refused, got %d", probe,
-				   tl, akind, rel, status);
+				/*
+				 * All three probes are deterministically
+				 * PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH
+				 * (pagestore_artifact_lifecycle.inc's ps_artifact_commit()):
+				 * wrong-token/wrong-lsn fail artifact_completed_attempt()'s
+				 * state==0 path (use_lsn/use_token can never match a prior
+				 * COMMIT -- art->lsn is this attempt's own unique, never-
+				 * before-committed generation) and then artifact_attempt()
+				 * itself, both mapped to ATTEMPT_MISMATCH; wrong-count keeps
+				 * the correct (lsn, token) so artifact_attempt() succeeds,
+				 * but the subsequent fork->artifact_page_count != count
+				 * check fails instead, still ATTEMPT_MISMATCH.
+				 */
+				ck(status == PS_STATUS_ERROR &&
+				   reason == PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH,
+				   "ARTIFACT_COMMIT probe=%d (tl=%u akind=%u rel=%u) must be "
+				   "refused with reason=ATTEMPT_MISMATCH, got status=%d "
+				   "reason=%u", probe, tl, akind, rel, status, reason);
 				record_cov(PS_OP_ARTIFACT_COMMIT, (uint32_t) status, reason);
 			}
 		}
@@ -4263,8 +4413,13 @@ act_artifact_drop(void)
 												   &reason);
 
 		ring_note("ARTIFACT_DROP adv=%d tl=%u", adv, target_tl);
-		ck(status == PS_STATUS_ERROR, "ARTIFACT_DROP with adversarial target "
-		   "must be refused (adv=%d tl=%u), got %d", adv, target_tl, status);
+		/* Same ps_handle_meta() generic-gate reasoning as ARTIFACT_BEGIN's
+		 * adversarial-target probe: reason reads back as
+		 * PS_ARTIFACT_REFUSE_NONE every time. */
+		ck(status == PS_STATUS_ERROR && reason == PS_ARTIFACT_REFUSE_NONE,
+		   "ARTIFACT_DROP with adversarial target must be refused with "
+		   "reason=NONE (adv=%d tl=%u), got status=%d reason=%u", adv,
+		   target_tl, status, reason);
 		record_cov(PS_OP_ARTIFACT_DROP, (uint32_t) status, reason);
 		return;
 	}
@@ -4426,6 +4581,7 @@ env_materialize(void)
 	unsigned char image[PSC_PAGE_SIZE];
 	unsigned char marker[PSC_PAGE_SIZE];
 	uint64_t	seq = 0;
+	uint64_t	ctl_seq;
 	int			ok = 1;
 	int			status;
 
@@ -4436,9 +4592,29 @@ env_materialize(void)
 	memset(marker, 0x3d, sizeof(marker));
 	memcpy(marker, &lsn, sizeof(lsn));
 
-	ok = ok && psc_op_write_control(1, note, lsn) == PS_STATUS_OK;
-	ok = ok && psc_op_write_control(0, image, lsn) == PS_STATUS_OK;
-	ok = ok && psc_op_write_control(3, marker, lsn) == PS_STATUS_OK;
+	/*
+	 * Each control write allocates its own fresh admission sequence (see
+	 * psc_op_write_control()'s header comment); feed every one that
+	 * actually completed into the barrier's high-water mark, not just the
+	 * retention reserve's below -- ok's short-circuit && means a later
+	 * write never runs once an earlier one has already failed, so each
+	 * call's own ctl_seq is only meaningful when it ran.
+	 */
+	ctl_seq = 0;
+	if (ok && psc_op_write_control(1, note, lsn, &ctl_seq) == PS_STATUS_OK)
+		note_mutation_seq(ctl_seq);
+	else
+		ok = 0;
+	ctl_seq = 0;
+	if (ok && psc_op_write_control(0, image, lsn, &ctl_seq) == PS_STATUS_OK)
+		note_mutation_seq(ctl_seq);
+	else
+		ok = 0;
+	ctl_seq = 0;
+	if (ok && psc_op_write_control(3, marker, lsn, &ctl_seq) == PS_STATUS_OK)
+		note_mutation_seq(ctl_seq);
+	else
+		ok = 0;
 	status = psc_op_walidx_progress_commit(0, 0, g_tl[0].walidx_progress, lsn);
 	ok = ok && status == PS_STATUS_OK;
 	if (ok)
@@ -4857,6 +5033,10 @@ verify_branch(uint32_t slot, const char *phase)
 			   "absent at its fork)", phase, slot, rel, nb);
 			continue;
 		}
+		ck(psc_op_exists(slot, b->incarnation, PS_KLASS_RELATION, rel, 0,
+						 &exists) == PS_STATUS_OK && exists,
+		   "%s: branch %u does not see relation %u that exists at its fork",
+		   phase, slot, rel);
 		ck(psc_op_nblocks(slot, b->incarnation, PS_KLASS_RELATION, rel, 0, 0,
 						  &nb) == PS_STATUS_OK && nb == m->nblocks,
 		   "%s: branch %u rel %u nblocks expected %u got %u", phase, slot,
@@ -5853,7 +6033,7 @@ static const FzAction g_actions[] = {
 	{"env_branch_write", env_branch_write, 4},
 	{"verify_branch_frozen", act_verify_branch_frozen, 4},
 	{"env_branch_begin_delete", env_branch_begin_delete, 1},
-	{"env_wait_deleted", env_wait_deleted, 1},
+	{"env_wait_deleted", env_wait_deleted, 2},
 	{"env_sleep", env_sleep, 3},
 	{"env_clean_restart", env_clean_restart, 1},
 	{"env_crash_restart", env_crash_restart, 1},

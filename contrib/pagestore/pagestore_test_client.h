@@ -1196,11 +1196,19 @@ psc_op_retention_floor(uint32_t tl, uint64_t inc, uint32_t resources,
 	return ch->status;
 }
 
-/* Control-class write mirroring the backend's/soak's obj_write shape, built
+/*
+ * Control-class write mirroring the backend's/soak's obj_write shape, built
  * only out of stage-1 opcodes (CREATE/NBLOCKS/WRITEV/EXTEND) against
- * PS_KLASS_CONTROL, for a materializer-style publication. */
+ * PS_KLASS_CONTROL, for a materializer-style publication.  out_seq
+ * (nullable): PS_KLASS_CONTROL is not an artifact_data_key(), so the final
+ * WRITEV/EXTEND's ps_artifact_write() (pagestore_artifact_lifecycle.inc)
+ * takes its "not under the lifecycle protocol" plain-append branch and
+ * stamps a genuine, freshly allocated admission sequence back through
+ * ch->req_seq on success -- same contract as psc_op_extend()/
+ * psc_op_writev(). */
 static int
-psc_op_write_control(uint32_t block, const unsigned char *page, uint64_t version)
+psc_op_write_control(uint32_t block, const unsigned char *page,
+					  uint64_t version, uint64_t *out_seq)
 {
 	PsChannel  *ch = psc_chan_ptr();
 	uint32_t	nb = 0;
@@ -1224,7 +1232,10 @@ psc_op_write_control(uint32_t block, const unsigned char *page, uint64_t version
 	ch->nblocks = 1;
 	ch->req_lsn = version;
 	memcpy(ch->data, page, PSC_PAGE_SIZE);
-	return psc_cl_exec()->status;
+	psc_cl_exec();
+	if (out_seq)
+		*out_seq = ch->req_seq;
+	return ch->status;
 }
 
 /*
