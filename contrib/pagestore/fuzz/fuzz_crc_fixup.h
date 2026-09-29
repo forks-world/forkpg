@@ -42,4 +42,23 @@
 extern void ps_fuzz_crc_fixup(const char *target_name, const char *work_dir,
 							   uint8_t *buf, size_t len);
 
+/*
+ * Sets the walidx_log_epoch target's sibling durable-length watermark
+ * (walidx_0_0_e00000000000000000001.size) to new_length, so
+ * posix_walidx_epoch_reconcile_locked() (storage_posix.c) does not clamp
+ * every read of the mutated log back down to whatever length the
+ * pristine/stale watermark recorded (0, in this harness's fixture). Unlike
+ * every other cross-file fixup in this file, ps_fuzz_run_one()
+ * (fuzz_common.c) calls this directly and unconditionally -- in both raw
+ * and CRC-fixup iterations -- right after the target file itself is
+ * written, since the mutated bytes reaching walidx_recover_one()'s record
+ * loop at all (as opposed to that loop then accepting or rejecting them)
+ * does not depend on whether this iteration also got the structure-aware
+ * checksum fixup. See its own comment in fuzz_crc_fixup.c for why
+ * new_length is always the log's own full length rather than a value
+ * derived from a few input bytes.
+ */
+extern void fixup_walidx_log_epoch_watermark(const char *work_dir,
+											  uint64_t new_length);
+
 #endif							/* PS_FUZZ_CRC_FIXUP_H */

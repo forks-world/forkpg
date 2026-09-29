@@ -944,6 +944,28 @@ ps_fuzz_run_one(const char *target_name, const uint8_t *data, size_t size)
 	write_file(target_path, content, content_len);
 	free(content);
 
+	/*
+	 * Codex finding on PR #303 (walidx_log_epoch, same class as this
+	 * round's page_segment finding): the mutated log file above is not the
+	 * only thing that decides whether walidx_recover_one() ever sees its
+	 * bytes -- posix_walidx_epoch_reconcile_locked() (storage_posix.c)
+	 * clamps every read of an epoch log to a *sibling* file's recorded
+	 * durable length, independent of this file's own on-disk length. That
+	 * sibling starts at 0 in this harness's fixture, so without this call
+	 * the walidx_log_epoch target's input -- mutated or pristine, raw or
+	 * CRC-fixed-up -- was silently discarded before a single byte reached
+	 * the parser. This has to run unconditionally, not only when
+	 * should_fixup_this_iteration() above decided to fix up this
+	 * iteration's checksums: raw mode still needs to actually reach
+	 * walidx_recover_one()'s crc/framing checks on whatever bytes the
+	 * mutation produced, not just get a chance to sometimes. See
+	 * fixup_walidx_log_epoch_watermark()'s own comment (fuzz_crc_fixup.c)
+	 * for the full mechanism and why the watermark is always synced to the
+	 * input's full length.
+	 */
+	if (strcmp(resolved_target_name, "walidx_log_epoch") == 0)
+		fixup_walidx_log_epoch_watermark(work_dir, (uint64_t) content_len);
+
 	mute_output();
 	if (ps_core_open(work_dir) == 0)
 	{

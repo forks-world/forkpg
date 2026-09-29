@@ -846,26 +846,47 @@ fixup_walidx_watermark(const char *work_dir, uint8_t *buf, size_t len)
 }
 
 /*
- * Round-6 coordinator review: for an epoch (nonzero) log,
- * posix_walidx_epoch_reconcile_locked() (storage_posix.c) is on every read
- * path a store open takes to this file (posix_walidx_read(), used by
- * walidx_recover_one() in pagestore_core.c) -- it reads the sibling
- * <logname>.size watermark and, if the log's actual on-disk length exceeds
- * the watermark's recorded length, silently ftruncate()s the log down to
- * that length *before* a single byte is parsed. This harness's one epoch
- * log fixture (walidx_0_0_e00000000000000000001) starts empty, so its
- * watermark already records length 0: every mutation that grows the log
- * (which is most of them, since the seed itself is empty) was reconciled
- * straight back down to zero bytes, and fixup_walidx_log() above never got
- * a single record in front of the reader. This patches the sibling
- * watermark's length (and crc) to the mutated log's actual length so the
+ * Codex finding on PR #303 (walidx_log_epoch, same class as the
+ * page_segment finding this round): posix_walidx_epoch_reconcile_locked()
+ * (storage_posix.c) is on every read path a store open takes to an epoch
+ * (nonzero) log (posix_walidx_read(), used by walidx_recover_one() in
+ * pagestore_core.c) -- it reads the sibling <logname>.size watermark and
+ * clamps every read to that recorded length, regardless of the log file's
+ * actual on-disk bytes. This harness's one epoch log fixture
+ * (walidx_0_0_e00000000000000000001) starts empty, so its watermark
+ * already records length 0: independent of what fixup_walidx_log() above
+ * did to the record bytes, or whether it ran at all, every read of this
+ * file was clamped straight back down to zero bytes before a single
+ * record was parsed -- exactly the "mutated bytes never reach the parser"
+ * shape as the watermark-segment page_segment finding, just via a sibling
+ * length record instead of a segment scan cursor.
+ *
+ * Sets the sibling watermark's length (and crc) to new_length so the
  * reconcile is a no-op and the mutated bytes actually reach
- * walidx_recover_one()'s record loop. walidx_log_legacy (epoch 0) is not
- * touched by this at all -- posix_walidx_read()/_append() special-case
- * epoch 0 to skip reconcile entirely (it is the pre-epoch lazily-created
- * log), so that target has no sibling watermark to keep in sync.
+ * walidx_recover_one()'s record loop. Exported (see fuzz_crc_fixup.h) and
+ * called unconditionally from ps_fuzz_run_one() (fuzz_common.c) right
+ * after the walidx_log_epoch target file itself is written -- in *both*
+ * raw and CRC-fixup iterations, not only fixed-up ones: raw mode still
+ * needs to see whatever bad crc/framing the mutation produced inside the
+ * log, it just should not be denied that chance by an unrelated, always-
+ * stale sibling file. new_length is always the log's own full length here
+ * (not a value derived from a few input bytes to sometimes clamp shorter):
+ * the fuzz input already supplies every interesting "torn" shape recover()
+ * itself checks for (a short header, a body that does not fit before the
+ * file's own end, ...), so a *shorter-than-physical* durable watermark
+ * would only ever throw away already-written suffix bytes without
+ * exercising any check this harness does not already reach some other
+ * way, while making the primary "does the mutation get parsed at all"
+ * property probabilistic instead of guaranteed. Kept simple, per the
+ * coordinator's call, at the cost of not separately fuzzing that specific
+ * watermark-below-physical-length relationship in this target.
+ *
+ * walidx_log_legacy (epoch 0) is not touched by this at all --
+ * posix_walidx_read()/_append() special-case epoch 0 to skip reconcile
+ * entirely (it is the pre-epoch lazily-created log), so that target has no
+ * sibling watermark to keep in sync.
  */
-static void
+void
 fixup_walidx_log_epoch_watermark(const char *work_dir, uint64_t new_length)
 {
 	char		path[4096];
@@ -900,8 +921,14 @@ fixup_walidx_log_epoch_watermark(const char *work_dir, uint64_t new_length)
 static void
 fixup_walidx_log_epoch(const char *work_dir, uint8_t *buf, size_t len)
 {
+	(void) work_dir;
 	fixup_walidx_log(buf, len, 0);		/* walidx_0_0_e...: timeline 0 */
-	fixup_walidx_log_epoch_watermark(work_dir, (uint64_t) len);
+	/* The sibling watermark is now kept in sync unconditionally by
+	 * ps_fuzz_run_one() (fuzz_common.c), in every iteration -- not only a
+	 * fixed-up one -- via fixup_walidx_log_epoch_watermark(); see that
+	 * function's own comment. Calling it again here would just re-derive
+	 * the same value from the same length a second time, not fix anything
+	 * this call site's own crc/framing work still needs. */
 }
 
 /* ---- wal_segments_<tl>/wal_store_identity_v1 (pagestore_wal_store.c) --
