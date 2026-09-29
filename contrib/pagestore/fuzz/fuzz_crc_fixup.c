@@ -29,6 +29,7 @@
 #endif
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -82,6 +83,13 @@ static uint64_t
 get_le64(const unsigned char *p)
 {
 	return (uint64_t) get_le32(p) | (uint64_t) get_le32(p + 4) << 32;
+}
+
+static void
+put_le64(unsigned char *p, uint64_t v)
+{
+	put_le32(p, (uint32_t) v);
+	put_le32(p + 4, (uint32_t) (v >> 32));
 }
 
 /*
@@ -1025,13 +1033,18 @@ fixup_image_layer(const char *work_dir, uint8_t *buf, size_t len)
  */
 #define FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL 80u
 
+/* checkpoint/tail live-directory paths, relative to work_dir -- shared by
+ * fixup_forkmeta_snapshot_manifest() (reads the pristine template copies)
+ * and fixup_forkmeta_snapshot_part() (reads/patches the live sibling). */
+static const char *const forkmeta_snapshot_part_paths[2] = {
+	"forkmeta_snapshots/forkmeta_checkpoint_v1_00000000000000000001",
+	"forkmeta_snapshots/forkmeta_tail_v1_00000000000000000001"
+};
+
 static void
 fixup_forkmeta_snapshot_manifest(uint8_t *buf, size_t len)
 {
-	static const char *const part_paths[2] = {
-		"forkmeta_snapshots/forkmeta_checkpoint_v1_00000000000000000001",
-		"forkmeta_snapshots/forkmeta_tail_v1_00000000000000000001"
-	};
+	const char *const *part_paths = forkmeta_snapshot_part_paths;
 	const uint8_t *parts[2];
 	size_t		part_lens[2];
 	uint64_t	generation;
@@ -1095,21 +1108,98 @@ fixup_forkmeta_snapshot_manifest(uint8_t *buf, size_t len)
  *     outer manifest checksum only to fail immediately on its own stale
  *     inner checksum, never reaching the semantic/ordering checks the
  *     record parser is supposed to see).
+ *
+ * Codex finding on PR #303 round 2 (e402d1d9a): a third gate sits ahead of
+ * both of the above. fork_meta_snapshot_load() requires *this* part's own
+ * record-count field (checkpoint_records for the checkpoint part,
+ * tail_records for the tail part) to satisfy
+ * `file length == header_bytes(80) + nrecords * sizeof(ForkMetaRecV2)`, and
+ * then requires the checkpoint and tail headers to be byte-identical from
+ * generation through tail_bytes -- which, since both headers carry *all
+ * four* of checkpoint_records/tail_records/checkpoint_bytes/tail_bytes
+ * (not one field per part), means a record-aligned append/remove to just
+ * this file also goes stale in the *sibling* part's on-disk header. This
+ * derives this part's own pair from the actual resized buffer, reads the
+ * sibling's own pair from its live on-disk header (unchanged), writes the
+ * agreed four fields into both this buffer and the sibling file, and -- since
+ * that patches the sibling file's bytes -- refreshes the sibling's own
+ * whole-file hash in the manifest alongside this part's (len, crc) entry.
  */
 static void
 fixup_forkmeta_snapshot_part(const char *work_dir, uint8_t *buf, size_t len,
 							  int is_tail)
 {
 	char		path[4096];
+	char		sibling_path[4096];
 	unsigned char manifest[FORKMETA_SNAPSHOT_HEADER_BYTES_LOCAL];
 	int			fd;
 	uint32_t	part_crc;
 	size_t		len_off = is_tail ? 52 : 40;
 	size_t		crc_off = is_tail ? 60 : 48;
+	size_t		sib_crc_off = is_tail ? 48 : 60;
+	int			sib_crc_valid = 0;
+	uint32_t	sib_crc = 0;
 
 	if (len > FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL)
 		fixup_forkmeta_records(buf + FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL,
 							   len - FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL);
+
+	if (len >= FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL &&
+		(len - FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL) %
+			sizeof(FuzzForkMetaRecV2) == 0 &&
+		snprintf(sibling_path, sizeof(sibling_path), "%s/%s", work_dir,
+				 forkmeta_snapshot_part_paths[is_tail ? 0 : 1]) <
+			(int) sizeof(sibling_path))
+	{
+		uint64_t	nrecords_this = (uint64_t)
+			(len - FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL) /
+			sizeof(FuzzForkMetaRecV2);
+		uint64_t	bytes_this = nrecords_this * sizeof(FuzzForkMetaRecV2);
+		int			sib_fd = open(sibling_path, O_RDWR);
+		struct stat sib_st;
+		uint8_t    *sib_buf = NULL;
+
+		if (sib_fd >= 0 && fstat(sib_fd, &sib_st) == 0 &&
+			sib_st.st_size >=
+				(off_t) FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL &&
+			(sib_buf = malloc((size_t) sib_st.st_size)) != NULL &&
+			read(sib_fd, sib_buf, (size_t) sib_st.st_size) ==
+				(ssize_t) sib_st.st_size)
+		{
+			/* Offsets within the 80-byte ForkMetaSnapshotPayloadHeader:
+			 * checkpoint_records@48, tail_records@56, checkpoint_bytes@64,
+			 * tail_bytes@72 (8 bytes each, pagestore_core.c). */
+			uint64_t	ckpt_records =
+				is_tail ? get_le64(sib_buf + 48) : nrecords_this;
+			uint64_t	tail_records =
+				is_tail ? nrecords_this : get_le64(sib_buf + 56);
+			uint64_t	ckpt_bytes =
+				is_tail ? get_le64(sib_buf + 64) : bytes_this;
+			uint64_t	tail_bytes =
+				is_tail ? bytes_this : get_le64(sib_buf + 72);
+
+			put_le64(buf + 48, ckpt_records);
+			put_le64(buf + 56, tail_records);
+			put_le64(buf + 64, ckpt_bytes);
+			put_le64(buf + 72, tail_bytes);
+
+			put_le64(sib_buf + 48, ckpt_records);
+			put_le64(sib_buf + 56, tail_records);
+			put_le64(sib_buf + 64, ckpt_bytes);
+			put_le64(sib_buf + 72, tail_bytes);
+
+			if (pwrite(sib_fd, sib_buf, (size_t) sib_st.st_size, 0) ==
+				(ssize_t) sib_st.st_size)
+			{
+				sib_crc = fnv1a_step(FNV1A_INIT, sib_buf,
+									  (size_t) sib_st.st_size);
+				sib_crc_valid = 1;
+			}
+		}
+		free(sib_buf);
+		if (sib_fd >= 0)
+			close(sib_fd);
+	}
 
 	if (snprintf(path, sizeof(path),
 				 "%s/forkmeta_snapshots/forkmeta_manifest_v1", work_dir) >=
@@ -1131,6 +1221,11 @@ fixup_forkmeta_snapshot_part(const char *work_dir, uint8_t *buf, size_t len,
 	for (unsigned i = 0; i < 8; i++)
 		manifest[len_off + i] = (unsigned char) ((uint64_t) len >> (i * 8));
 	put_le32(manifest + crc_off, part_crc);
+	/* The sibling's manifest-recorded length is left untouched: patching
+	 * its header in place above never changes its file length, only its
+	 * content hash. */
+	if (sib_crc_valid)
+		put_le32(manifest + sib_crc_off, sib_crc);
 	put_le32(manifest + 64, 0);
 	put_le32(manifest + 64,
 			 fnv1a_step(FNV1A_INIT, manifest, sizeof(manifest)));
@@ -1190,6 +1285,33 @@ fixup_walidx_snapshot_manifest(uint8_t *buf, size_t len)
 
 	if (len < 52)
 		return;					/* need through the crc field itself */
+
+	/*
+	 * Audit fix alongside the Codex round-2 findings on PR #303 (e402d1d9a):
+	 * the same "length/count field left stale after a resize" class those
+	 * two findings named. ps_walidx_snapshot_open_internal()
+	 * (pagestore_walidx_snapshot.c) requires this file's own actual length
+	 * to equal HEADER_BYTES(64) + nshards*ENTRY_BYTES(16) *before* even
+	 * reading the crc -- an entry-aligned length mutation left the
+	 * fuzzer-mutated nshards@20 field unrelated to the buffer's actual
+	 * (possibly resized) size, so it was rejected at that self-consistency
+	 * gate before this function's own crc/identity fixups below ever
+	 * mattered. Derived only for an entry-aligned length in range; anything
+	 * else can never satisfy that equation regardless, so it is left as
+	 * before.
+	 */
+	if (len >= WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL &&
+		(len - WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL) %
+			WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL == 0)
+	{
+		uint64_t	derived_nshards = (uint64_t)
+			(len - WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL) /
+			WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL;
+
+		if (derived_nshards > 0 &&
+			derived_nshards <= WALIDX_SNAPSHOT_MANIFEST_MAX_SHARDS_LOCAL)
+			put_le32(buf + 20, (uint32_t) derived_nshards);
+	}
 
 	manifest_tmpl = ps_fuzz_template_lookup(
 		"walidx_snapshots_0/walidx_manifest_v1", &manifest_tmpl_len);
@@ -1328,6 +1450,30 @@ fixup_walidx_snapshot_shard(const char *work_dir, uint8_t *buf, size_t len)
 		buf[56 + i] = (unsigned char) (generation >> (i * 8));	/* log_epoch */
 	}
 	memset(buf + 48, 0, 8);		/* source_offset must be 0 */
+
+	/*
+	 * Codex finding on PR #303 round 2 (e402d1d9a): a record-aligned length
+	 * mutation (a complete 64-byte WalIdxRec appended or removed) left
+	 * nrecords (the low 32 bits @20, the high 32 bits @68 -- see
+	 * walidx_snapshot_encode_header()/decode_header() in pagestore_core.c)
+	 * at whatever the fuzzer-mutated header carried. The reader computes
+	 * `expected_len = header_bytes + nrecords * record_bytes` and rejects
+	 * the shard if that disagrees with the manifest-recorded length (which
+	 * the fixup below already pins to this buffer's real len) -- so nrecords
+	 * must track the actual payload here too. Derived only for a
+	 * record-aligned length; a non-aligned length can never satisfy
+	 * expected_len regardless, so it is left alone like every other
+	 * unrecoverable shape in this file.
+	 */
+	if (len >= 72 && (len - 72) % WALIDX_REC_BYTES_LOCAL == 0)
+	{
+		uint64_t	derived_nrecords = (uint64_t) (len - 72) /
+			WALIDX_REC_BYTES_LOCAL;
+
+		put_le32(buf + 20, (uint32_t) derived_nrecords);
+		put_le32(buf + 68, (uint32_t) (derived_nrecords >> 32));
+	}
+
 	put_le32(buf + 64, 0);
 	put_le32(buf + 64, fnv1a_step(FNV1A_INIT, buf, 72));
 
