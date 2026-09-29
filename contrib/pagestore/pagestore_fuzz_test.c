@@ -170,6 +170,11 @@ typedef struct FzTimeline
 	int			has_parent;
 	uint32_t	parent;
 	uint64_t	branch_lsn;
+	uint64_t	branch_seq;		/* admission sequence fence captured right
+								 * after CREATE_BRANCH, before anything
+								 * (including the Bug-B workaround's own
+								 * throwaway WAL) can run again -- see
+								 * verify_branch_frozen(). */
 	uint64_t	wal_start;
 	uint64_t	wal_end;		/* next byte we will append at */
 	int			wal_shipped;	/* has this timeline's *own* WAL log ever
@@ -1478,14 +1483,39 @@ act_read_at(void)
 			req_seq = g_reader[0].seq;
 			/* verify against the pin's own snapshot, not the live model */
 			m = &g_reader[0].snap[rel];
-			if (b >= m->nblocks)
-				b = m->nblocks ? m->nblocks - 1 : 0;
 			if (m->nblocks == 0)
 			{
-				req_lsn = UINT64_MAX;
-				req_seq = 0;
-				m = &g_tl[tl].rel[rel];
+				/*
+				 * The pin was reserved while this relation was absent or
+				 * had zero blocks.  Keep the pinned (lsn, seq) horizon here
+				 * -- don't fall back to a newest-alias read against the
+				 * live model -- and require block 0 to still be absent
+				 * there, even though the live relation may since have been
+				 * created or extended: a regression that resolves a capped
+				 * read against the live nblocks instead of the fenced
+				 * snapshot would otherwise incorrectly surface block 0.
+				 */
+				b = 0;
+				status = psc_op_read_at(tl, target_inc, PS_KLASS_RELATION,
+										rel, b, req_lsn, req_seq, read_buf,
+										&found, &resolved_lsn, NULL);
+				ring_note("READ_AT tl=%u rel=%u block=%u mode=%d "
+						  "pinned-empty", tl, rel, b, mode);
+				observe(PS_OP_READ_AT, status, 0, "READ_AT (pinned-empty)",
+						0);
+				ck(status == PS_STATUS_OK, "READ_AT (pinned-empty) tl=%u "
+				   "rel=%u block=%u (status %d)", tl, rel, b, status);
+				if (status == PS_STATUS_OK)
+					ck(!found, "READ_AT (pinned-empty) tl=%u rel=%u "
+					   "block=%u: relation was empty at the pinned "
+					   "snapshot (lsn=%llu seq=%llu) but block 0 is "
+					   "visible there now", tl, rel, b,
+					   (unsigned long long) req_lsn,
+					   (unsigned long long) req_seq);
+				return;
 			}
+			if (b >= m->nblocks)
+				b = m->nblocks - 1;
 		}
 		else
 		{
@@ -1712,29 +1742,63 @@ act_unknown_opcode(void)
 	record_cov(PS_OP_NONE, (uint32_t) status, 0);
 }
 
-/* PS_OP_ADMISSION_BARRIER: no timeline/incarnation target, so there is no
+/*
+ * PS_OP_ADMISSION_BARRIER: no timeline/incarnation target, so there is no
  * generic adversarial dimension to exercise here (see g_stage1_ops' note);
- * the oracle is simply "OK, req_seq != 0, and never decreases" -- an
- * admission sequence is a single global monotonic counter. */
+ * the oracle is "OK, req_seq != 0, never decreases, and always covers the
+ * highest admission sequence any successful mutation has proven happened".
+ *
+ * g_last_admission_seq alone (the previous barrier response) only detects a
+ * sequence going *backwards* relative to an earlier barrier -- a daemon
+ * that keeps returning the same stale-but-nonzero sequence after real
+ * mutations complete would still pass.  g_max_mutation_seq is fed
+ * separately, by every successful mutation that exposes its own admission
+ * sequence (artifact BEGINs' token, retention reservations' seq -- see
+ * note_mutation_seq()'s call sites), and check_admission_barrier() requires
+ * each later barrier to be >= that high-water mark too.  Run the same check
+ * right after a restart (verify_after_restart()) and it also catches
+ * recovery rolling the allocator backward.
+ */
 static uint64_t g_last_admission_seq;
+static uint64_t g_max_mutation_seq;
 
 static void
-act_admission_barrier(void)
+note_mutation_seq(uint64_t seq)
+{
+	if (seq > g_max_mutation_seq)
+		g_max_mutation_seq = seq;
+}
+
+static void
+check_admission_barrier(const char *phase)
 {
 	uint64_t	seq = 0;
 	int			status = psc_op_admission_barrier(&seq);
 
-	ring_note("ADMISSION_BARRIER");
-	ck(status == PS_STATUS_OK && seq != 0, "ADMISSION_BARRIER (status %d "
-	   "seq=%llu)", status, (unsigned long long) seq);
+	ck(status == PS_STATUS_OK && seq != 0, "%s: ADMISSION_BARRIER (status %d "
+	   "seq=%llu)", phase, status, (unsigned long long) seq);
 	if (status == PS_STATUS_OK)
-		ck(seq >= g_last_admission_seq, "ADMISSION_BARRIER sequence went "
-		   "backwards: had %llu, got %llu",
+	{
+		ck(seq >= g_last_admission_seq, "%s: ADMISSION_BARRIER sequence "
+		   "went backwards: had %llu, got %llu", phase,
 		   (unsigned long long) g_last_admission_seq,
 		   (unsigned long long) seq);
+		ck(seq >= g_max_mutation_seq, "%s: ADMISSION_BARRIER sequence %llu "
+		   "does not cover the highest admission sequence a successful "
+		   "mutation already proved happened (%llu) -- a stale barrier, or "
+		   "(after restart) the allocator rolling backward", phase,
+		   (unsigned long long) seq, (unsigned long long) g_max_mutation_seq);
+	}
 	record_cov(PS_OP_ADMISSION_BARRIER, (uint32_t) status, 0);
 	if (status == PS_STATUS_OK && seq > g_last_admission_seq)
 		g_last_admission_seq = seq;
+}
+
+static void
+act_admission_barrier(void)
+{
+	ring_note("ADMISSION_BARRIER");
+	check_admission_barrier("ADMISSION_BARRIER");
 }
 
 /* ===================== WAL ops ============================================ */
@@ -1847,16 +1911,73 @@ act_walidx_add(void)
 
 	if (adv == ADV_NONE)
 	{
+		uint32_t	block = rng_below(FZ_MAXBLK);
 		uint64_t	lsn = ship_wal(tl);
 		int			status = psc_op_walidx_add(tl, target_inc,
 												  PS_KLASS_RELATION, rel,
-												  rng_below(FZ_MAXBLK), lsn);
+												  block, lsn);
 
-		ring_note("WAL_INDEX_ADD tl=%u rel=%u lsn=%llu", tl, rel,
-				  (unsigned long long) lsn);
-		ck(status == PS_STATUS_OK, "WAL_INDEX_ADD tl=%u rel=%u (status %d)",
-		   tl, rel, status);
+		ring_note("WAL_INDEX_ADD tl=%u rel=%u block=%u lsn=%llu", tl, rel,
+				  block, (unsigned long long) lsn);
+		ck(status == PS_STATUS_OK, "WAL_INDEX_ADD tl=%u rel=%u block=%u "
+		   "(status %d)", tl, rel, block, status);
 		record_cov(PS_OP_WAL_INDEX_ADD, (uint32_t) status, 0);
+		if (status == PS_STATUS_OK)
+		{
+			/*
+			 * Retain the (key, block, lsn) this single-record ADD just
+			 * published and require a subsequent GET to actually contain
+			 * it: the legal path above only checked the returned status,
+			 * so a daemon whose PS_OP_WAL_INDEX_ADD returns OK without
+			 * storing anything would otherwise pass unnoticed (every
+			 * *other* GET probe in this file writes its own fresh batch
+			 * record right before querying -- see act_walidx_get() -- so
+			 * none of them would catch this ADD-specific regression
+			 * either).  Publish progress past it first, the same way
+			 * act_walidx_get() does, since walidx_get() only returns
+			 * entries below the durable WAL_INDEX_PROGRESS marker.
+			 */
+			FzRel	   *m = &g_tl[tl].rel[rel];
+			int			dead = !m->exists || block >= m->nblocks;
+			uint64_t	end = lsn + FZ_WAL_PAYLOAD;
+			int			n = 0;
+			int			gstatus;
+
+			ck(psc_op_walidx_progress_commit(tl, target_inc,
+											 g_tl[tl].walidx_progress,
+											 end) == PS_STATUS_OK,
+			   "WAL_INDEX_PROGRESS commit after ADD tl=%u rel=%u block=%u",
+			   tl, rel, block);
+			if (end > g_tl[tl].walidx_progress)
+				g_tl[tl].walidx_progress = end;
+			g_tl[tl].walidx_progress_committed = 1;
+
+			gstatus = psc_op_walidx_get(tl, target_inc, PS_KLASS_RELATION,
+									   rel, block, UINT64_MAX,
+									   fz_walidx_get_recs, FZ_WALIDX_GET_CAP,
+									   &n);
+			ring_note("WAL_INDEX_GET after ADD tl=%u rel=%u block=%u", tl,
+					  rel, block);
+			ck(gstatus == PS_STATUS_OK, "WAL_INDEX_GET after ADD tl=%u "
+			   "rel=%u block=%u (status %d)", tl, rel, block, gstatus);
+			record_cov(PS_OP_WAL_INDEX_GET, (uint32_t) gstatus, 0);
+			if (gstatus == PS_STATUS_OK)
+			{
+				int			found = 0;
+
+				for (int i = 0; i < n; i++)
+					if (fz_walidx_get_recs[i].lsn == lsn &&
+						fz_walidx_get_recs[i].timeline == tl)
+						found = 1;
+				ck(found || dead, "WAL_INDEX_ADD tl=%u rel=%u block=%u: the "
+				   "record just added at lsn=%llu is missing from a "
+				   "subsequent WAL_INDEX_GET, but the block is still alive "
+				   "on tl (exists=%d nblocks=%u) -- no replacement base/"
+				   "death can legitimately have dropped it (n=%d)", tl, rel,
+				   block, (unsigned long long) lsn, m->exists, m->nblocks,
+				   n);
+			}
+		}
 	}
 	else
 	{
@@ -3217,6 +3338,7 @@ act_artifact_begin(void)
 			art->state = FZ_ART_OPEN;
 			art->lsn = lsn;
 			art->token = token;
+			note_mutation_seq(token);	/* token IS this BEGIN's admission_seq */
 			art->max_begin_lsn = lsn;
 			art->touched = 1;
 			art->dropped_exists_daemon_bug = 0;
@@ -3827,6 +3949,7 @@ env_materialize(void)
 	{
 		g_tl[0].mat_lsn = lsn;
 		g_tl[0].mat_seq = seq;
+		note_mutation_seq(seq);
 		g_tl[0].mat_registered = 1;
 	}
 }
@@ -3857,6 +3980,7 @@ env_reader_reserve(void)
 		r->held = 1;
 		r->lsn = lsn;
 		r->seq = seq;
+		note_mutation_seq(seq);
 		memcpy(r->snap, g_tl[0].rel, sizeof(r->snap));
 	}
 }
@@ -3886,6 +4010,7 @@ env_reader_advance(void)
 	{
 		r->lsn = lsn;
 		r->seq = seq;
+		note_mutation_seq(seq);
 		memcpy(r->snap, g_tl[0].rel, sizeof(r->snap));
 	}
 }
@@ -3978,6 +4103,28 @@ env_branch_create(void)
 		 * verify_branch_frozen() has a ground truth independent of the
 		 * workaround. */
 		memcpy(g_tl[slot].frozen, g_tl[parent].rel, sizeof(g_tl[slot].frozen));
+		/*
+		 * Capture the admission-sequence fence at this same instant: the
+		 * ADMISSION_BARRIER response covers every mutation admitted up to
+		 * and including CREATE_BRANCH itself, so any parent write admitted
+		 * strictly AFTER this point has an admission_seq greater than
+		 * branch_seq even when its lsn ties branch_lsn exactly.  Supplying
+		 * this as verify_branch_frozen()'s req_seq (instead of 0, which
+		 * imposes no fence at all) is what makes that oracle keep working
+		 * once the P3b Bug-B fix lands and the workaround above is
+		 * removed -- see verify_branch_frozen()'s header comment.
+		 */
+		{
+			uint64_t	barrier_seq = 0;
+			int			bstatus = psc_op_admission_barrier(&barrier_seq);
+
+			ck(bstatus == PS_STATUS_OK && barrier_seq != 0,
+			   "ADMISSION_BARRIER after CREATE_BRANCH slot=%u failed "
+			   "(status %d seq=%llu)", slot, bstatus,
+			   (unsigned long long) barrier_seq);
+			if (bstatus == PS_STATUS_OK)
+				g_tl[slot].branch_seq = barrier_seq;
+		}
 		/*
 		 * A (re)created slot's artifact model must not carry over an OLD
 		 * incarnation's own local state (a slot number is reused across
@@ -4202,10 +4349,22 @@ verify_branch_frozen(uint32_t slot)
 		for (uint32_t bl = 0; bl < nblk; bl++)
 		{
 			int			found = 0;
+			/*
+			 * req_seq=b->branch_seq (not 0) is load-bearing here: once the
+			 * P3b Bug-B fix lands and the workaround above is removed, a
+			 * parent write admitted after this branch was created can
+			 * legitimately land at lsn == branch_lsn, and req_seq=0 would
+			 * impose no admission-sequence fence at all, letting that
+			 * (legal, post-fork) write leak through and falsely trip
+			 * "BRANCH VIEW NOT FROZEN" below.  branch_seq is the admission
+			 * sequence as of CREATE_BRANCH itself (see env_branch_create()),
+			 * so this matches exactly what a read through the child's own
+			 * fenced ancestry walk would see.
+			 */
 			int			status = psc_op_read_at(parent, g_tl[parent].incarnation,
 												  PS_KLASS_RELATION, rel, bl,
-												  b->branch_lsn, 0, read_buf,
-												  &found, NULL, NULL);
+												  b->branch_lsn, b->branch_seq,
+												  read_buf, &found, NULL, NULL);
 
 			ring_note("verify_branch_frozen slot=%u rel=%u block=%u", slot,
 					  rel, bl);
@@ -4392,6 +4551,146 @@ verify_latest_all(const char *phase)
 }
 
 /*
+ * verify_latest_all()'s WAL_INDEX_PROGRESS check above only proves the
+ * durable *progress marker* survives a restart -- it never queries any
+ * individual record.  A recovery regression that preserves the marker but
+ * drops or corrupts every indexed record would pass unnoticed: every GET
+ * probe elsewhere in this file (act_walidx_get(), act_walidx_add()) writes
+ * its own fresh batch record immediately before querying, so none of them
+ * ever look for something that predates a restart.
+ *
+ * seed_restart_walidx_record() (called just before each restart) picks a
+ * block the live model currently considers alive, adds a WAL_INDEX_ADD_BATCH
+ * record for it (KNOWN|FPI, so retain_chain()'s FPI fallback alone can never
+ * drop it -- see act_walidx_get()'s "provable" comment), publishes progress
+ * past it, and confirms with its own WAL_INDEX_GET that the record is
+ * visible *before* the restart happens.  verify_restart_walidx_seed() (called
+ * from verify_after_restart()) then re-queries that same (tl, key, block,
+ * lsn) afterward and requires it still be found -- nothing else runs between
+ * the two calls that could legitimately make the model change its mind about
+ * this block's liveness, so this is provable, not approximate.
+ */
+typedef struct FzWalidxSeed
+{
+	int			valid;
+	uint32_t	tl;
+	uint64_t	incarnation;
+	uint32_t	rel;
+	uint32_t	block;
+	uint64_t	lsn;
+} FzWalidxSeed;
+
+static FzWalidxSeed g_restart_walidx_seed;
+
+/* Finds a (tl, rel) with at least one live block; picks one of its blocks at
+ * random.  Returns 0 if nothing on any live timeline currently qualifies. */
+static int
+pick_live_relblock(uint32_t *out_tl, uint32_t *out_rel, uint32_t *out_block)
+{
+	for (uint32_t tl = 0; tl < FZ_NTL; tl++)
+	{
+		if (!g_tl[tl].known || g_tl[tl].state != PS_TIMELINE_LIVE)
+			continue;
+		for (uint32_t rel = 0; rel < FZ_NREL; rel++)
+		{
+			FzRel	   *m = &g_tl[tl].rel[rel];
+
+			if (m->exists && m->nblocks > 0)
+			{
+				*out_tl = tl;
+				*out_rel = rel;
+				*out_block = rng_below(m->nblocks);
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+
+static void
+seed_restart_walidx_record(void)
+{
+	uint32_t	tl,
+				rel,
+				block;
+	uint64_t	lsn,
+				end;
+	uint32_t	blocks[1];
+	int			n = 0;
+	int			found = 0;
+
+	g_restart_walidx_seed.valid = 0;
+	if (!pick_live_relblock(&tl, &rel, &block))
+		return;					/* nothing live to seed a provable record against */
+
+	blocks[0] = block;
+	lsn = ship_wal(tl);
+	end = lsn + FZ_WAL_PAYLOAD;
+	ck(psc_op_walidx_add_batch(tl, g_tl[tl].incarnation, PS_KLASS_RELATION,
+							   rel, blocks, 1, lsn, end) == PS_STATUS_OK,
+	   "seed_restart_walidx_record: WAL_INDEX_ADD_BATCH tl=%u rel=%u "
+	   "block=%u", tl, rel, block);
+	ck(psc_op_walidx_progress_commit(tl, g_tl[tl].incarnation,
+									 g_tl[tl].walidx_progress, end) ==
+	   PS_STATUS_OK, "seed_restart_walidx_record: WAL_INDEX_PROGRESS commit "
+	   "tl=%u", tl);
+	if (end > g_tl[tl].walidx_progress)
+		g_tl[tl].walidx_progress = end;
+	g_tl[tl].walidx_progress_committed = 1;
+
+	ck(psc_op_walidx_get(tl, g_tl[tl].incarnation, PS_KLASS_RELATION, rel,
+						 block, UINT64_MAX, fz_walidx_get_recs,
+						 FZ_WALIDX_GET_CAP, &n) == PS_STATUS_OK,
+	   "seed_restart_walidx_record: WAL_INDEX_GET tl=%u rel=%u block=%u",
+	   tl, rel, block);
+	for (int i = 0; i < n; i++)
+		if (fz_walidx_get_recs[i].lsn == lsn &&
+			fz_walidx_get_recs[i].timeline == tl)
+			found = 1;
+	ck(found, "seed_restart_walidx_record: just-added record tl=%u rel=%u "
+	   "block=%u lsn=%llu is missing before the restart even happened", tl,
+	   rel, block, (unsigned long long) lsn);
+
+	g_restart_walidx_seed.valid = 1;
+	g_restart_walidx_seed.tl = tl;
+	g_restart_walidx_seed.incarnation = g_tl[tl].incarnation;
+	g_restart_walidx_seed.rel = rel;
+	g_restart_walidx_seed.block = block;
+	g_restart_walidx_seed.lsn = lsn;
+}
+
+static void
+verify_restart_walidx_seed(const char *phase)
+{
+	FzWalidxSeed *s = &g_restart_walidx_seed;
+	int			n = 0;
+	int			found = 0;
+	int			status;
+
+	if (!s->valid)
+		return;
+	status = psc_op_walidx_get(s->tl, s->incarnation, PS_KLASS_RELATION,
+							   s->rel, s->block, UINT64_MAX,
+							   fz_walidx_get_recs, FZ_WALIDX_GET_CAP, &n);
+	ck(status == PS_STATUS_OK, "%s: WAL_INDEX_GET for the pre-restart seeded "
+	   "record tl=%u rel=%u block=%u (status %d)", phase, s->tl, s->rel,
+	   s->block, status);
+	if (status == PS_STATUS_OK)
+	{
+		for (int i = 0; i < n; i++)
+			if (fz_walidx_get_recs[i].lsn == s->lsn &&
+				fz_walidx_get_recs[i].timeline == s->tl)
+				found = 1;
+		ck(found, "%s: WAL-index record seeded before restart (tl=%u rel=%u "
+		   "block=%u lsn=%llu) is missing afterward -- recovery dropped or "
+		   "corrupted a retained live-block record even though the durable "
+		   "progress marker survived", phase, s->tl, s->rel, s->block,
+		   (unsigned long long) s->lsn);
+	}
+	s->valid = 0;
+}
+
+/*
  * Restarting (clean or crash) abandons any open artifact attempt:
  * artifact_recovery_seq (pagestore_core.c) is set to the store's post-
  * recovery admission-sequence high-water mark, and artifact_attempt()
@@ -4568,6 +4867,16 @@ verify_artifacts(const char *phase)
 static void
 verify_after_restart(const char *phase)
 {
+	/*
+	 * Recovery must never roll the global admission-sequence allocator
+	 * backward: check it against the same high-water mark act_admission_
+	 * barrier() maintains (g_max_mutation_seq), which already reflects
+	 * every mutation this run has proven happened before the restart --
+	 * see check_admission_barrier()'s header comment.
+	 */
+	ring_note("verify_after_restart ADMISSION_BARRIER");
+	check_admission_barrier(phase);
+
 	for (uint32_t tl = 0; tl < FZ_NTL; tl++)
 		if (g_tl[tl].known && g_tl[tl].state == PS_TIMELINE_LIVE)
 		{
@@ -4721,6 +5030,7 @@ verify_after_restart(const char *phase)
 			verify_branch(slot, phase);
 	for (uint32_t slot = 1; slot < FZ_NTL; slot++)
 		verify_branch_frozen(slot);
+	verify_restart_walidx_seed(phase);
 }
 
 static void
@@ -4729,6 +5039,7 @@ env_clean_restart(void)
 	int			ok;
 
 	ring_note("clean_restart");
+	seed_restart_walidx_record();
 	ok = psc_stop_daemon_clean();
 	ck(ok, "daemon must exit cleanly (status 0) on SIGTERM");
 	psc_spawn_daemon(FZ_PAGE_SIZE, FZ_SEGMENT_SIZE, FZ_NSHARDS, FZ_FLUSH_PAGES,
@@ -4745,6 +5056,7 @@ static void
 env_crash_restart(void)
 {
 	ring_note("crash_restart");
+	seed_restart_walidx_record();
 	psc_stop_daemon_crash();
 	psc_spawn_daemon(FZ_PAGE_SIZE, FZ_SEGMENT_SIZE, FZ_NSHARDS, FZ_FLUSH_PAGES,
 					 FZ_COMPACT_LAYERS, FZ_PAGE_HIGH_WATER, FZ_PAGE_CATCH_UP,
