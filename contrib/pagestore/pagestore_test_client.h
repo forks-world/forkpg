@@ -1263,6 +1263,35 @@ psc_op_read_control(uint32_t block, unsigned char *out)
 	return ch->status;
 }
 
+/* EXISTS/NBLOCKS counterparts of psc_op_read_control(): same zeroed
+ * psc_setmeta()-based key the writer/reader use, not the ordinary
+ * psc_set_channel_key() layout. */
+static int
+psc_op_exists_control(int *exists)
+{
+	PsChannel  *ch = psc_chan_ptr();
+
+	psc_setmeta(ch, 0, 0);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_EXISTS;
+	psc_cl_exec();
+	*exists = ch->result != 0;
+	return ch->status;
+}
+
+static int
+psc_op_nblocks_control(uint32_t *nblocks)
+{
+	PsChannel  *ch = psc_chan_ptr();
+
+	psc_setmeta(ch, 0, 0);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_NBLOCKS;
+	psc_cl_exec();
+	*nblocks = ch->result;
+	return ch->status;
+}
+
 /* ===================== op wrappers: artifact lifecycle =================== */
 /*
  * PS_OP_ARTIFACT_BEGIN/COMMIT/DROP (see pagestore_artifact_lifecycle.inc's

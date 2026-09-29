@@ -496,7 +496,14 @@ static const char *g_weak_oracle_ops[] = {
 	"an error, never a lower bound\" for PS_OP_WAL_RETAIN_FLOOR and the same "
 	"failure path (an unreadable/absent control note) is structurally "
 	"reachable here too, e.g. for a timeline with no control-object write "
-	"of its own yet (a branch, in this stage's model).",
+	"of its own yet (a branch, in this stage's model).  ERROR from the WAL "
+	"resource specifically is NOT \"unprovable, so treat as unavailable\": "
+	"wal_segment_reclaim_one() requires retention_effective_floor_internal() "
+	"to succeed before it ever reclaims anything on a timeline, so an "
+	"unprovable floor is fail-closed and *stronger* than a provable one -- "
+	"callers (verify_after_restart(), act_wal_read()) treat ERROR the same "
+	"as floor==0 (the whole shipped range is retained), not as grounds to "
+	"skip the WAL content check.",
 	"BLOCK_DEATH: newest retained death of (key,block) at/below a horizon "
 	"requires a full per-block death-event history (every UNLINK/TRUNCATE "
 	"that could have killed it); the model here only tracks each relation's "
@@ -735,13 +742,21 @@ dump_ring(void)
  * lives there), but ck() -- defined early so every act_*()/env_*() below can
  * use it -- needs to invoke them on a failure. */
 static void write_seq_file(const char *path);
-static void shrink_on_failure(const char *orig_fmt);
+static void shrink_on_failure(const char *orig_site);
 
-/* Oracle failure: distinct from psc_fatal() (infra/hang).  Prints the seed,
+/*
+ * Oracle failure: distinct from psc_fatal() (infra/hang).  Prints the seed,
  * step, ring buffer and expected-vs-actual, keeps the store, and exits
- * non-zero.  Never returns. */
+ * non-zero.  Never returns.
+ *
+ * ck() (the macro below) is the only caller, always passing __LINE__ as
+ * `line`: the raw format string alone does not uniquely identify a call
+ * site (two sites can share an identical message, e.g. a helper invoked
+ * from more than one place, or copy-pasted text), so the shrinker's
+ * "same oracle point" fingerprint below folds in the source line too.
+ */
 static void
-ck(int cond, const char *fmt, ...)
+ck_impl(int line, int cond, const char *fmt, ...)
 {
 	va_list		ap;
 
@@ -755,29 +770,35 @@ ck(int cond, const char *fmt, ...)
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);
 	fputc('\n', stderr);
-	/*
-	 * A raw, unsubstituted fingerprint of *which* check fired -- distinct
-	 * lines for distinct ck() call sites even when the substituted message
-	 * above happens to look similar.  The shrinker's child processes each
-	 * print this to their captured output; the parent driver greps for it
-	 * verbatim to decide whether a reduced candidate "still fails at the
-	 * same oracle point" (spec wording) rather than just "still fails".
-	 */
-	fprintf(stderr, "ORACLE_SITE: %s\n", fmt);
-	dump_ring();
-	fprintf(stderr, "reproduce with: PAGESTORE_FUZZ_SEED=%llu "
-			"PAGESTORE_FUZZ_OPS=%lld <this binary> <daemon> [store-dir]\n",
-			(unsigned long long) g_seed, g_step);
 	{
-		char		seq_path[560];
+		/*
+		 * A raw, unsubstituted fingerprint of *which* check fired --
+		 * distinct lines for distinct ck() call sites even when the
+		 * format string is identical.  The shrinker's child processes
+		 * each print this to their captured output; the parent driver
+		 * requires an exact match (see shrink_try_candidate()) to decide
+		 * whether a reduced candidate "still fails at the same oracle
+		 * point" (spec wording) rather than just "still fails".
+		 */
+		char		site[1200];
 
-		snprintf(seq_path, sizeof(seq_path), "%s.opseq", psc_store_dir);
-		write_seq_file(seq_path);
-		fprintf(stderr, "op sequence for PAGESTORE_FUZZ_REPLAY written to "
-				"%s\n", seq_path);
-		if (getenv("PAGESTORE_FUZZ_SHRINK") != NULL &&
-			getenv("PAGESTORE_FUZZ_SHRINK_CHILD") == NULL)
-			shrink_on_failure(fmt);
+		snprintf(site, sizeof(site), "%d: %s", line, fmt);
+		fprintf(stderr, "ORACLE_SITE: %s\n", site);
+		dump_ring();
+		fprintf(stderr, "reproduce with: PAGESTORE_FUZZ_SEED=%llu "
+				"PAGESTORE_FUZZ_OPS=%lld <this binary> <daemon> [store-dir]\n",
+				(unsigned long long) g_seed, g_step);
+		{
+			char		seq_path[560];
+
+			snprintf(seq_path, sizeof(seq_path), "%s.opseq", psc_store_dir);
+			write_seq_file(seq_path);
+			fprintf(stderr, "op sequence for PAGESTORE_FUZZ_REPLAY written "
+					"to %s\n", seq_path);
+			if (getenv("PAGESTORE_FUZZ_SHRINK") != NULL &&
+				getenv("PAGESTORE_FUZZ_SHRINK_CHILD") == NULL)
+				shrink_on_failure(site);
+		}
 	}
 	if (log_fp != NULL)
 		fflush(log_fp);
@@ -789,6 +810,11 @@ ck(int cond, const char *fmt, ...)
 		fprintf(stderr, "store kept at %s\n", psc_store_dir);
 	exit(1);
 }
+
+/* Every call site's own __LINE__ becomes part of the shrink fingerprint
+ * (see ck_impl()'s header comment); every one of this file's ~230 call
+ * sites goes through this macro, never ck_impl() directly. */
+#define ck(cond, ...) ck_impl(__LINE__, (cond), __VA_ARGS__)
 
 /*
  * status in {OK,ERROR} plus STALE when allow_stale, and always records
@@ -2103,7 +2129,18 @@ act_wal_read(void)
 
 			lo += k * (uint64_t) FZ_WAL_PAYLOAD;
 		}
-		if (fstatus != PS_STATUS_OK || lo >= g_tl[tl].wal_end)
+		/*
+		 * PS_STATUS_ERROR here is not "unprovable, could have been
+		 * reclaimed": wal_segment_reclaim_one() (pagestore_core.c) requires
+		 * retention_effective_floor_internal() to succeed before it ever
+		 * reclaims anything on this timeline, `goto retry_timeline`
+		 * otherwise -- an unprovable floor is a stronger guarantee of full
+		 * retention than a provable one (fail-closed), so the entire
+		 * [wal_start, wal_end) range stays provably retained and lo is left
+		 * at wal_start (only the OK+floor branch above ever advances it).
+		 * Only bail when even that full range has nothing left to sample.
+		 */
+		if (lo >= g_tl[tl].wal_end)
 		{
 			/* Nothing in [wal_start, wal_end) is provably retained right
 			 * now -- reclaim could legitimately have dropped all of it, so
@@ -5736,6 +5773,19 @@ verify_materializer_control(const char *phase)
 	memcpy(expected[3], &lsn, sizeof(lsn));
 	memset(expected[2], 0, PSC_PAGE_SIZE);
 
+	{
+		int			exists = 0;
+		uint32_t	nblocks = 0;
+		int			estatus = psc_op_exists_control(&exists);
+		int			nstatus = psc_op_nblocks_control(&nblocks);
+
+		ring_note("%s CONTROL EXISTS/NBLOCKS", phase);
+		ck(estatus == PS_STATUS_OK && exists, "%s: PS_KLASS_CONTROL EXISTS "
+		   "expected true (status %d)", phase, estatus);
+		ck(nstatus == PS_STATUS_OK && nblocks == 4, "%s: PS_KLASS_CONTROL "
+		   "NBLOCKS expected 4 got %u (status %d)", phase, nblocks, nstatus);
+	}
+
 	for (int i = 0; i < 4; i++)
 	{
 		int			status = psc_op_read_control((uint32_t) i, got);
@@ -5789,14 +5839,23 @@ verify_after_restart(const char *phase)
 				ck(status == PS_STATUS_OK || status == PS_STATUS_ERROR,
 				   "%s: WAL retention floor tl=%u unexpected status %d",
 				   phase, tl, status);
-				/* WAL reclaim removes only a complete prefix up to the aligned-
+				/*
+				 * WAL reclaim removes only a complete prefix up to the aligned-
 				 * down minimum of its retention, durable-progress, raw-index, and
 				 * branch limits (pagestore_core.c:wal_segment_reclaim_one).  A
 				 * record beginning at or after the effective WAL retention floor
 				 * cannot be in that reclaimed prefix.  Older tail records may
 				 * legitimately have been reclaimed, so only read the latest one
-				 * when it is still inside the retained range. */
-				if (status == PS_STATUS_OK && (floor == 0 || start >= floor))
+				 * when it is still inside the retained range -- PS_STATUS_ERROR
+				 * counts as "inside": wal_segment_reclaim_one() requires
+				 * retention_effective_floor_internal() to succeed (rc == 0)
+				 * before it ever reclaims anything for this timeline, `goto
+				 * retry_timeline` (no reclaim at all) otherwise, so an
+				 * unprovable floor is a stronger guarantee of full retention
+				 * than a provable one, not weaker.
+				 */
+				if (status == PS_STATUS_ERROR ||
+					(status == PS_STATUS_OK && (floor == 0 || start >= floor)))
 				{
 					unsigned char expected[FZ_WAL_PAYLOAD];
 					unsigned char got[FZ_WAL_PAYLOAD];
@@ -5821,9 +5880,9 @@ verify_after_restart(const char *phase)
 					}
 				}
 				else
-					ring_note("verify_after_restart WAL tail may be reclaimed tl=%u "
-						  "or floor unavailable: start=%llu floor=%llu proven=%d "
-						  "status=%d", tl,
+					ring_note("verify_after_restart WAL tail may be reclaimed "
+						  "(provable floor beyond it) tl=%u start=%llu "
+						  "floor=%llu proven=%d status=%d", tl,
 						  (unsigned long long) start,
 						  (unsigned long long) floor, proven, status);
 			}
@@ -5873,7 +5932,64 @@ verify_after_restart(const char *phase)
 		   "%s: materializer pin "
 		   "survives restart", phase);
 	}
+	{
+		/*
+		 * The per-owner LOOKUPs above only prove that every pin this
+		 * model believes is held still is -- they cannot see a stray
+		 * *extra* pin recovery left behind (a dropped or never-modeled
+		 * owner whose entry survived).  PS_OP_RETENTION_PIN_GET's total
+		 * active count (returned unconditionally on OK, regardless of
+		 * whether index 0 itself resolves to an entry) is exactly that
+		 * missing enumeration-level check.
+		 */
+		PsRetentionPin pin;
+		uint32_t	count = 0;
+		uint64_t	epoch = 0;
+		int			rc = psc_op_retention_get(0, &epoch, &pin, &count);
+		int			gstatus = psc_chan_ptr()->status;
+		uint32_t	expected_count = g_tl[0].mat_registered ? 1 : 0;
+
+		for (uint32_t i = 0; i < FZ_NREADERS; i++)
+			if (g_reader[i].held)
+				expected_count++;
+		(void) rc;
+		ring_note("verify_after_restart RETENTION_PIN_GET count");
+		ck(gstatus == PS_STATUS_OK && count == expected_count,
+		   "%s: RETENTION_PIN_GET active count expected %u got %u (status "
+		   "%d) -- a stray pin may have survived, or a held one was lost",
+		   phase, expected_count, count, gstatus);
+	}
 	verify_materializer_control(phase);
+	/*
+	 * The canonical undefined timeline IDs (never created by any action --
+	 * see their definitions) must still read back as undefined after a
+	 * restart.  This final restart pair is the last thing that runs (no
+	 * later random adversarial action, e.g. act_timeline_state()'s own
+	 * undefined-target probe, follows it), so a recovery bug that invents
+	 * a timeline entry for an unused ID here would otherwise pass
+	 * unnoticed for the rest of the run.
+	 */
+	{
+		uint32_t	undef_ids[2] = {FZ_TL_UNDEF_A, FZ_TL_UNDEF_B};
+
+		for (int i = 0; i < 2; i++)
+		{
+			PsTimelineState state;
+			uint64_t	inc;
+			int			status = psc_op_timeline_state(undef_ids[i], &state,
+														&inc);
+
+			ring_note("verify_after_restart TIMELINE_STATE undefined tl=%u",
+					  undef_ids[i]);
+			ck(status == PS_STATUS_ERROR, "%s: TIMELINE_STATE on canonical "
+			   "undefined tl=%u must be refused, got status=%d", phase,
+			   undef_ids[i], status);
+			ck(state == PS_TIMELINE_STATE_UNDEFINED, "%s: TIMELINE_STATE on "
+			   "canonical undefined tl=%u: result should be "
+			   "PS_TIMELINE_STATE_UNDEFINED, got %u", phase, undef_ids[i],
+			   state);
+		}
+	}
 	/* Every known timeline, not just LIVE ones: a clean/crash recovery that
 	 * loses a deletion transition or resurrects a deleted branch would
 	 * otherwise report success here, since no later generated action runs
@@ -5917,11 +6033,80 @@ verify_after_restart(const char *phase)
 				   "slot=%u expected incarnation %llu got %llu", phase, slot,
 				   (unsigned long long) g_tl[slot].incarnation,
 				   (unsigned long long) inc);
+				/*
+				 * Branch ancestry (TIMELINE_INFO: parent/branch_lsn/parent's
+				 * incarnation) was previously only ever queried by the random
+				 * act_timeline_info() action mid-run, never re-verified after
+				 * a restart -- verify_branch_frozen()'s content match only
+				 * infers branch_lsn correctness indirectly.  A recovery bug
+				 * that corrupts the ancestry record itself (while the daemon
+				 * still happens to serve correct content some other way)
+				 * would otherwise pass unnoticed.  LIVE only: timeline_op_
+				 * allowed() (pagestore_core.c) requires state == PS_TIMELINE_
+				 * LIVE for PS_OP_TIMELINE_INFO specifically (unlike TIMELINE_
+				 * STATE/BEGIN_DELETE, which it always allows), so a DELETING/
+				 * DELETED slot correctly refuses this and is out of scope here.
+				 */
+				if (g_tl[slot].has_parent && g_tl[slot].state == PS_TIMELINE_LIVE)
+				{
+					int			has_parent = 0;
+					uint32_t	parent = 0;
+					uint64_t	branch_lsn = 0,
+								parent_inc = 0;
+					int			istatus = psc_op_timeline_info(slot,
+											  g_tl[slot].incarnation,
+											  &has_parent, &parent,
+											  &branch_lsn,
+											  &parent_inc);
+
+					ring_note("verify_after_restart TIMELINE_INFO slot=%u",
+							  slot);
+					ck(istatus == PS_STATUS_OK && has_parent &&
+					   parent == g_tl[slot].parent &&
+					   branch_lsn == g_tl[slot].branch_lsn &&
+					   parent_inc == g_tl[g_tl[slot].parent].incarnation,
+					   "%s: TIMELINE_INFO slot=%u expected parent=%u "
+					   "branch_lsn=%llu parent_inc=%llu, got status=%d "
+					   "has_parent=%d parent=%u branch_lsn=%llu "
+					   "parent_inc=%llu", phase, slot, g_tl[slot].parent,
+					   (unsigned long long) g_tl[slot].branch_lsn,
+					   (unsigned long long) g_tl[g_tl[slot].parent].incarnation,
+					   istatus, has_parent, parent,
+					   (unsigned long long) branch_lsn,
+					   (unsigned long long) parent_inc);
+				}
 			}
 		}
 	for (uint32_t slot = 1; slot < FZ_NTL; slot++)
 		if (g_tl[slot].known && g_tl[slot].state == PS_TIMELINE_LIVE)
 			verify_branch(slot, phase);
+	for (uint32_t slot = 1; slot < FZ_NTL; slot++)
+		/*
+		 * A DELETED slot is otherwise checked only through TIMELINE_STATE
+		 * above: env_wait_deleted() verifies once, live, that an ordinary
+		 * request is rejected, but nothing rechecks that gate after a
+		 * restart, on every restart, for the rest of the run.  Recovery
+		 * could restore the DELETED *state* while regressing the ordinary-
+		 * operation fence that state is supposed to enforce, and every
+		 * later restart check would keep passing because this slot is
+		 * skipped by the LIVE-only verify_branch() loop above. NBLOCKS is
+		 * an arbitrary representative "ordinary request" -- ps_handle_meta()
+		 * -> timeline_op_allowed() refuses any non-LIVE, non-special-cased
+		 * opcode uniformly, so any other stage-1 opcode would do the same.
+		 */
+		if (g_tl[slot].known && g_tl[slot].state == PS_TIMELINE_DELETED)
+		{
+			uint32_t	nb = 0;
+			int			status = psc_op_nblocks(slot, g_tl[slot].incarnation,
+												PS_KLASS_RELATION, 0, 0, 0,
+												&nb);
+
+			ring_note("verify_after_restart DELETED-fence NBLOCKS slot=%u",
+					  slot);
+			ck(status == PS_STATUS_ERROR, "%s: DELETED branch slot=%u must "
+			   "still refuse an ordinary NBLOCKS request, got status=%d",
+			   phase, slot, status);
+		}
 	for (uint32_t slot = 1; slot < FZ_NTL; slot++)
 		verify_branch_frozen(slot);
 	verify_restart_walidx_seed(phase);
@@ -6114,17 +6299,33 @@ write_seq_file(const char *path)
 	fclose(f);
 }
 
-static void
+/*
+ * Returns 1 on a fully durable write, 0 on any failure (fopen, an fprintf
+ * reporting an I/O error, or fclose) -- distinct from write_seq_file(),
+ * which only ever writes the one authoritative full sequence for a real
+ * failure and already warns on its own fopen failure.  Callers here treat
+ * 0 as "this candidate's file is missing or truncated": ddmin_run() must
+ * not let shrink_try_candidate() replay a stale or partial file left over
+ * from a previous candidate and mistake it for this one, and the final
+ * .min write failing must be reported, not silently produce a missing or
+ * stale-looking file.
+ */
+static int
 write_seq_subset(const char *path, const int *seq, long long n)
 {
 	FILE	   *f = fopen(path, "w");
+	int			ok = 1;
 
 	if (f == NULL)
-		return;
-	fprintf(f, "# replay seed=%llu\n", (unsigned long long) g_seed);
-	for (long long i = 0; i < n; i++)
-		fprintf(f, "%s\n", g_actions[seq[i]].name);
-	fclose(f);
+		return 0;
+	if (fprintf(f, "# replay seed=%llu\n", (unsigned long long) g_seed) < 0)
+		ok = 0;
+	for (long long i = 0; i < n && ok; i++)
+		if (fprintf(f, "%s\n", g_actions[seq[i]].name) < 0)
+			ok = 0;
+	if (fclose(f) != 0)
+		ok = 0;
+	return ok;
 }
 
 /*
@@ -6132,10 +6333,13 @@ write_seq_subset(const char *path, const int *seq, long long n)
  * binary (re-exec via g_self_exe, resolved once at startup by
  * resolve_self_exe()) against its own fresh daemon/store, with a bounded
  * wait.  Returns 1 iff the child exits non-zero AND its captured output
- * contains an "ORACLE_SITE: <orig_fmt>" line -- i.e. it failed at the
- * *same* ck() call site as the original failure, not merely "failed
- * somehow" (a shrunk-too-far candidate can legitimately hit a different,
- * earlier assertion; that is not "the same bug" and must not be accepted).
+ * contains an "ORACLE_SITE: " line whose remainder exactly matches
+ * orig_site (which already carries its own "<line>: <fmt>" call-site
+ * identity, see ck_impl()) -- i.e. it failed at the *same* ck() call site
+ * as the original failure, not merely "failed somehow" (a shrunk-too-far
+ * candidate can legitimately hit a different, earlier assertion -- even
+ * one with an identical format string at a different line -- and that is
+ * not "the same bug", so it must not be accepted).
  *
  * The candidate runs in its own process group (setpgid(), set from both
  * sides to close the fork/exec race): on a hang, killing only the replay
@@ -6218,7 +6422,7 @@ shrink_candidate_timeout_s(long long candidate_ops, uint64_t base_timeout_s)
 }
 
 static FzShrinkCandidateResult
-shrink_try_candidate(const char *cand_path, const char *orig_fmt,
+shrink_try_candidate(const char *cand_path, const char *orig_site,
 						 long long candidate_ops, uint64_t base_timeout_s)
 {
 	char		capture_path[600];
@@ -6345,16 +6549,31 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt,
 	{
 		FILE	   *f = fopen(capture_path, "r");
 		char		line[1024];
-		size_t		fmtlen = strlen(orig_fmt);
 
 		if (f != NULL)
 		{
 			while (fgets(line, sizeof(line), f) != NULL)
-				if (strncmp(line, "ORACLE_SITE: ", 13) == 0 &&
-					strncmp(line + 13, orig_fmt, fmtlen) == 0)
+				if (strncmp(line, "ORACLE_SITE: ", 13) == 0)
 				{
-					ok = 1;
-					break;
+					/*
+					 * Exact match, not a prefix match: two distinct ck()
+					 * call sites can share an identical format string (see
+					 * ck_impl()'s header comment), so a prefix hit alone
+					 * would accept a candidate that actually failed at a
+					 * different site.  orig_site already carries its
+					 * "<line>: " prefix (see ck_impl()), so comparing the
+					 * whole remainder -- after trimming fgets()'s trailing
+					 * newline -- is the full fingerprint, not just the
+					 * message text.
+					 */
+					size_t		n = strcspn(line + 13, "\r\n");
+
+					if (n == strlen(orig_site) &&
+						strncmp(line + 13, orig_site, n) == 0)
+					{
+						ok = 1;
+						break;
+					}
 				}
 			fclose(f);
 		}
@@ -6373,7 +6592,7 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt,
  * sensitive failure may simply not shrink -- see the report.
  */
 static void
-ddmin_run(int *cur, long long *len_io, const char *orig_fmt,
+ddmin_run(int *cur, long long *len_io, const char *orig_site,
 		  uint64_t budget_s, uint64_t candidate_base_timeout_s,
 		  long long *timeouts_out, int *budget_expired_out,
 		  int *attempt_cap_hit_out)
@@ -6429,11 +6648,27 @@ ddmin_run(int *cur, long long *len_io, const char *orig_fmt,
 			for (long long i = end; i < len; i++)
 				cand[m++] = cur[i];
 
-			write_seq_subset(cand_path, cand, m);
 			attempts++;
-			result = shrink_try_candidate(cand_path,
-													 orig_fmt, m,
-													 candidate_base_timeout_s);
+			if (!write_seq_subset(cand_path, cand, m))
+			{
+				/*
+				 * Could not durably write this candidate's file: never
+				 * hand shrink_try_candidate() a path that may still hold a
+				 * previous candidate's stale contents (or nothing at all)
+				 * and have it mistake that for this candidate reproducing.
+				 * Treat exactly like FZ_SHRINK_NOT_REPRODUCED -- keep the
+				 * current reduction, try a different chunk -- not as a
+				 * successful reduction and not as a fatal shrink error.
+				 */
+				fprintf(stderr, "shrink: could not write candidate file %s "
+						"(%s); treating as not reproduced\n", cand_path,
+						strerror(errno));
+				result = FZ_SHRINK_NOT_REPRODUCED;
+			}
+			else
+				result = shrink_try_candidate(cand_path,
+														 orig_site, m,
+														 candidate_base_timeout_s);
 
 			if (result == FZ_SHRINK_REPRODUCED)
 			{
@@ -6482,7 +6717,7 @@ done:
  * spec's allowance.
  */
 static void
-shrink_on_failure(const char *orig_fmt)
+shrink_on_failure(const char *orig_site)
 {
 	long long	orig_len = g_seq_len;
 	long long	len = orig_len;
@@ -6510,11 +6745,14 @@ shrink_on_failure(const char *orig_fmt)
 			"candidate timeout %llus at 4000 steps, same-site match "
 			"required)...\n", orig_len, (unsigned long long) budget_s,
 			(unsigned long long) candidate_timeout_s);
-	ddmin_run(cur, &len, orig_fmt, budget_s, candidate_timeout_s,
+	ddmin_run(cur, &len, orig_site, budget_s, candidate_timeout_s,
 			  &candidate_timeouts, &budget_expired, &attempt_cap_hit);
 
 	snprintf(min_path, sizeof(min_path), "%s.opseq.min", psc_store_dir);
-	write_seq_subset(min_path, cur, len);
+	if (!write_seq_subset(min_path, cur, len))
+		fprintf(stderr, "shrink: ERROR: could not write minimized sequence "
+				"file %s (%s); the %lld-step reduction was found but is "
+				"not saved\n", min_path, strerror(errno), len);
 	if (candidate_timeouts > 0 || budget_expired || attempt_cap_hit)
 		fprintf(stderr, "shrink: inconclusive after %.1fs (%s%s%s); %s: %s\n",
 				(double) (psc_now_ns() - t0) / 1e9,
