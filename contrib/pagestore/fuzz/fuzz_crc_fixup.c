@@ -101,6 +101,13 @@ put_le64(unsigned char *p, uint64_t v)
  */
 #define PS_MANIFEST_HEADER_BYTES_LOCAL 20u		/* magic,version,type,len,crc */
 #define PS_MANIFEST_ADD_LAYER_LOCAL 1u
+#define PS_MANIFEST_SET_REMOTE_DURABLE_LOCAL 2u
+#define PS_MANIFEST_DROP_LOCAL_LOCAL 3u
+#define PS_MANIFEST_MARK_DELETE_LOCAL 4u
+#define PS_MANIFEST_REMOVE_LAYER_LOCAL 5u
+#define PS_MANIFEST_SET_FLUSH_WATERMARK_LOCAL 6u
+#define PS_MANIFEST_SET_REMOTE_LOCATION_LOCAL 7u
+#define PS_MANIFEST_REBASE_FLUSH_WATERMARK_LOCAL 8u
 #define PS_LAYER_URI_MAX_LOCAL 512u
 #define PS_LAYER_MAX_LOCATIONS_LOCAL 3u
 #define PS_LAYER_TIER_LOCAL_HOT_LOCAL 1u
@@ -156,6 +163,62 @@ typedef struct FuzzManifestLayerDisk
 	uint8_t		deleting;
 	uint8_t		pad;
 } FuzzManifestLayerDisk;
+
+/* Mirrors pagestore_manifest.c's private PsManifestLayerIdEvent/
+ * PsManifestRemoteLocationEvent and pagestore_manifest.h's exported
+ * PsFlushWatermark -- the other three payload shapes
+ * manifest_type_payload_len() maps a record's `type` to. */
+typedef struct FuzzManifestLayerIdEvent
+{
+	uint64_t	layer_id;
+	uint64_t	value;
+} FuzzManifestLayerIdEvent;
+
+typedef struct FuzzManifestRemoteLocationEvent
+{
+	uint64_t	layer_id;
+	FuzzManifestLocationDisk location;
+} FuzzManifestRemoteLocationEvent;
+
+typedef struct FuzzFlushWatermark
+{
+	uint32_t	shard;
+	uint32_t	seg_id;
+	uint64_t	seg_off;
+} FuzzFlushWatermark;
+
+/*
+ * Codex round-4-audit finding: manifest_record_valid_at()
+ * (pagestore_manifest.c) requires a record's on-disk `len` field to
+ * *exactly* equal manifest_type_payload_len(type) -- a fixed size that
+ * depends only on `type`, never fuzzer-controlled -- checked before the
+ * crc. A record whose type survived a mutation unchanged (very likely for
+ * a byte flip elsewhere in the 20-byte header) but whose len field did not
+ * was rejected outright, no matter how correct the fixed-up crc was.
+ * Mirrors manifest_type_payload_len()'s switch exactly; an unrecognized
+ * type returns -1, same as the product function, and is left to the raw
+ * "explore malformed type" path untouched. */
+static int
+manifest_type_payload_len_local(uint32_t type)
+{
+	switch (type)
+	{
+		case PS_MANIFEST_ADD_LAYER_LOCAL:
+			return (int) sizeof(FuzzManifestLayerDisk);
+		case PS_MANIFEST_SET_REMOTE_DURABLE_LOCAL:
+		case PS_MANIFEST_DROP_LOCAL_LOCAL:
+		case PS_MANIFEST_MARK_DELETE_LOCAL:
+		case PS_MANIFEST_REMOVE_LAYER_LOCAL:
+			return (int) sizeof(FuzzManifestLayerIdEvent);
+		case PS_MANIFEST_SET_REMOTE_LOCATION_LOCAL:
+			return (int) sizeof(FuzzManifestRemoteLocationEvent);
+		case PS_MANIFEST_SET_FLUSH_WATERMARK_LOCAL:
+		case PS_MANIFEST_REBASE_FLUSH_WATERMARK_LOCAL:
+			return (int) sizeof(FuzzFlushWatermark);
+		default:
+			return -1;
+	}
+}
 
 /*
  * Round-6 coordinator review, full-audit finding: local_recover_local_
@@ -230,8 +293,22 @@ fixup_manifest(uint8_t *buf, size_t len)
 	{
 		uint32_t	type = get_le32(buf + off + 8);
 		uint32_t	declared_len = get_le32(buf + off + 12);
-		size_t		payload_len = declared_len;
+		size_t		payload_len;
+		int			expected_len = manifest_type_payload_len_local(type);
 		uint32_t	crc;
+
+		/* A record's len must exactly equal its type's fixed payload size
+		 * (see manifest_type_payload_len_local()'s comment); correct it
+		 * here when the type is recognized and its size still fits what is
+		 * actually left in the buffer, so a len mutation alone no longer
+		 * rejects an otherwise-intact record. An unrecognized type, or one
+		 * whose size no longer fits, is left exactly as before. */
+		if (expected_len >= 0 && (size_t) expected_len <= len - off - 20)
+		{
+			declared_len = (uint32_t) expected_len;
+			put_le32(buf + off + 12, declared_len);
+		}
+		payload_len = declared_len;
 
 		if (payload_len > len - off - 20)
 			payload_len = len - off - 20;
@@ -272,6 +349,7 @@ typedef struct FuzzForkMetaRecV2
 	uint8_t		pad[3];
 } FuzzForkMetaRecV2;
 
+#define FORK_META_V2_MAGIC_LOCAL 0x324d4b46u /* "FKM2" */
 #define FORK_META_V3_MAGIC_LOCAL 0x334d4b46u /* "FKM3" */
 
 static uint32_t
@@ -301,7 +379,14 @@ crc24_openpgp(const unsigned char *bytes, size_t n)
  * checkpoint/tail payload's first record would be wrong -- it is an
  * ordinary event record, not a marker, and pinning it to marker identity
  * would just make fork_meta_snapshot_record_valid()'s ordering/semantic
- * checks fail instead. */
+ * checks fail instead.
+ *
+ * Codex round-4-audit finding: fork_meta_rec_wire_valid() (pagestore_core.c)
+ * requires an FKM2 (legacy, no-checksum) record's `pad` to be exactly zero
+ * -- unlike FKM3, FKM2 has no crc-24 to make a mutated pad self-consistent
+ * with, so a nonzero pad there was rejected outright regardless of every
+ * other field. Zeroed here rather than left "no checksum, nothing to fix"
+ * like the rest of an FKM2 record. */
 static void
 fixup_forkmeta_records(uint8_t *buf, size_t len)
 {
@@ -310,7 +395,11 @@ fixup_forkmeta_records(uint8_t *buf, size_t len)
 
 	for (size_t off = 0; off + stride <= len; off += stride)
 	{
-		if (get_le32(buf + off) == FORK_META_V3_MAGIC_LOCAL)
+		uint32_t	magic = get_le32(buf + off);
+
+		if (magic == FORK_META_V2_MAGIC_LOCAL)
+			memset(buf + off + crc_off, 0, 3);
+		else if (magic == FORK_META_V3_MAGIC_LOCAL)
 		{
 			uint32_t	crc = crc24_openpgp(buf + off, crc_off);
 
@@ -443,8 +532,20 @@ fixup_retention_meta(const char *work_dir, uint8_t *buf, size_t len)
 
 	for (size_t off = 0; off + stride <= len; off += stride)
 	{
-		uint32_t	crc = fnv1a_step(FNV1A_INIT, buf + off, crc_off);
+		uint32_t	crc;
 
+		/*
+		 * Codex finding on PR #303 round 4: retention_record_valid()
+		 * (pagestore_retention.c) also requires `pad` (the four bytes after
+		 * `crc`, outside what the crc itself covers) to be exactly zero --
+		 * a record with a mutated, nonzero pad still stopped at that gate
+		 * regardless of a correct crc. Zeroed before both the crc and the
+		 * sibling retention.state (nrecords, log_hash) derivation below,
+		 * which hashes this whole record (pad included) the same way the
+		 * product's own replay loop does.
+		 */
+		memset(buf + off + offsetof(FuzzRetentionRecord, pad), 0, 4);
+		crc = fnv1a_step(FNV1A_INIT, buf + off, crc_off);
 		put_le32(buf + off + crc_off, crc);
 	}
 
@@ -622,8 +723,19 @@ fixup_walidx_frontier(uint8_t *buf, size_t len)
 #define WALIDX_REC_V1_BYTES 56u
 #define WALIDX_PROGRESS_BYTES 1080u /* 4*6 + 8+8+16 + PS_MAX_CHANNELS(128)*8 */
 
+/*
+ * expected_timeline: walidx_recover_one() (pagestore_core.c) requires
+ * every shape's `timeline` field (offset 16 in all three -- WalIdxRec,
+ * WalIdxRecV1, and WalIdxProgressRec all put it right after their common
+ * magic/rec_len/crc/flags-or-reserved-or-pad prefix) to equal the
+ * directory's own timeline -- a fixed, known harness constant (which
+ * timeline differs by target: walidx_log_epoch's walidx_0_0_... is
+ * timeline 0, walidx_log_legacy's walidx_1_0 is timeline 1 -- see
+ * posix_walidx_name()'s "walidx_%u_%u" in storage_posix.c), not a sibling
+ * file's content, so both callers pass their own target's real value.
+ */
 static void
-fixup_walidx_log(uint8_t *buf, size_t len)
+fixup_walidx_log(uint8_t *buf, size_t len, uint32_t expected_timeline)
 {
 	size_t		off = 0;
 
@@ -632,17 +744,32 @@ fixup_walidx_log(uint8_t *buf, size_t len)
 		uint32_t	magic = get_le32(buf + off);
 		uint32_t	rec_len = get_le32(buf + off + 4);
 		size_t		stride;
+		int			is_v1 = 0;
 
 		if (magic == WALIDX_MAGIC_LOCAL && rec_len == WALIDX_REC_BYTES)
 			stride = WALIDX_REC_BYTES;
 		else if (magic == WALIDX_MAGIC_LOCAL && rec_len == WALIDX_REC_V1_BYTES)
+		{
 			stride = WALIDX_REC_V1_BYTES;
+			is_v1 = 1;
+		}
 		else if (magic == WALIDX_PROGRESS_MAGIC_LOCAL)
 			stride = WALIDX_PROGRESS_BYTES;
 		else
 			break;
 		if (off + stride > len)
 			break;
+		/*
+		 * Codex finding on PR #303 round 4: walidx_recover_one()
+		 * (pagestore_core.c) rejects a V1 (56-byte) record outright when its
+		 * `reserved` field (offset 12, WalIdxRecV1) is nonzero -- checked
+		 * before the record is added to the index, independent of a
+		 * correct crc. Only the V1 shape carries this field (WalIdxRec and
+		 * WalIdxProgressRec have no equivalent), so it is zeroed only here.
+		 */
+		if (is_v1)
+			memset(buf + off + 12, 0, 4);
+		put_le32(buf + off + 16, expected_timeline);
 		put_le32(buf + off + 8, 0);
 		put_le32(buf + off + 8, fnv1a_step(FNV1A_INIT, buf + off, stride));
 		off += stride;
@@ -756,7 +883,7 @@ fixup_walidx_log_epoch_watermark(const char *work_dir, uint64_t new_length)
 static void
 fixup_walidx_log_epoch(const char *work_dir, uint8_t *buf, size_t len)
 {
-	fixup_walidx_log(buf, len);
+	fixup_walidx_log(buf, len, 0);		/* walidx_0_0_e...: timeline 0 */
 	fixup_walidx_log_epoch_watermark(work_dir, (uint64_t) len);
 }
 
@@ -847,7 +974,25 @@ fixup_wal_segment(uint8_t *buf, size_t len)
  * i.e. PS_CRC32C_FIN() since FIN is XOR 0xffffffff == bitwise NOT here).
  * Only fixed up when the buffer already parses as "PSS2 <digits> <hex>";
  * a mutation that broke the textual shape explores that path instead, same
- * as every other format's "give up cleanly" fallback. */
+ * as every other format's "give up cleanly" fallback.
+ *
+ * Codex finding on PR #303 round 4: %u canonicalizes a spelling like "01"
+ * to "1", so the freshly formatted text can be shorter than the mutated
+ * input it replaces (`len` itself cannot shrink -- ps_fuzz_crc_fixup() has
+ * no way to report a new length back to its caller, which always writes
+ * exactly `len` bytes). The old fix only memcpy()'d the new (shorter) text
+ * over the front of `buf`, leaving that suffix's stale bytes -- part of the
+ * old, longer spelling and/or old checksum -- immediately after the new
+ * checksum with no separating whitespace. validate_store_shard_count()'s
+ * `sscanf(line, "PSS2 %u %x %c", ...)` reads %x greedily, so leftover hex-
+ * looking digits right after the new checksum silently became part of the
+ * parsed checksum value instead of stopping there, and non-hex leftovers
+ * fed the trailing `%c` (making sscanf return 3, not the required 2, since
+ * the literal space in the format string only skips whitespace, not
+ * arbitrary text). Space-padding this tail instead is always safe: %x never
+ * treats ' ' as a digit, and the format's implicit "skip whitespace" before
+ * %c consumes any amount of it, so %c still fails to match at EOF exactly
+ * as it does for the checksum's own real trailing newline. */
 static void
 fixup_store_config(uint8_t *buf, size_t len)
 {
@@ -874,6 +1019,11 @@ fixup_store_config(uint8_t *buf, size_t len)
 	if (n <= 0 || (size_t) n > len)
 		return;
 	memcpy(buf, out, (size_t) n);
+	/* Blank only the bytes the canonical spelling no longer covers; the
+	 * original tail (newline or trailing garbage) after `consumed` stays
+	 * fuzzer-controlled. */
+	if ((size_t) n < (size_t) consumed)
+		memset(buf + n, ' ', (size_t) consumed - (size_t) n);
 }
 
 /* ---- layer_<shard>_<id> (pagestore_layer.c/.h PsImgFooter) -------------
@@ -907,6 +1057,46 @@ typedef struct FuzzImgFooter
 	uint32_t	data_crc;
 	uint32_t	index_crc;
 } FuzzImgFooter;
+
+/*
+ * Mirrors pagestore_layer.c's private PsImgIndexEntV2/PsImgIndexEntV3 (not
+ * exported -- reproduced field-for-field, sizeof() doing the layout-
+ * sensitive work, same convention as every other mirrored struct in this
+ * file) and pagestore_layer.h's exported PsImgIndexEnt (the current,
+ * version-4 shape) -- the three per-entry sizes ps_image_layer_read_index()
+ * picks between by the footer's own `version` field. */
+typedef struct FuzzImgIndexEntV2
+{
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;
+	uint64_t	data_off;
+} FuzzImgIndexEntV2;
+typedef struct FuzzImgIndexEntV3
+{
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;
+	uint64_t	data_off;
+	uint64_t	growth_lsn;
+	uint64_t	order_id;
+	uint64_t	seg_off;
+	uint32_t	seg_id;
+	uint32_t	flags;
+} FuzzImgIndexEntV3;
+typedef struct FuzzImgIndexEntV4
+{
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;
+	uint64_t	admission_seq;
+	uint64_t	data_off;
+	uint64_t	growth_lsn;
+	uint64_t	order_id;
+	uint64_t	seg_off;
+	uint32_t	seg_id;
+	uint32_t	flags;
+} FuzzImgIndexEntV4;
 
 /*
  * Find the ADD_LAYER record in the (pristine, in-memory-cached) template
@@ -1018,6 +1208,8 @@ fixup_image_layer(const char *work_dir, uint8_t *buf, size_t len)
 	uint64_t	index_off;
 	uint32_t	data_crc;
 	uint32_t	index_crc;
+	uint32_t	version;
+	size_t		ent_size;
 
 	/* Sync the manifest's recorded size to this mutated file's actual
 	 * length regardless of whether the footer below gets fixed up too --
@@ -1031,6 +1223,36 @@ fixup_image_layer(const char *work_dir, uint8_t *buf, size_t len)
 	index_off = get_le64(footer + offsetof(FuzzImgFooter, index_off));
 	if (index_off > len - footer_bytes)
 		return;					/* out of range: leave fully fuzzer-controlled */
+
+	/*
+	 * Codex finding on PR #303 round 4: a whole-entry insertion/deletion in
+	 * the index section changes its span (len - footer_bytes - index_off)
+	 * without updating `nrecs`, and ps_image_layer_read_index()
+	 * (pagestore_layer.c) requires nrecs*entry_size to equal that span
+	 * exactly -- checked before index_crc even matters. Entry size depends
+	 * on the footer's own (possibly fuzzer-mutated) version field, exactly
+	 * as the reader itself picks it; an unrecognized version already fails
+	 * the reader's very first check regardless of nrecs, so it is left
+	 * alone. Derived only for an entry-aligned span.
+	 */
+	version = get_le32(footer + offsetof(FuzzImgFooter, version));
+	ent_size = version == 2 ? sizeof(FuzzImgIndexEntV2) :
+		version == 3 ? sizeof(FuzzImgIndexEntV3) :
+		version == 4 ? sizeof(FuzzImgIndexEntV4) : 0;
+	if (ent_size != 0)
+	{
+		uint64_t	index_span = (len - footer_bytes) - index_off;
+
+		if (index_span % ent_size == 0)
+		{
+			uint64_t	derived_nrecs = index_span / ent_size;
+
+			if (derived_nrecs > 0 && derived_nrecs <= UINT32_MAX)
+				put_le32(footer + offsetof(FuzzImgFooter, nrecs),
+						 (uint32_t) derived_nrecs);
+		}
+	}
+
 	data_crc = fnv1a_step(FNV1A_INIT, buf, (size_t) index_off);
 	index_crc = fnv1a_step(FNV1A_INIT, buf + index_off,
 							(len - footer_bytes) - (size_t) index_off);
@@ -1571,6 +1793,15 @@ fixup_walidx_snapshot_shard(const char *work_dir, uint8_t *buf, size_t len)
 	{
 		uint32_t	crc;
 
+		/*
+		 * Codex round-4-audit finding: the reader's per-record check in
+		 * pagestore_core.c (the walidx_snapshot_shard recovery loop) also
+		 * requires each WalIdxRec's own `timeline` (offset 16) to equal the
+		 * timeline being recovered -- 0, this harness's only populated
+		 * timeline, a fixed known constant like the header's own timeline
+		 * field above, not a sibling file's content.
+		 */
+		put_le32(buf + off + 16, 0);
 		put_le32(buf + off + WALIDX_REC_CRC_OFF_LOCAL, 0);
 		crc = fnv1a_step(FNV1A_INIT, buf + off, WALIDX_REC_BYTES_LOCAL);
 		put_le32(buf + off + WALIDX_REC_CRC_OFF_LOCAL, crc);
@@ -1664,7 +1895,7 @@ ps_fuzz_crc_fixup(const char *target_name, const char *work_dir,
 	else if (strcmp(target_name, "walidx_log_epoch") == 0)
 		fixup_walidx_log_epoch(work_dir, buf, len);
 	else if (strcmp(target_name, "walidx_log_legacy") == 0)
-		fixup_walidx_log(buf, len);
+		fixup_walidx_log(buf, len, 1);	/* walidx_1_0: timeline 1 */
 	else if (strcmp(target_name, "walidx_watermark") == 0)
 		fixup_walidx_watermark(work_dir, buf, len);
 	else if (strcmp(target_name, "wal_store_identity") == 0)
