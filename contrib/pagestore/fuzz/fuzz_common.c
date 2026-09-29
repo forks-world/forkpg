@@ -457,6 +457,22 @@ reset_work_dir(void)
 	}
 }
 
+/*
+ * Exported for gate_sweep.c (fuzz/tests/): that tool calls
+ * ps_fuzz_crc_fixup() and ps_core_open()/close() directly, one mutated
+ * field at a time, instead of going through ps_fuzz_run_one() -- it needs
+ * the exact same "the work directory is pristine again before the next
+ * call" guarantee ps_fuzz_run_one() gets from this function, or state a
+ * successful open leaves behind (a checkpoint, a compacted manifest, ...)
+ * silently drifts the store away from the fixture across thousands of
+ * sweep iterations, masking real gates instead of finding them.
+ */
+void
+ps_fuzz_reset_work_dir(void)
+{
+	reset_work_dir();
+}
+
 /* ---- optional post-reset self-check (fuzz-build only) -------------------- */
 
 /*

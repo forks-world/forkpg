@@ -67,4 +67,13 @@ extern void ps_fuzz_run_one(const char *target_name,
 extern const uint8_t *ps_fuzz_template_lookup(const char *relpath,
 											   size_t *len_out);
 
+/* Restores the live work directory to the pristine template (rewrites any
+ * file a prior ps_core_open()/maintenance()/close() call changed, deletes
+ * anything it added, recreates anything it removed). ps_fuzz_run_one()
+ * already calls this after every iteration; exported only for a caller
+ * that drives ps_core_open() directly instead (gate_sweep.c, fuzz/tests/),
+ * which needs the same "pristine again" guarantee between its own
+ * iterations. */
+extern void ps_fuzz_reset_work_dir(void);
+
 #endif							/* PS_FUZZ_COMMON_H */

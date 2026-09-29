@@ -282,3 +282,97 @@ Findings 1-2 were the round's two accepted Codex findings; 3-7 were found by
 this table's own mechanical sweep (probe every candidate "redundant
 size/count field" per target under `PS_FUZZ_CRC_FIXUP=always`) and fixed in
 the same commit.
+
+## Round 7: the manual method wasn't enough -- gate_sweep.c
+
+Codex reviewed round 6's commit and found three more gates this table
+missed by manual reading:
+
+1. `wal_segment`: `ps_wal_segment_decode()` (pagestore_wal_segment.c) also
+   requires `header_len`@8 to equal `PS_WAL_SEGMENT_HEADER_BYTES` (64) and
+   `flags`@12 to be exactly zero. **FIXED**: both pinned in
+   `fixup_wal_segment()` (fuzz_crc_fixup.c), the same way payload_len/
+   segment_size already were.
+2. `image_layer`: `ps_image_layer_verify_data()` (pagestore_layer.c)
+   requires the footer's `page_size` to equal the store's own configured
+   `page_size` (the `page_size` global in pagestore_core.c,
+   `PS_DEFAULT_PAGE_SIZE`=8192 unless overridden). **FIXED**: pinned in
+   `fixup_image_layer()`.
+3. `forkmeta` / `forkmeta_snapshot_checkpoint` / `forkmeta_snapshot_tail`
+   (all three share `fixup_forkmeta_records()`): `fork_meta_rec_wire_valid()`
+   (pagestore_core.c) checks `rec->rec_len != sizeof(*rec)` *first*, before
+   magic, pad, or crc. **FIXED**: `rec_len` pinned to
+   `sizeof(FuzzForkMetaRecV2)` (64) for every record whose magic this
+   function recognizes (FKM2 or FKM3).
+
+Three rounds of Codex findings on top of three rounds of "we read the
+loader and thought we got every gate" makes the point: manual reading does
+not scale to a file that now fixes up ~20 formats' worth of pre-parse
+gates. `contrib/pagestore/fuzz/tests/gate_sweep.c` replaces judgment with
+brute force wherever brute force is cheap enough to run -- see its own
+header comment for exactly what it does and why (byte-flip every offset in
+each target's pristine file's first N bytes, fixup(always), open, and
+treat the presence of `pagestore_core: open step ... failed` in that one
+call's stderr as authoritative pass/fail, verified against
+`open_step_failed()`'s own comment that *every* `ps_core_open()` failure
+path is routed through it).
+
+### Rerunning it
+
+```
+contrib/pagestore/fuzz/build.sh   # or: ninja -C build contrib/pagestore/pagestore_gate_sweep
+# full audit (256 bytes/target, both flip masks) -- what round 7 used:
+build/contrib/pagestore/pagestore_gate_sweep list contrib/pagestore
+# regression check against the reviewed allowlist (what meson runs, with a
+# smaller sweep width so it finishes in seconds -- see meson.build's own
+# comment on why: neither this binary nor pagestore_format_fuzz_replay
+# wraps fsync(), unlike the instrumented libFuzzer binary):
+build/contrib/pagestore/pagestore_gate_sweep check \
+  contrib/pagestore/fuzz/tests/gate_sweep_allowlist.txt contrib/pagestore
+```
+
+`check` exits nonzero and prints every offset not on the allowlist. For
+each new one, decide (see gate_sweep.c's own header comment for the full
+rubric): (a) a fixable gate -> pin the field in fuzz_crc_fixup.c and rerun;
+(b) a genuine semantic rejection, or (c) a deliberately unpinned identity
+field -> add a documented entry to
+`fuzz/tests/gate_sweep_allowlist.txt` explaining which, with a file:line
+citation for the check that rejects it.
+
+### Round 7 sweep results (256 bytes/target, both masks, after all fixes)
+
+| target | rejected offsets found | classification |
+|---|---|---|
+| manifest | 47 (0-11, 20-27, 100-103) | (c) magic/type identity; (b) layer_id/URI consistency + location_count bound |
+| forkmeta | 186 | (c) per-record magic; (b) per-record semantic fields (rec_len fixed this round) |
+| forkmeta_snapshot_manifest | 16 (0-7) | (c) magic/version (header_bytes fixed this round) |
+| forkmeta_snapshot_checkpoint | 131 | same per-record pattern as forkmeta, offset by the 80-byte header |
+| forkmeta_snapshot_tail | 122 | same |
+| image_layer | 0 | none (page_size fixed this round; data bytes healed by crc recompute) |
+| page_frontier | 16 (0-7) | (c) magic/version |
+| page_segment | 7 (0-3) | (c) magic (this format has no crc at all) |
+| retention_meta | 283 | (c) per-record magic/type; (b) per-record PsRetentionPin semantic fields (len fixed this round) |
+| retention_state | 16 (0-7) | (c) magic/version |
+| store_config | 3 (0-1) | (c) the literal "PS" prefix sscanf requires |
+| timelines | 333 | (c) per-record magic (rec_len fixed this round); (b) per-record semantic fields |
+| wal_log | 32 (0-15) | (c) magic; (b) len/start_lsn (this target has no fixup at all -- see below) |
+| wal_store_identity | 80 (0-7, 16-47) | (c) magic/version (header@8 fixed round 6); (b) decode_metadata()'s semantic LSN/segment_size checks |
+| wal_segment | 16 (0-7) | (c) magic/version only (everything else fixed round 6/7) |
+| walidx_frontier | 16 (0-7) | (c) magic/version |
+| walidx_log_epoch | 40 | (c) magic/rec_len shape-selection; (b) flags/end_lsn semantic (timeline correctly pinned, absent) |
+| walidx_log_legacy | 380 | (c) per-record magic/rec_len shape-selection; (b) WIPG progress-record semantic fields |
+| walidx_watermark | 16 (0-7) | (c) magic |
+| walidx_snapshot_manifest | 16 (0-7) | (c) magic/version (header@8/@12 fixed round 6) |
+| walidx_snapshot_shard | 139 | (c) magic/version/per-record magic+rec_len; (b) per-record semantic fields (bytes@8/timeline both fixed) |
+| **total** | **1895** | **all (b)/(c), `check` PASSes against gate_sweep_allowlist.txt** |
+
+Full per-offset classification with file:line citations for every (b)/(c)
+class lives in `fuzz/tests/gate_sweep_allowlist.txt`'s own header comment
+and per-target blocks -- this table is the summary; that file is the
+source of truth `gate_sweep check` actually enforces.
+
+No new class-(a) gaps were found beyond the three Codex reported this
+round: every one of the 1895 rejections this sweep found, across all 21
+targets, was already explained by an existing fixed-up field (rec_len/
+header_bytes fixes from this round and round 6), a deliberately-unpinned
+identity field, or a genuine semantic/consistency check.

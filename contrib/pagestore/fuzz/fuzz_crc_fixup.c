@@ -397,12 +397,35 @@ fixup_forkmeta_records(uint8_t *buf, size_t len)
 	{
 		uint32_t	magic = get_le32(buf + off);
 
+		/*
+		 * Codex finding on PR #303 (round 7, gate-sweep):
+		 * fork_meta_rec_wire_valid() (pagestore_core.c) checks
+		 * `rec->rec_len != sizeof(*rec)` *first*, before magic, pad, or
+		 * crc -- an unrecognized rec_len rejects the record outright
+		 * regardless of everything else this function already fixes up.
+		 * This function commits to treating every stride-aligned chunk as
+		 * one fixed-size ForkMetaRecV2 record (the same shape FKM2 and
+		 * FKM3 both share), so rec_len is pinned to that one size for
+		 * every record whose magic it recognizes -- the same reasoning
+		 * already applied to rec_len/header_bytes-style fields elsewhere
+		 * in this file. A record whose magic is neither FKM2 nor FKM3 is
+		 * left alone: it already fails wire_valid() on magic regardless,
+		 * so pinning its rec_len would not change reachability and would
+		 * cost coverage of that independent identity gate.
+		 */
 		if (magic == FORK_META_V2_MAGIC_LOCAL)
+		{
+			put_le32(buf + off + offsetof(FuzzForkMetaRecV2, rec_len),
+					 (uint32_t) stride);
 			memset(buf + off + crc_off, 0, 3);
+		}
 		else if (magic == FORK_META_V3_MAGIC_LOCAL)
 		{
-			uint32_t	crc = crc24_openpgp(buf + off, crc_off);
+			uint32_t	crc;
 
+			put_le32(buf + off + offsetof(FuzzForkMetaRecV2, rec_len),
+					 (uint32_t) stride);
+			crc = crc24_openpgp(buf + off, crc_off);
 			buf[off + crc_off + 0] = (uint8_t) (crc >> 16);
 			buf[off + crc_off + 1] = (uint8_t) (crc >> 8);
 			buf[off + crc_off + 2] = (uint8_t) crc;
@@ -1077,6 +1100,19 @@ fixup_wal_segment(uint8_t *buf, size_t len)
 	if (len < 64)
 		return;
 	payload_len = (uint32_t) (len - 64);
+	/*
+	 * Codex finding on PR #303 (round 7, gate-sweep): ps_wal_segment_decode()
+	 * (pagestore_wal_segment.c) also requires header_len@8 to equal
+	 * PS_WAL_SEGMENT_HEADER_BYTES (64) and flags@12 to be exactly zero,
+	 * both checked before payload_len, segment_identity_valid(), or
+	 * header_crc ever matter. Neither varies for any record this function
+	 * seals -- header_len is this format's one fixed header size and flags
+	 * has no defined nonzero value yet -- so both are pinned the same way
+	 * payload_len/segment_size are, not left fuzzer-controlled like
+	 * magic/version.
+	 */
+	put_le32(buf + 8, 64);		/* header_len */
+	put_le32(buf + 12, 0);		/* flags */
 	put_le32(buf + 20, payload_len);
 	tmpl = ps_fuzz_template_lookup(
 		"wal_segments_0/walv1_1_00000000000000000000", &tmpl_len);
@@ -1373,6 +1409,20 @@ fixup_image_layer(const char *work_dir, uint8_t *buf, size_t len)
 	index_off = get_le64(footer + offsetof(FuzzImgFooter, index_off));
 	if (index_off > len - footer_bytes)
 		return;					/* out of range: leave fully fuzzer-controlled */
+
+	/*
+	 * Codex finding on PR #303 (round 7, gate-sweep):
+	 * ps_image_layer_verify_data() (pagestore_layer.c) also requires the
+	 * footer's `page_size` to equal the store's own configured page_size
+	 * (pagestore_core.c's `page_size` global, PS_DEFAULT_PAGE_SIZE unless a
+	 * test overrides it) -- checked before data_crc ever matters, right
+	 * alongside magic/version. Unlike magic/version (left fuzzer-
+	 * controlled: a real format-identity choice), page_size is this
+	 * store's one fixed operating parameter, the same class as
+	 * segment_size in wal_segment or header_bytes elsewhere in this file,
+	 * so it is pinned.
+	 */
+	put_le32(footer + offsetof(FuzzImgFooter, page_size), page_size);
 
 	/*
 	 * Codex finding on PR #303 round 4: a whole-entry insertion/deletion in
