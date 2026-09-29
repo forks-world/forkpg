@@ -2894,8 +2894,17 @@ act_retention_reserve_adv(void)
 
 		ring_note("RETENTION_PIN_RESERVE adv=stale-or-zero-lsn owner=%llu",
 				  (unsigned long long) g_reader[0].owner_id);
-		observe(PS_OP_RETENTION_PIN_RESERVE, status, 0,
-				"RETENTION_PIN_RESERVE adversarial generation/lsn", 1);
+		/*
+		 * lsn=0 can never succeed: retention_pin_valid() rejects it
+		 * unconditionally before anything is persisted, so the only
+		 * reachable outcomes are STALE (the generation check runs first) or
+		 * ERROR.  observe()'s allow_stale=1 would also accept OK.
+		 */
+		ck(status == PS_STATUS_ERROR || status == PS_STATUS_STALE,
+		   "RETENTION_PIN_RESERVE adversarial generation/lsn owner=%llu: "
+		   "lsn=0 must never succeed, got status=%d",
+		   (unsigned long long) g_reader[0].owner_id, status);
+		record_cov(PS_OP_RETENTION_PIN_RESERVE, (uint32_t) status, 0);
 	}
 	else
 	{
@@ -3280,15 +3289,16 @@ verify_artifact_entry(const char *phase, uint32_t tl, uint32_t akind,
 	   "%s: inherited artifact tl=%u akind=%u rel=%u EXISTS expected %d "
 	   "got %d (status %d)", phase, tl, akind, rel,
 	   art->visible.exists, exists, status);
-	if (status != PS_STATUS_OK || !exists)
-		return;
+	/* NBLOCKS is checked even when absent (expected 0): see
+	 * verify_latest_all(). */
 	status = psc_op_nblocks(tl, g_tl[tl].incarnation, klass, rel, 0, 0,
 						   &nblocks);
 	ck(status == PS_STATUS_OK && nblocks == art->visible.nblocks,
 	   "%s: inherited artifact tl=%u akind=%u rel=%u NBLOCKS expected %u "
 	   "got %u (status %d)", phase, tl, akind, rel,
 	   art->visible.nblocks, nblocks, status);
-	if (status != PS_STATUS_OK || nblocks != art->visible.nblocks)
+	if (!art->visible.exists || status != PS_STATUS_OK ||
+		nblocks != art->visible.nblocks)
 		return;
 	for (uint32_t block = 0; block < art->visible.nblocks; block++)
 	{
@@ -4599,6 +4609,12 @@ verify_branch(uint32_t slot, const char *phase)
 							 &exists) == PS_STATUS_OK && !exists,
 			   "%s: branch %u does not see relation %u absent at its fork",
 			   phase, slot, rel);
+			/* Absent must also report zero blocks: see verify_latest_all().
+			 * Once this branch is deleted no later check examines it. */
+			ck(psc_op_nblocks(slot, b->incarnation, PS_KLASS_RELATION, rel,
+							  0, 0, &nb) == PS_STATUS_OK && nb == 0,
+			   "%s: branch %u rel %u nblocks expected 0 got %u (relation "
+			   "absent at its fork)", phase, slot, rel, nb);
 			continue;
 		}
 		ck(psc_op_nblocks(slot, b->incarnation, PS_KLASS_RELATION, rel, 0, 0,
@@ -5157,10 +5173,20 @@ verify_artifacts(const char *phase)
 									&exists);
 				if (art->state == FZ_ART_NONE)
 				{
+					int			nbstatus;
+
 					ck(est == PS_STATUS_OK && !exists,
 					   "%s: abandoned first artifact tl=%u akind=%u rel=%u "
 					   "must remain invisible (EXISTS status %d, exists %d)",
 					   phase, tl, akind, rel, est, exists);
+					/* Absent must also report zero blocks: see
+					 * verify_latest_all(). */
+					nbstatus = psc_op_nblocks(tl, g_tl[tl].incarnation, klass,
+											  rel, 0, 0, &nb);
+					ck(nbstatus == PS_STATUS_OK && nb == 0,
+					   "%s: abandoned first artifact tl=%u akind=%u rel=%u "
+					   "NBLOCKS expected 0 got %u (status %d)", phase, tl,
+					   akind, rel, nb, nbstatus);
 					continue;
 				}
 				/*
@@ -5184,20 +5210,23 @@ verify_artifacts(const char *phase)
 				   "%s: artifact tl=%u akind=%u rel=%u astate=%d exists "
 				   "expected %d got %d (EXISTS status %d)", phase, tl, akind,
 				   rel, art->state, art->visible.exists, exists, est);
-				if (art->state == FZ_ART_DROPPED)
+				if (!art->visible.exists)
 				{
+					/* Any modeled-absent key (DROPPED, or OPEN with no
+					 * prior settled generation) must report zero blocks:
+					 * see verify_latest_all(). */
 					int			nbstatus = psc_op_nblocks(tl,
 												 g_tl[tl].incarnation,
 												 klass, rel, 0, 0, &nb);
 
-					ck(nbstatus == PS_STATUS_OK && nb == 0, "%s: DROPPED "
-					   "artifact tl=%u akind=%u rel=%u NBLOCKS expected 0 got %u "
-					   "(status %d)", phase, tl, akind, rel, nb, nbstatus);
-				}
-				if (!art->visible.exists)
+					ck(nbstatus == PS_STATUS_OK && nb == 0, "%s: absent "
+					   "artifact tl=%u akind=%u rel=%u astate=%d NBLOCKS "
+					   "expected 0 got %u (status %d)", phase, tl, akind, rel,
+					   art->state, nb, nbstatus);
 					continue;		/* including the weak-oracle case above:
 									 * the model's belief is what subsequent
 									 * NBLOCKS/content checks are keyed to */
+				}
 				{
 					int			nbstatus = psc_op_nblocks(tl,
 														 g_tl[tl].incarnation,
