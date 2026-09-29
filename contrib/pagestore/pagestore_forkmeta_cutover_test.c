@@ -4494,6 +4494,76 @@ test_hole_record_bad_len_rejected(void)
 }
 
 /*
+ * A no-op ZEROEXTEND (the fork's size at (lsn, seq) already covers the
+ * requested to_nblocks) must not report the admission sequence it
+ * allocated: fork_grow_with_seq() persists and inserts nothing for it, so
+ * the sequence is never durable.  Before the fix, PS_OP_ZEROEXTEND echoed
+ * the burned sequence back as req_seq anyway; a client could then observe a
+ * "committed" sequence that a later clean restart's admission barrier comes
+ * back below, because admission_seq_observe() during recovery only restores
+ * the allocator to what fork-meta actually persisted (op-fuzzer PR #302,
+ * seed 500: ZEROEXTEND at step 6039 allocated seq 2361 with no persisted
+ * effect; a clean restart at step 6046 produced barrier 2360).
+ */
+static void
+test_zeroextend_noop_does_not_report_seq(void)
+{
+	char		store[] = "/tmp/psforkmetazenoopXXXXXX";
+	PsKey		key = {31, 31, 501, 0, PS_KLASS_RELATION};
+	PsChannel	reply;
+	uint64_t	grow_seq;
+	uint64_t	barrier;
+
+	check(mkdtemp(store) != NULL, "create zeroextend-noop-seq store");
+	check(ps_core_open(store) == 0, "bootstrap zeroextend-noop-seq store");
+
+	/* A real grow (0 -> 4) is durable and must return a nonzero seq. */
+	check(meta_request(PS_OP_ZEROEXTEND, &key, 100, 0, 4, 0, &reply) &&
+		  reply.status == PS_STATUS_OK && reply.req_seq != 0,
+		  "a real ZEROEXTEND grow returns a nonzero admission sequence");
+	grow_seq = reply.req_seq;
+
+	/* A no-op grow to a size already covered by the durable grow above:
+	 * still PS_STATUS_OK (it is not an error), but req_seq must come back
+	 * 0 -- nothing was persisted for the sequence it burned. */
+	check(meta_request(PS_OP_ZEROEXTEND, &key, 100, 0, 2, 0, &reply) &&
+		  reply.status == PS_STATUS_OK && reply.req_seq == 0,
+		  "a no-op ZEROEXTEND at/below the current size reports req_seq == 0");
+
+	/* A second no-op, burning a further sequence, must not leak it either:
+	 * this is the case that actually violates the barrier invariant if
+	 * either no-op instead reports its seq (the first no-op's burned seq
+	 * would then sit strictly between the durable grow's seq and this
+	 * one's, so a post-restart barrier resuming right after the durable
+	 * grow would be lower than a previously reported sequence). */
+	check(meta_request(PS_OP_ZEROEXTEND, &key, 100, 0, 4, 0, &reply) &&
+		  reply.status == PS_STATUS_OK && reply.req_seq == 0,
+		  "a second no-op ZEROEXTEND also reports req_seq == 0");
+
+	check(meta_request(PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 4,
+		  "no-op ZEROEXTENDs left the fork's durable size unchanged");
+
+	close_runtime();
+	check(ps_core_open(store) == 0,
+		  "zeroextend-noop-seq store reopens after a clean restart");
+
+	check(meta_request(PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 4,
+		  "the durable grow's size survives the restart");
+
+	ps_lifecycle_read_lock();
+	barrier = ps_admission_barrier();
+	ps_lifecycle_read_unlock();
+	check(barrier != 0 && barrier > grow_seq,
+		  "post-restart admission barrier exceeds every admission sequence "
+		  "ever reported to a client, including the durable grow's");
+
+	close_runtime();
+	remove_tree(store);
+}
+
+/*
  * ---- T2: page_cleanup_tombstone_segment() keeps every survivor's offset ----
  *
  * Folds $SP/f3/q1_test.c's three variants (crash right after the tombstone
@@ -5815,6 +5885,7 @@ main(void)
 	test_artifact_write_unfenced_after_pin_drop();
 	test_hole_record_skipped_on_reopen();
 	test_hole_record_bad_len_rejected();
+	test_zeroextend_noop_does_not_report_seq();
 	test_timeline_delete_keeps_offsets();
 	test_timeline_delete_reclaims_by_segment_gc();
 	test_compaction_never_prunes_above_watermark();

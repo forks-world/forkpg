@@ -8161,6 +8161,19 @@ ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
 	return 1;
 }
 
+/*
+ * Returns 1 if growth was durably applied (persisted to fork-meta and
+ * inserted as a GROW event), 0 if the request was a no-op (the fork's size
+ * at (lsn, admission_seq) already covers to_nblocks, so nothing was
+ * persisted or inserted), or -1 on error (not durable: nothing applied).
+ *
+ * A no-op admits no mutation, so admission_seq is never made durable for
+ * it.  Callers that hand admission_seq back to a client as a mutation
+ * response MUST treat a 0 return as "burn the sequence, report none of it":
+ * reporting it anyway would let a client observe a sequence that a clean
+ * restart's allocator rollback (admission_seq_observe() during recovery)
+ * can later place below the ADMISSION_BARRIER -- see PS_OP_ZEROEXTEND below.
+ */
 static int
 fork_grow_with_seq(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 				   uint64_t lsn, uint64_t admission_seq)
@@ -8173,12 +8186,13 @@ fork_grow_with_seq(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 	 */
 	if (lsn < e->last_def_lsn || lsn == 0)
 		lsn = e->last_def_lsn;
-	if (fork_size_asof_hop(e, lsn, admission_seq) < to_nblocks &&
-		fork_meta_persist(timeline, key, lsn, admission_seq, to_nblocks,
+	if (fork_size_asof_hop(e, lsn, admission_seq) >= to_nblocks)
+		return 0;			/* no-op: already at or above to_nblocks */
+	if (fork_meta_persist(timeline, key, lsn, admission_seq, to_nblocks,
 						  FEV_GROW) != 0)
 		return -1;			/* not durable: do not apply in memory */
 	fork_event_add(e, lsn, admission_seq, to_nblocks, FEV_GROW, true);
-	return 0;
+	return 1;
 }
 
 int
@@ -8192,7 +8206,10 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 	admission_seq = admission_seq_alloc();
 	if (admission_seq == 0)
 		return -1;
-	return fork_grow_with_seq(timeline, key, to_nblocks, lsn, admission_seq);
+	/* Callers of fork_grow() only need success/failure, not the
+	 * applied-vs-no-op distinction; collapse both non-error outcomes to 0. */
+	return fork_grow_with_seq(timeline, key, to_nblocks, lsn, admission_seq) < 0 ?
+		-1 : 0;
 }
 
 /* Apply growth whose durability is already represented by metadata/segment. */
@@ -22193,21 +22210,36 @@ ps_handle_meta(PsChannel *ch)
 			 * The segment log has no record of it, so the GROW event must be
 			 * persisted -- but only when it actually raises the size at its
 			 * horizon, keeping the log as sparse as the in-memory dedup.
+			 *
+			 * A no-op grow (fork_grow_with_seq() returns 0: the fork's size
+			 * already covers 'to') persists and inserts nothing, so 'seq' is
+			 * never made durable.  It must not be reported as req_seq: a
+			 * client that observed it as a mutation sequence could later see
+			 * a clean-restart ADMISSION_BARRIER below it, since the
+			 * allocator itself rolls back to what recovery actually
+			 * observed.  Report req_seq = 0 instead; the burned seq value is
+			 * otherwise harmless (nothing references it).
 			 */
 			{
 				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
 				uint32_t	to = ch->blocknum + ch->nblocks;
+				int			grew;
 
 				/* Validate the caller's explicit tuple before fork_grow_with_seq()
 				 * can clamp its effective LSN to a newer definitive event. */
 				if (seq == 0 ||
 					(ch->req_lsn != 0 &&
-					 !fork_meta_mutation_future(ch->req_lsn, seq)) ||
-					fork_grow_with_seq(tl, &ch->key, to, lsn, seq) != 0)
+					 !fork_meta_mutation_future(ch->req_lsn, seq)))
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
+				grew = fork_grow_with_seq(tl, &ch->key, to, lsn, seq);
+				if (grew < 0)
 					ch->status = PS_STATUS_ERROR;
 				else
-					ch->req_seq = seq;
+					ch->req_seq = grew ? seq : 0;
 			}
 			break;
 
