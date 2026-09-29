@@ -938,6 +938,26 @@ ship_wal_past_fork(uint32_t tl)
 	return lsn;
 }
 
+/*
+ * Fed by every successful mutation that exposes its own admission sequence
+ * -- the relation lifecycle ops below (CREATE/UNLINK/TRUNCATE/ZEROEXTEND,
+ * whenever the core handler actually allocated one instead of taking a
+ * no-op/dedup path), EXTEND/WRITEV, artifact BEGIN's token, and the
+ * retention reservation ops further down -- so that the ADMISSION_BARRIER
+ * oracle (check_admission_barrier(), below) always has the true high-water
+ * mark to compare a barrier response against, not just what
+ * act_admission_barrier() happened to sample.  See that oracle's own
+ * header comment for the full rationale.
+ */
+static uint64_t g_max_mutation_seq;
+
+static void
+note_mutation_seq(uint64_t seq)
+{
+	if (seq > g_max_mutation_seq)
+		g_max_mutation_seq = seq;
+}
+
 /* ===================== relation ops ======================================= */
 
 static void
@@ -959,19 +979,23 @@ act_create(void)
 		if (m->exists && rng_pct(40))
 		{
 			/* ensure-existing: req_lsn=0 is a no-op idempotent ensure */
+			uint64_t	seq = 0;
 			int			status = psc_op_create(tl, target_inc, PS_KLASS_RELATION,
-												  rel, 0);
+												  rel, 0, &seq);
 
 			ring_note("CREATE ensure tl=%u rel=%u", tl, rel);
 			ck(status == PS_STATUS_OK, "CREATE ensure of existing tl=%u rel=%u"
 			   " (status %d)", tl, rel, status);
 			record_cov(PS_OP_CREATE, (uint32_t) status, 0);
+			if (status == PS_STATUS_OK)
+				note_mutation_seq(seq);
 		}
 		else
 		{
 			uint64_t	lsn = ship_wal(tl);
+			uint64_t	seq = 0;
 			int			status = psc_op_create(tl, target_inc, PS_KLASS_RELATION,
-												  rel, lsn);
+												  rel, lsn, &seq);
 
 			ring_note("CREATE tl=%u rel=%u lsn=%llu", tl, rel,
 					  (unsigned long long) lsn);
@@ -980,6 +1004,7 @@ act_create(void)
 			record_cov(PS_OP_CREATE, (uint32_t) status, 0);
 			if (status == PS_STATUS_OK)
 			{
+				note_mutation_seq(seq);
 				m->exists = 1;
 				m->nblocks = 0;
 				memset(m->tag, 0, sizeof(m->tag));
@@ -992,7 +1017,7 @@ act_create(void)
 	{
 		uint64_t	lsn = adv == ADV_UNDEFINED_TIMELINE ? 0 : g_tl[tl].wal_end;
 		int			status = psc_op_create(target_tl, target_inc,
-											  PS_KLASS_RELATION, rel, lsn);
+											  PS_KLASS_RELATION, rel, lsn, NULL);
 
 		ring_note("CREATE adv=%d tl=%u inc=%llu", adv, target_tl,
 				  (unsigned long long) target_inc);
@@ -1019,8 +1044,9 @@ act_unlink(void)
 	{
 		FzRel	   *m = &g_tl[tl].rel[rel];
 		uint64_t	lsn = ship_wal(tl);
+		uint64_t	seq = 0;
 		int			status = psc_op_unlink(tl, target_inc, PS_KLASS_RELATION,
-											  rel, lsn);
+											  rel, lsn, &seq);
 
 		ring_note("UNLINK tl=%u rel=%u lsn=%llu", tl, rel,
 				  (unsigned long long) lsn);
@@ -1029,6 +1055,7 @@ act_unlink(void)
 		record_cov(PS_OP_UNLINK, (uint32_t) status, 0);
 		if (status == PS_STATUS_OK)
 		{
+			note_mutation_seq(seq);
 			m->exists = 0;
 			m->nblocks = 0;
 			memset(m->tag, 0, sizeof(m->tag));
@@ -1039,7 +1066,7 @@ act_unlink(void)
 	else
 	{
 		int			status = psc_op_unlink(target_tl, target_inc,
-											  PS_KLASS_RELATION, rel, 0);
+											  PS_KLASS_RELATION, rel, 0, NULL);
 
 		ring_note("UNLINK adv=%d tl=%u", adv, target_tl);
 		ck(status == PS_STATUS_ERROR, "UNLINK with adversarial target must be "
@@ -1070,20 +1097,24 @@ act_truncate(void)
 	{
 		uint32_t	to = rng_below(m->nblocks + 1);
 		uint64_t	lsn = ship_wal(tl);
+		uint64_t	seq = 0;
 		int			status = psc_op_truncate(tl, target_inc, PS_KLASS_RELATION,
-												 rel, to, lsn);
+												 rel, to, lsn, &seq);
 
 		ring_note("TRUNCATE tl=%u rel=%u to=%u", tl, rel, to);
 		ck(status == PS_STATUS_OK, "TRUNCATE tl=%u rel=%u to=%u (status %d)",
 		   tl, rel, to, status);
 		record_cov(PS_OP_TRUNCATE, (uint32_t) status, 0);
 		if (status == PS_STATUS_OK)
+		{
+			note_mutation_seq(seq);
 			m->nblocks = to;
+		}
 	}
 	else
 	{
 		int			status = psc_op_truncate(target_tl, target_inc,
-												 PS_KLASS_RELATION, rel, 0, 0);
+												 PS_KLASS_RELATION, rel, 0, 0, NULL);
 
 		ring_note("TRUNCATE adv=%d tl=%u", adv, target_tl);
 		ck(status == PS_STATUS_ERROR, "TRUNCATE with adversarial target must be "
@@ -1118,6 +1149,7 @@ act_zeroextend(void)
 		uint32_t	n = huge ? 500 + rng_below(4000) : 1 + rng_below(3);
 		uint32_t	block = m->nblocks;
 		uint64_t	lsn = ship_wal(tl);
+		uint64_t	seq = 0;
 		int			status;
 
 		if (!huge && block + n > FZ_MAXBLK)
@@ -1125,7 +1157,7 @@ act_zeroextend(void)
 		if (n == 0)
 			n = 1, block = FZ_MAXBLK - 1;
 		status = psc_op_zeroextend(tl, target_inc, PS_KLASS_RELATION, rel,
-								   block, n, lsn);
+								   block, n, lsn, &seq);
 		ring_note("ZEROEXTEND tl=%u rel=%u block=%u n=%u huge=%d", tl, rel,
 				  block, n, huge);
 		ck(status == PS_STATUS_OK, "ZEROEXTEND tl=%u rel=%u block=%u n=%u "
@@ -1133,6 +1165,31 @@ act_zeroextend(void)
 		record_cov(PS_OP_ZEROEXTEND, (uint32_t) status, 0);
 		if (status == PS_STATUS_OK)
 		{
+			/*
+			 * KNOWN DAEMON BUG (not a fuzzer-model gap): unlike CREATE
+			 * (fork_has_create_at() guard) and UNLINK/TRUNCATE (which
+			 * unconditionally call fork_meta_persist() before ever setting
+			 * ch->req_seq), ZEROEXTEND's handler -- fork_grow_with_seq(),
+			 * pagestore_core.c -- allocates admission_seq unconditionally
+			 * but only calls fork_meta_persist() when
+			 * fork_size_asof_hop(...) < to_nblocks; when that is false (the
+			 * fork's tracked size already covers the requested grow, e.g.
+			 * a branch that inherited a size at least this large from its
+			 * parent) it still returns success and stamps ch->req_seq with
+			 * the allocated-but-never-persisted sequence.  Recovery's
+			 * admission_seq_observe() only ever sees a persisted event, so
+			 * that sequence is not replay-observable and the allocator can
+			 * legitimately roll back past it across a restart.  Confirmed
+			 * by direct code reading and reproduced live: seed 500,
+			 * step 6039 (ZEROEXTEND tl=2 rel=2 block=9 n=1 huge=0)
+			 * allocated seq 2361 with no persisted marker; the clean
+			 * restart at step 6046 then observed ADMISSION_BARRIER=2360,
+			 * failing check_admission_barrier()'s high-water-mark check.
+			 * Do not feed this op's returned sequence into
+			 * g_max_mutation_seq until the daemon is fixed to only stamp
+			 * req_seq on the actually-persisted path (see psc_op_
+			 * zeroextend()'s header comment in pagestore_test_client.h).
+			 */
 			if (huge)
 			{
 				/* WEAK ORACLE for the huge case's resulting nblocks: shrink
@@ -1149,13 +1206,16 @@ act_zeroextend(void)
 				record_cov(PS_OP_NBLOCKS, (uint32_t) rc, 0);
 				{
 					uint64_t	tlsn = ship_wal(tl);
+					uint64_t	tseq = 0;
 					int			trc = psc_op_truncate(tl, target_inc,
 														 PS_KLASS_RELATION, rel,
-														 block, tlsn);
+														 block, tlsn, &tseq);
 
 					ck(trc == PS_STATUS_OK, "shrink-back TRUNCATE after huge "
 					   "ZEROEXTEND tl=%u rel=%u (status %d)", tl, rel, trc);
 					record_cov(PS_OP_TRUNCATE, (uint32_t) trc, 0);
+					if (trc == PS_STATUS_OK)
+						note_mutation_seq(tseq);
 				}
 			}
 			else
@@ -1170,7 +1230,8 @@ act_zeroextend(void)
 	else
 	{
 		int			status = psc_op_zeroextend(target_tl, target_inc,
-												  PS_KLASS_RELATION, rel, 0, 1, 0);
+												  PS_KLASS_RELATION, rel, 0, 1, 0,
+												  NULL);
 
 		ring_note("ZEROEXTEND adv=%d tl=%u", adv, target_tl);
 		ck(status == PS_STATUS_ERROR, "ZEROEXTEND with adversarial target must "
@@ -1201,11 +1262,12 @@ act_extend(void)
 	{
 		uint64_t	lsn = ship_wal(tl);
 		unsigned char tag = (unsigned char) (1 + rng_below(255));
+		uint64_t	seq = 0;
 		int			status;
 
 		psc_fill_page(page_buf, lsn, tag);
 		status = psc_op_extend(tl, target_inc, PS_KLASS_RELATION, rel,
-							   m->nblocks, page_buf, 0, 0);
+							   m->nblocks, page_buf, 0, 0, &seq);
 		ring_note("EXTEND tl=%u rel=%u block=%u lsn=%llu", tl, rel,
 				  m->nblocks, (unsigned long long) lsn);
 		ck(status == PS_STATUS_OK, "EXTEND tl=%u rel=%u block=%u (status %d)",
@@ -1213,6 +1275,7 @@ act_extend(void)
 		record_cov(PS_OP_EXTEND, (uint32_t) status, 0);
 		if (status == PS_STATUS_OK)
 		{
+			note_mutation_seq(seq);
 			m->tag[m->nblocks] = tag;
 			m->lsn[m->nblocks] = lsn;
 			m->version_floor[m->nblocks] = fz_local_version_floor(tl, lsn);
@@ -1225,7 +1288,7 @@ act_extend(void)
 		{
 			int			status = psc_op_extend(target_tl, target_inc,
 												  PS_KLASS_RELATION, rel,
-												  0, page_buf, 0, 0);
+												  0, page_buf, 0, 0, NULL);
 
 			ring_note("EXTEND adv=%d tl=%u", adv, target_tl);
 			ck(status == PS_STATUS_ERROR, "EXTEND with adversarial target must "
@@ -1258,6 +1321,7 @@ act_writev(void)
 		uint32_t	n = 1 + rng_below(3);
 		uint32_t	block;
 		uint64_t	lsn;
+		uint64_t	seq = 0;
 		int			status;
 		unsigned char tags[3];
 
@@ -1276,19 +1340,22 @@ act_writev(void)
 			psc_fill_page(page_buf + (size_t) i * PSC_PAGE_SIZE, lsn, tags[i]);
 		}
 		status = psc_op_writev(tl, target_inc, PS_KLASS_RELATION, rel, block,
-							   page_buf, n);
+							   page_buf, n, &seq);
 		ring_note("WRITEV tl=%u rel=%u block=%u n=%u lsn=%llu", tl, rel,
 				  block, n, (unsigned long long) lsn);
 		ck(status == PS_STATUS_OK, "WRITEV tl=%u rel=%u block=%u n=%u "
 		   "(status %d)", tl, rel, block, n, status);
 		record_cov(PS_OP_WRITEV, (uint32_t) status, 0);
 		if (status == PS_STATUS_OK)
+		{
+			note_mutation_seq(seq);
 			for (uint32_t i = 0; i < n; i++)
 			{
 				m->tag[block + i] = tags[i];
 				m->lsn[block + i] = lsn;
 				m->version_floor[block + i] = fz_local_version_floor(tl, lsn);
 			}
+		}
 	}
 	else
 	{
@@ -1336,7 +1403,7 @@ act_writev(void)
 			 * WRITEV with nblocks != 1 is refused by an explicit, unrelated
 			 * check at the top of handle_request() -- no OOB risk. */
 			int			status = psc_op_writev(tl, target_inc, PS_KLASS_SLRU,
-												  rel, 0, page_buf, 2);
+												  rel, 0, page_buf, 2, NULL);
 
 			ring_note("WRITEV adv=slru-nblocks tl=%u", tl);
 			ck(status == PS_STATUS_ERROR, "WRITEV on PS_KLASS_SLRU with "
@@ -1349,7 +1416,7 @@ act_writev(void)
 			{
 				int			status = psc_op_writev(target_tl, target_inc,
 													  PS_KLASS_RELATION, rel, 0,
-													  page_buf, 1);
+													  page_buf, 1, NULL);
 
 				ring_note("WRITEV adv=%d tl=%u", adv, target_tl);
 				ck(status == PS_STATUS_ERROR, "WRITEV with adversarial target "
@@ -1773,21 +1840,15 @@ act_unknown_opcode(void)
  * that keeps returning the same stale-but-nonzero sequence after real
  * mutations complete would still pass.  g_max_mutation_seq is fed
  * separately, by every successful mutation that exposes its own admission
- * sequence (artifact BEGINs' token, retention reservations' seq -- see
- * note_mutation_seq()'s call sites), and check_admission_barrier() requires
- * each later barrier to be >= that high-water mark too.  Run the same check
- * right after a restart (verify_after_restart()) and it also catches
- * recovery rolling the allocator backward.
+ * sequence (artifact BEGINs' token, retention reservations' seq, and the
+ * relation lifecycle/write ops -- see note_mutation_seq()'s call sites and
+ * its own header comment, above the relation-ops section), and
+ * check_admission_barrier() requires each later barrier to be >= that
+ * high-water mark too.  Run the same check right after a restart
+ * (verify_after_restart()) and it also catches recovery rolling the
+ * allocator backward.
  */
 static uint64_t g_last_admission_seq;
-static uint64_t g_max_mutation_seq;
-
-static void
-note_mutation_seq(uint64_t seq)
-{
-	if (seq > g_max_mutation_seq)
-		g_max_mutation_seq = seq;
-}
 
 /*
  * Every caller that issues a real ADMISSION_BARRIER -- not just the
@@ -1903,15 +1964,57 @@ act_wal_read(void)
 
 	if (adv == ADV_NONE)
 	{
-		uint64_t	nrec = (g_tl[tl].wal_end - g_tl[tl].wal_start) /
-			FZ_WAL_PAYLOAD;
-		uint64_t	start = g_tl[tl].wal_start +
-			rng_below((uint32_t) nrec) * (uint64_t) FZ_WAL_PAYLOAD;
+		uint64_t	floor = 0;
+		int			proven = 0;
+		int			fstatus = psc_op_retention_floor(tl, target_inc,
+													  PS_RETENTION_RESOURCE_WAL,
+													  &floor, &proven);
+		uint64_t	lo = g_tl[tl].wal_start;
+		uint64_t	nrec;
+		uint64_t	start;
 		unsigned char expect[FZ_WAL_PAYLOAD];
 		unsigned char got[FZ_WAL_PAYLOAD];
 		uint32_t	nread = 0;
-		int			status = psc_op_wal_read(tl, target_inc, start,
-											 FZ_WAL_PAYLOAD, got, &nread);
+		int			status;
+
+		ck(fstatus == PS_STATUS_OK || fstatus == PS_STATUS_ERROR,
+		   "act_wal_read: WAL retention floor tl=%u unexpected status %d",
+		   tl, fstatus);
+		/*
+		 * WAL reclaim removes only a complete prefix (verify_after_
+		 * restart()'s same reasoning): a record beginning at or after the
+		 * effective retention floor cannot be in that reclaimed prefix, but
+		 * an older record legitimately may have been.  wal_start alone (the
+		 * first LSN this run ever shipped) is not that guarantee -- reclaim
+		 * can legally advance past it during a long exploration run -- so
+		 * restrict candidates to the floor-or-above suffix, rounded up to
+		 * the next record boundary.
+		 */
+		if (fstatus == PS_STATUS_OK && floor > lo)
+		{
+			uint64_t	off = floor - lo;
+			uint64_t	k = (off + FZ_WAL_PAYLOAD - 1) / FZ_WAL_PAYLOAD;
+
+			lo += k * (uint64_t) FZ_WAL_PAYLOAD;
+		}
+		if (fstatus != PS_STATUS_OK || lo >= g_tl[tl].wal_end)
+		{
+			/* Nothing in [wal_start, wal_end) is provably retained right
+			 * now -- reclaim could legitimately have dropped all of it, so
+			 * an absent copy would not be provable either way.  Ship fresh
+			 * WAL instead of risking a spurious failure. */
+			ship_wal(tl);
+			return;
+		}
+		nrec = (g_tl[tl].wal_end - lo) / FZ_WAL_PAYLOAD;
+		if (nrec == 0)
+		{
+			ship_wal(tl);
+			return;
+		}
+		start = lo + rng_below((uint32_t) nrec) * (uint64_t) FZ_WAL_PAYLOAD;
+		status = psc_op_wal_read(tl, target_inc, start,
+								 FZ_WAL_PAYLOAD, got, &nread);
 
 		ring_note("WAL_READ tl=%u start=%llu", tl, (unsigned long long) start);
 		ck(status == PS_STATUS_OK, "WAL_READ tl=%u start=%llu (status %d)",
@@ -3695,7 +3798,7 @@ act_artifact_write(void)
 
 			psc_fill_page(page_buf, art->lsn, 1);
 			status = psc_op_extend(target_tl, target_inc, klass, rel, 0,
-								   page_buf, art->lsn, art->token);
+								   page_buf, art->lsn, art->token, NULL);
 			ring_note("ARTIFACT_WRITE adv=%d tl=%u", adv, target_tl);
 			ck(status == PS_STATUS_ERROR, "ARTIFACT_WRITE with adversarial "
 			   "target must be refused (adv=%d tl=%u), got %d", adv,
@@ -3733,7 +3836,7 @@ act_artifact_write(void)
 			}
 
 			status = psc_op_extend(tl, g_tl[tl].incarnation, klass, rel,
-								   block, page_buf, use_lsn, use_token);
+								   block, page_buf, use_lsn, use_token, NULL);
 			reason = psc_chan_ptr()->result;
 			ring_note("ARTIFACT_WRITE tl=%u akind=%u rel=%u block=%u "
 					  "probe=%d", tl, akind, rel, block, probe);
@@ -4328,6 +4431,29 @@ env_reader_drop(void)
 	record_env(ENV_READER_DROP, status == PS_STATUS_OK);
 	if (status == PS_STATUS_OK)
 	{
+		/*
+		 * Pre-restart masking: without this, a DROP that returns OK but
+		 * leaves generation N's pin actually in place would go unnoticed
+		 * whenever this owner is reserved again (at generation N+1) before
+		 * the next restart or enumeration -- the later reserve overwrites
+		 * the stale pin and only the valid new generation ever gets
+		 * checked.  Require the lookup to see no pin for this owner right
+		 * away, while the drop is still the last thing that happened to
+		 * it.
+		 */
+		PsRetentionPin pin;
+		int			found = psc_op_retention_lookup(0, 0,
+													 PS_RETENTION_OWNER_READER,
+													 r->owner_id, &pin);
+		int			lstatus = psc_chan_ptr()->status;
+
+		ring_note("reader_drop lookup i=%u status=%d found=%d", i, lstatus,
+				  found);
+		ck(lstatus == PS_STATUS_OK && !found, "reader %llu still has a "
+		   "pin immediately after a successful DROP (lookup status %d, "
+		   "found %d)", (unsigned long long) r->owner_id, lstatus, found);
+		record_cov(PS_OP_RETENTION_PIN_LOOKUP, (uint32_t) lstatus, found);
+
 		r->held = 0;
 		r->generation++;
 	}
@@ -4561,6 +4687,7 @@ env_branch_write(void)
 	FzRel	   *m;
 	uint32_t	block;
 	uint64_t	lsn;
+	uint64_t	seq = 0;
 	unsigned char tag;
 	int			status;
 
@@ -4575,7 +4702,7 @@ env_branch_write(void)
 	tag = (unsigned char) (1 + rng_below(255));
 	psc_fill_page(page_buf, lsn, tag);
 	status = psc_op_writev(slot, b->incarnation, PS_KLASS_RELATION, rel,
-						   block, page_buf, 1);
+						   block, page_buf, 1, &seq);
 	ring_note("branch_write slot=%u rel=%u block=%u status=%d", slot, rel,
 			  block, status);
 	ck(status == PS_STATUS_OK, "branch %u write rel=%u block=%u failed "
@@ -4584,6 +4711,7 @@ env_branch_write(void)
 	record_cov(PS_OP_WRITEV, (uint32_t) status, 0);
 	if (status == PS_STATUS_OK)
 	{
+		note_mutation_seq(seq);
 		m->tag[block] = tag, m->lsn[block] = lsn;
 		m->version_floor[block] = fz_local_version_floor(slot, lsn);
 	}
@@ -5243,11 +5371,14 @@ verify_artifacts(const char *phase)
 					 * cause as the DROPPED/EXISTS daemon bug above;
 					 * evidence: seed 200001 step 3681. Does not weaken the
 					 * value check when status is OK, and does not apply to
-					 * the root timeline or a non-committed state. See
+					 * the root timeline or a non-committed state. Restricted
+					 * to the specific PS_STATUS_ERROR observed for that
+					 * bug: any other out-of-domain status (e.g. a leaked
+					 * PS_STATUS_STALE) must still fail.  See
 					 * g_weak_oracle_ops.
 					 */
 					ck((nbstatus == PS_STATUS_OK && nb == art->visible.nblocks) ||
-					   (nbstatus != PS_STATUS_OK &&
+					   (nbstatus == PS_STATUS_ERROR &&
 						art->state == FZ_ART_COMMITTED && g_tl[tl].has_parent),
 					   "%s: artifact tl=%u akind=%u rel=%u nblocks expected "
 					   "%u got %u (status %d)", phase, tl, akind, rel,
@@ -5851,8 +5982,31 @@ shrink_try_candidate(const char *cand_path, const char *orig_fmt,
 	 * own pid exactly as main() does; matches psc_shm_name/psc_store_dir's
 	 * formats there. */
 	snprintf(cand_shm_name, sizeof(cand_shm_name), "/psfuzz_%d", (int) pid);
-	snprintf(cand_store_dir, sizeof(cand_store_dir), "%s/pagestore-fuzz-%d",
-			 g_store_base, (int) pid);
+	{
+		int			n1 = snprintf(cand_store_dir, sizeof(cand_store_dir),
+									 "%s/pagestore-fuzz-%d", g_store_base,
+									 (int) pid);
+
+		/*
+		 * Same truncation hazard main() guards against: a truncated
+		 * cand_store_dir would make the timeout/failure cleanup below
+		 * (psc_remove_tree(cand_store_dir)) delete whatever shorter prefix
+		 * it names instead of this candidate's own directory.  Bail before
+		 * either that or the opseq-path snprintf below runs.
+		 */
+		if (n1 < 0 || (size_t) n1 >= sizeof(cand_store_dir))
+		{
+			fprintf(stderr, "shrink: candidate store directory path "
+					"truncated (base \"%s\" too long); refusing to guess "
+					"which directory to remove\n", g_store_base);
+			kill(-pid, SIGKILL);
+			waitpid(pid, &status, 0);
+			while (waitpid(-pid, &status, WNOHANG) > 0)
+				;
+			ps_shm_unlink(cand_shm_name);
+			return FZ_SHRINK_NOT_REPRODUCED;
+		}
+	}
 	/* ck() (see above) names this file "%s.opseq" off its own psc_store_dir,
 	 * which in the candidate is cand_store_dir; it is a sibling of the store
 	 * directory, so psc_remove_tree(cand_store_dir) does not remove it. */
@@ -6226,11 +6380,14 @@ bootstrap(void)
 	for (uint32_t rel = 0; rel < FZ_NREL; rel++)
 	{
 		uint64_t	lsn = ship_wal(0);
+		uint64_t	seq = 0;
 		int			status = psc_op_create(0, g_tl[0].incarnation,
-											PS_KLASS_RELATION, rel, lsn);
+											PS_KLASS_RELATION, rel, lsn, &seq);
 
 		ck(status == PS_STATUS_OK, "bootstrap create rel=%u (status %d)", rel,
 		   status);
+		if (status == PS_STATUS_OK)
+			note_mutation_seq(seq);
 		g_tl[0].rel[rel].exists = 1;
 	}
 	env_materialize();
@@ -6363,8 +6520,29 @@ main(int argc, char **argv)
 	rng_state = seed ? seed : 1;
 
 	snprintf(psc_shm_name, sizeof(psc_shm_name), "/psfuzz_%d", (int) getpid());
-	snprintf(psc_store_dir, sizeof(psc_store_dir), "%s/pagestore-fuzz-%d",
-			 base, (int) getpid());
+	{
+		int			n = snprintf(psc_store_dir, sizeof(psc_store_dir),
+									"%s/pagestore-fuzz-%d", base, (int) getpid());
+
+		/*
+		 * A truncated path silently names some other, shorter directory --
+		 * possibly an existing one -- and psc_remove_tree() would then
+		 * delete that prefix instead of this run's own per-process
+		 * directory.  Bail before it is ever used for removal or creation;
+		 * do not route through psc_fatal(), which would itself call
+		 * psc_remove_tree(psc_store_dir) on the very truncated value this
+		 * is rejecting.
+		 */
+		if (n < 0 || (size_t) n >= sizeof(psc_store_dir))
+		{
+			fprintf(stderr, "FATAL: store directory path truncated (base "
+					"\"%s\" too long for a %zu-byte buffer); refusing to "
+					"guess which directory to create or remove\n", base,
+					sizeof(psc_store_dir));
+			ps_shm_unlink(psc_shm_name);
+			exit(2);
+		}
+	}
 	ps_shm_unlink(psc_shm_name);
 	psc_remove_tree(psc_store_dir);
 	if (mkdir(psc_store_dir, 0700) != 0)

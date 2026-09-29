@@ -497,31 +497,51 @@ psc_setmeta(PsChannel *ch, uint32_t tl, uint64_t incarnation)
 
 /* ===================== op wrappers: relation ops ========================= */
 
+/*
+ * out_seq (nullable): the core CREATE handler stamps its allocated
+ * admission sequence back into ch->req_seq whenever this call actually
+ * persisted a mutation (an unstamped "ensure" of an already-live fork, or
+ * a redundant create at an already-known lsn, allocates nothing and leaves
+ * it 0).  Callers that feed g_max_mutation_seq's barrier tracking want
+ * this; everyone else passes NULL.
+ */
 static int
-psc_op_create(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel, uint64_t lsn)
+psc_op_create(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
+			  uint64_t lsn, uint64_t *out_seq)
 {
 	PsChannel  *ch = psc_chan_ptr();
 
 	psc_set_channel_key(ch, tl, inc, klass, rel);
 	ch->opcode = PS_OP_CREATE;
 	ch->req_lsn = lsn;
-	return psc_cl_exec()->status;
+	psc_cl_exec();
+	if (out_seq)
+		*out_seq = ch->req_seq;
+	return ch->status;
 }
 
+/* out_seq (nullable): see psc_op_create()'s header comment -- same
+ * contract for the core UNLINK handler. */
 static int
-psc_op_unlink(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel, uint64_t lsn)
+psc_op_unlink(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
+			  uint64_t lsn, uint64_t *out_seq)
 {
 	PsChannel  *ch = psc_chan_ptr();
 
 	psc_set_channel_key(ch, tl, inc, klass, rel);
 	ch->opcode = PS_OP_UNLINK;
 	ch->req_lsn = lsn;
-	return psc_cl_exec()->status;
+	psc_cl_exec();
+	if (out_seq)
+		*out_seq = ch->req_seq;
+	return ch->status;
 }
 
+/* out_seq (nullable): see psc_op_create()'s header comment -- same
+ * contract for the core TRUNCATE handler. */
 static int
 psc_op_truncate(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
-				uint32_t nblocks, uint64_t lsn)
+				uint32_t nblocks, uint64_t lsn, uint64_t *out_seq)
 {
 	PsChannel  *ch = psc_chan_ptr();
 
@@ -529,12 +549,29 @@ psc_op_truncate(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->nblocks = nblocks;
 	ch->req_lsn = lsn;
-	return psc_cl_exec()->status;
+	psc_cl_exec();
+	if (out_seq)
+		*out_seq = ch->req_seq;
+	return ch->status;
 }
 
+/*
+ * out_seq (nullable): see psc_op_create()'s header comment for the general
+ * contract.  UNLIKE create/unlink/truncate, ZEROEXTEND's handler --
+ * fork_grow_with_seq(), pagestore_core.c -- can return this success/nonzero
+ * even when nothing was persisted (its internal fork_size_asof_hop(...) <
+ * to_nblocks guard short-circuits fork_meta_persist() when the fork's
+ * tracked size already covers the request, e.g. inherited branch sizing):
+ * KNOWN DAEMON BUG, not a fuzzer-model gap -- see act_zeroextend()'s
+ * comment at its note_mutation_seq() (deliberately omitted) call site for
+ * a live repro.  Callers must not feed this op's out_seq into barrier
+ * tracking until the daemon is fixed to only stamp req_seq on the
+ * actually-persisted path.
+ */
 static int
 psc_op_zeroextend(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
-				  uint32_t block, uint32_t nblocks, uint64_t lsn)
+				  uint32_t block, uint32_t nblocks, uint64_t lsn,
+				  uint64_t *out_seq)
 {
 	PsChannel  *ch = psc_chan_ptr();
 
@@ -543,18 +580,24 @@ psc_op_zeroextend(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
 	ch->blocknum = block;
 	ch->nblocks = nblocks;
 	ch->req_lsn = lsn;
-	return psc_cl_exec()->status;
+	psc_cl_exec();
+	if (out_seq)
+		*out_seq = ch->req_seq;
+	return ch->status;
 }
 
 /* PS_OP_EXTEND: a single page write at blocknum, growing the fork; the
  * page's own encoded LSN (bytes 0..7, via psc_fill_page) is what the daemon
  * uses as this write's version -- req_lsn/req_seq here are the caller's
  * conflict-detection tuple (0 means "no prior write assumed"), separate from
- * the page content's LSN stamp. */
+ * the page content's LSN stamp.  On success ps_artifact_write()/
+ * append_page_raw_outcome() overwrites ch->req_seq (aliasing the same
+ * field) with the admission sequence this specific append allocated;
+ * out_seq (nullable) exposes it, same contract as psc_op_create(). */
 static int
 psc_op_extend(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
 			  uint32_t block, const unsigned char *page,
-			  uint64_t req_lsn, uint64_t req_seq)
+			  uint64_t req_lsn, uint64_t req_seq, uint64_t *out_seq)
 {
 	PsChannel  *ch = psc_chan_ptr();
 
@@ -564,12 +607,19 @@ psc_op_extend(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
 	ch->req_lsn = req_lsn;
 	ch->req_seq = req_seq;
 	memcpy(ch->data, page, PSC_PAGE_SIZE);
-	return psc_cl_exec()->status;
+	psc_cl_exec();
+	if (out_seq)
+		*out_seq = ch->req_seq;
+	return ch->status;
 }
 
+/* out_seq (nullable): the *last* block's admission sequence on a
+ * successful multi-block write (each ps_artifact_write() call in the
+ * daemon's WRITEV loop overwrites ch->req_seq); see psc_op_extend(). */
 static int
 psc_op_writev(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
-			  uint32_t block, const unsigned char *pages, uint32_t n)
+			  uint32_t block, const unsigned char *pages, uint32_t n,
+			  uint64_t *out_seq)
 {
 	PsChannel  *ch = psc_chan_ptr();
 
@@ -579,7 +629,10 @@ psc_op_writev(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
 	ch->nblocks = n;
 	if (n > 0)
 		memcpy(ch->data, pages, (size_t) n * PSC_PAGE_SIZE);
-	return psc_cl_exec()->status;
+	psc_cl_exec();
+	if (out_seq)
+		*out_seq = ch->req_seq;
+	return ch->status;
 }
 
 static int
@@ -746,7 +799,22 @@ psc_op_wal_read(uint32_t tl, uint64_t inc, uint64_t lsn, uint32_t len,
 	psc_cl_exec();
 	*nread = ch->result;
 	if (ch->status == PS_STATUS_OK && ch->result > 0)
+	{
+		/*
+		 * A malformed response larger than what was requested (or than the
+		 * channel's own data[] capacity) must not be trusted to memcpy():
+		 * 'out' is only ever sized to 'len' by callers, so copying an
+		 * untrusted, unbounded count would overflow the caller's buffer
+		 * before any oracle check runs.  Fail deterministically instead --
+		 * this is a protocol-contract violation, not an ordinary status/
+		 * value mismatch the model can characterize.
+		 */
+		if (ch->result > len || ch->result > PS_IO_UNIT)
+			psc_fatal("psc_op_wal_read: daemon returned nread=%u exceeding "
+					  "requested len=%u (PS_IO_UNIT=%u) -- refusing to copy",
+					  ch->result, len, (unsigned) PS_IO_UNIT);
 		memcpy(out, ch->data, ch->result);
+	}
 	return ch->status;
 }
 
@@ -801,7 +869,19 @@ psc_op_walidx_get(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
 	psc_cl_exec();
 	*n_out = (int) ch->result;
 	if (ch->status == PS_STATUS_OK && ch->result > 0)
+	{
+		/* Same untrusted-count hazard as psc_op_wal_read(): 'out' is only
+		 * ever sized to 'max_out' entries by callers, and ch->data can
+		 * only ever legitimately carry PS_IO_UNIT / sizeof(PsWalRec)
+		 * entries.  Refuse to copy a count outside either bound. */
+		if (ch->result > (uint32_t) max_out ||
+			ch->result > PS_IO_UNIT / sizeof(PsWalRec))
+			psc_fatal("psc_op_walidx_get: daemon returned result=%u "
+					  "exceeding requested max_out=%d (PS_IO_UNIT/"
+					  "sizeof(PsWalRec)=%zu) -- refusing to copy",
+					  ch->result, max_out, PS_IO_UNIT / sizeof(PsWalRec));
 		memcpy(out, ch->data, (size_t) ch->result * sizeof(PsWalRec));
+	}
 	return ch->status;
 }
 
