@@ -99,6 +99,29 @@ for ((i = 0; i < ${#TARGETS[@]}; i++)); do
   done
 done
 
+# Codex finding on PR #303 round 3 (10548b631): validating just the target
+# *name* above still lets a caller-controlled -o out-dir alias the checked-in
+# corpus or known-crashes trees themselves -- e.g.
+# `-o contrib/pagestore/fuzz/corpus manifest` makes "$OUT_DIR/manifest"
+# resolve to exactly fuzz/corpus/manifest, and the `rm -rf "$work"` in the
+# loop below deletes the checked-in corpus before the following `cp -r` from
+# that same (now-gone) directory fails. Resolve both sides with realpath -m
+# (out-dir need not exist yet) and reject any overlap -- equal, an ancestor,
+# or a descendant -- with either checked-in input tree, before mkdir'ing
+# out-dir or touching any target's working copy. (This also covers out-dir
+# resolving to fuzz/ itself, or to an ancestor of it such as the repo root:
+# either is necessarily an ancestor of fuzz/corpus too.)
+RESOLVED_OUT_DIR="$(realpath -m -- "$OUT_DIR")"
+for guard_dir in "$FUZZ_DIR/corpus" "$FUZZ_DIR/known-crashes"; do
+  resolved_guard="$(realpath -m -- "$guard_dir")"
+  if [[ "$RESOLVED_OUT_DIR" == "$resolved_guard" ||
+        "$RESOLVED_OUT_DIR" == "$resolved_guard"/* ||
+        "$resolved_guard" == "$RESOLVED_OUT_DIR"/* ]]; then
+    echo "run_fuzz.sh: -o out-dir '$OUT_DIR' overlaps the checked-in '$guard_dir'; refusing to touch it" >&2
+    exit 2
+  fi
+done
+
 # Per-target -max_len: roughly 2x the largest checked-in seed, since a
 # mutated file should be allowed to grow past what any fixture happened to
 # record. Every case below was checked against `du -sb` on fuzz/corpus/<target>

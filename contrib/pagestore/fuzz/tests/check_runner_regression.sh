@@ -204,6 +204,28 @@ for bad_duration in 0 -5 abc 3.5; do
   fi
 done
 
+# Codex finding on PR #303 round 3: an out-dir that resolves to (or
+# contains, or sits inside) the checked-in corpus/known-crashes trees must
+# be rejected before anything is removed, instead of `rm -rf "$work"`
+# deleting the checked-in corpus itself.
+mkdir -p "$RUNNER_DIR/known-crashes/manifest"
+printf keep > "$RUNNER_DIR/known-crashes/manifest/finding.txt"
+for bad_out in \
+  "$RUNNER_DIR/corpus" \
+  "$RUNNER_DIR/corpus/manifest" \
+  "$RUNNER_DIR" \
+  "$RUNNER_DIR/known-crashes"
+do
+  if "$RUNNER_DIR/run_fuzz.sh" -o "$bad_out" manifest \
+    >"$TMP_DIR/overlap.log" 2>&1; then
+    echo "runner accepted an out-dir overlapping a checked-in tree: $bad_out" >&2
+    exit 1
+  fi
+  grep -q 'overlaps the checked-in' "$TMP_DIR/overlap.log"
+done
+[[ "$(cat "$RUNNER_DIR/corpus/manifest/seed")" == x ]]
+[[ "$(cat "$RUNNER_DIR/known-crashes/manifest/finding.txt")" == keep ]]
+
 export STUB_PID_FILE="$TMP_DIR/worker.pid"
 export STUB_MODE=fail
 if "$RUNNER_DIR/run_fuzz.sh" -d 5 -o "$TMP_DIR/failure-out" manifest \

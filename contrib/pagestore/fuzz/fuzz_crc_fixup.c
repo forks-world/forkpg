@@ -512,7 +512,14 @@ fixup_retention_state(uint8_t *buf, size_t len)
  * shape, still by far the common case in a mutated corpus of V2 seeds).
  * crc = FNV-1a over the whole record with crc temporarily zeroed
  * (timeline_event_crc()), so `reserved` (after crc) is part of the hash
- * input exactly as-is. */
+ * input.
+ *
+ * Proactive audit fix (PR #303 round 3): the timelines replay loop
+ * (pagestore_core.c) requires `reserved` to be exactly zero and hard-fails
+ * the *entire* load otherwise (`rec.reserved != 0` -> `return -1`, not a
+ * per-record skip) -- the same reserved-padding class as the forkmeta/
+ * walidx snapshot manifest headers, the walidx watermark, and the wal_store
+ * identity file. Zeroed here, before the crc, for the same reason. */
 typedef struct FuzzTimelineRecEvent
 {
 	uint32_t	magic;
@@ -536,12 +543,11 @@ fixup_timelines(uint8_t *buf, size_t len)
 
 	for (size_t off = 0; off + stride <= len; off += stride)
 	{
-		uint32_t	saved = get_le32(buf + off + crc_off);
 		uint32_t	crc;
 
+		memset(buf + off + offsetof(FuzzTimelineRecEvent, reserved), 0, 4);
 		put_le32(buf + off + crc_off, 0);
 		crc = fnv1a_step(FNV1A_INIT, buf + off, stride);
-		(void) saved;
 		put_le32(buf + off + crc_off, crc);
 	}
 }
@@ -681,6 +687,15 @@ fixup_walidx_watermark(const char *work_dir, uint8_t *buf, size_t len)
 	for (unsigned i = 0; i < 8; i++)
 		buf[offsetof(FuzzWalIdxWatermark, length) + i] =
 			(unsigned char) ((uint64_t) st.st_size >> (i * 8));
+	/*
+	 * Proactive audit fix (PR #303 round 3): posix_walidx_watermark_read()
+	 * (storage_posix.c) also requires `reserved` to be exactly zero,
+	 * checked before the crc -- the same reserved-padding class as the
+	 * forkmeta/walidx snapshot manifest headers, zeroed here for the same
+	 * reason (magic is left fuzzer-controlled, matching this file's
+	 * convention of not pinning format-identity constants).
+	 */
+	memset(buf + offsetof(FuzzWalIdxWatermark, reserved), 0, 4);
 	put_le32(buf + crc_off, 0);
 	put_le32(buf + crc_off,
 			 fnv1a_step(FNV1A_INIT, buf, sizeof(FuzzWalIdxWatermark)));
@@ -755,6 +770,17 @@ fixup_wal_store_identity(uint8_t *buf, size_t len)
 
 	if (len != 64)
 		return;					/* only the exact identity encoding is fixed up */
+	/*
+	 * Proactive audit fix (PR #303 round 3): decode_metadata()
+	 * (pagestore_wal_store.c) also requires the reserved fields at offset
+	 * 12 (4 bytes), 52 (4 bytes), and 56 (8 bytes) to be exactly zero,
+	 * checked before the crc -- the same reserved-padding class as the
+	 * forkmeta/walidx snapshot manifest headers and the walidx watermark,
+	 * zeroed here for the same reason.
+	 */
+	memset(buf + 12, 0, 4);
+	memset(buf + 52, 0, 4);
+	memset(buf + 56, 0, 8);
 	memcpy(copy, buf, 64);
 	memset(copy + 48, 0, 4);
 	put_le32(buf + 48, fnv1a_step(FNV1A_INIT, copy, 64));
@@ -1060,6 +1086,23 @@ fixup_forkmeta_snapshot_manifest(uint8_t *buf, size_t len)
 			part_lens[i] < FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL)
 			return;
 	}
+
+	/*
+	 * Proactive audit fix (PR #303 round 3, requested alongside the two
+	 * findings): read_record() (pagestore_forkmeta_snapshot.c) also requires
+	 * the reserved field at offset 12 (4 bytes) and the two reserved fields
+	 * at offsets 68 (4 bytes) and 72 (8 bytes) to be exactly zero, checked
+	 * before the crc alongside magic/version/header_bytes. Unlike
+	 * magic/version/header_bytes (left fuzzer-controlled in both halves
+	 * throughout this file, matching the project's convention of not pinning
+	 * format-identity constants), these are pure reserved padding with no
+	 * fuzzer-interesting shape of their own, so the fixup half zeroes them
+	 * the same way the sibling walidx_snapshot_manifest fixup does for its
+	 * own reserved fields.
+	 */
+	memset(buf + 12, 0, 4);
+	memset(buf + 68, 0, 12);
+
 	/* Bind the mutated manifest back to the fixture payloads.  The raw half
 	 * still exercises arbitrary identity/length/hash corruption; in the fixup
 	 * half these cross-file fields must agree so loading reaches payload and
@@ -1124,6 +1167,26 @@ fixup_forkmeta_snapshot_manifest(uint8_t *buf, size_t len)
  * agreed four fields into both this buffer and the sibling file, and -- since
  * that patches the sibling file's bytes -- refreshes the sibling's own
  * whole-file hash in the manifest alongside this part's (len, crc) entry.
+ *
+ * Codex finding on PR #303 round 3 (10548b631): round 2 only synced the
+ * last 32 bytes of the header (the two record-count/byte pairs). The
+ * fields ahead of those -- magic, version, header_bytes, part, record_bytes
+ * (16 bytes, offsets 0-15) and generation/cutoff_lsn/cutoff_admission_seq/
+ * freeze_admission_seq (32 bytes, offsets 16-47) -- are *also* required by
+ * fork_meta_snapshot_load(): the first five directly (a fixed, known shape
+ * for this part), and generation/cutoff_lsn/cutoff_admission_seq both
+ * directly (must equal the outer manifest's own fields) and via the same
+ * checkpoint/tail byte-identical memcmp() the round-2 fix already satisfies
+ * for the trailing 32 bytes, with freeze_admission_seq required nonzero and
+ * matched the same way. A mutation to any of these first 48 bytes (e.g.
+ * byte 16, inside generation) was rejected at `load selected forkmeta
+ * snapshot` before a single record was parsed, no matter how correct the
+ * trailing 32 bytes and the two checksum layers above were. Unlike
+ * checkpoint_records/etc., none of these 48 bytes can legitimately differ
+ * between a resized and a pristine file of the *same part* -- they are this
+ * part's own fixed identity -- so they are simply copied from this part's
+ * own template, the same "pin identity, leave the rest fuzzer-controlled"
+ * shape used throughout this file.
  */
 static void
 fixup_forkmeta_snapshot_part(const char *work_dir, uint8_t *buf, size_t len,
@@ -1139,10 +1202,17 @@ fixup_forkmeta_snapshot_part(const char *work_dir, uint8_t *buf, size_t len,
 	size_t		sib_crc_off = is_tail ? 48 : 60;
 	int			sib_crc_valid = 0;
 	uint32_t	sib_crc = 0;
+	const uint8_t *own_tmpl;
+	size_t		own_tmpl_len;
 
 	if (len > FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL)
 		fixup_forkmeta_records(buf + FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL,
 							   len - FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL);
+
+	own_tmpl = ps_fuzz_template_lookup(forkmeta_snapshot_part_paths[is_tail ? 1 : 0],
+										&own_tmpl_len);
+	if (own_tmpl != NULL && own_tmpl_len >= 48 && len >= 48)
+		memcpy(buf, own_tmpl, 48);
 
 	if (len >= FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL &&
 		(len - FORKMETA_SNAPSHOT_PAYLOAD_HEADER_BYTES_LOCAL) %
@@ -1311,6 +1381,23 @@ fixup_walidx_snapshot_manifest(uint8_t *buf, size_t len)
 		if (derived_nshards > 0 &&
 			derived_nshards <= WALIDX_SNAPSHOT_MANIFEST_MAX_SHARDS_LOCAL)
 			put_le32(buf + 20, (uint32_t) derived_nshards);
+	}
+
+	/*
+	 * Proactive audit fix (PR #303 round 3, requested alongside the two
+	 * findings): ps_walidx_snapshot_open_internal() also requires
+	 * timeline@16 to equal the caller's timeline (always 0 -- this harness's
+	 * one fixture only has a walidx_snapshots_0 directory, a fixed,
+	 * known-correct value, not a sibling file's content) and the two
+	 * reserved fields at 52-55 and 56-63 to be exactly zero, all checked
+	 * before the crc, let alone generation/start_lsn/end_lsn or any shard
+	 * entry. Neither was pinned, so a mutation to either -- fully
+	 * independent of every gate already fixed up above -- still rejected
+	 * the file outright. */
+	if (len >= WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL)
+	{
+		put_le32(buf + 16, 0);		/* timeline */
+		memset(buf + 52, 0, 12);	/* reserved: must be zero */
 	}
 
 	manifest_tmpl = ps_fuzz_template_lookup(
