@@ -1595,6 +1595,17 @@ act_read_at(void)
 								&resolved_seq);
 		ring_note("READ_AT tl=%u rel=%u block=%u mode=%d strong=%d", tl, rel,
 				  b, mode, strong);
+		/*
+		 * Status itself (not just the value-checks g_weak_oracle_ops's
+		 * READ_AT entry documents) stays weak here: read_resolve_version()
+		 * (pagestore_core.c) reports reclaimed as-of history as absent
+		 * (found=0, status OK, its -2 return), but returns -1 -> ERROR for
+		 * an inherited WAL-less block on a branch (tl != timeline &&
+		 * pv->lsn == 0) regardless of req_lsn -- reachable even in
+		 * "strong" mode 0/1 for a zero-extended block this model does not
+		 * exclude -- and for other unauthoritative-storage conditions this
+		 * model does not track separately.
+		 */
 		observe(PS_OP_READ_AT, status, 0, "READ_AT", 0);
 		if (status == PS_STATUS_OK && found && req_lsn != UINT64_MAX)
 			ck(resolved_lsn <= req_lsn, "READ_AT horizon tl=%u rel=%u "
@@ -1977,6 +1988,8 @@ act_wal_read(void)
 		uint32_t	nread = 0;
 		int			status;
 
+		/* See g_weak_oracle_ops's RETENTION_FLOOR entry: an unprovable
+		 * floor is documented to return ERROR, not a fabricated 0. */
 		ck(fstatus == PS_STATUS_OK || fstatus == PS_STATUS_ERROR,
 		   "act_wal_read: WAL retention floor tl=%u unexpected status %d",
 		   tl, fstatus);
@@ -2502,7 +2515,10 @@ act_wal_retain_floor(void)
 		ring_note("WAL_RETAIN_FLOOR tl=%u", tl);
 		/* A floor may legitimately be unprovable before any materializer
 		 * publication ever ran on this timeline: accept OK either way, but
-		 * a provable floor must never exceed what we have shipped. */
+		 * a provable floor must never exceed what we have shipped.  See
+		 * g_weak_oracle_ops's RETENTION_FLOOR entry: pagestore_core.c
+		 * documents "a floor that cannot be proven is an error, never a
+		 * lower bound" for this exact opcode. */
 		observe(PS_OP_WAL_RETAIN_FLOOR, status, 0, "WAL_RETAIN_FLOOR", 0);
 		if (status == PS_STATUS_OK && proven)
 			ck(floor <= g_tl[tl].wal_end, "WAL_RETAIN_FLOOR tl=%u floor=%llu"
@@ -2645,7 +2661,21 @@ act_retention_lookup(void)
 
 	ring_note("RETENTION_PIN_LOOKUP kind=%u owner=%llu", kind,
 			  (unsigned long long) owner_id);
-	observe(PS_OP_RETENTION_PIN_LOOKUP, status, found, "RETENTION_PIN_LOOKUP", 0);
+	/*
+	 * This targets tl=0 (always defined/live) and a modeled owner: an
+	 * absent owner is PS_STATUS_OK with found==0 (ps_retention_lookup()
+	 * only ever returns -1, mapped to PS_STATUS_ERROR, when
+	 * retention_is_poisoned -- pagestore_retention.c -- a global
+	 * corruption state, not an ordinary "no such owner" miss), and the
+	 * undefined-timeline case below already supplies separate refusal
+	 * coverage. Require OK so a daemon failure here (rather than a
+	 * genuine poison) cannot pass by being counted as an ordinary
+	 * refusal.
+	 */
+	ck(status == PS_STATUS_OK, "RETENTION_PIN_LOOKUP kind=%u owner=%llu "
+	   "must succeed, got status %d", kind, (unsigned long long) owner_id,
+	   status);
+	record_cov(PS_OP_RETENTION_PIN_LOOKUP, (uint32_t) status, (uint32_t) found);
 	if (status == PS_STATUS_OK && kind == PS_RETENTION_OWNER_READER)
 	{
 		FzReaderPin *r = g_reader[0].held && g_reader[0].owner_id == owner_id ?
@@ -2788,8 +2818,20 @@ act_retention_get(void)
 		ring_note("RETENTION_PIN_GET stale epoch");
 		ck(status2 == PS_STATUS_STALE, "RETENTION_PIN_GET with a wrong "
 		   "epoch must return PS_STATUS_STALE, got %d", status2);
+		/*
+		 * ps_retention_get_consistent() (pagestore_retention.c) resets
+		 * *epoch_io to 0 before returning PS_RETENTION_STALE, and the
+		 * daemon's PS_OP_RETENTION_PIN_GET handler writes that reset value
+		 * straight back through ch->req_lsn -- so psc_op_retention_get()'s
+		 * wrapper must both return -2 (its documented "restart enumeration"
+		 * signal) and hand the caller back epoch==0.  A daemon that
+		 * reports STALE without resetting the epoch would otherwise trap a
+		 * real caller retrying with the same bad epoch forever.
+		 */
+		ck(rc2 == -2 && bad_epoch == 0, "RETENTION_PIN_GET with a wrong "
+		   "epoch must return -2 with the epoch reset to 0, got rc=%d "
+		   "epoch=%llu", rc2, (unsigned long long) bad_epoch);
 		record_cov(PS_OP_RETENTION_PIN_GET, (uint32_t) status2, 0);
-		(void) rc2;
 	}
 }
 
@@ -2962,8 +3004,13 @@ act_retention_set(void)
 
 		ring_note("RETENTION_PIN_SET generation=0 owner=%llu",
 				  (unsigned long long) r->owner_id);
-		ck(status != PS_STATUS_OK, "RETENTION_PIN_SET with generation 0 must "
-		   "be refused, got %d", status);
+		/* Generation 0 is rejected as PS_RETENTION_ERROR unconditionally,
+		 * before any retention state (old_found/timeline_live/frontier
+		 * checks) is even computed -- see the top-of-handler short-circuit
+		 * in PS_OP_RETENTION_PIN_SET, pagestore_core.c -- so PS_STATUS_STALE
+		 * is not reachable here. */
+		ck(status == PS_STATUS_ERROR, "RETENTION_PIN_SET with generation 0 "
+		   "must be refused, got %d", status);
 		record_cov(PS_OP_RETENTION_PIN_SET, (uint32_t) status, 0);
 	}
 }
@@ -3019,7 +3066,17 @@ act_retention_reserve_adv(void)
 													   0, &seq);
 
 		ring_note("RETENTION_PIN_RESERVE adv=undefined-timeline");
-		ck(status != PS_STATUS_OK, "RETENTION_PIN_RESERVE on an undefined "
+		/*
+		 * PS_RETENTION_STALE is not reachable here: it requires
+		 * ps_retention_generation_stale() to find an existing pin entry for
+		 * (tl=FZ_TL_UNDEF_A, READER, 999), and FZ_TL_UNDEF_A is never used
+		 * to create a real pin anywhere in this fuzzer.  With no stale
+		 * entry, timeline_defined/timeline_live are both false, which
+		 * forces the PS_OP_RETENTION_PIN_RESERVE handler's admission
+		 * ternary to PS_RETENTION_ERROR (pagestore_core.c) regardless of
+		 * the requested resources.
+		 */
+		ck(status == PS_STATUS_ERROR, "RETENTION_PIN_RESERVE on an undefined "
 		   "timeline must be refused, got %d", status);
 		record_cov(PS_OP_RETENTION_PIN_RESERVE, (uint32_t) status, 0);
 	}
@@ -3031,7 +3088,10 @@ act_retention_reserve_adv(void)
 													999999, 0);
 
 		ring_note("RETENTION_PIN_DROP adv=generation-zero");
-		ck(status != PS_STATUS_OK, "RETENTION_PIN_DROP with generation 0 "
+		/* Same unconditional short-circuit as SET's generation-0 case
+		 * above: ret = PS_RETENTION_ERROR before ps_retention_drop() is
+		 * ever called, so PS_STATUS_STALE is not reachable. */
+		ck(status == PS_STATUS_ERROR, "RETENTION_PIN_DROP with generation 0 "
 		   "must be refused, got %d", status);
 		record_cov(PS_OP_RETENTION_PIN_DROP, (uint32_t) status, 0);
 	}
@@ -3201,8 +3261,19 @@ act_check_branch(void)
 		}
 		else
 		{
-			/* Slot is LIVE or DELETING: not a valid target for a brand-new
-			 * branch definition, so only check status-domain sanity. */
+			/*
+			 * Slot is LIVE or DELETING: not a valid target for a
+			 * brand-new branch definition, so only check status-domain
+			 * sanity. Genuinely ambiguous, not just unexploited: for a
+			 * LIVE slot, branch_create_request_ok() (pagestore_core.c)
+			 * accepts an "exact metadata retry" -- this probe's
+			 * (parent, target_inc=0, current wal_end) only matches
+			 * that iff no WAL has shipped on the parent since the
+			 * branch's original creation and timeline_is_used()/
+			 * wal_end_read() also agree -- both daemon-internal facts
+			 * this model does not track, so either OK or ERROR is
+			 * legal here.
+			 */
 			observe(PS_OP_CHECK_BRANCH, status, 0, "CHECK_BRANCH", 0);
 		}
 	}
@@ -3719,6 +3790,24 @@ act_artifact_begin(void)
 		record_cov(PS_OP_ARTIFACT_BEGIN, (uint32_t) status, reason);
 		if (status == PS_STATUS_OK)
 		{
+			/*
+			 * ps_artifact_begin() (pagestore_artifact_lifecycle.inc) sets
+			 * *reason = PS_ARTIFACT_REFUSE_NONE up front and never touches
+			 * it again on either success return, and the fresh-generation
+			 * path's token comes from artifact_store_record() ->
+			 * append_page_raw_outcome() -> append_page_impl(), whose
+			 * admission_seq_alloc() call only returns 0 on failure (which
+			 * takes the rc!=0/refusal path, never this one). A zero token
+			 * here would be silently adopted as this attempt's identity and
+			 * only surface later as a spurious refusal on the first WRITE/
+			 * COMMIT against it, or be masked entirely by
+			 * artifact_restart_reset() treating it as ordinary abandonment.
+			 */
+			ck(token != 0 && reason == PS_ARTIFACT_REFUSE_NONE,
+			   "ARTIFACT_BEGIN tl=%u akind=%u rel=%u lsn=%llu succeeded with "
+			   "token=%llu reason=%u (expected nonzero token, reason NONE)",
+			   tl, akind, rel, (unsigned long long) lsn,
+			   (unsigned long long) token, reason);
 			if (art->state == FZ_ART_OPEN)
 				artifact_cancel_pending(tl, akind, rel, art->lsn, art->token, 0);
 			/* Shadow the last settled state before overwriting it -- see the
@@ -3888,9 +3977,32 @@ act_artifact_write(void)
 			}
 			else
 			{
-				ck(status == PS_STATUS_ERROR, "ARTIFACT_WRITE probe=%d "
-				   "(tl=%u akind=%u rel=%u block=%u) must be refused, got "
-				   "%d", probe, tl, akind, rel, block, status);
+				/*
+				 * Both mismatch probes (wrong token, wrong lsn) reach
+				 * ps_artifact_write()'s state==0 (not-a-completed-retry)
+				 * path -- last->lsn (any prior COMMIT on this key) can
+				 * never equal use_lsn here, since art->lsn is this open
+				 * attempt's own unique, strictly-newer generation -- and
+				 * fail either artifact_attempt() or the
+				 * fork->artifact_attempt_seq comparison right after,
+				 * both of which the caller reports as
+				 * PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH.  The zero-token
+				 * probe takes the earlier `token == 0` branch, which
+				 * returns PS_ARTIFACT_REFUSE_LEGACY_BYPASS whenever
+				 * artifact_has_protocol() is true -- guaranteed here since
+				 * this key has an OPEN attempt (a prior BEGIN already
+				 * established the protocol).  All three reasons are
+				 * deterministic given art->state == FZ_ART_OPEN.
+				 */
+				uint32_t	expect_reason = probe == 2 ?
+					PS_ARTIFACT_REFUSE_LEGACY_BYPASS :
+					PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH;
+
+				ck(status == PS_STATUS_ERROR && reason == expect_reason,
+				   "ARTIFACT_WRITE probe=%d (tl=%u akind=%u rel=%u block=%u) "
+				   "must be refused with reason=%u, got status=%d reason=%u",
+				   probe, tl, akind, rel, block, expect_reason, status,
+				   reason);
 				record_cov(PS_OP_EXTEND, (uint32_t) status, reason);
 			}
 		}
@@ -4820,6 +4932,11 @@ verify_branch_frozen(uint32_t slot)
 
 			ring_note("verify_branch_frozen slot=%u rel=%u block=%u", slot,
 					  rel, bl);
+			/* Same status-level nondeterminism as act_read_at()'s main
+			 * observe(PS_OP_READ_AT, ...) call: read_resolve_version()
+			 * (pagestore_core.c) can return ERROR for a page-reclaimed
+			 * frontier crossing the parent's own ancestry at this as-of
+			 * lsn, independent of the found/absent distinction below. */
 			ck(status == PS_STATUS_OK || status == PS_STATUS_ERROR,
 			   "verify_branch_frozen slot=%u rel=%u block=%u: READ_AT "
 			   "status %d is not in {OK,ERROR}", slot, rel, bl, status);
