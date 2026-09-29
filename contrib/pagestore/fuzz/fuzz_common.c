@@ -61,6 +61,28 @@
  * bytes differ.  "control" (the pg_control admission-fence mirror) is
  * PGDATA-side state written by backend_localsvc.c, not a file ps_core_open()
  * reads from the store directory, so it is out of scope for this layer.
+ *
+ * Codex finding on PR #303: page_segment names seg_00000005, a segment
+ * *past* the highest one the fixture actually has (seg_00000004, 16512
+ * bytes).  recover() (pagestore_core.c) does not scan every segment from
+ * byte 0 -- the durable flush watermark says shard 0's watermark segment is
+ * exactly seg_00000004 at offset 16512 (this fixture's seg_00000004 is
+ * *exactly* that many bytes: the whole file is the unsynced tail below the
+ * watermark), and recover()'s per-segment scan starts the *watermark*
+ * segment's own read at flush_watermark.seg_off, not 0 -- so a target
+ * naming seg_00000004 wrote fuzzer bytes recover() never reads at all: every
+ * input, mutated or pristine, replayed identically (zero records recovered
+ * from this file, every time). recover()'s loop (`for (int id = first;;
+ * id++) { uint64_t off = (id == first ...) ? watermark.seg_off : 0; ... }`)
+ * *does* scan every segment after the watermark one from byte 0 -- seg 5
+ * does not need to already exist in the template for this: write_file()
+ * O_CREAT|O_TRUNCs it fresh each iteration, ps_storage->seg_size() treats a
+ * missing/short file as "nothing here yet" (not a hard failure) rather than
+ * refusing to open, and reset_work_dir() (fuzz_common.c) already unlinks
+ * any file not part of the original template after every iteration -- the
+ * same mechanism every other target's mutated file relies on to leave no
+ * state behind. This makes the fuzz input the entire content the parser
+ * sees, from byte 0.
  */
 const PsFuzzTarget ps_fuzz_targets[] = {
 	{"manifest", "layers.manifest"},
@@ -70,7 +92,7 @@ const PsFuzzTarget ps_fuzz_targets[] = {
 	{"forkmeta_snapshot_tail", "forkmeta_snapshots/forkmeta_tail_v1_00000000000000000001"},
 	{"image_layer", "layer_0_000000000000000a"},
 	{"page_frontier", "page-prune.frontiers"},
-	{"page_segment", "seg_00000004"},
+	{"page_segment", "seg_00000005"},
 	{"retention_meta", "retention.meta"},
 	{"retention_state", "retention.state"},
 	{"store_config", ".pagestore-nshards"},

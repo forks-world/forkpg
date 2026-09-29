@@ -760,6 +760,23 @@ fixup_walidx_log(uint8_t *buf, size_t len, uint32_t expected_timeline)
 		if (off + stride > len)
 			break;
 		/*
+		 * Codex finding on PR #303: walidx_recover_one() (pagestore_core.c)
+		 * only ever treats a WIPG record as the progress shape when its own
+		 * rec_len field (offset 4, same layout slot the WIDX branches key
+		 * off above) equals exactly sizeof(WalIdxProgressRec)
+		 * (WALIDX_PROGRESS_BYTES) -- unlike the two WIDX branches above,
+		 * this function's own shape selection for WIPG keys off the magic
+		 * alone and never required rec_len to already hold that value, so a
+		 * fuzzer-mutated rec_len sailed through crc recomputation and still
+		 * hit the reader's `else return -1` (an unrecognized shape, not a
+		 * bad-crc rejection of just this record) -- failing the whole
+		 * recovery, not merely skipping the record. Pin it before the crc
+		 * is (re)computed over the record, the same "pin identity, leave
+		 * the rest fuzzer-controlled" shape used throughout this file.
+		 */
+		if (magic == WALIDX_PROGRESS_MAGIC_LOCAL)
+			put_le32(buf + off + 4, WALIDX_PROGRESS_BYTES);
+		/*
 		 * Codex finding on PR #303 round 4: walidx_recover_one()
 		 * (pagestore_core.c) rejects a V1 (56-byte) record outright when its
 		 * `reserved` field (offset 12, WalIdxRecV1) is nonzero -- checked
@@ -1620,6 +1637,35 @@ fixup_walidx_snapshot_manifest(uint8_t *buf, size_t len)
 	{
 		put_le32(buf + 16, 0);		/* timeline */
 		memset(buf + 52, 0, 12);	/* reserved: must be zero */
+	}
+
+	/*
+	 * Codex finding on PR #303: ps_walidx_snapshot_open_internal()
+	 * (pagestore_walidx_snapshot.c) rejects the whole manifest unless every
+	 * entry's own shard-index field (offset 0 in the entry, distinct from
+	 * this entry's crc/len this function syncs below) equals that entry's
+	 * position `i` in the array -- checked in the same per-entry loop as
+	 * the crc/len gate, so a fuzzer-mutated index there rejected the file
+	 * outright regardless of everything else already fixed up. This must
+	 * run for *every* entry in range (not only the ones with a real
+	 * template-backed shard file below, which `continue`s past entries it
+	 * does not recognize): the reader's loop checks the index field for
+	 * every entry from 0..nshards-1 unconditionally.
+	 */
+	{
+		uint32_t	nshards_for_index = get_le32(buf + 20);
+		uint32_t	idx;
+
+		for (idx = 0; idx < nshards_for_index &&
+			 idx < WALIDX_SNAPSHOT_MANIFEST_MAX_SHARDS_LOCAL; idx++)
+		{
+			size_t		entry_off = WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL +
+				(size_t) idx * WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL;
+
+			if (entry_off + WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL > len)
+				break;
+			put_le32(buf + entry_off, idx);
+		}
 	}
 
 	manifest_tmpl = ps_fuzz_template_lookup(
