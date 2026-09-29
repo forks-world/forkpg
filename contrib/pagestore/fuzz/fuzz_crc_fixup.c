@@ -543,7 +543,25 @@ fixup_retention_meta(const char *work_dir, uint8_t *buf, size_t len)
 		 * sibling retention.state (nrecords, log_hash) derivation below,
 		 * which hashes this whole record (pad included) the same way the
 		 * product's own replay loop does.
+		 *
+		 * Codex finding on PR #303 (round 6, gate-table audit): the same
+		 * function also requires `len` to equal exactly sizeof(*rec) (64)
+		 * -- checked in the same `||` chain as pad, magic, and version,
+		 * independent of crc -- and ps_retention_open()'s own outer header
+		 * check (pagestore_retention.c) reads *record 0's* len first, to
+		 * pick the legacy-vs-current record shape for the whole file, and
+		 * hard-fails the entire open ("unrecognized version ... record
+		 * size ...") if it does not match sizeof(PsRetentionRecord)
+		 * either. A len mutation was previously left fuzzer-controlled
+		 * like magic/version/type, but unlike those, len is not a
+		 * meaningful identity value to fuzz here -- every valid record of
+		 * this fixed-size format has the same len by construction, so
+		 * pinning it costs no coverage, the same reasoning already applied
+		 * to walidx/timelines/wal_segment rec_len-style fields elsewhere in
+		 * this file. Pinned before the crc, for the same reason pad is.
 		 */
+		put_le32(buf + off + offsetof(FuzzRetentionRecord, len),
+				 (uint32_t) stride);
 		memset(buf + off + offsetof(FuzzRetentionRecord, pad), 0, 4);
 		crc = fnv1a_step(FNV1A_INIT, buf + off, crc_off);
 		put_le32(buf + off + crc_off, crc);
@@ -620,7 +638,24 @@ fixup_retention_state(uint8_t *buf, size_t len)
  * the *entire* load otherwise (`rec.reserved != 0` -> `return -1`, not a
  * per-record skip) -- the same reserved-padding class as the forkmeta/
  * walidx snapshot manifest headers, the walidx watermark, and the wal_store
- * identity file. Zeroed here, before the crc, for the same reason. */
+ * identity file. Zeroed here, before the crc, for the same reason.
+ *
+ * Codex finding on PR #303 (round 6): a gate ahead of even that one was
+ * still open. load_timelines()'s outer loop (pagestore_core.c) reads only
+ * an 8-byte magic+rec_len header first and requires rec_len to equal
+ * exactly one of three known struct sizes (TimelineRecV2,
+ * TimelineRecEventV1, or this current TimelineRecEvent shape) *before*
+ * reading the rest of the record at all, let alone checking its crc -- an
+ * unrecognized rec_len is not a per-record skip, it is `return -1` for the
+ * *entire* file's load, the exact same "whole-file hard fail" shape as the
+ * reserved-padding check just above. This function's whole design already
+ * commits to treating every stride-aligned chunk as this one current
+ * shape (see the file-header comment above), so rec_len is now pinned to
+ * that shape's own size for the same reason `reserved` already is:
+ * anything else can never satisfy load_timelines()'s outer gate regardless
+ * of what the rest of the record says. magic is deliberately left
+ * fuzzer-controlled -- unlike rec_len, a wrong magic is a meaningful,
+ * independently fuzzable rejection this harness can still reach. */
 typedef struct FuzzTimelineRecEvent
 {
 	uint32_t	magic;
@@ -646,6 +681,8 @@ fixup_timelines(uint8_t *buf, size_t len)
 	{
 		uint32_t	crc;
 
+		put_le32(buf + off + offsetof(FuzzTimelineRecEvent, rec_len),
+				 (uint32_t) stride);
 		memset(buf + off + offsetof(FuzzTimelineRecEvent, reserved), 0, 4);
 		put_le32(buf + off + crc_off, 0);
 		crc = fnv1a_step(FNV1A_INIT, buf + off, stride);
@@ -948,7 +985,18 @@ fixup_wal_store_identity(uint8_t *buf, size_t len)
 	 * checked before the crc -- the same reserved-padding class as the
 	 * forkmeta/walidx snapshot manifest headers and the walidx watermark,
 	 * zeroed here for the same reason.
+	 *
+	 * Codex finding on PR #303 (round 6, gate-table audit): the same
+	 * function also requires header@8 to equal PS_WAL_STORE_METADATA_BYTES
+	 * (64) -- a fixed product constant in that same pre-crc `||` chain,
+	 * not touched before -- so a mutation to it alone still rejected the
+	 * file outright regardless of a correct crc. magic@0 and version@4 are
+	 * deliberately left alone, matching how every other target's format-
+	 * identity fields are treated in this file; header@8 is not a
+	 * meaningful identity value the same way, since this function only
+	 * ever produces (and this format only ever has) one encoding length.
 	 */
+	put_le32(buf + 8, 64);
 	memset(buf + 12, 0, 4);
 	memset(buf + 52, 0, 4);
 	memset(buf + 56, 0, 8);
@@ -980,6 +1028,38 @@ fixup_wal_store_identity(uint8_t *buf, size_t len)
  * records a zero identity regardless of payload (payload_identity_matches()'s
  * version_known() special case), which the zero-initialized locals already
  * give it.
+ *
+ * Codex finding on PR #303 (round 6): the checksum gates above are not the
+ * ones this target's own reader actually gets stopped at first.
+ * load_segment() (pagestore_wal_store.c) requires header.payload_len to
+ * equal store->segment_size *exactly* -- WAL_IMMUTABLE_SEGMENT_BYTES ==
+ * PS_WAL_SEGMENT_MIN_BYTES, a fixed product constant, not "whatever length
+ * this file happens to be" -- header.segment_size to equal that same
+ * constant, and the file's own on-disk size (fstat(), independent of this
+ * buffer) to equal PS_WAL_SEGMENT_HEADER_BYTES + header.payload_len, all
+ * three checked before a single payload byte is hashed. Deriving
+ * payload_len from this buffer's own (possibly mutated) length, as above,
+ * satisfies the third check (self-consistent) but essentially never the
+ * first two: a length-changing mutation only rarely lands on exactly
+ * PS_WAL_SEGMENT_MIN_BYTES + 64 bytes, so every such mutation failed here,
+ * long before header_crc or payload_crc ever mattered.
+ * ps_fuzz_run_one() (fuzz_common.c) now resizes the fuzzed buffer itself
+ * (zero-padding a short input, truncating a long one) to exactly
+ * ps_fuzz_wal_segment_fixed_len() *before* this function -- or the crc
+ * gates above -- ever runs, but only for a fixed-up iteration (see that
+ * call site's own comment for why the raw half is deliberately left
+ * untouched: a length-changing mutation is exactly what this finding is
+ * about proving reaches deeper parsing once fixed up, not something this
+ * fixup should silently repair in raw mode). By the time this function
+ * runs, len already equals that fixed length in fixup mode, so
+ * payload_len = len - 64 now legitimately equals segment_size for real.
+ * This also pins timeline/segment_no/start_lsn/segment_size to this
+ * fixture's one real captured segment's own identity -- its only legal
+ * values for a freshly opened store's first segment on timeline 0, the
+ * same "pin identity, leave the rest fuzzer-controlled" shape used
+ * throughout this file -- since load_segment() checks all four against the
+ * store's own state before payload_crc is ever computed, independent of
+ * the length fix above.
  */
 static void
 fixup_wal_segment(uint8_t *buf, size_t len)
@@ -991,11 +1071,22 @@ fixup_wal_segment(uint8_t *buf, size_t len)
 	uint16_t	xlp_magic = 0;
 	uint16_t	xlp_info = 0;
 	uint32_t	xlp_seg_size = 0;
+	const uint8_t *tmpl;
+	size_t		tmpl_len;
 
 	if (len < 64)
 		return;
 	payload_len = (uint32_t) (len - 64);
 	put_le32(buf + 20, payload_len);
+	tmpl = ps_fuzz_template_lookup(
+		"wal_segments_0/walv1_1_00000000000000000000", &tmpl_len);
+	if (tmpl != NULL && tmpl_len >= 56)
+	{
+		put_le32(buf + 16, get_le32(tmpl + 16));	/* timeline */
+		put_le64(buf + 24, get_le64(tmpl + 24));	/* segment_no */
+		put_le64(buf + 32, get_le64(tmpl + 32));	/* start_lsn */
+		put_le64(buf + 48, get_le64(tmpl + 48));	/* segment_size */
+	}
 	if (get_le32(buf + 4) != PS_WAL_SEGMENT_LEGACY_VERSION)
 		(void) ps_wal_segment_payload_identity(buf + 64, payload_len,
 												&xlp_magic, &xlp_info,
@@ -1009,6 +1100,21 @@ fixup_wal_segment(uint8_t *buf, size_t len)
 	memset(header + 44, 0, 4);
 	header_crc = fnv1a_step(FNV1A_INIT, header, 64);
 	put_le32(buf + 44, header_crc);
+}
+
+/*
+ * Exported for ps_fuzz_run_one() (fuzz_common.c): the wal_segment target's
+ * one legal on-disk length in a fixed-up iteration --
+ * PS_WAL_SEGMENT_HEADER_BYTES + PS_WAL_SEGMENT_MIN_BYTES, the same fixed
+ * product constant load_segment() (pagestore_wal_store.c) calls
+ * WAL_IMMUTABLE_SEGMENT_BYTES -- see fixup_wal_segment()'s own comment.
+ * The caller resizes its buffer to this length before fixup_wal_segment()
+ * (or any of this file's crc gates) ever runs.
+ */
+size_t
+ps_fuzz_wal_segment_fixed_len(void)
+{
+	return (size_t) PS_WAL_SEGMENT_HEADER_BYTES + PS_WAL_SEGMENT_MIN_BYTES;
 }
 
 /* ---- .pagestore-nshards (pagestore_core.c, "PSS2 %u %08x\n") -----------
@@ -1359,13 +1465,29 @@ fixup_forkmeta_snapshot_manifest(uint8_t *buf, size_t len)
 	 * the reserved field at offset 12 (4 bytes) and the two reserved fields
 	 * at offsets 68 (4 bytes) and 72 (8 bytes) to be exactly zero, checked
 	 * before the crc alongside magic/version/header_bytes. Unlike
-	 * magic/version/header_bytes (left fuzzer-controlled in both halves
-	 * throughout this file, matching the project's convention of not pinning
-	 * format-identity constants), these are pure reserved padding with no
+	 * magic/version (left fuzzer-controlled in both halves throughout this
+	 * file, matching the project's convention of not pinning format-
+	 * identity constants), these are pure reserved padding with no
 	 * fuzzer-interesting shape of their own, so the fixup half zeroes them
 	 * the same way the sibling walidx_snapshot_manifest fixup does for its
 	 * own reserved fields.
+	 *
+	 * Codex finding on PR #303 (round 6, gate-table audit): header_bytes@8
+	 * itself was grouped with magic/version above and left unpinned, but on
+	 * its own gate it does not belong there -- every record this function
+	 * (or the product's own writer) ever produces has the same fixed
+	 * header_bytes value by construction, unlike magic/version, which
+	 * really do vary across a format's real revisions and are worth
+	 * independently fuzzing rejection of. Left unpinned, a mutation to
+	 * header_bytes alone (leaving magic/version untouched) still rejected
+	 * the whole manifest outright before any of the cross-file binding
+	 * below -- or a single checkpoint/tail record -- was ever reached, the
+	 * same class this round's audit is about. Pinned to this file's own
+	 * fixed size, the same reasoning already applied to the sibling
+	 * walidx_snapshot_manifest/walidx_snapshot_shard/wal_store_identity
+	 * targets' equivalent fields this same round.
 	 */
+	put_le32(buf + 8, FORKMETA_SNAPSHOT_HEADER_BYTES_LOCAL);
 	memset(buf + 12, 0, 4);
 	memset(buf + 68, 0, 12);
 
@@ -1660,8 +1782,20 @@ fixup_walidx_snapshot_manifest(uint8_t *buf, size_t len)
 	 * entry. Neither was pinned, so a mutation to either -- fully
 	 * independent of every gate already fixed up above -- still rejected
 	 * the file outright. */
+	/*
+	 * Codex finding on PR #303 (round 6, gate-table audit): the same
+	 * open_internal() check also requires header@8 to equal
+	 * WALIDX_SNAPSHOT_HEADER_BYTES (64) and header@12 to equal
+	 * WALIDX_SNAPSHOT_ENTRY_BYTES (16) -- two more fixed product
+	 * constants in that same pre-crc `||` chain, exactly the same class
+	 * as timeline@16 and the two reserved fields just pinned above, but
+	 * neither was pinned: a mutation to either field alone still
+	 * rejected the file outright regardless of everything else.
+	 */
 	if (len >= WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL)
 	{
+		put_le32(buf + 8, WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL);
+		put_le32(buf + 12, WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL);
 		put_le32(buf + 16, 0);		/* timeline */
 		memset(buf + 52, 0, 12);	/* reserved: must be zero */
 	}
@@ -1822,6 +1956,27 @@ fixup_walidx_snapshot_shard(const char *work_dir, uint8_t *buf, size_t len)
 	start_lsn = get_le64(manifest_tmpl + 32);
 	end_lsn = get_le64(manifest_tmpl + 40);
 
+	/*
+	 * Codex finding on PR #303 (round 6, gate-table audit):
+	 * walidx_snapshot_decode_header() (pagestore_core.c) only accepts this
+	 * header's version@4 and "bytes" (header_bytes)@8 as one of three fixed
+	 * pairs -- (V1, 64), (V2, 64), or (current, 72) -- and uses that same
+	 * "bytes" value both as the span it hashes and to pick which of two
+	 * crc offsets (56 or 64) to check against, all before this record's own
+	 * per-field identity/crc checks below ever run. This function already
+	 * commits to only ever fixing up the *current* (72-byte, crc@64) shape
+	 * -- the crc it computes a few lines down is always `fnv1a_step(...,
+	 * buf, 72)` -- so "bytes" is pinned to that shape's own fixed size for
+	 * the same reason a rec_len/struct-size field is pinned elsewhere in
+	 * this file: it is not a meaningful identity value to leave fuzzer-
+	 * controlled on its own, since every record this function actually
+	 * knows how to seal has the same value by construction. version@4 is
+	 * deliberately left alone -- unlike "bytes", it *is* a meaningful,
+	 * independently fuzzable identity field (which shape gets selected at
+	 * all), matching how magic/version are treated everywhere else in this
+	 * file.
+	 */
+	put_le32(buf + 8, 72);		/* header_bytes: this function's one shape */
 	put_le32(buf + 12, 0);		/* timeline 0 */
 	put_le32(buf + 16, 0);		/* shard 0 */
 	for (unsigned i = 0; i < 8; i++)

@@ -61,4 +61,17 @@ extern void ps_fuzz_crc_fixup(const char *target_name, const char *work_dir,
 extern void fixup_walidx_log_epoch_watermark(const char *work_dir,
 											  uint64_t new_length);
 
+/*
+ * The wal_segment target's one legal on-disk length in a fixed-up
+ * iteration (PS_WAL_SEGMENT_HEADER_BYTES + PS_WAL_SEGMENT_MIN_BYTES --
+ * load_segment() in pagestore_wal_store.c requires the file's own on-disk
+ * size to equal exactly this, independent of what length the fuzz input
+ * happened to be). ps_fuzz_run_one() (fuzz_common.c) calls this only for a
+ * fixed-up wal_segment iteration, and only to decide how to resize its
+ * buffer *before* calling ps_fuzz_crc_fixup() -- the raw half is left
+ * alone, matching this finding's design. See fixup_wal_segment()'s own
+ * comment in fuzz_crc_fixup.c.
+ */
+extern size_t ps_fuzz_wal_segment_fixed_len(void);
+
 #endif							/* PS_FUZZ_CRC_FIXUP_H */

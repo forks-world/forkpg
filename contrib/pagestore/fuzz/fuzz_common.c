@@ -933,7 +933,46 @@ ps_fuzz_run_one(const char *target_name, const uint8_t *data, size_t size)
 		memcpy(content, data, content_len);
 
 	if (should_fixup_this_iteration(content, content_len))
+	{
+		/*
+		 * Codex finding on PR #303 (round 6): load_segment()
+		 * (pagestore_wal_store.c) requires the wal_segment target's own
+		 * on-disk file size to equal a fixed constant
+		 * (ps_fuzz_wal_segment_fixed_len(), independent of whatever length
+		 * the fuzz input happened to be) before it hashes a single payload
+		 * byte -- see fixup_wal_segment()'s own comment (fuzz_crc_fixup.c).
+		 * fixup_wal_segment() cannot satisfy that alone: it recomputes
+		 * fields *in* this buffer, but write_file() below always writes
+		 * exactly content_len bytes, and content_len is fixed by the time
+		 * ps_fuzz_crc_fixup() returns. So this resizes the buffer itself --
+		 * zero-padding a short input, truncating a long one -- to that
+		 * fixed length right here, before the fixup (or any of its crc
+		 * recomputation) ever runs, but only for a fixed-up iteration: the
+		 * raw half is deliberately left alone, since a length-changing
+		 * mutation reaching deeper parsing once fixed up is exactly what
+		 * this finding is about, not something to silently repair before
+		 * should_fixup_this_iteration() even had a say.
+		 */
+		if (strcmp(resolved_target_name, "wal_segment") == 0)
+		{
+			size_t want_len = ps_fuzz_wal_segment_fixed_len();
+
+			if (want_len > 0 && want_len != content_len)
+			{
+				uint8_t    *resized = realloc(content, want_len);
+
+				if (resized != NULL)
+				{
+					if (want_len > content_len)
+						memset(resized + content_len, 0,
+							   want_len - content_len);
+					content = resized;
+					content_len = want_len;
+				}
+			}
+		}
 		ps_fuzz_crc_fixup(resolved_target_name, work_dir, content, content_len);
+	}
 
 	if (snprintf(target_path, sizeof(target_path), "%s/%s", work_dir,
 				 relpath) >= (int) sizeof(target_path))
