@@ -1769,8 +1769,21 @@ note_mutation_seq(uint64_t seq)
 		g_max_mutation_seq = seq;
 }
 
-static void
-check_admission_barrier(const char *phase)
+/*
+ * Every caller that issues a real ADMISSION_BARRIER -- not just the
+ * dedicated action -- routes through here: RETENTION_PIN_SET's setup
+ * (act_retention_set()) and CREATE_BRANCH's fence capture
+ * (env_branch_create()) both need a fresh sequence for their own purposes,
+ * and if either bypassed this, its observed value would never update
+ * g_last_admission_seq, so a restart that rolled the allocator back to just
+ * below that (unrecorded) observation -- but still above the last value
+ * this checker itself saw -- would pass unnoticed.  Folding every
+ * observation through one helper means verify_after_restart()'s check
+ * always covers the highest sequence this run has ever actually seen, not
+ * just the highest one act_admission_barrier() happened to sample.
+ */
+static int
+observe_admission_barrier(const char *phase, uint64_t *seq_out)
 {
 	uint64_t	seq = 0;
 	int			status = psc_op_admission_barrier(&seq);
@@ -1788,10 +1801,21 @@ check_admission_barrier(const char *phase)
 		   "mutation already proved happened (%llu) -- a stale barrier, or "
 		   "(after restart) the allocator rolling backward", phase,
 		   (unsigned long long) seq, (unsigned long long) g_max_mutation_seq);
+		if (seq > g_last_admission_seq)
+			g_last_admission_seq = seq;
 	}
+	if (seq_out)
+		*seq_out = seq;
+	return status;
+}
+
+static void
+check_admission_barrier(const char *phase)
+{
+	uint64_t	seq = 0;
+	int			status = observe_admission_barrier(phase, &seq);
+
 	record_cov(PS_OP_ADMISSION_BARRIER, (uint32_t) status, 0);
-	if (status == PS_STATUS_OK && seq > g_last_admission_seq)
-		g_last_admission_seq = seq;
 }
 
 static void
@@ -1897,6 +1921,23 @@ act_wal_read(void)
 	}
 }
 
+/*
+ * Search recs[0..n) for the record this run itself just added at
+ * (tl, lsn), identified by that (timeline, lsn) pair alone -- shared by
+ * every WAL_INDEX_GET-after-ADD probe (act_walidx_add(),
+ * act_walidx_add_batch(), act_walidx_get()) so each one's full-metadata
+ * comparison (end_lsn/flags) is checked against the exact same lookup,
+ * not a second, possibly-diverging copy of the search.
+ */
+static PsWalRec *
+walidx_find_own_record(PsWalRec *recs, int n, uint32_t tl, uint64_t lsn)
+{
+	for (int i = 0; i < n; i++)
+		if (recs[i].lsn == lsn && recs[i].timeline == tl)
+			return &recs[i];
+	return NULL;
+}
+
 static void
 act_walidx_add(void)
 {
@@ -1963,19 +2004,36 @@ act_walidx_add(void)
 			record_cov(PS_OP_WAL_INDEX_GET, (uint32_t) gstatus, 0);
 			if (gstatus == PS_STATUS_OK)
 			{
-				int			found = 0;
+				/*
+				 * walidx_add() (pagestore_core.c) always stamps a
+				 * single-record ADD's entry with end_lsn=0 (PsWalRec's own
+				 * "zero for legacy unknown") and flags=0 (neither KNOWN nor
+				 * FPI) -- unlike WAL_INDEX_ADD_BATCH's callers, which always
+				 * set KNOWN|FPI and an explicit end_lsn.  Compare the full
+				 * record, not just its presence: a daemon that stores this
+				 * entry with a fabricated end_lsn/flags would otherwise
+				 * still pass, even though those fields change how a later
+				 * consumer fetches the covered WAL range and whether
+				 * compaction treats it as an FPI base.
+				 */
+				PsWalRec   *rec = walidx_find_own_record(fz_walidx_get_recs,
+														 n, tl, lsn);
 
-				for (int i = 0; i < n; i++)
-					if (fz_walidx_get_recs[i].lsn == lsn &&
-						fz_walidx_get_recs[i].timeline == tl)
-						found = 1;
-				ck(found || dead, "WAL_INDEX_ADD tl=%u rel=%u block=%u: the "
-				   "record just added at lsn=%llu is missing from a "
-				   "subsequent WAL_INDEX_GET, but the block is still alive "
-				   "on tl (exists=%d nblocks=%u) -- no replacement base/"
-				   "death can legitimately have dropped it (n=%d)", tl, rel,
-				   block, (unsigned long long) lsn, m->exists, m->nblocks,
-				   n);
+				if (rec)
+					ck(rec->end_lsn == 0 && rec->flags == 0,
+					   "WAL_INDEX_ADD tl=%u rel=%u block=%u record lsn=%llu "
+					   "has end_lsn=%llu flags=%u, expected end_lsn=0 "
+					   "flags=0 (single-record ADD persists 'legacy "
+					   "unknown')", tl, rel, block, (unsigned long long) lsn,
+					   (unsigned long long) rec->end_lsn, rec->flags);
+				if (!rec)
+					ck(dead, "WAL_INDEX_ADD tl=%u rel=%u block=%u: the "
+					   "record just added at lsn=%llu is missing from a "
+					   "subsequent WAL_INDEX_GET, but the block is still "
+					   "alive on tl (exists=%d nblocks=%u) -- no "
+					   "replacement base/death can legitimately have "
+					   "dropped it (n=%d)", tl, rel, block,
+					   (unsigned long long) lsn, m->exists, m->nblocks, n);
 			}
 		}
 	}
@@ -2009,13 +2067,35 @@ act_walidx_add_batch(void)
 		uint32_t	n = 1 + rng_below(3);
 		uint32_t	blocks[3];
 		uint64_t	lsn = adv == ADV_NONE ? ship_wal(tl) : 1;
+		uint64_t	end = lsn + FZ_WAL_PAYLOAD;
 		int			status;
 
+		/*
+		 * Distinct blocks per entry when n > 1: a duplicate block within
+		 * the same batch (same key, same lsn) collapses to a single
+		 * stored record (walidx_add_batch_locked()'s own-lsn dedup), which
+		 * would make the per-block verification below unable to tell
+		 * "every submitted tuple was actually stored" apart from "only
+		 * the first one was".
+		 */
 		for (uint32_t i = 0; i < n; i++)
-			blocks[i] = rng_below(FZ_MAXBLK);
+		{
+			uint32_t	candidate;
+			int			dup;
+
+			do
+			{
+				candidate = rng_below(FZ_MAXBLK);
+				dup = 0;
+				for (uint32_t j = 0; j < i; j++)
+					if (blocks[j] == candidate)
+						dup = 1;
+			} while (dup);
+			blocks[i] = candidate;
+		}
 		status = psc_op_walidx_add_batch(adv == ADV_NONE ? tl : target_tl,
 										 target_inc, PS_KLASS_RELATION, rel,
-										 blocks, n, lsn, lsn + FZ_WAL_PAYLOAD);
+										 blocks, n, lsn, end);
 		ring_note("WAL_INDEX_ADD_BATCH adv=%d tl=%u n=%u", adv,
 				  adv == ADV_NONE ? tl : target_tl, n);
 		if (adv == ADV_NONE)
@@ -2025,6 +2105,73 @@ act_walidx_add_batch(void)
 			ck(status == PS_STATUS_ERROR, "WAL_INDEX_ADD_BATCH with adversarial "
 			   "target must be refused (adv=%d), got %d", adv, status);
 		record_cov(PS_OP_WAL_INDEX_ADD_BATCH, (uint32_t) status, 0);
+
+		if (adv == ADV_NONE && status == PS_STATUS_OK)
+		{
+			/*
+			 * The legal path above only checked the whole batch's status,
+			 * not what actually landed: a daemon that accepts a multi-
+			 * entry batch but only persists its first record would pass
+			 * unnoticed (every other batch submission in this file --
+			 * act_walidx_get()'s and seed_restart_walidx_record()'s setup
+			 * -- always submits exactly one record, so neither exercises
+			 * this).  Publish progress past the whole batch, then require
+			 * every submitted (block, lsn) tuple to show up, with the
+			 * exact metadata WAL_INDEX_ADD_BATCH is defined to persist, in
+			 * its own subsequent GET.
+			 */
+			ck(psc_op_walidx_progress_commit(tl, target_inc,
+											 g_tl[tl].walidx_progress,
+											 end) == PS_STATUS_OK,
+			   "WAL_INDEX_PROGRESS commit after ADD_BATCH tl=%u rel=%u",
+			   tl, rel);
+			if (end > g_tl[tl].walidx_progress)
+				g_tl[tl].walidx_progress = end;
+			g_tl[tl].walidx_progress_committed = 1;
+
+			for (uint32_t i = 0; i < n; i++)
+			{
+				FzRel	   *m = &g_tl[tl].rel[rel];
+				int			dead = !m->exists || blocks[i] >= m->nblocks;
+				int			n_out = 0;
+				int			gstatus;
+				PsWalRec   *rec;
+
+				gstatus = psc_op_walidx_get(tl, target_inc, PS_KLASS_RELATION,
+										   rel, blocks[i], UINT64_MAX,
+										   fz_walidx_get_recs,
+										   FZ_WALIDX_GET_CAP, &n_out);
+				ring_note("WAL_INDEX_GET after ADD_BATCH tl=%u rel=%u "
+						  "block=%u", tl, rel, blocks[i]);
+				ck(gstatus == PS_STATUS_OK, "WAL_INDEX_GET after ADD_BATCH "
+				   "tl=%u rel=%u block=%u (status %d)", tl, rel, blocks[i],
+				   gstatus);
+				record_cov(PS_OP_WAL_INDEX_GET, (uint32_t) gstatus, 0);
+				if (gstatus != PS_STATUS_OK)
+					continue;
+				rec = walidx_find_own_record(fz_walidx_get_recs, n_out, tl,
+											 lsn);
+				if (rec)
+					ck(rec->end_lsn == end && rec->flags ==
+					   (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI),
+					   "WAL_INDEX_ADD_BATCH tl=%u rel=%u block=%u record "
+					   "lsn=%llu has end_lsn=%llu flags=%u, expected "
+					   "end_lsn=%llu flags=%u", tl, rel, blocks[i],
+					   (unsigned long long) lsn,
+					   (unsigned long long) rec->end_lsn, rec->flags,
+					   (unsigned long long) end,
+					   PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI);
+				if (!rec)
+					ck(dead, "WAL_INDEX_ADD_BATCH tl=%u rel=%u block=%u: "
+					   "the record submitted at lsn=%llu is missing from a "
+					   "subsequent WAL_INDEX_GET, but the block is still "
+					   "alive on tl (exists=%d nblocks=%u) -- no "
+					   "replacement base/death can legitimately have "
+					   "dropped it (n=%d)", tl, rel, blocks[i],
+					   (unsigned long long) lsn, m->exists, m->nblocks,
+					   n_out);
+			}
+		}
 	}
 }
 
@@ -2173,12 +2320,9 @@ act_walidx_get(void)
 			 */
 			FzRel	   *m = &g_tl[tl].rel[rel];
 			int			dead = !m->exists || block >= m->nblocks;
-			int			found = 0;
-			for (int i = 0; i < n; i++)
-				if (fz_walidx_get_recs[i].lsn == lsn &&
-					fz_walidx_get_recs[i].timeline == tl)
-					found = 1, rec = &fz_walidx_get_recs[i];
-			if (found)
+
+			rec = walidx_find_own_record(fz_walidx_get_recs, n, tl, lsn);
+			if (rec)
 				ck(rec->end_lsn == end && rec->flags ==
 				   (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI),
 				   "WAL_INDEX_GET tl=%u rel=%u block=%u record lsn=%llu has "
@@ -2187,7 +2331,7 @@ act_walidx_get(void)
 				   (unsigned long long) rec->end_lsn, rec->flags,
 				   (unsigned long long) end,
 				   PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI);
-			if (!found)
+			if (!rec)
 				ck(dead, "WAL_INDEX_GET tl=%u rel=%u block=%u: the record "
 				   "just added at lsn=%llu is missing, but the block is "
 				   "still alive on tl (exists=%d nblocks=%u) -- no "
@@ -2605,12 +2749,13 @@ act_retention_set(void)
 		ck(lsn > old_lsn, "RETENTION_PIN_SET update point %llu must advance "
 		   "reader %llu from %llu", (unsigned long long) lsn,
 		   (unsigned long long) r->owner_id, (unsigned long long) old_lsn);
-		status = psc_op_admission_barrier(&seq);
-		ck(status == PS_STATUS_OK && seq > old_seq,
-		   "RETENTION_PIN_SET update barrier must advance reader %llu sequence "
-		   "from %llu (status %d, seq %llu)",
-		   (unsigned long long) r->owner_id, (unsigned long long) old_seq,
-		   status, (unsigned long long) seq);
+		status = observe_admission_barrier("RETENTION_PIN_SET setup", &seq);
+		if (status == PS_STATUS_OK)
+			ck(seq > old_seq,
+			   "RETENTION_PIN_SET update barrier must advance reader %llu "
+			   "sequence from %llu (status %d, seq %llu)",
+			   (unsigned long long) r->owner_id, (unsigned long long) old_seq,
+			   status, (unsigned long long) seq);
 		if (status != PS_STATUS_OK || lsn <= old_lsn || seq <= old_seq)
 			return;
 
@@ -2770,6 +2915,82 @@ act_wal_append_adv(void)
 	   "content that diverges from what is already there must be refused, "
 	   "got %d", (unsigned long long) start, FZ_WAL_PAYLOAD, status);
 	record_cov(PS_OP_WAL_APPEND, (uint32_t) status, 0);
+}
+
+/*
+ * The other half of the overlap policy (wal_overlap_check()/
+ * wal_append_locked(), pagestore_core.c): re-shipping a range that is
+ * *fully* covered by already-shipped WAL with IDENTICAL bytes is the
+ * idempotent-archiver-retry case (a caller that lost the ack for a append
+ * it already sent), and must succeed with covered_prefix == len short-
+ * circuiting straight to wal_segment_sync() -- no new chunk is appended
+ * and wal_end never advances.  act_wal_append_adv() above only exercises
+ * the *divergent*-content half of this policy; without this action a
+ * daemon that started refusing every duplicate WAL shipment (breaking
+ * recovery from a lost acknowledgement) would pass unnoticed.
+ *
+ * Re-ships the most recently shipped record verbatim (recomputed via
+ * fz_wal_fill(), the same deterministic content every record ever gets),
+ * guarded by the WAL retention floor the same way verify_after_restart()'s
+ * "latest WAL record" check is: only when that record is provably still
+ * retained (floor == 0, or the record starts at/after it) does an absent
+ * copy in wal_overlap_check() unambiguously mean a real regression rather
+ * than a legitimate reclaim racing this action.
+ */
+static void
+act_wal_reship_idempotent(void)
+{
+	uint32_t	tl = pick_live_tl();
+	uint64_t	start;
+	uint64_t	floor = 0;
+	int			proven = 0;
+	int			fstatus;
+	unsigned char buf[FZ_WAL_PAYLOAD];
+	uint64_t	end_before;
+	uint64_t	end_after = 0;
+	int			status;
+
+	if (!g_tl[tl].wal_shipped ||
+		g_tl[tl].wal_end - g_tl[tl].wal_start < FZ_WAL_PAYLOAD)
+	{
+		ship_wal(tl);
+		return;
+	}
+	start = g_tl[tl].wal_end - FZ_WAL_PAYLOAD;
+	fstatus = psc_op_wal_retain_floor(tl, g_tl[tl].incarnation, &floor,
+									  &proven);
+	ck(fstatus == PS_STATUS_OK || fstatus == PS_STATUS_ERROR,
+	   "act_wal_reship_idempotent: WAL retention floor tl=%u unexpected "
+	   "status %d", tl, fstatus);
+	if (fstatus != PS_STATUS_OK || (floor != 0 && start < floor))
+	{
+		/* Not provably retained right now -- reclaim could legitimately
+		 * have dropped it, so an absent copy here would not be provable
+		 * either way.  Ship something fresh instead of risking a spurious
+		 * failure on a range this model cannot vouch for. */
+		ship_wal(tl);
+		return;
+	}
+
+	fz_wal_fill(start, buf);
+	end_before = g_tl[tl].wal_end;
+	status = psc_op_wal_append(tl, g_tl[tl].incarnation, start, buf,
+							   FZ_WAL_PAYLOAD);
+	ring_note("WAL_APPEND reship tl=%u start=%llu", tl,
+			  (unsigned long long) start);
+	ck(status == PS_STATUS_OK, "WAL_APPEND identical re-ship tl=%u "
+	   "start=%llu must succeed as an idempotent archive retry (status %d)",
+	   tl, (unsigned long long) start, status);
+	record_cov(PS_OP_WAL_APPEND, (uint32_t) status, 0);
+	if (status != PS_STATUS_OK)
+		return;
+
+	status = psc_op_wal_size(tl, g_tl[tl].incarnation, &end_after);
+	ck(status == PS_STATUS_OK && end_after == end_before,
+	   "WAL_APPEND identical re-ship tl=%u start=%llu must not extend the "
+	   "logical tail: had %llu, now %llu (status %d)", tl,
+	   (unsigned long long) start, (unsigned long long) end_before,
+	   (unsigned long long) end_after, status);
 }
 
 /* ===================== branch / timeline lifecycle ops ==================== */
@@ -4085,6 +4306,27 @@ env_branch_create(void)
 	record_cov(PS_OP_CREATE_BRANCH, (uint32_t) status, 0);
 	if (status == PS_STATUS_OK)
 	{
+		/*
+		 * branch_create_request_ok() (pagestore_core.c) defines the
+		 * returned incarnation precisely, not just "whatever it stores and
+		 * echoes back consistently": a never-before-defined slot always
+		 * gets incarnation 1, and a reused DELETED slot gets exactly the
+		 * caller's requested target_inc (which this model always sets to
+		 * the slot's previous incarnation + 1 -- see target_inc above),
+		 * never some other value the daemon happens to have picked.  A
+		 * daemon that skipped or fabricated the incarnation but was
+		 * otherwise internally consistent would still pass every later
+		 * READV/EXISTS/etc probe (they all key off g_tl[slot].incarnation,
+		 * which would simply adopt the wrong value) and every restart
+		 * check, so this must be checked right here, before that value
+		 * gets adopted into the model.
+		 */
+		uint64_t	expected_inc = g_tl[slot].known ? target_inc : 1;
+
+		ck(new_inc == expected_inc, "CREATE_BRANCH slot=%u returned "
+		   "incarnation=%llu, expected %llu (%s slot)", slot,
+		   (unsigned long long) new_inc, (unsigned long long) expected_inc,
+		   g_tl[slot].known ? "reused" : "fresh");
 		g_tl[slot].known = 1;
 		g_tl[slot].state = PS_TIMELINE_LIVE;
 		g_tl[slot].incarnation = new_inc;
@@ -4116,12 +4358,10 @@ env_branch_create(void)
 		 */
 		{
 			uint64_t	barrier_seq = 0;
-			int			bstatus = psc_op_admission_barrier(&barrier_seq);
+			int			bstatus;
 
-			ck(bstatus == PS_STATUS_OK && barrier_seq != 0,
-			   "ADMISSION_BARRIER after CREATE_BRANCH slot=%u failed "
-			   "(status %d seq=%llu)", slot, bstatus,
-			   (unsigned long long) barrier_seq);
+			bstatus = observe_admission_barrier("CREATE_BRANCH admission "
+												 "barrier", &barrier_seq);
 			if (bstatus == PS_STATUS_OK)
 				g_tl[slot].branch_seq = barrier_seq;
 		}
@@ -4578,6 +4818,11 @@ typedef struct FzWalidxSeed
 	uint32_t	rel;
 	uint32_t	block;
 	uint64_t	lsn;
+	uint64_t	end_lsn;		/* expected metadata: this seed always goes
+								 * through WAL_INDEX_ADD_BATCH, which always
+								 * stamps an explicit end_lsn and KNOWN|FPI
+								 * (see walidx_find_own_record()'s callers) */
+	uint32_t	flags;
 } FzWalidxSeed;
 
 static FzWalidxSeed g_restart_walidx_seed;
@@ -4643,13 +4888,24 @@ seed_restart_walidx_record(void)
 						 FZ_WALIDX_GET_CAP, &n) == PS_STATUS_OK,
 	   "seed_restart_walidx_record: WAL_INDEX_GET tl=%u rel=%u block=%u",
 	   tl, rel, block);
-	for (int i = 0; i < n; i++)
-		if (fz_walidx_get_recs[i].lsn == lsn &&
-			fz_walidx_get_recs[i].timeline == tl)
-			found = 1;
-	ck(found, "seed_restart_walidx_record: just-added record tl=%u rel=%u "
-	   "block=%u lsn=%llu is missing before the restart even happened", tl,
-	   rel, block, (unsigned long long) lsn);
+	{
+		PsWalRec   *rec = walidx_find_own_record(fz_walidx_get_recs, n, tl,
+												 lsn);
+
+		found = rec != NULL;
+		ck(found, "seed_restart_walidx_record: just-added record tl=%u "
+		   "rel=%u block=%u lsn=%llu is missing before the restart even "
+		   "happened", tl, rel, block, (unsigned long long) lsn);
+		ck(!found || (rec->end_lsn == end && rec->flags ==
+					  (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI)),
+		   "seed_restart_walidx_record: just-added record tl=%u rel=%u "
+		   "block=%u lsn=%llu has end_lsn=%llu flags=%u before the restart "
+		   "even happened, expected end_lsn=%llu flags=%u", tl, rel, block,
+		   (unsigned long long) lsn,
+		   (unsigned long long) (found ? rec->end_lsn : 0),
+		   found ? rec->flags : 0, (unsigned long long) end,
+		   PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI);
+	}
 
 	g_restart_walidx_seed.valid = 1;
 	g_restart_walidx_seed.tl = tl;
@@ -4657,6 +4913,9 @@ seed_restart_walidx_record(void)
 	g_restart_walidx_seed.rel = rel;
 	g_restart_walidx_seed.block = block;
 	g_restart_walidx_seed.lsn = lsn;
+	g_restart_walidx_seed.end_lsn = end;
+	g_restart_walidx_seed.flags = PS_WAL_INDEX_FLAG_KNOWN |
+		PS_WAL_INDEX_FLAG_FPI;
 }
 
 static void
@@ -4664,7 +4923,6 @@ verify_restart_walidx_seed(const char *phase)
 {
 	FzWalidxSeed *s = &g_restart_walidx_seed;
 	int			n = 0;
-	int			found = 0;
 	int			status;
 
 	if (!s->valid)
@@ -4677,15 +4935,33 @@ verify_restart_walidx_seed(const char *phase)
 	   s->block, status);
 	if (status == PS_STATUS_OK)
 	{
-		for (int i = 0; i < n; i++)
-			if (fz_walidx_get_recs[i].lsn == s->lsn &&
-				fz_walidx_get_recs[i].timeline == s->tl)
-				found = 1;
+		/*
+		 * Compare the full record, not just its (timeline, lsn) identity:
+		 * this seed was deliberately created via WAL_INDEX_ADD_BATCH with
+		 * an exact end_lsn and KNOWN|FPI (see seed_restart_walidx_record()),
+		 * and those fields govern WAL range retrieval and retention
+		 * decisions just as much as the record's mere presence does --
+		 * recovery preserving identity while corrupting end_lsn or
+		 * stripping the flags must still fail this check.
+		 */
+		PsWalRec   *rec = walidx_find_own_record(fz_walidx_get_recs, n,
+												 s->tl, s->lsn);
+		int			found = rec != NULL;
+
 		ck(found, "%s: WAL-index record seeded before restart (tl=%u rel=%u "
 		   "block=%u lsn=%llu) is missing afterward -- recovery dropped or "
 		   "corrupted a retained live-block record even though the durable "
 		   "progress marker survived", phase, s->tl, s->rel, s->block,
 		   (unsigned long long) s->lsn);
+		ck(!found || (rec->end_lsn == s->end_lsn && rec->flags == s->flags),
+		   "%s: WAL-index record seeded before restart (tl=%u rel=%u "
+		   "block=%u lsn=%llu) has end_lsn=%llu flags=%u afterward, expected "
+		   "end_lsn=%llu flags=%u -- recovery corrupted its metadata even "
+		   "though its identity survived", phase, s->tl, s->rel, s->block,
+		   (unsigned long long) s->lsn,
+		   (unsigned long long) (found ? rec->end_lsn : 0),
+		   found ? rec->flags : 0, (unsigned long long) s->end_lsn,
+		   s->flags);
 	}
 	s->valid = 0;
 }
@@ -5105,6 +5381,7 @@ static const FzAction g_actions[] = {
 	{"unknown_opcode", act_unknown_opcode, 2},
 	{"admission_barrier", act_admission_barrier, 3},
 	{"wal_append_adv", act_wal_append_adv, 2},
+	{"wal_reship_idempotent", act_wal_reship_idempotent, 2},
 	{"wal_size", act_wal_size, 4},
 	{"wal_read", act_wal_read, 4},
 	{"walidx_add", act_walidx_add, 4},

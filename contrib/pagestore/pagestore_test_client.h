@@ -36,6 +36,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -88,13 +89,48 @@ psc_sleep_ms(long ms)
 	nanosleep(&ts, NULL);
 }
 
+/*
+ * nftw() callback for psc_remove_tree(): unlink every non-directory entry
+ * and rmdir() every directory in post-order (FTW_DEPTH below guarantees a
+ * directory's children are all visited, and thus already gone, before the
+ * directory itself is).  FTW_PHYS keeps this from ever following a
+ * symlink into some unrelated tree.  A path that fails to remove is not
+ * fatal here -- best-effort cleanup, same as the shell "rm -rf" this
+ * replaces -- but is recorded so the caller can still warn once.
+ */
+static int	psc_remove_tree_failed;
+
+static int
+psc_remove_tree_visit(const char *fpath, const struct stat *sb,
+					   int typeflag, struct FTW *ftwbuf)
+{
+	(void) sb;
+	(void) ftwbuf;
+	if (typeflag == FTW_DP ? rmdir(fpath) != 0 : unlink(fpath) != 0)
+		psc_remove_tree_failed = 1;
+	return 0;
+}
+
+/*
+ * Recursively removes the directory tree at 'path' without ever passing it
+ * through a shell: 'path' can be attacker/user-controlled (it derives from
+ * an optional command-line argument, see main()'s [store-dir]), and the
+ * previous system("rm -rf -- '%s'") implementation broke -- both its
+ * quoting and, with it, cleanup itself -- on any path containing a single
+ * quote, and would execute arbitrary shell text for a more deliberately
+ * crafted path.  nftw() only ever unlinks/rmdirs the literal paths it
+ * walks, so no path content is ever interpreted as shell syntax.
+ */
 static void
 psc_remove_tree(const char *path)
 {
-	char		cmd[1024];
+	struct stat st;
 
-	if (snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", path) > 0 &&
-		system(cmd) != 0)
+	if (lstat(path, &st) != 0)
+		return;					/* nothing to remove */
+	psc_remove_tree_failed = 0;
+	if (nftw(path, psc_remove_tree_visit, 64, FTW_DEPTH | FTW_PHYS) != 0 ||
+		psc_remove_tree_failed)
 		fprintf(stderr, "warning: could not remove %s\n", path);
 }
 
