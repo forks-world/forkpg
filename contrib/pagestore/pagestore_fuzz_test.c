@@ -1470,7 +1470,8 @@ act_read_at(void)
 		int			mode = rng_below(3);	/* 0=newest-alias 1=pin 2=random */
 		uint64_t	req_lsn,
 					req_seq = 0,
-					resolved_lsn = 0;
+					resolved_lsn = 0,
+					resolved_seq = 0;
 		int			found;
 		int			status;
 		int			strong = 1;
@@ -1524,7 +1525,7 @@ act_read_at(void)
 		}
 		status = psc_op_read_at(tl, target_inc, PS_KLASS_RELATION, rel, b,
 								req_lsn, req_seq, read_buf, &found, &resolved_lsn,
-								NULL);
+								&resolved_seq);
 		ring_note("READ_AT tl=%u rel=%u block=%u mode=%d strong=%d", tl, rel,
 				  b, mode, strong);
 		observe(PS_OP_READ_AT, status, 0, "READ_AT", 0);
@@ -1533,6 +1534,25 @@ act_read_at(void)
 			   "block=%u resolved_lsn=%llu exceeds requested horizon=%llu",
 			   tl, rel, b, (unsigned long long) resolved_lsn,
 			   (unsigned long long) req_lsn);
+		/*
+		 * req_seq != 0 only for mode==1 (the reader-pin read): that is the
+		 * one case where req_seq is a genuine admission-sequence fence
+		 * (g_reader[0].seq), not just an unused 0.  When the resolved
+		 * version's LSN exactly ties the requested horizon -- the only
+		 * ambiguous case a same-LSN admission-sequence tiebreak actually
+		 * disambiguates -- the resolved admission_seq must not exceed the
+		 * pin's own fence: a daemon returning correct bytes/LSN but a
+		 * stale or fabricated admission_seq (the second half of the
+		 * resolved version's identity) would otherwise pass unnoticed,
+		 * since resolved_seq was previously discarded (NULL) here.
+		 */
+		if (status == PS_STATUS_OK && found && req_seq != 0 &&
+			resolved_lsn == req_lsn)
+			ck(resolved_seq <= req_seq, "READ_AT (strong) tl=%u rel=%u "
+			   "block=%u: resolved admission_seq=%llu exceeds the pin's "
+			   "own fence seq=%llu at the tied horizon lsn=%llu", tl, rel,
+			   b, (unsigned long long) resolved_seq,
+			   (unsigned long long) req_seq, (unsigned long long) resolved_lsn);
 		if (strong)
 		{
 			ck(status == PS_STATUS_OK, "READ_AT (strong) tl=%u rel=%u "
@@ -2532,15 +2552,32 @@ act_retention_lookup(void)
 		   "expected held=%d got found=%d", (unsigned long long) owner_id,
 		   r->held, found);
 		if (found && r->held)
-			ck(pin.lsn == r->lsn && pin.admission_seq == r->seq &&
-			   pin.generation == r->generation, "RETENTION_PIN_LOOKUP reader "
+			ck(pin.timeline == 0 &&
+			   pin.owner_kind == PS_RETENTION_OWNER_READER &&
+			   pin.owner_id == owner_id && pin.lsn == r->lsn &&
+			   pin.admission_seq == r->seq &&
+			   pin.generation == r->generation &&
+			   pin.resources == PS_RETENTION_RESOURCE_ALL,
+			   "RETENTION_PIN_LOOKUP reader "
 			   "owner=%llu stored pin does not match model",
 			   (unsigned long long) owner_id);
 	}
 	else if (status == PS_STATUS_OK)
+	{
 		ck(found == g_tl[0].mat_registered, "RETENTION_PIN_LOOKUP "
 		   "materializer expected held=%d got found=%d",
 		   g_tl[0].mat_registered, found);
+		if (found && g_tl[0].mat_registered)
+			ck(pin.timeline == 0 &&
+			   pin.owner_kind == PS_RETENTION_OWNER_MATERIALIZER &&
+			   pin.owner_id == owner_id && pin.lsn == g_tl[0].mat_lsn &&
+			   pin.admission_seq == g_tl[0].mat_seq &&
+			   pin.generation == 1 &&
+			   pin.resources == (PS_RETENTION_RESOURCE_WAL |
+								 PS_RETENTION_RESOURCE_WAL_INDEX),
+			   "RETENTION_PIN_LOOKUP materializer owner=%llu stored pin "
+			   "does not match model", (unsigned long long) owner_id);
+	}
 
 	if (rng_pct(25))
 	{
@@ -3150,11 +3187,20 @@ act_begin_delete_adv(void)
 
 	if (choice == 0)
 	{
-		/* Timeline 0 (main) can never be deleted: DELETE_REFUSE_INVALID. */
+		/*
+		 * Timeline 0 (main) can never be deleted: timeline_begin_delete()
+		 * (pagestore_core.c) sets ch->result = PS_DELETE_REFUSE_INVALID
+		 * up front and returns -1 immediately on "timeline == 0", before
+		 * any other check gets a chance to overwrite it.
+		 */
 		status = psc_op_begin_delete_r(0, g_tl[0].incarnation, &reason);
 		ring_note("BEGIN_DELETE adv=main-timeline");
 		ck(status == PS_STATUS_ERROR, "BEGIN_DELETE on the main timeline must "
 		   "be refused, got %d", status);
+		if (status == PS_STATUS_ERROR)
+			ck(reason == PS_DELETE_REFUSE_INVALID, "BEGIN_DELETE on the "
+			   "main timeline must be refused as INVALID, got reason=%u",
+			   reason);
 	}
 	else if (choice == 1)
 	{
@@ -3162,21 +3208,39 @@ act_begin_delete_adv(void)
 
 		if (g_tl[slot].known && g_tl[slot].state == PS_TIMELINE_DELETED)
 		{
+			/*
+			 * timeline_begin_delete() sets ch->result =
+			 * PS_DELETE_REFUSE_INCARNATION before checking "req_seq !=
+			 * incarnation || state == PS_TIMELINE_DELETED"; our token
+			 * (g_tl[slot].incarnation) matches the real incarnation here
+			 * (delete never changes it), so it is exactly the
+			 * state==DELETED half of that check that fires.
+			 */
 			status = psc_op_begin_delete_r(slot, g_tl[slot].incarnation,
 										   &reason);
 			ring_note("BEGIN_DELETE adv=already-deleted slot=%u", slot);
 			ck(status == PS_STATUS_ERROR, "BEGIN_DELETE on an already-DELETED "
 			   "timeline must be refused, got %d", status);
+			if (status == PS_STATUS_ERROR)
+				ck(reason == PS_DELETE_REFUSE_INCARNATION, "BEGIN_DELETE on "
+				   "an already-DELETED timeline must be refused as "
+				   "INCARNATION, got reason=%u", reason);
 		}
 		else
 			return;
 	}
 	else
 	{
+		/* !timelines[timeline].defined -> PS_DELETE_REFUSE_INVALID, set
+		 * before that check and never overwritten on this path. */
 		status = psc_op_begin_delete_r(FZ_TL_UNDEF_A, 1, &reason);
 		ring_note("BEGIN_DELETE adv=undefined");
 		ck(status == PS_STATUS_ERROR, "BEGIN_DELETE on an undefined timeline "
 		   "must be refused, got %d", status);
+		if (status == PS_STATUS_ERROR)
+			ck(reason == PS_DELETE_REFUSE_INVALID, "BEGIN_DELETE on an "
+			   "undefined timeline must be refused as INVALID, got "
+			   "reason=%u", reason);
 	}
 	record_cov(PS_OP_BEGIN_DELETE, (uint32_t) status, reason);
 }
@@ -4589,6 +4653,8 @@ verify_branch_frozen(uint32_t slot)
 		for (uint32_t bl = 0; bl < nblk; bl++)
 		{
 			int			found = 0;
+			uint64_t	resolved_lsn = 0;
+			uint64_t	resolved_seq = 0;
 			/*
 			 * req_seq=b->branch_seq (not 0) is load-bearing here: once the
 			 * P3b Bug-B fix lands and the workaround above is removed, a
@@ -4604,7 +4670,9 @@ verify_branch_frozen(uint32_t slot)
 			int			status = psc_op_read_at(parent, g_tl[parent].incarnation,
 												  PS_KLASS_RELATION, rel, bl,
 												  b->branch_lsn, b->branch_seq,
-												  read_buf, &found, NULL, NULL);
+												  read_buf, &found,
+												  &resolved_lsn,
+												  &resolved_seq);
 
 			ring_note("verify_branch_frozen slot=%u rel=%u block=%u", slot,
 					  rel, bl);
@@ -4626,6 +4694,27 @@ verify_branch_frozen(uint32_t slot)
 			 */
 			if (!found)
 				continue;
+			/*
+			 * Same resolved-version-identity checks act_read_at()'s own
+			 * strong path applies (resolved_lsn <= horizon; the admission
+			 * sequence at a tied horizon must not exceed the fence): this
+			 * is a fork-frozen PARENT read, never a child-local write
+			 * ordered after the fork, so no version_floor clamping ever
+			 * applies here and resolved_lsn must land exactly at m->lsn.
+			 */
+			ck(resolved_lsn <= b->branch_lsn, "verify_branch_frozen slot=%u "
+			   "rel=%u block=%u: resolved_lsn=%llu exceeds the branch "
+			   "horizon=%llu", slot, rel, bl,
+			   (unsigned long long) resolved_lsn,
+			   (unsigned long long) b->branch_lsn);
+			if (resolved_lsn == b->branch_lsn)
+				ck(resolved_seq <= b->branch_seq, "verify_branch_frozen "
+				   "slot=%u rel=%u block=%u: resolved admission_seq=%llu "
+				   "exceeds the branch's own fence seq=%llu at the tied "
+				   "horizon lsn=%llu", slot, rel, bl,
+				   (unsigned long long) resolved_seq,
+				   (unsigned long long) b->branch_seq,
+				   (unsigned long long) resolved_lsn);
 			if (m->tag[bl] == 0)
 				ck(psc_page_is_zero(read_buf), "BRANCH VIEW NOT FROZEN: "
 				   "branch %u's frozen parent %u rel %u block %u was "
@@ -4635,6 +4724,7 @@ verify_branch_frozen(uint32_t slot)
 				   "through)", slot, parent, rel, bl,
 				   (unsigned long long) b->branch_lsn);
 			else
+			{
 				ck(psc_page_has_tag(read_buf, m->tag[bl]) &&
 				   psc_page_lsn(read_buf) == m->lsn[bl], "BRANCH VIEW NOT "
 				   "FROZEN: branch %u's frozen parent %u rel %u block %u "
@@ -4642,6 +4732,12 @@ verify_branch_frozen(uint32_t slot)
 				   "different content (suspected Bug B)", slot, parent, rel,
 				   bl, m->tag[bl], (unsigned long long) m->lsn[bl],
 				   (unsigned long long) b->branch_lsn);
+				ck(resolved_lsn == m->lsn[bl], "verify_branch_frozen "
+				   "slot=%u rel=%u block=%u expected resolved LSN=%llu "
+				   "got %llu", slot, rel, bl,
+				   (unsigned long long) m->lsn[bl],
+				   (unsigned long long) resolved_lsn);
+			}
 		}
 	}
 }
@@ -4766,12 +4862,22 @@ verify_latest_all(const char *phase)
 							 0, &exists) == PS_STATUS_OK &&
 			   exists == m->exists, "%s: tl=%u rel=%u existence", phase, tl,
 			   rel);
-			if (!m->exists)
-				continue;
+			/*
+			 * act_nblocks()'s own oracle expects OK+0 for an absent
+			 * relation unconditionally, not just a defined nblocks for an
+			 * existing one -- the model always keeps m->nblocks == 0 while
+			 * !m->exists (see act_unlink()/act_create()).  Check it even
+			 * when absent: a recovery regression that restores
+			 * nonexistence but leaves stale fork-size metadata behind
+			 * would otherwise survive this final check with no later
+			 * generated action left to expose it.
+			 */
 			ck(psc_op_nblocks(tl, g_tl[tl].incarnation, PS_KLASS_RELATION,
 							  rel, 0, 0, &nb) == PS_STATUS_OK &&
 			   nb == m->nblocks, "%s: tl=%u rel=%u nblocks expected %u got "
 			   "%u", phase, tl, rel, m->nblocks, nb);
+			if (!m->exists)
+				continue;
 			for (uint32_t b = 0; b < m->nblocks; b++)
 			{
 				ck(psc_op_readv(tl, g_tl[tl].incarnation, PS_KLASS_RELATION,
@@ -5140,6 +5246,54 @@ verify_artifacts(const char *phase)
 	}
 }
 
+/*
+ * env_materialize()'s three PS_KLASS_CONTROL writes (blocks 0, 1, 3 --
+ * image, note, marker) are fully deterministic from g_tl[0].mat_lsn:
+ * reconstruct their exact expected bytes the same way env_materialize()
+ * built them and read them back.  Block 2 is never written by any call
+ * (write_control() only ever targets 0, 1, 3): psc_op_write_control()'s
+ * own block=3-while-nb=2 call extends across that gap, leaving it a
+ * zero-filled hole -- the same "missing blocks never inherit an older
+ * page" invariant every other klass's holes rely on elsewhere in this
+ * file.  Without this, a recovery bug that lost or corrupted the
+ * acknowledged control note/image/marker (or that hole) while preserving
+ * the materializer pin and WAL-index progress would pass unnoticed:
+ * verify_latest_all() only ever reads PS_KLASS_RELATION data, and no
+ * later generated action reads PS_KLASS_CONTROL at all.
+ */
+static void
+verify_materializer_control(const char *phase)
+{
+	uint64_t	lsn = g_tl[0].mat_lsn;
+	unsigned char expected[4][PSC_PAGE_SIZE];
+	unsigned char got[PSC_PAGE_SIZE];
+
+	if (!g_tl[0].mat_registered)
+		return;
+
+	memset(expected[1], 0, PSC_PAGE_SIZE);
+	memcpy(expected[1], &lsn, sizeof(lsn));
+	memset(expected[0], 0x5c, PSC_PAGE_SIZE);
+	memcpy(expected[0], &lsn, sizeof(lsn));
+	memset(expected[3], 0x3d, PSC_PAGE_SIZE);
+	memcpy(expected[3], &lsn, sizeof(lsn));
+	memset(expected[2], 0, PSC_PAGE_SIZE);
+
+	for (int i = 0; i < 4; i++)
+	{
+		int			status = psc_op_read_control((uint32_t) i, got);
+
+		ring_note("%s CONTROL READV block=%d", phase, i);
+		ck(status == PS_STATUS_OK, "%s: PS_KLASS_CONTROL block=%d read "
+		   "(status %d)", phase, i, status);
+		if (status == PS_STATUS_OK)
+			ck(memcmp(got, expected[i], PSC_PAGE_SIZE) == 0,
+			   "%s: PS_KLASS_CONTROL block=%d content mismatch (expected "
+			   "the deterministic materializer bytes for lsn=%llu)", phase,
+			   i, (unsigned long long) lsn);
+	}
+}
+
 static void
 verify_after_restart(const char *phase)
 {
@@ -5233,7 +5387,10 @@ verify_after_restart(const char *phase)
 		   phase, (unsigned long long) g_reader[i].owner_id, status);
 
 		if (g_reader[i].held)
-			ck(found && pin.lsn == g_reader[i].lsn &&
+			ck(found && pin.timeline == 0 &&
+			   pin.owner_kind == PS_RETENTION_OWNER_READER &&
+			   pin.owner_id == g_reader[i].owner_id &&
+			   pin.lsn == g_reader[i].lsn &&
 			   pin.admission_seq == g_reader[i].seq &&
 			   pin.generation == g_reader[i].generation &&
 			   pin.resources == PS_RETENTION_RESOURCE_ALL,
@@ -5249,13 +5406,17 @@ verify_after_restart(const char *phase)
 		PsRetentionPin pin;
 
 		ck(psc_op_retention_lookup(0, 0, PS_RETENTION_OWNER_MATERIALIZER, 1,
-								   &pin) && pin.lsn == g_tl[0].mat_lsn &&
+								   &pin) && pin.timeline == 0 &&
+		   pin.owner_kind == PS_RETENTION_OWNER_MATERIALIZER &&
+		   pin.owner_id == 1 && pin.lsn == g_tl[0].mat_lsn &&
 		   pin.admission_seq == g_tl[0].mat_seq &&
 		   pin.resources == (PS_RETENTION_RESOURCE_WAL |
-							 PS_RETENTION_RESOURCE_WAL_INDEX),
+							 PS_RETENTION_RESOURCE_WAL_INDEX) &&
+		   pin.generation == 1,
 		   "%s: materializer pin "
 		   "survives restart", phase);
 	}
+	verify_materializer_control(phase);
 	/* Every known timeline, not just LIVE ones: a clean/crash recovery that
 	 * loses a deletion transition or resurrects a deleted branch would
 	 * otherwise report success here, since no later generated action runs

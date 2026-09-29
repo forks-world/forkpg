@@ -1147,6 +1147,31 @@ psc_op_write_control(uint32_t block, const unsigned char *page, uint64_t version
 	return psc_cl_exec()->status;
 }
 
+/*
+ * Read-side counterpart of psc_op_write_control(): the ordinary op_readv()
+ * wrapper below builds its key via psc_set_channel_key(), which stamps
+ * spcOid=1/dbOid=1/relNumber=1000+rel -- a completely different key than
+ * psc_op_write_control()'s own psc_setmeta()-based (spcOid=0, dbOid=0,
+ * relNumber=0) key.  Reading PS_KLASS_CONTROL back must use the same
+ * zeroed key the writer used, or every block reads back as an ordinary
+ * unwritten (all-zero) miss on a key that was never touched.
+ */
+static int
+psc_op_read_control(uint32_t block, unsigned char *out)
+{
+	PsChannel  *ch = psc_chan_ptr();
+
+	psc_setmeta(ch, 0, 0);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	psc_cl_exec();
+	if (ch->status == PS_STATUS_OK)
+		memcpy(out, ch->data, PSC_PAGE_SIZE);
+	return ch->status;
+}
+
 /* ===================== op wrappers: artifact lifecycle =================== */
 /*
  * PS_OP_ARTIFACT_BEGIN/COMMIT/DROP (see pagestore_artifact_lifecycle.inc's
