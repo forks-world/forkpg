@@ -741,7 +741,7 @@ dump_ring(void)
 /* Forward declarations: defined near run_step() (op-sequence recording
  * lives there), but ck() -- defined early so every act_*()/env_*() below can
  * use it -- needs to invoke them on a failure. */
-static void write_seq_file(const char *path);
+static int write_seq_file(const char *path);
 static void shrink_on_failure(const char *orig_site);
 
 /*
@@ -792,9 +792,12 @@ ck_impl(int line, int cond, const char *fmt, ...)
 			char		seq_path[560];
 
 			snprintf(seq_path, sizeof(seq_path), "%s.opseq", psc_store_dir);
-			write_seq_file(seq_path);
-			fprintf(stderr, "op sequence for PAGESTORE_FUZZ_REPLAY written "
-					"to %s\n", seq_path);
+			if (write_seq_file(seq_path))
+				fprintf(stderr, "op sequence for PAGESTORE_FUZZ_REPLAY written "
+						"to %s\n", seq_path);
+			else
+				fprintf(stderr, "warning: could not finish op-sequence file "
+						"%s: %s\n", seq_path, strerror(errno));
 			if (getenv("PAGESTORE_FUZZ_SHRINK") != NULL &&
 				getenv("PAGESTORE_FUZZ_SHRINK_CHILD") == NULL)
 				shrink_on_failure(site);
@@ -3390,10 +3393,16 @@ act_check_branch(void)
 			   (unsigned long long) target_inc, status);
 			record_cov(PS_OP_CHECK_BRANCH, (uint32_t) status, 0);
 		}
+		else if (g_tl[slot].state == PS_TIMELINE_DELETING)
+		{
+			ck(status == PS_STATUS_ERROR, "CHECK_BRANCH on DELETING slot=%u "
+			   "must be refused, got %d", slot, status);
+			record_cov(PS_OP_CHECK_BRANCH, (uint32_t) status, 0);
+		}
 		else
 		{
 			/*
-			 * Slot is LIVE or DELETING: not a valid target for a
+			 * Slot is LIVE: not a valid target for a
 			 * brand-new branch definition, so only check status-domain
 			 * sanity. Genuinely ambiguous, not just unexploited: for a
 			 * LIVE slot, branch_create_request_ok() (pagestore_core.c)
@@ -4690,7 +4699,10 @@ env_reader_reserve(void)
 	int			status;
 
 	if (r->held)
-		return;					/* env_reader_advance/drop handle the held case */
+	{
+		record_env(ENV_READER_RESERVE, 0);
+		return;
+	}
 	status = psc_op_retention_reserve(0, PS_RETENTION_OWNER_READER,
 									  r->owner_id, r->generation,
 									  PS_RETENTION_RESOURCE_ALL, lsn, &seq);
@@ -4721,7 +4733,10 @@ env_reader_advance(void)
 	int			status;
 
 	if (!r->held)
+	{
+		record_env(ENV_READER_ADVANCE, 0);
 		return;
+	}
 	status = psc_op_retention_reserve(0, PS_RETENTION_OWNER_READER,
 									  r->owner_id, r->generation,
 									  PS_RETENTION_RESOURCE_ALL, lsn, &seq);
@@ -4749,7 +4764,10 @@ env_reader_drop(void)
 	int			status;
 
 	if (!r->held)
+	{
+		record_env(ENV_READER_DROP, 0);
 		return;
+	}
 	status = psc_op_retention_drop(0, PS_RETENTION_OWNER_READER, r->owner_id,
 								   r->generation);
 	ring_note("reader_drop i=%u status=%d", i, status);
@@ -4806,11 +4824,17 @@ env_branch_create(void)
 	int			status = PS_STATUS_ERROR;
 
 	if (g_tl[slot].known && g_tl[slot].state != PS_TIMELINE_DELETED)
-		return;					/* slot busy; try another step */
+	{
+		record_env(ENV_BRANCH_CREATE, 0);
+		return;
+	}
 
 	env_materialize();
 	if (!g_tl[0].mat_registered)
+	{
+		record_env(ENV_BRANCH_CREATE, 0);
 		return;
+	}
 
 	target_inc = g_tl[slot].known ? g_branch_last_incarnation[slot] + 1 : 0;
 
@@ -5020,11 +5044,17 @@ env_branch_write(void)
 	int			status;
 
 	if (!b->known || b->state != PS_TIMELINE_LIVE)
+	{
+		record_env(ENV_BRANCH_WRITE, 0);
 		return;
+	}
 	rel = rng_below(FZ_NREL);
 	m = &b->rel[rel];
 	if (!m->exists || m->nblocks == 0)
+	{
+		record_env(ENV_BRANCH_WRITE, 0);
 		return;
+	}
 	block = rng_below(m->nblocks);
 	lsn = ship_wal(slot);
 	tag = (unsigned char) (1 + rng_below(255));
@@ -5125,6 +5155,32 @@ verify_branch_frozen(uint32_t slot)
 	{
 		FzRel	   *m = &b->frozen[rel];
 		uint32_t	nblk = m->nblocks;
+		uint32_t	nb = 0;
+		int			exists = 0;
+		int			estatus = psc_op_exists_at(parent,
+											 g_tl[parent].incarnation,
+											 PS_KLASS_RELATION, rel,
+											 b->branch_lsn, b->branch_seq, &exists);
+		int			nstatus = psc_op_nblocks(parent,
+										   g_tl[parent].incarnation,
+										   PS_KLASS_RELATION, rel,
+										   b->branch_lsn, b->branch_seq, &nb);
+
+		/* As-of metadata can be unavailable below a reclaimed frontier or
+		 * for WAL-less pages. Every successful answer must match the fork,
+		 * including absent and zero-block relations. */
+		ck(estatus == PS_STATUS_OK || estatus == PS_STATUS_ERROR,
+		   "frozen EXISTS slot=%u rel=%u unexpected status %d", slot, rel,
+		   estatus);
+		ck(nstatus == PS_STATUS_OK || nstatus == PS_STATUS_ERROR,
+		   "frozen NBLOCKS slot=%u rel=%u unexpected status %d", slot, rel,
+		   nstatus);
+		if (estatus == PS_STATUS_OK)
+			ck(exists == m->exists, "frozen EXISTS slot=%u rel=%u expected %d "
+			   "got %d", slot, rel, m->exists, exists);
+		if (nstatus == PS_STATUS_OK)
+			ck(nb == nblk, "frozen NBLOCKS slot=%u rel=%u expected %u got %u",
+			   slot, rel, nblk, nb);
 
 		for (uint32_t bl = 0; bl < nblk; bl++)
 		{
@@ -5238,7 +5294,10 @@ env_branch_begin_delete(void)
 	int			status;
 
 	if (!b->known || b->state != PS_TIMELINE_LIVE)
+	{
+		record_env(ENV_BRANCH_BEGIN_DELETE, 0);
 		return;
+	}
 	verify_branch(slot, "pre-delete");
 	status = psc_op_begin_delete(slot, b->incarnation);
 	ring_note("branch_begin_delete slot=%u status=%d", slot, status);
@@ -5260,7 +5319,10 @@ env_wait_deleted(void)
 
 	if (!b->known || (b->state != PS_TIMELINE_DELETING &&
 					  b->state != PS_TIMELINE_DELETED))
+	{
+		record_env(ENV_WAIT_DELETED, 0);
 		return;
+	}
 	if (b->state == PS_TIMELINE_DELETED)
 	{
 		PsTimelineState state = PS_TIMELINE_LIVE;
@@ -5993,6 +6055,18 @@ verify_after_restart(const char *phase)
 			   state);
 		}
 	}
+	{
+		int has_parent = 1;
+		uint32_t parent = 0;
+		uint64_t branch_lsn = 0, parent_inc = 0;
+		int status = psc_op_timeline_info(0, g_tl[0].incarnation,
+										 &has_parent, &parent,
+										 &branch_lsn, &parent_inc);
+
+		ck(status == PS_STATUS_OK && !has_parent,
+		   "%s: root TIMELINE_INFO must have no parent (status %d)",
+		   phase, status);
+	}
 	/* Every known timeline, not just LIVE ones: a clean/crash recovery that
 	 * loses a deletion transition or resurrects a deleted branch would
 	 * otherwise report success here, since no later generated action runs
@@ -6282,55 +6356,43 @@ find_action_index(const char *name)
 	return -1;
 }
 
-/* Writes the sequence recorded so far (g_seq_actions[0..g_seq_len)) as a
- * replay-loadable file: a header line naming the seed (informational only
- * -- replaying a sequence file no longer re-derives arguments from the
- * seed's rng stream the way stage 1's REPLAY did; the seed line just keeps
- * the failure self-documenting), then one action name per line. */
-static void
-write_seq_file(const char *path)
-{
-	FILE	   *f = fopen(path, "w");
-
-	if (f == NULL)
-	{
-		fprintf(stderr, "warning: could not write op-sequence file %s: %s\n",
-				path, strerror(errno));
-		return;
-	}
-	fprintf(f, "# replay seed=%llu\n", (unsigned long long) g_seed);
-	for (long long i = 0; i < g_seq_len; i++)
-		fprintf(f, "%s\n", g_actions[g_seq_actions[i]].name);
-	fclose(f);
-}
-
-/*
- * Returns 1 on a fully durable write, 0 on any failure (fopen, an fprintf
- * reporting an I/O error, or fclose) -- distinct from write_seq_file(),
- * which only ever writes the one authoritative full sequence for a real
- * failure and already warns on its own fopen failure.  Callers here treat
- * 0 as "this candidate's file is missing or truncated": ddmin_run() must
- * not let shrink_try_candidate() replay a stale or partial file left over
- * from a previous candidate and mistake it for this one, and the final
- * .min write failing must be reported, not silently produce a missing or
- * stale-looking file.
- */
+/* Write a replay header and action names, checking buffered write and close
+ * errors. Both authoritative and minimized sequences use this writer. */
 static int
 write_seq_subset(const char *path, const int *seq, long long n)
 {
 	FILE	   *f = fopen(path, "w");
 	int			ok = 1;
+	int			saved_errno = 0;
 
 	if (f == NULL)
 		return 0;
 	if (fprintf(f, "# replay seed=%llu\n", (unsigned long long) g_seed) < 0)
+	{
 		ok = 0;
+		saved_errno = errno;
+	}
 	for (long long i = 0; i < n && ok; i++)
 		if (fprintf(f, "%s\n", g_actions[seq[i]].name) < 0)
+		{
 			ok = 0;
+			saved_errno = errno;
+		}
 	if (fclose(f) != 0)
+	{
 		ok = 0;
+		if (saved_errno == 0)
+			saved_errno = errno;
+	}
+	if (!ok)
+		errno = saved_errno;
 	return ok;
+}
+
+static int
+write_seq_file(const char *path)
+{
+	return write_seq_subset(path, g_seq_actions, g_seq_len);
 }
 
 /*

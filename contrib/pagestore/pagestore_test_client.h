@@ -694,17 +694,25 @@ psc_op_nblocks(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
 }
 
 static int
-psc_op_exists(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
-			  uint64_t lsn, int *exists)
+psc_op_exists_at(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
+			  uint64_t lsn, uint64_t seq, int *exists)
 {
 	PsChannel  *ch = psc_chan_ptr();
 
 	psc_set_channel_key(ch, tl, inc, klass, rel);
 	ch->opcode = PS_OP_EXISTS;
 	ch->req_lsn = lsn;
+	ch->req_seq = seq;
 	psc_cl_exec();
 	*exists = ch->result != 0;
 	return ch->status;
+}
+
+static int
+psc_op_exists(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
+			  uint64_t lsn, int *exists)
+{
+	return psc_op_exists_at(tl, inc, klass, rel, lsn, 0, exists);
 }
 
 static int

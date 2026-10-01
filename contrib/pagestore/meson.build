@@ -499,6 +499,15 @@ test('pagestore_op_fuzz',
   env: ['PAGESTORE_FUZZ_BUGB_WORKAROUND=1', 'PAGESTORE_FUZZ_OPS=2000'],
 )
 
+pagestore_fuzz_helpers_test = executable('pagestore_fuzz_helpers_test',
+  files('pagestore_fuzz_helpers_test.c'),
+  install: false,
+)
+test('pagestore_fuzz_helpers', pagestore_fuzz_helpers_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Deterministic page/WAL lag-controller and admission-wait coverage.
 pagestore_backpressure_test = executable('pagestore_backpressure_test',
   files('pagestore_backpressure_test.c', 'pagestore_core.c',
