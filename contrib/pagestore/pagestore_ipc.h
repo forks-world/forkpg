@@ -71,6 +71,12 @@
 							 * 19: checkpoint admission gate + barrier;
 								 * 18: req_seq caps same-LSN admission order;
 								 *     writes return their admission sequence
+								 *     -- except a mutation that turned out to be a
+								 *     durability no-op (e.g. a ZEROEXTEND whose target
+								 *     size was already reached), which returns req_seq
+								 *     == 0: its allocated sequence was never persisted,
+								 *     so it must not surface as a barrier the caller can
+								 *     rely on surviving a restart;
 								 * 17: NBLOCKS/EXISTS honour req_lsn as an
 								 *     as-of horizon; fork-mutating ops carry
 								 *     their WAL position in req_lsn;

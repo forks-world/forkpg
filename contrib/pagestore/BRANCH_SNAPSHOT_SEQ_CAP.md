@@ -321,7 +321,7 @@ Transitions:
 | **Commit-class orphan adoption** (`fork_event_commit_adoptable`, `:6300-6320`; F2/F3 history) | Applies only to legacy `SEG_COMMIT*` markers. New records are growth-class, whose adoption rule is already proven sound unconditionally (MVP_COMPLETION_PLAN rev-3 row of 2026-09-19). Tests `test_orphaned_commit_marker_*` stay as legacy-format tests. |
 | **F5 scaling guard** (`test_fork_event_index_scaling`) | The FSM/VM rewrite pattern now produces GROW events instead of inert commit markers. The guard's step bounds stay (lookups are still bisected). Add a memory-bound assertion after a cutover (below). |
 | **`fev_bench.c`** | Re-baseline. |
-| **ZEROEXTEND persist-skip** (`fork_grow_with_seq`, `:6966`) | This is a **META** GROW, and it is kept. It is view-independent: a skipped ZEROEXTEND equals a hidden one, which is crash-equivalent (unlogged growth). It never makes a page readable beyond `nblocks`, because pages carry their own PAGE GROWs. |
+| **ZEROEXTEND persist-skip** (`fork_grow_with_seq`, `:6966`) | This is a **META** GROW, and it is kept. It is view-independent: a skipped ZEROEXTEND equals a hidden one, which is crash-equivalent (unlogged growth). It never makes a page readable beyond `nblocks`, because pages carry their own PAGE GROWs. Separately, the *admission sequence* allocated for a skipped (no-op) ZEROEXTEND is never made durable by the skip, so `PS_OP_ZEROEXTEND` must not report it as `req_seq` -- op-fuzzer repro (PR #302), fixed by making `fork_grow_with_seq()` return applied/no-op/error and reporting `req_seq == 0` for the no-op case (see `pagestore_ipc.h`'s protocol-version-18 comment). |
 | **`fork_has_growth_at`** (markerless SEG0) | Reads only; unaffected. |
 
 **Cost:**
