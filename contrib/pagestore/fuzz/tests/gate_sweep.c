@@ -187,7 +187,7 @@ load_seed(const char *name, const char *relpath, uint8_t **buf, size_t *len)
 	size_t		tmpl_len = 0;
 
 	tmpl = ps_fuzz_template_lookup(relpath, &tmpl_len);
-	if (tmpl != NULL && tmpl_len > 0)
+	if (strcmp(name, "store_config") != 0 && tmpl != NULL && tmpl_len > 0)
 	{
 		*buf = malloc(tmpl_len);
 		memcpy(*buf, tmpl, tmpl_len);
@@ -232,13 +232,15 @@ load_seed(const char *name, const char *relpath, uint8_t **buf, size_t *len)
 		return 0;
 	}
 
-	if (strcmp(name, "page_segment") == 0)
+	if (strcmp(name, "page_segment") == 0 || strcmp(name, "store_config") == 0)
 	{
 		char		path[4096];
 		FILE	   *f;
 		long		flen;
 
 		snprintf(path, sizeof(path), "%s/%s", pagestore_dir,
+				 strcmp(name, "store_config") == 0 ?
+				 "fuzz/corpus/store_config/posix-artifact-lifecycle" :
 				 PAGE_SEGMENT_FALLBACK_SEED);
 		f = fopen(path, "rb");
 		if (f == NULL)
@@ -283,7 +285,8 @@ run_one(const char *name, const char *relpath, const uint8_t *seed,
 	ps_fuzz_crc_fixup(name, work_dir, mutant, len);
 	if (strcmp(name, "walidx_log_epoch") == 0)
 		fixup_walidx_log_epoch_watermark(work_dir, (uint64_t) len);
-	if (strcmp(name, "wal_segment") == 0)
+	if (strcmp(name, "wal_segment") == 0 ||
+		strcmp(name, "walidx_snapshot_manifest") == 0)
 	{
 		/* Mirror ps_fuzz_run_one()'s own pre-fixup resize (fuzz_common.c):
 		 * this tool calls ps_fuzz_crc_fixup() directly rather than through
@@ -291,7 +294,9 @@ run_one(const char *name, const char *relpath, const uint8_t *seed,
 		 * order (resize, then fixup) -- fixup_wal_segment() only derives a
 		 * correct payload_len/segment_size once the buffer is already the
 		 * fixed length. */
-		size_t		want = ps_fuzz_wal_segment_fixed_len();
+		size_t		want = strcmp(name, "wal_segment") == 0 ?
+			ps_fuzz_wal_segment_fixed_len() :
+			ps_fuzz_walidx_manifest_fixed_len();
 
 		if (want > 0 && want != len)
 		{
@@ -411,7 +416,17 @@ sweep_target(const char *name, const char *relpath)
 	if (load_seed(name, relpath, &seed, &len) != 0)
 	{
 		fprintf(stderr, "gate_sweep: %-30s SKIP (no seed available)\n", name);
+		if (strcmp(name, "store_config") == 0 ||
+			strcmp(name, "walidx_snapshot_manifest") == 0)
+			exit(1);
 		return;
+	}
+
+	if (strcmp(name, "store_config") == 0 &&
+		(len < 5 || memcmp(seed, "PSS2 ", 5) != 0))
+	{
+		fprintf(stderr, "gate_sweep: store_config requires a PSS2 seed\n");
+		exit(1);
 	}
 
 	if (!run_one(name, relpath, seed, len))
@@ -421,7 +436,25 @@ sweep_target(const char *name, const char *relpath)
 				"under fixup -- see FIXUP_GATES.md, not this sweep)\n",
 				name);
 		free(seed);
+		if (strcmp(name, "store_config") == 0 ||
+			strcmp(name, "walidx_snapshot_manifest") == 0)
+			exit(1);
 		return;
+	}
+
+	/* Length mutations must still open with the fixture's shard set. */
+	if (strcmp(name, "walidx_snapshot_manifest") == 0)
+	{
+		uint8_t    *extended = calloc(1, len + 16);
+
+		memcpy(extended, seed, len);
+		if (!run_one(name, relpath, extended, len + 16) ||
+			!run_one(name, relpath, seed, len - 16))
+		{
+			fprintf(stderr, "gate_sweep: manifest resize failed\n");
+			exit(1);
+		}
+		free(extended);
 	}
 
 	sweep_len = len < g_sweep_bytes ? len : g_sweep_bytes;

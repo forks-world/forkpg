@@ -353,7 +353,7 @@ citation for the check that rejects it.
 | page_segment | 7 (0-3) | (c) magic (this format has no crc at all) |
 | retention_meta | 283 | (c) per-record magic/type; (b) per-record PsRetentionPin semantic fields (len fixed this round) |
 | retention_state | 16 (0-7) | (c) magic/version |
-| store_config | 3 (0-1) | (c) the literal "PS" prefix sscanf requires |
+| store_config | structured PSS2 seed | (c) malformed text; (b) zero shard count or trailing garbage; checksum digits are repaired |
 | timelines | 333 | (c) per-record magic (rec_len fixed this round); (b) per-record semantic fields |
 | wal_log | 32 (0-15) | (c) magic; (b) len/start_lsn (this target has no fixup at all -- see below) |
 | wal_store_identity | 80 (0-7, 16-47) | (c) magic/version (header@8 fixed round 6); (b) decode_metadata()'s semantic LSN/segment_size checks |
@@ -376,3 +376,14 @@ round: every one of the 1895 rejections this sweep found, across all 21
 targets, was already explained by an existing fixed-up field (rec_len/
 header_bytes fixes from this round and round 6), a deliberately-unpinned
 identity field, or a genuine semantic/consistency check.
+
+### Current-head review regressions
+
+- `walidx_snapshot_manifest`: fixed-up inputs are resized to the fixture
+  manifest before checksum repair. This preserves exactly the shard set whose
+  payload files exist. Raw inputs keep their original lengths. The gate sweep
+  requires a one-entry append and removal to open after repair.
+- `store_config`: the sweep uses `corpus/store_config/posix-artifact-lifecycle`
+  and requires its `PSS2` prefix, instead of using the fixture's legacy `1\n`.
+  Missing or invalid seeds fail the sweep. The allowlist documents malformed
+  text, zero shard counts, and trailing garbage; checksum repair stays checked.

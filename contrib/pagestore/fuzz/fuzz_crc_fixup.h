@@ -74,4 +74,7 @@ extern void fixup_walidx_log_epoch_watermark(const char *work_dir,
  */
 extern size_t ps_fuzz_wal_segment_fixed_len(void);
 
+/* Manifest size matching the template-backed shard set. */
+extern size_t ps_fuzz_walidx_manifest_fixed_len(void);
+
 #endif							/* PS_FUZZ_CRC_FIXUP_H */

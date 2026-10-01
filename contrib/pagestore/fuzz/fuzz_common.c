@@ -969,9 +969,14 @@ ps_fuzz_run_one(const char *target_name, const uint8_t *data, size_t size)
 		 * this finding is about, not something to silently repair before
 		 * should_fixup_this_iteration() even had a say.
 		 */
-		if (strcmp(resolved_target_name, "wal_segment") == 0)
+		/* A manifest cannot add shards absent from the fixture. Normalize
+		 * its size as well; raw iterations retain length mutations. */
+		if (strcmp(resolved_target_name, "wal_segment") == 0 ||
+			strcmp(resolved_target_name, "walidx_snapshot_manifest") == 0)
 		{
-			size_t want_len = ps_fuzz_wal_segment_fixed_len();
+			size_t want_len = strcmp(resolved_target_name, "wal_segment") == 0 ?
+				ps_fuzz_wal_segment_fixed_len() :
+				ps_fuzz_walidx_manifest_fixed_len();
 
 			if (want_len > 0 && want_len != content_len)
 			{

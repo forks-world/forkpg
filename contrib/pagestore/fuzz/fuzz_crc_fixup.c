@@ -1760,6 +1760,17 @@ fixup_forkmeta_snapshot_part(const char *work_dir, uint8_t *buf, size_t len,
 #define WALIDX_SNAPSHOT_MANIFEST_ENTRY_BYTES_LOCAL 16u
 #define WALIDX_SNAPSHOT_MANIFEST_MAX_SHARDS_LOCAL 128u
 
+/* Fixed-up manifests can only name the fixture's existing shard files. */
+size_t
+ps_fuzz_walidx_manifest_fixed_len(void)
+{
+	size_t len = 0;
+
+	(void) ps_fuzz_template_lookup("walidx_snapshots_0/walidx_manifest_v1",
+								  &len);
+	return len;
+}
+
 /* ---- walidx_snapshots_<tl>/walidx_manifest_v1 (pagestore_walidx_
  * snapshot.c encode_manifest()) -- header_bytes(64) + nshards*entry_bytes
  * (16) bytes, whatever the buffer's actual (possibly fuzzer-resized)
