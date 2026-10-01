@@ -2997,7 +2997,7 @@ act_retention_floor(void)
 		observe(PS_OP_RETENTION_FLOOR, status, 0, "RETENTION_FLOOR", 0);
 		(void) proven;
 	}
-	else if (adv == ADV_UNDEFINED_TIMELINE)
+	else
 	{
 		uint64_t	floor = 0;
 		int			proven = 0;
@@ -3005,14 +3005,13 @@ act_retention_floor(void)
 													 PS_RETENTION_RESOURCE_WAL,
 													 &floor, &proven);
 
-		ring_note("RETENTION_FLOOR undefined tl=%u", target_tl);
-		ck(status == PS_STATUS_ERROR, "RETENTION_FLOOR on an undefined timeline "
-		   "must be refused (tl=%u), got %d", target_tl, status);
+		ring_note("RETENTION_FLOOR adversarial tl=%u adv=%d", target_tl, adv);
+		ck(status == PS_STATUS_ERROR, "RETENTION_FLOOR on an adversarial target "
+		   "must be refused (tl=%u adv=%d), got %d", target_tl, adv, status);
 		record_cov(PS_OP_RETENTION_FLOOR, (uint32_t) status, 0);
 	}
-	else
 	{
-		/* Malformed resources mask (multiple bits): must be refused. */
+		/* Independently test a malformed mask on a valid live target. */
 		uint64_t	floor = 0;
 		int			proven = 0;
 		int			status = psc_op_retention_floor(tl, g_tl[tl].incarnation,
@@ -3496,7 +3495,7 @@ act_begin_delete_adv(void)
 	/* Adversarial-only action: legal BEGIN_DELETE is driven by
 	 * env_branch_begin_delete (stateful: transitions a live branch). Here we
 	 * only cover refusal reasons reachable without mutating a live branch. */
-	uint32_t	choice = rng_below(3);
+	uint32_t	choice = rng_below(4);
 	uint32_t	reason;
 	int			status;
 
@@ -3543,6 +3542,24 @@ act_begin_delete_adv(void)
 		}
 		else
 			return;
+	}
+	else if (choice == 3)
+	{
+		uint32_t slot = pick_live_tl();
+		uint64_t bad_inc;
+
+		if (slot == 0)
+			return;
+		bad_inc = g_tl[slot].incarnation == UINT64_MAX ? 1 :
+			g_tl[slot].incarnation + 1;
+		status = psc_op_begin_delete_r(slot, bad_inc, &reason);
+		ring_note("BEGIN_DELETE adv=bad-incarnation slot=%u", slot);
+		ck(status == PS_STATUS_ERROR, "BEGIN_DELETE with a stale live "
+		   "incarnation must be refused, got %d", status);
+		if (status == PS_STATUS_ERROR)
+			ck(reason == PS_DELETE_REFUSE_INCARNATION,
+			   "BEGIN_DELETE stale live incarnation must be refused as "
+			   "INCARNATION, got reason=%u", reason);
 	}
 	else
 	{
@@ -3630,6 +3647,33 @@ verify_artifact_entry(const char *phase, uint32_t tl, uint32_t akind,
  * pre-sequence-cap daemon leaks such commits; only the explicitly enabled
  * Bug-B compatibility workaround models that legacy behavior. */
 static void
+artifact_apply_parent_commit(FzArtifact *ca, uint64_t lsn, uint64_t token,
+							 const FzRel *visible)
+{
+	ca->inherited_open_pending = 0;
+	ca->inherited_open_lsn = 0;
+	ca->inherited_open_token = 0;
+	if (!g_bugb_workaround || ca->locally_settled)
+		return;
+	if (ca->state == FZ_ART_OPEN)
+	{
+		/* A local OPEN remains pending, but now shadows this completed
+		 * inherited generation so restart restores the right visible state. */
+		ca->prev_state = FZ_ART_COMMITTED;
+		ca->prev_lsn = lsn;
+		ca->prev_token = token;
+	}
+	else
+	{
+		ca->state = FZ_ART_COMMITTED;
+		ca->lsn = lsn;
+		ca->token = token;
+	}
+	ca->visible = *visible;
+	ca->dropped_exists_daemon_bug = 0;
+}
+
+static void
 artifact_propagate_parent_commit(uint32_t parent, uint32_t akind,
 								 uint32_t rel, uint64_t lsn, uint64_t token,
 								 const FzRel *visible)
@@ -3649,27 +3693,7 @@ artifact_propagate_parent_commit(uint32_t parent, uint32_t akind,
 			ca->inherited_open_lsn != lsn ||
 			ca->inherited_open_token != token)
 			continue;
-		ca->inherited_open_pending = 0;
-		ca->inherited_open_lsn = 0;
-		ca->inherited_open_token = 0;
-		if (!g_bugb_workaround || ca->locally_settled)
-			continue;
-		if (ca->state == FZ_ART_OPEN)
-		{
-			/* A local OPEN remains pending, but now shadows this completed
-			 * inherited generation so restart restores the right visible state. */
-			ca->prev_state = FZ_ART_COMMITTED;
-			ca->prev_lsn = lsn;
-			ca->prev_token = token;
-		}
-		else
-		{
-			ca->state = FZ_ART_COMMITTED;
-			ca->lsn = lsn;
-			ca->token = token;
-		}
-		ca->visible = *visible;
-		ca->dropped_exists_daemon_bug = 0;
+		artifact_apply_parent_commit(ca, lsn, token, visible);
 		ring_note("artifact_inherit_commit child=%u akind=%u rel=%u "
 				  "lsn=%llu", child, akind, rel,
 				  (unsigned long long) lsn);
@@ -6588,13 +6612,15 @@ shrink_try_candidate(const char *cand_path, const char *orig_site,
 		}
 		usleep(20000);
 	}
-	if (!done)
+	if (!done || !WIFEXITED(status))
 	{
 		/* Kill the whole group -- the replay process and the daemon it
 		 * spawned -- then reap our direct child and clean up the daemon's
 		 * shm/store the way psc_fatal() does for a normal run. */
 		kill(-pid, SIGKILL);
-		waitpid(pid, &status, 0);
+		if (!done)
+			while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+				;
 		while (waitpid(-pid, &status, WNOHANG) > 0)
 			;						/* reap any other of our own children
 									 * left in the group, if any */
@@ -6602,6 +6628,8 @@ shrink_try_candidate(const char *cand_path, const char *orig_site,
 		psc_remove_tree(cand_store_dir);
 		unlink(cand_opseq_path);
 		unlink(capture_path);
+		if (done)
+			return FZ_SHRINK_NOT_REPRODUCED;
 		fprintf(stderr, "shrink: candidate replay timed out after %llus "
 				"(%lld steps); outcome is inconclusive\n",
 				(unsigned long long) timeout_s, candidate_ops);
