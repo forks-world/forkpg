@@ -1296,6 +1296,7 @@ act_extend(void)
 		record_cov(PS_OP_EXTEND, (uint32_t) status, 0);
 		if (status == PS_STATUS_OK)
 		{
+			ck(seq != 0, "EXTEND succeeded without an admission sequence");
 			note_mutation_seq(seq);
 			m->tag[m->nblocks] = tag;
 			m->lsn[m->nblocks] = lsn;
@@ -1369,6 +1370,7 @@ act_writev(void)
 		record_cov(PS_OP_WRITEV, (uint32_t) status, 0);
 		if (status == PS_STATUS_OK)
 		{
+			ck(seq != 0, "WRITEV succeeded without an admission sequence");
 			note_mutation_seq(seq);
 			for (uint32_t i = 0; i < n; i++)
 			{
@@ -3233,6 +3235,31 @@ act_wal_append_adv(void)
 	unsigned char bogus[FZ_WAL_PAYLOAD];
 	int			status;
 
+	/* These stateless probes cover every constructible identity fence.
+	 * Preserve the action-selection RNG stream while resolve_target()
+	 * chooses an undefined ID, so adding probes preserves replay choices. */
+	for (FzAdv adv = ADV_BAD_INCARNATION; adv <= ADV_DELETED_TIMELINE; adv++)
+	{
+		uint32_t target_tl;
+		uint64_t target_inc;
+		uint64_t saved_rng = rng_state;
+		int resolved = resolve_target(tl, adv, &target_tl, &target_inc);
+
+		rng_state = saved_rng;
+		if (!resolved)
+			continue;
+		/* Contiguous, valid bytes avoid the overlap refusal below. */
+		start = target_tl < FZ_NTL ? g_tl[target_tl].wal_end : 4096;
+		fz_wal_fill(start, bogus);
+		status = psc_op_wal_append(target_tl, target_inc, start, bogus,
+								   FZ_WAL_PAYLOAD);
+		ring_note("WAL_APPEND adv=%d tl=%u", adv, target_tl);
+		ck(status == PS_STATUS_ERROR,
+		   "WAL_APPEND with adversarial identity (adv=%d tl=%u) "
+		   "must be refused, got %d", adv, target_tl, status);
+		record_cov(PS_OP_WAL_APPEND, (uint32_t) status, 0);
+	}
+
 	if (g_tl[tl].wal_end - g_tl[tl].wal_start < FZ_WAL_PAYLOAD)
 	{
 		ship_wal(tl);
@@ -3594,9 +3621,8 @@ enum
 	FZ_ART_DROPPED = 3,
 };
 
-/* Verify the child view immediately after a parent's pre-fork OPEN attempt
- * becomes complete.  The page image is checked against the source attempt's
- * committed model, including zero-filled holes. */
+/* Verify a child's frozen view immediately after a parent commit, including
+ * attempts first opened after the fork and zero-filled holes. */
 static void
 verify_artifact_entry(const char *phase, uint32_t tl, uint32_t akind,
 					  uint32_t rel)
@@ -3689,11 +3715,13 @@ artifact_propagate_parent_commit(uint32_t parent, uint32_t akind,
 			lsn > g_tl[child].branch_lsn)
 			continue;
 		ca = &g_artifact[child][akind][rel];
-		if (!ca->inherited_open_pending ||
-			ca->inherited_open_lsn != lsn ||
-			ca->inherited_open_token != token)
-			continue;
-		artifact_apply_parent_commit(ca, lsn, token, visible);
+		if (ca->inherited_open_pending &&
+			ca->inherited_open_lsn == lsn &&
+			ca->inherited_open_token == token)
+			artifact_apply_parent_commit(ca, lsn, token, visible);
+		/* An attempt first opened after the fork has no pending marker,
+		 * but a tied LSN still needs the sequence fence. Check that view
+		 * now too, before a child deletion can hide the leaked commit. */
 		ring_note("artifact_inherit_commit child=%u akind=%u rel=%u "
 				  "lsn=%llu", child, akind, rel,
 				  (unsigned long long) lsn);
@@ -4160,6 +4188,8 @@ act_artifact_write(void)
 					 * allocator back below this acknowledged write but
 					 * above the BEGIN token would pass unnoticed.
 					 */
+					ck(seq != 0, "ARTIFACT_WRITE succeeded without an "
+					   "admission sequence");
 					note_mutation_seq(seq);
 					if (!art->open_written[block])
 					{
@@ -5088,6 +5118,7 @@ env_branch_write(void)
 	record_cov(PS_OP_WRITEV, (uint32_t) status, 0);
 	if (status == PS_STATUS_OK)
 	{
+		ck(seq != 0, "branch WRITEV succeeded without an admission sequence");
 		note_mutation_seq(seq);
 		m->tag[block] = tag, m->lsn[block] = lsn;
 		m->version_floor[block] = fz_local_version_floor(slot, lsn);
@@ -5672,6 +5703,11 @@ artifact_restart_reset(const char *phase)
 				   "rel=%u: an attempt open before restart (token=%llu) "
 				   "must not be committable afterward, got OK", phase, tl,
 				   akind, rel, (unsigned long long) art->token);
+				if (g_tl[tl].state == PS_TIMELINE_LIVE)
+					ck(reason == PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH,
+					   "%s: abandoned live artifact tl=%u akind=%u rel=%u "
+					   "must refuse with ATTEMPT_MISMATCH, got reason=%u",
+					   phase, tl, akind, rel, reason);
 				record_cov(PS_OP_ARTIFACT_COMMIT, (uint32_t) status, reason);
 				artifact_cancel_pending(tl, akind, rel, art->lsn, art->token,
 										0);
