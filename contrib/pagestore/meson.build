@@ -1023,6 +1023,8 @@ pagestore_gate_sweep = executable('pagestore_gate_sweep',
 # every record-structured format) so it finishes in seconds even under
 # meson's own parallel test load; rerun with no such cap (see
 # FIXUP_GATES.md) for the full audit by hand.
+# The fixture stores native little-endian structures.
+if host_machine.endian() == 'little'
 test('pagestore_gate_sweep',
   pagestore_gate_sweep,
   args: ['check',
@@ -1031,6 +1033,7 @@ test('pagestore_gate_sweep',
   suite: ['pagestore', 'pagestore-fuzz'],
   timeout: 60,
 )
+endif
 # The JSON artifacts of the branch controller and the materializer
 # supervisor (pagestore_artifact_schema.py): the tools' identities must
 # match the fixture, every captured artifact must load through the shared
