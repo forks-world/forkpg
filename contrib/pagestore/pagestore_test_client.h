@@ -563,10 +563,8 @@ psc_op_truncate(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
  * to_nblocks guard short-circuits fork_meta_persist() when the fork's
  * tracked size already covers the request, e.g. inherited branch sizing):
  * KNOWN DAEMON BUG, not a fuzzer-model gap -- see act_zeroextend()'s
- * comment at its note_mutation_seq() (deliberately omitted) call site for
- * a live repro.  Callers must not feed this op's out_seq into barrier
- * tracking until the daemon is fixed to only stamp req_seq on the
- * actually-persisted path.
+ * comment. Callers may track out_seq when a size increase proves the
+ * operation persisted a GROW event, but must not track a no-op's sequence.
  */
 static int
 psc_op_zeroextend(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,

@@ -82,6 +82,37 @@ main(void)
 	REQUIRE(artifact_growth_refusal_ok(PS_STATUS_OK, PS_ARTIFACT_REFUSE_NONE));
 	REQUIRE(!artifact_growth_refusal_ok(PS_STATUS_OK,
 									  PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF));
+	/* A parent settling an attempt after the fork must not replace the
+	 * child's frozen absence, nor an earlier settled generation. */
+	g_tl[1].known = 1;
+	g_tl[1].state = PS_TIMELINE_LIVE;
+	g_tl[1].has_parent = 1;
+	g_tl[1].parent = 0;
+	g_tl[1].branch_lsn = 100;
+	g_tl[1].branch_seq = 10;
+	g_bugb_workaround = 0;
+	for (int prior = 0; prior < 2; prior++)
+	{
+		FzArtifact *child = &g_artifact[1][0][0];
+		FzRel published = {0};
+
+		memset(child, 0, sizeof(*child));
+		child->state = prior ? FZ_ART_COMMITTED : FZ_ART_NONE;
+		child->lsn = prior ? 50 : 0;
+		child->visible.exists = prior;
+		child->visible.nblocks = prior;
+		child->inherited_open_pending = 1;
+		child->inherited_open_lsn = 100;
+		child->inherited_open_token = 9;
+		published.exists = 1;
+		published.nblocks = 3;
+		artifact_propagate_parent_commit(0, 0, 0, 100, 9, &published);
+		REQUIRE(!child->inherited_open_pending);
+		REQUIRE(child->state == (prior ? FZ_ART_COMMITTED : FZ_ART_NONE));
+		REQUIRE(child->lsn == (prior ? 50 : 0));
+		REQUIRE(child->visible.exists == prior);
+		REQUIRE(child->visible.nblocks == (uint32_t) prior);
+	}
 	puts("fuzzer helper regressions passed");
 	return 0;
 }

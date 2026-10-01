@@ -1179,12 +1179,17 @@ act_zeroextend(void)
 		uint32_t	block = m->nblocks;
 		uint64_t	lsn = ship_wal(tl);
 		uint64_t	seq = 0;
+		uint32_t	before = 0;
+		uint32_t	after = 0;
 		int			status;
 
 		if (!huge && block + n > FZ_MAXBLK)
 			n = FZ_MAXBLK - block;
 		if (n == 0)
 			n = 1, block = FZ_MAXBLK - 1;
+		ck(psc_op_nblocks(tl, target_inc, PS_KLASS_RELATION, rel, 0, 0,
+						  &before) == PS_STATUS_OK,
+		   "pre-ZEROEXTEND NBLOCKS tl=%u rel=%u", tl, rel);
 		status = psc_op_zeroextend(tl, target_inc, PS_KLASS_RELATION, rel,
 								   block, n, lsn, &seq);
 		ring_note("ZEROEXTEND tl=%u rel=%u block=%u n=%u huge=%d", tl, rel,
@@ -1194,31 +1199,18 @@ act_zeroextend(void)
 		record_cov(PS_OP_ZEROEXTEND, (uint32_t) status, 0);
 		if (status == PS_STATUS_OK)
 		{
-			/*
-			 * KNOWN DAEMON BUG (not a fuzzer-model gap): unlike CREATE
-			 * (fork_has_create_at() guard) and UNLINK/TRUNCATE (which
-			 * unconditionally call fork_meta_persist() before ever setting
-			 * ch->req_seq), ZEROEXTEND's handler -- fork_grow_with_seq(),
-			 * pagestore_core.c -- allocates admission_seq unconditionally
-			 * but only calls fork_meta_persist() when
-			 * fork_size_asof_hop(...) < to_nblocks; when that is false (the
-			 * fork's tracked size already covers the requested grow, e.g.
-			 * a branch that inherited a size at least this large from its
-			 * parent) it still returns success and stamps ch->req_seq with
-			 * the allocated-but-never-persisted sequence.  Recovery's
-			 * admission_seq_observe() only ever sees a persisted event, so
-			 * that sequence is not replay-observable and the allocator can
-			 * legitimately roll back past it across a restart.  Confirmed
-			 * by direct code reading and reproduced live: seed 500,
-			 * step 6039 (ZEROEXTEND tl=2 rel=2 block=9 n=1 huge=0)
-			 * allocated seq 2361 with no persisted marker; the clean
-			 * restart at step 6046 then observed ADMISSION_BARRIER=2360,
-			 * failing check_admission_barrier()'s high-water-mark check.
-			 * Do not feed this op's returned sequence into
-			 * g_max_mutation_seq until the daemon is fixed to only stamp
-			 * req_seq on the actually-persisted path (see psc_op_
-			 * zeroextend()'s header comment in pagestore_test_client.h).
-			 */
+			/* No-op grows can return a sequence without persisting it.
+			 * A visible size increase proves a durable GROW was required. */
+			ck(psc_op_nblocks(tl, target_inc, PS_KLASS_RELATION, rel, 0, 0,
+							  &after) == PS_STATUS_OK,
+			   "post-ZEROEXTEND NBLOCKS tl=%u rel=%u", tl, rel);
+			if (after > before)
+			{
+				ck(seq != 0, "ZEROEXTEND grew tl=%u rel=%u without an "
+				   "admission sequence", tl, rel);
+				note_mutation_seq(seq);
+			}
+
 			if (huge)
 			{
 				/* WEAK ORACLE for the huge case's resulting nblocks: shrink
@@ -3634,8 +3626,9 @@ verify_artifact_entry(const char *phase, uint32_t tl, uint32_t akind,
 }
 
 /* Pending inheritance is modeled only for branches directly from timeline 0.
- * A later first COMMIT of the inherited attempt is visible at an existing
- * branch horizon when that generation's BEGIN LSN is at or below the fork. */
+ * A settlement after the fork must not enter the frozen child model. The
+ * pre-sequence-cap daemon leaks such commits; only the explicitly enabled
+ * Bug-B compatibility workaround models that legacy behavior. */
 static void
 artifact_propagate_parent_commit(uint32_t parent, uint32_t akind,
 								 uint32_t rel, uint64_t lsn, uint64_t token,
@@ -3659,7 +3652,7 @@ artifact_propagate_parent_commit(uint32_t parent, uint32_t akind,
 		ca->inherited_open_pending = 0;
 		ca->inherited_open_lsn = 0;
 		ca->inherited_open_token = 0;
-		if (ca->locally_settled)
+		if (!g_bugb_workaround || ca->locally_settled)
 			continue;
 		if (ca->state == FZ_ART_OPEN)
 		{
@@ -3841,10 +3834,12 @@ act_artifact_begin(void)
 
 		ring_note("ARTIFACT_BEGIN retry-committed tl=%u akind=%u rel=%u "
 				  "lsn=%llu", tl, akind, rel, (unsigned long long) art->lsn);
-		ck(status == PS_STATUS_OK && token == art->token, "ARTIFACT_BEGIN "
+		ck(status == PS_STATUS_OK && reason == PS_ARTIFACT_REFUSE_NONE &&
+		   token == art->token, "ARTIFACT_BEGIN "
 		   "exact retry of committed generation lsn=%llu expected OK "
-		   "token=%llu, got status=%d token=%llu", (unsigned long long) art->lsn,
-		   (unsigned long long) art->token, status, (unsigned long long) token);
+		   "token=%llu reason=NONE, got status=%d token=%llu reason=%u",
+		   (unsigned long long) art->lsn, (unsigned long long) art->token,
+		   status, (unsigned long long) token, reason);
 		record_cov(PS_OP_ARTIFACT_BEGIN, (uint32_t) status, reason);
 		return;
 	}
@@ -4429,7 +4424,8 @@ act_artifact_commit_retry(void)
 
 		ring_note("ARTIFACT_COMMIT retry-committed tl=%u akind=%u rel=%u",
 				  tl, akind, rel);
-		ck(status == PS_STATUS_OK, "ARTIFACT_COMMIT exact retry of an "
+		ck(status == PS_STATUS_OK && reason == PS_ARTIFACT_REFUSE_NONE,
+		   "ARTIFACT_COMMIT exact retry of an "
 		   "already-committed generation tl=%u akind=%u rel=%u must "
 		   "succeed idempotently, got %d (reason %u)", tl, akind, rel,
 		   status, reason);
@@ -4533,7 +4529,7 @@ act_artifact_drop(void)
 
 		ring_note("ARTIFACT_DROP retry-dropped tl=%u akind=%u rel=%u "
 				  "lsn=%llu", tl, akind, rel, (unsigned long long) art->lsn);
-		ck(status == PS_STATUS_OK ||
+		ck((status == PS_STATUS_OK && reason == PS_ARTIFACT_REFUSE_NONE) ||
 		   (status == PS_STATUS_ERROR && reason == PS_ARTIFACT_REFUSE_HORIZON),
 		   "ARTIFACT_DROP exact retry of an already-dropped generation "
 		   "lsn=%llu must succeed idempotently (or HORIZON), got %d "
@@ -4925,9 +4921,8 @@ env_branch_create(void)
 		 * the parent's ancestry (artifact_metadata()/artifact_visible()
 		 * walk tl_walk_first/next the same way ordinary page reads do), so
 		 * copy the parent's settled visible state. An in-flight OPEN itself is
-		 * not visible at the fork, but its identity is remembered below: if
-		 * that generation later COMMITs at an LSN within the fork horizon, it
-		 * becomes visible to the child's horizon too.
+		 * not visible at the fork. Its identity is remembered below solely
+		 * for the pre-sequence-cap Bug-B compatibility workaround.
 		 *
 		 * Deliberately NOT copied: max_begin_lsn (left 0) and token.  The
 		 * BEGIN/DROP exact-lsn-retry probes' begin-block/commit-block
@@ -7022,6 +7017,9 @@ main(int argc, char **argv)
 	keep_store = getenv("PAGESTORE_FUZZ_KEEP") != NULL;
 	psc_keep_store = keep_store;
 	g_bugb_workaround = getenv("PAGESTORE_FUZZ_BUGB_WORKAROUND") != NULL;
+	if (g_bugb_workaround)
+		fprintf(stderr, "Bug-B compatibility enabled: post-fork parent artifact "
+				"settlements follow the legacy LSN-only visibility rule\n");
 
 	for (int i = 0; i < FZ_NKNOWN; i++)
 		if (g_known_failures[i].seed == seed)
