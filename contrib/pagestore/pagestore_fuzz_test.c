@@ -3301,7 +3301,7 @@ act_wal_reship_idempotent(void)
 	ck(fstatus == PS_STATUS_OK || fstatus == PS_STATUS_ERROR,
 	   "act_wal_reship_idempotent: WAL retention floor tl=%u unexpected "
 	   "status %d", tl, fstatus);
-	if (fstatus != PS_STATUS_OK || (floor != 0 && start < floor))
+	if (fstatus == PS_STATUS_OK && floor != 0 && start < floor)
 	{
 		/* Not provably retained right now -- reclaim could legitimately
 		 * have dropped it, so an absent copy here would not be provable
@@ -3311,6 +3311,7 @@ act_wal_reship_idempotent(void)
 		return;
 	}
 
+	/* An unprovable floor is fail-closed: no shipped WAL can be reclaimed. */
 	fz_wal_fill(start, buf);
 	end_before = g_tl[tl].wal_end;
 	status = psc_op_wal_append(tl, g_tl[tl].incarnation, start, buf,
@@ -3723,7 +3724,7 @@ artifact_cancel_pending(uint32_t parent, uint32_t akind, uint32_t rel,
 static int
 artifact_growth_refusal_ok(int status, uint32_t reason)
 {
-	return status == PS_STATUS_OK ||
+	return (status == PS_STATUS_OK && reason == PS_ARTIFACT_REFUSE_NONE) ||
 		(status == PS_STATUS_ERROR &&
 		 reason == PS_ARTIFACT_REFUSE_FORKMETA_CUTOFF);
 }
@@ -4279,6 +4280,7 @@ act_artifact_commit(void)
 				record_cov(PS_OP_ARTIFACT_COMMIT, (uint32_t) status, reason);
 				if (status == PS_STATUS_OK)
 				{
+					check_admission_barrier("after ARTIFACT_COMMIT");
 					memset(&art->visible, 0, sizeof(art->visible));
 					art->visible.exists = 1;
 					art->visible.nblocks = art->open_nblocks;
@@ -4577,6 +4579,7 @@ act_artifact_drop(void)
 		record_cov(PS_OP_ARTIFACT_DROP, (uint32_t) status, reason);
 		if (status == PS_STATUS_OK)
 		{
+			check_admission_barrier("after ARTIFACT_DROP");
 			artifact_cancel_pending(tl, akind, rel, 0, 0, 1);
 			art->state = FZ_ART_DROPPED;
 			art->lsn = lsn;
@@ -6094,16 +6097,18 @@ verify_after_restart(const char *phase)
 		 * -> timeline_op_allowed() refuses any non-LIVE, non-special-cased
 		 * opcode uniformly, so any other stage-1 opcode would do the same.
 		 */
-		if (g_tl[slot].known && g_tl[slot].state == PS_TIMELINE_DELETED)
+		if (g_tl[slot].known &&
+			(g_tl[slot].state == PS_TIMELINE_DELETING ||
+			 g_tl[slot].state == PS_TIMELINE_DELETED))
 		{
 			uint32_t	nb = 0;
 			int			status = psc_op_nblocks(slot, g_tl[slot].incarnation,
 												PS_KLASS_RELATION, 0, 0, 0,
 												&nb);
 
-			ring_note("verify_after_restart DELETED-fence NBLOCKS slot=%u",
+			ring_note("verify_after_restart non-LIVE-fence NBLOCKS slot=%u",
 					  slot);
-			ck(status == PS_STATUS_ERROR, "%s: DELETED branch slot=%u must "
+			ck(status == PS_STATUS_ERROR, "%s: non-LIVE branch slot=%u must "
 			   "still refuse an ordinary NBLOCKS request, got status=%d",
 			   phase, slot, status);
 		}
