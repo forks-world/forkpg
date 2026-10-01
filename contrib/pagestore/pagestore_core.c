@@ -1968,7 +1968,21 @@ segment_order_id_observe(uint64_t order_id)
  * (block- and timeline-independent), so a key's blocks and all its timelines
  * stay on one shard.
  */
+/*
+ * Overridable at compile time (must stay a power of two -- IDX_MASK below
+ * assumes it) for the throughput-sensitive fuzz/build.sh binaries: every
+ * ps_core_open()/ps_core_close() unconditionally sweeps all MAX_SHARDS *
+ * IDX_BUCKETS buckets in free_page_fork_indexes()/free_walidx_indexes() to
+ * reset these hash tables, regardless of how many entries (if any) they
+ * hold.  That sweep is pure bucket-array bookkeeping -- it has no bearing on
+ * any persisted format or validation bound -- so a fuzz binary whose fixture
+ * only ever populates a handful of entries can shrink it without changing
+ * any code path's semantics.  Ordinary builds are unaffected (no -D, same
+ * 65536 as before).
+ */
+#ifndef IDX_BUCKETS
 #define IDX_BUCKETS		(1 << 16)
+#endif
 #define IDX_MASK		(IDX_BUCKETS - 1)
 
 struct PageEnt;
@@ -24030,6 +24044,7 @@ ps_core_open(const char *store_dir)
 	int rc;
 	int save_errno;
 	int storage_opened = 0;
+	uint32_t	i;
 
 	/* Lifecycle recovery and publication both copy a complete fixed record.
 	 * Validate before opening storage, including for callers without a CLI. */
@@ -24053,6 +24068,24 @@ ps_core_open(const char *store_dir)
 		 * startup failure, including failures after manifest replay begins. */
 		save_errno = errno;
 		__atomic_store_n(&core_opened, 0, __ATOMIC_RELEASE);
+		/* ps_core_open_impl() allocates each shard's memtable, and
+		 * unconditionally the page cache, well before several later
+		 * validation/replay steps that can still fail -- a failure past that
+		 * point used to leak both (see lsan_suppressions.txt's prior
+		 * ps_memtable_create/ps_pgcache_init entries, now removed: this is
+		 * the fix, not a suppression).  Free rather than flush: the store
+		 * just failed to open, so its in-memory state may be incomplete or
+		 * inconsistent, and nothing has published a lease for a flush to be
+		 * durable under. */
+		for (i = 0; i < MAX_SHARDS; i++)
+		{
+			if (g_shards[i].memtable != NULL)
+			{
+				ps_memtable_destroy(g_shards[i].memtable);
+				g_shards[i].memtable = NULL;
+			}
+		}
+		ps_pgcache_free();
 		ps_manifest_close();
 		layer_verified_reset();
 		if (ps_layer_store != NULL && ps_layer_store->close != NULL)

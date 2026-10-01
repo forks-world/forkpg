@@ -1,0 +1,15 @@
+# LeakSanitizer suppressions for the pagestore persisted-format fuzz targets.
+#
+# Round-1 finding (see known-crashes/manifest/
+# leak_memtable_on_post_alloc_open_failure.txt) used to suppress
+# ps_memtable_create/ps_pgcache_init here: ps_core_open_impl()
+# (pagestore_core.c) allocates a per-shard memtable and, unconditionally,
+# a page cache, before several later validation/replay steps that can
+# still fail and return -1, and ps_core_open()'s failure-unwind path never
+# freed either. Round-5 coordinator review: that is a real product leak
+# (any embedding process that reopens after a failed open accumulates it
+# too), not just a fuzz-harness artifact, so it is fixed in product code
+# instead of suppressed here -- see "pagestore: free the memtable when
+# ps_core_open() fails after allocating it". No suppressions are currently
+# needed; this file is kept (and referenced by run_fuzz.sh/meson.build)
+# for whatever the next real, already-triaged leak turns out to be.

@@ -985,6 +985,108 @@ test('pagestore_pgdata_format_fixture',
   timeout: 60,
 )
 endif
+# Layer 2 persisted-format fuzzing (contrib/pagestore/fuzz/): byte-level
+# fuzzing of every file kind a store directory persists (layers.manifest,
+# forkmeta and its snapshots, image layers, seg_* page segments, the WAL and
+# WAL-index catalogs and their snapshots, retention/timeline/frontier
+# records, the shard-count file), asserting a corrupt or truncated file
+# either fails ps_core_open() cleanly or opens and serves reads without an
+# ASan/UBSan error, a hang, or unbounded memory growth.  The instrumented
+# libFuzzer+ASan+UBSan binary is built out-of-band by fuzz/build.sh (a clang
+# with libFuzzer support, not part of this build); what runs here is the
+# non-instrumented replay driver (fuzz_standalone_driver.c) over the
+# checked-in corpus, a plain-compiler regression check that known-good
+# inputs still don't crash, so a clang+libFuzzer toolchain is not required
+# to exercise this in CI.  Confirmed findings live under
+# fuzz/known-crashes/<target>/ and are deliberately not replayed here --
+# see fuzz/run_fuzz.sh's header for how to reproduce and triage those.
+pagestore_format_fuzz_replay = executable('pagestore_format_fuzz_replay',
+  files('pagestore_core.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c', 'pagestore_wal_segment.c',
+        'pagestore_walidx_prune.c', 'pagestore_walidx_snapshot.c',
+        'pagestore_forkmeta_prune.c', 'pagestore_forkmeta_snapshot.c',
+        'pagestore_fault.c', 'fuzz/fuzz_common.c', 'fuzz/fuzz_crc_fixup.c',
+        'fuzz/fuzz_standalone_driver.c'),
+  include_directories: include_directories('.'),
+  c_args: ['-DPS_FUZZ_FIXTURE_TGZ="' +
+           (meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline' / 'store.tar.gz') +
+           '"'] + pagestore_cassert_c_args,
+  dependencies: [dependency('threads')],
+  install: false,
+)
+foreach fuzz_target : [
+  'manifest', 'forkmeta', 'forkmeta_snapshot_manifest',
+  'forkmeta_snapshot_checkpoint', 'forkmeta_snapshot_tail', 'image_layer',
+  'page_frontier', 'page_segment', 'retention_meta', 'retention_state',
+  'store_config', 'timelines', 'wal_log', 'wal_store_identity', 'wal_segment',
+  'walidx_frontier', 'walidx_log_epoch', 'walidx_log_legacy',
+  'walidx_watermark', 'walidx_snapshot_manifest', 'walidx_snapshot_shard',
+]
+  test('pagestore_format_fuzz_replay_' + fuzz_target,
+    pagestore_format_fuzz_replay,
+    args: [fuzz_target, meson.current_source_dir() / 'fuzz' / 'corpus' / fuzz_target],
+    suite: ['pagestore', 'pagestore-fuzz'],
+    timeout: 60,
+  )
+endforeach
+test('pagestore_fuzz_runner_regressions',
+  find_program(meson.current_source_dir() / 'fuzz' / 'tests' /
+               'check_runner_regression.sh'),
+  suite: ['pagestore', 'pagestore-fuzz'],
+  timeout: 30,
+)
+# PR #303 round 7: three straight rounds of manually reading each target's
+# product loader against its fuzz_crc_fixup.c handling (fuzz/FIXUP_GATES.md)
+# still missed real gates Codex's review found. gate_sweep.c (fuzz/tests/)
+# replaces that manual reading with brute force wherever brute force is
+# cheap enough to run in a regression test: for every target, it flips
+# every byte in the first 256 bytes of the pristine fixture file two ways,
+# runs the real ps_fuzz_crc_fixup() and ps_core_open(), and fails if any
+# offset newly rejects a fixed-up file the pristine one opens and is not on
+# the reviewed (b)/(c) allowlist (gate_sweep_allowlist.txt's own header
+# comment explains that format and the classification scheme). See
+# FIXUP_GATES.md for how to add a fixup-side fix (class (a)) versus
+# document a new allowlist entry (class (b)/(c)) when this fails.
+pagestore_gate_sweep = executable('pagestore_gate_sweep',
+  files('pagestore_core.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c', 'pagestore_wal_segment.c',
+        'pagestore_walidx_prune.c', 'pagestore_walidx_snapshot.c',
+        'pagestore_forkmeta_prune.c', 'pagestore_forkmeta_snapshot.c',
+        'pagestore_fault.c', 'fuzz/fuzz_common.c', 'fuzz/fuzz_crc_fixup.c',
+        'fuzz/tests/gate_sweep.c'),
+  include_directories: include_directories('.', 'fuzz'),
+  c_args: ['-DPS_FUZZ_FIXTURE_TGZ="' +
+           (meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline' / 'store.tar.gz') +
+           '"'] + pagestore_cassert_c_args,
+  dependencies: [dependency('threads')],
+  install: false,
+)
+# Neither this binary nor pagestore_format_fuzz_replay above wraps
+# fsync() (only fuzz/build.sh's instrumented libFuzzer binary does, via
+# fuzz_nosync.c) -- each of this tool's ps_core_open()/close() cycles pays
+# a real fsync(), fine at the handful of corpus files each replay test
+# above runs but not at the ~3800 (offset, mask) pairs a *full* 256-byte/
+# 2-mask sweep tries per run. Args 3/4 below cap the wired regression run
+# to one mask over the first 64 bytes of each target (still every fixed
+# header this file's fixups know about, just not several records deep of
+# every record-structured format) so it finishes in seconds even under
+# meson's own parallel test load; rerun with no such cap (see
+# FIXUP_GATES.md) for the full audit by hand.
+# The fixture stores native little-endian structures.
+if host_machine.endian() == 'little'
+test('pagestore_gate_sweep',
+  pagestore_gate_sweep,
+  args: ['check',
+         meson.current_source_dir() / 'fuzz' / 'tests' / 'gate_sweep_allowlist.txt',
+         meson.current_source_dir(), '64', '1'],
+  suite: ['pagestore', 'pagestore-fuzz'],
+  timeout: 60,
+)
+endif
 # The JSON artifacts of the branch controller and the materializer
 # supervisor (pagestore_artifact_schema.py): the tools' identities must
 # match the fixture, every captured artifact must load through the shared
