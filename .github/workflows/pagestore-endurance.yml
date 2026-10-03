@@ -44,7 +44,7 @@ permissions:
 
 jobs:
   endurance:
-    if: github.event_name != 'schedule' || github.repository == 'clapdb/postgres'
+    if: github.event_name != 'schedule' || github.repository == 'forks-world/forkpg'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
