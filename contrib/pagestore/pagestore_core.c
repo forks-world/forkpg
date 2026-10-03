@@ -19968,21 +19968,35 @@ control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
 					uint32_t block, const PsPruneVersion *v)
 {
 	int			lsn_retained = 0;
+	uint64_t	newest_seq = 0;
+	int			have_newest = 0;
 
 	if (!plan->valid)
 		return 1;
+	/*
+	 * One retained version LSN can carry more than one planned tuple: a
+	 * record-less pre-checkpoint state image (DB_SHUTDOWNING) and the
+	 * checkpoint's exact-redo twin both sit at the checkpoint redo, and a
+	 * mirror retry appends the same LSN under a new admission sequence.
+	 * Only the newest admission sequence at that LSN is authoritative (the
+	 * read path resolves an uncapped lookup to the greatest tuple), so find
+	 * it across the whole kept set rather than returning on the first LSN
+	 * match: the old short-circuit kept the first same-LSN tuple, which for
+	 * a shutdown checkpoint kept the stale pre-checkpoint image and dropped
+	 * the exact-redo twin the branch controller must restore.
+	 */
 	for (uint32_t i = 0; i < plan->nkept; i++)
 		if (plan->kept[i].lsn == v->lsn)
 		{
-			/* The image block, and every independently versioned block that
-			 * planned its own chain, keep exactly the planned tuple. */
-			if (block == PS_CONTROL_IMAGE_BLOCK || block >= PS_CONTROL_PAIRED_BLOCKS)
-				return plan->kept[i].admission_seq == v->admission_seq;
+			if (!have_newest || plan->kept[i].admission_seq > newest_seq)
+			{
+				newest_seq = plan->kept[i].admission_seq;
+				have_newest = 1;
+			}
 			lsn_retained = 1;
-			break;
 		}
 	if (block == PS_CONTROL_IMAGE_BLOCK || block >= PS_CONTROL_PAIRED_BLOCKS)
-		return 0;
+		return have_newest && newest_seq == v->admission_seq;
 	if (!lsn_retained)
 	{
 		int			in_flight = 0;
