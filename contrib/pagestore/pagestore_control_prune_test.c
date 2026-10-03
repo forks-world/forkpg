@@ -1073,6 +1073,62 @@ test_live_slru_mirror_follows_page_history(void)
 	remove_tree(store);
 }
 
+/*
+ * A shutdown checkpoint writes a record-less DB_SHUTDOWNING state image at
+ * the future checkpoint record's start LSN, then the completed checkpoint
+ * publishes its exact-redo twin at that same LSN under a later admission
+ * sequence.  Compaction must keep the twin: the two images share a version,
+ * and only the exact (lsn, admission_seq) tuple is authoritative.  A stale
+ * pre-checkpoint image surviving as the sole version makes
+ * pagestore_branch_checkpoint() reject the writer's checkpoint.
+ */
+static void
+test_same_version_twin_supersedes_pre_checkpoint_image(void)
+{
+	char store[] = "/tmp/pagestore-control-prune-twin-XXXXXX";
+	PsKey key = control_key();
+	unsigned char page[8192];
+	uint64_t version = 0;
+	const uint64_t redo = 3000;
+	const uint64_t update = 3200;
+	const uint64_t prev_redo = 2800;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open store for the exact-redo twin test");
+
+	/* The pre-checkpoint state image: its note names the previous
+	 * checkpoint's redo and its image carries that identity. */
+	ps_lock_shard_wr(ps_shard_of(&key));
+	memset(page, 0, sizeof(page));
+	memcpy(page, &prev_redo, sizeof(prev_redo));
+	check(append_page(0, &key, PS_REDO_NOTE_BLOCK, page, redo, NULL) == 0,
+		  "pre-checkpoint note at the future redo");
+	memset(page, 0, sizeof(page));
+	memcpy(page, &prev_redo, sizeof(prev_redo));
+	check(append_page(0, &key, PS_CONTROL_IMAGE_BLOCK, page, redo, NULL) == 0,
+		  "pre-checkpoint image at the future redo");
+	ps_unlock_shard(ps_shard_of(&key));
+	check(ps_storage->sync() == 0, "sync the pre-checkpoint image");
+
+	/* The completed checkpoint then publishes its exact-redo twin at the
+	 * same version, under a later admission sequence. */
+	check(write_checkpoint(0, redo, update),
+		  "checkpoint with an exact-redo twin at the same redo");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_ALL, redo - 1),
+		  "materializer cutoff below the checkpoint");
+	run_maintenance(64);
+	check(read_control_at(0, PS_CONTROL_IMAGE_BLOCK, redo, &version) &&
+		  version == redo,
+		  "the exact-redo twin, not the pre-checkpoint image, is restorable");
+	check(read_control_at(0, PS_REDO_NOTE_BLOCK, redo, &version) &&
+		  version == redo,
+		  "the twin's redo note is the one retained");
+	close_store();
+	remove_tree(store);
+}
+
 /* Independently versioned control blocks (materializer marker, checkpoints)
  * keep their own newest visible version, whether or not their LSNs coincide
  * with image versions the pair plan drops. */
@@ -1138,6 +1194,7 @@ main(void)
 	test_checkpoint_note_is_the_page_cutoff();
 	test_stale_artifacts_are_retired();
 	test_live_slru_mirror_follows_page_history();
+	test_same_version_twin_supersedes_pre_checkpoint_image();
 	test_independent_blocks_keep_their_newest();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
