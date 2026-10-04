@@ -60,6 +60,12 @@ Pending growth cannot change either answer. Lifecycle record version 2 stores
 the completed size alongside the distinct-page count. Live attempt counters
 need no recovery because unfinished pre-restart attempts cannot commit.
 
+Once a local or inherited object uses the publication protocol, redo's
+CREATE is an ensure request and succeeds without writing a fork event.
+It cannot publish an empty object over an inherited COMMIT or DROP.
+Ordinary CREATE, TRUNCATE, ZEROEXTEND and UNLINK remain refused for managed
+objects; BEGIN/COMMIT and DROP control their published state.
+
 An unfinished generation can be retried at the same LSN with a fresh token.
 Once completed, a generation is immutable: BEGIN returns its original token,
 WRITE verifies identical durable bytes without appending, and COMMIT verifies

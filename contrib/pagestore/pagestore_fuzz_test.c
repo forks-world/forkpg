@@ -296,17 +296,6 @@ typedef struct FzArtifact
 	FzRel		visible;		/* what EXISTS/NBLOCKS/READV currently see:
 								 * only changes on COMMIT/DROP, never on a
 								 * still-open attempt */
-	/*
-	 * KNOWN DAEMON BUG WEAK ORACLE (see g_weak_oracle_ops): set only when
-	 * this entry's DROPPED state was reached via one of two specific
-	 * transitions -- a branch inheriting a parent that was OPEN with a
-	 * prior DROPPED generation (branch-creation loop's FZ_ART_OPEN case),
-	 * or artifact_restart_reset() reverting an abandoned post-restart
-	 * BEGIN back to a prior DROPPED generation. Both have been observed
-	 * making a branch's EXISTS return 1 instead of 0. Not set for an
-	 * ordinary direct DROP, so this does not weaken the common case.
-	 */
-	int			dropped_exists_daemon_bug;
 	int			touched;		/* this key had a successful BEGIN locally or in an ancestor */
 	int			locally_dropped;	/* a successful DROP on this timeline, not inherited */
 	int			locally_settled;	/* this timeline settled its own generation */
@@ -554,46 +543,6 @@ static const char *g_weak_oracle_ops[] = {
 	"integration-run failure (seed 2542129034, ~/pagestore-fuzz/failures/"
 	"20260925T115625-w2-seed2542129034) triaged as a fuzzer-model gap, not "
 	"a product bug -- see the report.",
-	"KNOWN DAEMON BUG (not a fuzzer-model gap; PR #302 round-2 report, "
-	"finding on item 333's branch-artifact-inheritance fix): EXISTS for an "
-	"artifact key whose settled state is DROPPED, but which has (or had, "
-	"now abandoned) a later uncommitted BEGIN, can return 1 instead of 0. "
-	"Two triggers confirmed: (1) a branch inheriting such a parent's state "
-	"live (parent: DROP, then BEGIN a new uncommitted attempt, then the "
-	"branch is taken) -- reproduces before any restart, so this is not a "
-	"recovery bug -- confirmed by calling verify_artifacts() directly right "
-	"after the op replay, before env_clean_restart()/env_crash_restart() "
-	"ever run; (2) the simpler, non-branching case of a restart abandoning "
-	"a timeline's own uncommitted BEGIN that followed its own DROP "
-	"(artifact_restart_reset()) -- this is the more common trigger in "
-	"practice, needing no branching at all, and is why a 20-seed x "
-	"20000-op run hit this across most seeds. Both contradict "
-	"ARTIFACT_LIFECYCLE.md:46-59 (\"An unfinished newer generation leaves "
-	"the prior complete generation available\" ... \"EXISTS and NBLOCKS "
-	"resolve the same completed interval ... Pending growth cannot change "
-	"either answer,\" including through ancestry -- DROPPED is one of "
-	"exactly two terminal/\"completed\" record states, see "
-	"pagestore_artifact_lifecycle.inc's artifact_record()). Confirmed NOT "
-	"a regression from commit 6e618a28e35 (\"thread the full ViewCap "
-	"through artifact reads\"): reverting just that commit's "
-	"artifact_metadata() body (restoring the pre-P1 page_visible()/"
-	"viewcap_lsn_seq()/tl_walk_first() form) against the same minimized "
-	"repro reproduces identically, so the defect predates P1 seq-cap "
-	"work. Minimal repro (177 steps): $SCRATCHPAD/round2-check/"
-	"merged-shrink3/pagestore-fuzz-1507713.opseq.min (replay against a "
-	"daemon built from this branch merged with origin/pagestore). Tracked "
-	"per-entry via FzArtifact.dropped_exists_daemon_bug (set only by these "
-	"two transitions into DROPPED, never by an ordinary direct DROP) so "
-	"this does not weaken the common DROPPED case. A distinct symptom seen "
-	"in the same 20-seed run, narrowly weakened separately in "
-	"verify_artifacts() (scoped to art->state == FZ_ART_COMMITTED && "
-	"g_tl[tl].has_parent, i.e. a committed branch artifact, checked only "
-	"after a restart): NBLOCKS returning a non-OK status (not a wrong "
-	"value) for such an entry -- untriaged, possibly the same root cause "
-	"as the DROPPED/EXISTS one; evidence: seed 200001 step 3681. Daemon "
-	"fix for both tracked separately; see the report's evidence directory "
-	"($SCRATCHPAD/round2-check/ and round2-seed-runs4/) for the minimized "
-	"op sequences and traces.",
 };
 #define FZ_NWEAK ((int) (sizeof(g_weak_oracle_ops) / sizeof(g_weak_oracle_ops[0])))
 
@@ -3696,7 +3645,6 @@ artifact_apply_parent_commit(FzArtifact *ca, uint64_t lsn, uint64_t token,
 		ca->token = token;
 	}
 	ca->visible = *visible;
-	ca->dropped_exists_daemon_bug = 0;
 }
 
 static void
@@ -4028,7 +3976,6 @@ act_artifact_begin(void)
 			note_mutation_seq(token);	/* token IS this BEGIN's admission_seq */
 			art->max_begin_lsn = lsn;
 			art->touched = 1;
-			art->dropped_exists_daemon_bug = 0;
 			art->open_count = 0;
 			art->open_nblocks = 0;
 			memset(art->open_written, 0, sizeof(art->open_written));
@@ -4348,7 +4295,6 @@ act_artifact_commit(void)
 						   sizeof(art->open_block_lsn));
 					art->state = FZ_ART_COMMITTED;
 					art->locally_settled = 1;
-					art->dropped_exists_daemon_bug = 0;
 
 					/*
 					 * Level-1 content verification: from this instant,
@@ -4645,7 +4591,6 @@ act_artifact_drop(void)
 			art->max_begin_lsn_at_drop = art->max_begin_lsn;
 			art->locally_dropped = 1;
 			art->locally_settled = 1;
-			art->dropped_exists_daemon_bug = 0;
 			memset(&art->visible, 0, sizeof(art->visible));
 
 			{
@@ -5025,8 +4970,6 @@ env_branch_create(void)
 						ca->inherited_open_lsn = pa->lsn;
 						ca->inherited_open_token = pa->token;
 					}
-					if (pa->prev_state == FZ_ART_DROPPED)
-						ca->dropped_exists_daemon_bug = 1;
 					if (pa->prev_state == FZ_ART_NONE &&
 						ca->inherited_open_pending)
 					{
@@ -5714,16 +5657,6 @@ artifact_restart_reset(const char *phase)
 				art->state = art->prev_state;
 				art->lsn = art->prev_lsn;
 				art->token = art->prev_token;
-				/*
-				 * Same known daemon bug as the branch-inheritance case
-				 * (FzArtifact.dropped_exists_daemon_bug's comment): an
-				 * uncommitted attempt abandoned here by a restart, whose
-				 * prior settled generation was DROPPED, hits the identical
-				 * EXISTS-returns-1 defect -- this is in fact the more
-				 * direct trigger (no branching needed at all).
-				 */
-				if (art->state == FZ_ART_DROPPED)
-					art->dropped_exists_daemon_bug = 1;
 			}
 	}
 }
@@ -5771,24 +5704,7 @@ verify_artifacts(const char *phase)
 					   akind, rel, nb, nbstatus);
 					continue;
 				}
-				/*
-				 * WEAK ORACLE (art->dropped_exists_daemon_bug only): known
-				 * daemon bug, see the PR #302 round-2 report evidence dir
-				 * ($SCRATCHPAD/round2-check/livecheck193* and
-				 * merged-shrink*) -- a branch's EXISTS for a key whose
-				 * DROPPED state was inherited from a parent that was OPEN
-				 * with a prior DROPPED generation can return 1 instead of
-				 * 0, live, before any restart, contradicting
-				 * ARTIFACT_LIFECYCLE.md's "pending growth cannot change
-				 * either answer".  Not caused by commit 6e618a28e35 (ruled
-				 * out by reverting just that commit's artifact_metadata()
-				 * piece against the same repro).  Accept either answer only
-				 * for entries flagged with this exact inheritance pattern;
-				 * see g_weak_oracle_ops.
-				 */
-				ck(est == PS_STATUS_OK &&
-				   (exists == art->visible.exists ||
-					(art->dropped_exists_daemon_bug && exists == 1)),
+				ck(est == PS_STATUS_OK && exists == art->visible.exists,
 				   "%s: artifact tl=%u akind=%u rel=%u astate=%d exists "
 				   "expected %d got %d (EXISTS status %d)", phase, tl, akind,
 				   rel, art->state, art->visible.exists, exists, est);
@@ -5805,35 +5721,14 @@ verify_artifacts(const char *phase)
 					   "artifact tl=%u akind=%u rel=%u astate=%d NBLOCKS "
 					   "expected 0 got %u (status %d)", phase, tl, akind, rel,
 					   art->state, nb, nbstatus);
-					continue;		/* including the weak-oracle case above:
-									 * the model's belief is what subsequent
-									 * NBLOCKS/content checks are keyed to */
+					continue;
 				}
 				{
 					int			nbstatus = psc_op_nblocks(tl,
 														 g_tl[tl].incarnation,
 														 klass, rel, 0, 0, &nb);
 
-					/*
-					 * WEAK ORACLE, narrowly scoped (art->state ==
-					 * FZ_ART_COMMITTED && g_tl[tl].has_parent only, i.e. a
-					 * committed branch artifact, checked here only after a
-					 * restart since verify_artifacts() has no other
-					 * caller): a 20-seed x 20000-op run hit NBLOCKS
-					 * returning a non-OK status (not a wrong value) for
-					 * such an entry -- untriaged, possibly the same root
-					 * cause as the DROPPED/EXISTS daemon bug above;
-					 * evidence: seed 200001 step 3681. Does not weaken the
-					 * value check when status is OK, and does not apply to
-					 * the root timeline or a non-committed state. Restricted
-					 * to the specific PS_STATUS_ERROR observed for that
-					 * bug: any other out-of-domain status (e.g. a leaked
-					 * PS_STATUS_STALE) must still fail.  See
-					 * g_weak_oracle_ops.
-					 */
-					ck((nbstatus == PS_STATUS_OK && nb == art->visible.nblocks) ||
-					   (nbstatus == PS_STATUS_ERROR &&
-						art->state == FZ_ART_COMMITTED && g_tl[tl].has_parent),
+					ck(nbstatus == PS_STATUS_OK && nb == art->visible.nblocks,
 					   "%s: artifact tl=%u akind=%u rel=%u nblocks expected "
 					   "%u got %u (status %d)", phase, tl, akind, rel,
 					   art->visible.nblocks, nb, nbstatus);
