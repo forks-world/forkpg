@@ -264,6 +264,38 @@ test_pending_after_drop(const char *store)
 	key = saved;
 }
 
+/* Parent adoption after the branch cut cannot suppress a child legacy CREATE. */
+static void
+test_protocol_after_branch(const char *store)
+{
+	PsKey saved = key;
+	PsChannel branch = {.opcode = PS_OP_CREATE_BRANCH, .timeline = 8,
+		.req_lsn = 1100100};
+	uint64_t token;
+
+	key.relNumber = 79;
+	meta(&branch);
+	token = begin(1100200);
+	check(write_page(1100200, token, 0, 0x79) == 0 &&
+		  commit(1100200, token, 1) == 0, "late-protocol: parent publication");
+	for (int redo = 1; redo <= 2; redo++)
+	{
+		PsChannel create = {.opcode = PS_OP_CREATE, .timeline = 8,
+			.key = key, .req_lsn = 1100300, .is_redo = redo};
+
+		ps_lock_shard_wr(ps_shard_of(&key));
+		(void) ps_handle_meta(&create);
+		ps_unlock_shard(ps_shard_of(&key));
+		check(create.status == PS_STATUS_OK && metadata_matches(8, 0, 0, 1, 0),
+			  "late-protocol: child CREATE records an empty legacy fork");
+	}
+	maintain();
+	ps_core_close();
+	check(ps_core_open(store) == 0 && metadata_matches(8, 0, 0, 1, 0),
+		  "late-protocol: child legacy fork survives compacted restart");
+	key = saved;
+}
+
 /*
  * R5-1/R5-2 regression: the reader-snapshot DATA object (object number
  * PS_READER_SNAPSHOT_DATA_OBJECT) used to be published under the same
@@ -811,6 +843,7 @@ main(int argc, char **argv)
 	token = begin(600);
 	check(write_page(600, token, 0, 0x66) == 0 && commit(600, token, 1) == 0 && read_value(0, 600, 0, 0x66), "recreate after drop");
 	test_pending_after_drop(store);
+	test_protocol_after_branch(store);
 	test_reader_snapshot_owner_key_split();
 	test_admission_refusal_does_not_poison();
 	test_viewcap_artifact_property();

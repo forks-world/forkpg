@@ -62,6 +62,9 @@ need no recovery because unfinished pre-restart attempts cannot commit.
 
 Once a local or inherited object uses the publication protocol, redo's
 CREATE is an ensure request and succeeds without writing a fork event.
+Inherited protocol records must be visible at the branch horizon; a parent
+that adopts the protocol after the branch cut does not manage the child's
+legacy fork.
 It cannot publish an empty object over an inherited COMMIT or DROP.
 Ordinary CREATE, TRUNCATE, ZEROEXTEND and UNLINK remain refused for managed
 objects; BEGIN/COMMIT and DROP control their published state.
