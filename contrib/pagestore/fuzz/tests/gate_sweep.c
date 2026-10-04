@@ -512,6 +512,55 @@ allowed(const char *allowlist_path, const char *target, long offset,
 	return found;
 }
 
+/* Mutate each rec_len in both 448-byte shapes and mixed logs. A repair
+ * must preserve all other bytes and produce the pristine repaired log. */
+static int
+timeline_framing_regression(void)
+{
+	const size_t shapes[][8] = {
+		{64, 64, 64, 64, 64, 64, 64, 0},
+		{56, 56, 56, 56, 56, 56, 56, 56},
+		{56, 64, 56, 64, 0, 0, 0, 0},
+		{64, 56, 64, 56, 0, 0, 0, 0}
+	};
+	const uint32_t bad_lengths[] = {0, 55, 65, UINT32_MAX};
+	unsigned char pristine[448], expected[448], mutated[448];
+
+	for (size_t shape = 0; shape < sizeof(shapes) / sizeof(shapes[0]); shape++)
+	{
+		size_t len = 0;
+
+		memset(pristine, 0, sizeof(pristine));
+		for (size_t record = 0; record < 8 && shapes[shape][record]; record++)
+		{
+			uint32_t magic = 0x12345678;
+			uint32_t stride = shapes[shape][record];
+			uint32_t id = record + 1;
+
+			memcpy(pristine + len, &magic, 4);
+			memcpy(pristine + len + 4, &stride, 4);
+			memcpy(pristine + len + 12, &id, 4);
+			len += stride;
+		}
+		memcpy(expected, pristine, len);
+		ps_fuzz_crc_fixup("timelines", work_dir, expected, len);
+		for (size_t off = 0, record = 0; off < len; off += shapes[shape][record++])
+			for (size_t bad = 0; bad < sizeof(bad_lengths) / sizeof(bad_lengths[0]); bad++)
+			{
+				memcpy(mutated, pristine, len);
+				memcpy(mutated + off + 4, &bad_lengths[bad], 4);
+				ps_fuzz_crc_fixup("timelines", work_dir, mutated, len);
+				if (memcmp(mutated, expected, len) != 0)
+				{
+					fprintf(stderr, "FAIL: timeline framing shape=%zu offset=%zu bad=%u\n",
+							shape, off, bad_lengths[bad]);
+					return 0;
+				}
+			}
+	}
+	return 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -581,6 +630,8 @@ main(int argc, char **argv)
 	 * exercises the fixed-up half, by construction. */
 	ps_fuzz_global_init();
 	find_work_dir(scratch);
+	if (!timeline_framing_regression())
+		return 1;
 
 	for (i = 0; i < ps_fuzz_target_count; i++)
 		sweep_target(ps_fuzz_targets[i].name, ps_fuzz_targets[i].relpath);

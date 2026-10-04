@@ -674,15 +674,38 @@ static void
 fixup_timelines(uint8_t *buf, size_t len)
 {
 	size_t off = 0;
+	size_t previous_stride = sizeof(FuzzTimelineRecEvent);
 
 	while (off + 8 <= len)
 	{
 		uint32_t framed_len = get_le32(buf + off + 4);
-		size_t stride = framed_len == 64 ||
-			(framed_len != 56 && len % 64 == 0 && len % 56 != 0) ?
-			64 : sizeof(FuzzTimelineRecEvent);
-		size_t crc_off = stride - 8;
+		size_t stride = framed_len;
+		size_t crc_off;
 		uint32_t crc;
+
+		if (stride != 56 && stride != 64)
+		{
+			int next56 = off + 56 + 8 <= len &&
+				get_le32(buf + off + 56) == get_le32(buf + off) &&
+				(get_le32(buf + off + 60) == 56 || get_le32(buf + off + 60) == 64);
+			int next64 = off + 64 + 8 <= len &&
+				get_le32(buf + off + 64) == get_le32(buf + off) &&
+				(get_le32(buf + off + 68) == 56 || get_le32(buf + off + 68) == 64);
+
+			/* A length divisible by both shapes cannot identify framing.
+			 * Prefer an intact following header, also in mixed logs. At
+			 * EOF use the remaining record size; otherwise retain the
+			 * previous shape when neither candidate has a clear header. */
+			if (next56 != next64)
+				stride = next64 ? 64 : 56;
+			else if (len - off == 56 || len - off == 64)
+				stride = len - off;
+			else if ((len - off) % 64 == 0 && (len - off) % 56 != 0)
+				stride = 64;
+			else
+				stride = previous_stride;
+		}
+		crc_off = stride - 8;
 
 		if (off + stride > len)
 			break;
@@ -693,6 +716,7 @@ fixup_timelines(uint8_t *buf, size_t len)
 		put_le32(buf + off + crc_off, 0);
 		crc = fnv1a_step(FNV1A_INIT, buf + off, stride);
 		put_le32(buf + off + crc_off, crc);
+		previous_stride = stride;
 		off += stride;
 	}
 }
