@@ -597,6 +597,7 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 	 * helper is reused for a split-phase request.
 	 */
 	ch->req_lsn = 0;
+	ch->req_floor_lsn = 0;
 	ch->req_seq = 0;
 }
 
@@ -1907,6 +1908,7 @@ pagestore_localsvc_walidx_progress(void)
 	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
 	ch->timeline = (uint32) localsvc_timeline;
 	ch->req_lsn = 0;
+	ch->req_floor_lsn = 0;
 	ch->req_seq = 0;
 	ch->incarnation = incarnation;
 	ls_exec(ch);
@@ -1970,6 +1972,7 @@ pagestore_localsvc_timeline_info(uint32 timeline, uint32 *parent_timeline,
 	ch->timeline = timeline;
 	ch->incarnation = ls_expected_incarnation(timeline);
 	ch->req_lsn = 0;
+	ch->req_floor_lsn = 0;
 	ch->req_seq = 0;
 	ch->parent_timeline = 0;
 	ch->result = 0;
@@ -2261,7 +2264,8 @@ pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = block;
 	ch->nblocks = 1;
-	ch->req_lsn = 0;			/* explicit: channels are reused across op kinds */
+	ch->req_lsn = 0;
+	ch->req_floor_lsn = 0;			/* explicit: channels are reused across op kinds */
 	ls_exec(ch);
 	memcpy(page, ch->data, BLCKSZ);
 }

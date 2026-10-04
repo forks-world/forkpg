@@ -135,7 +135,7 @@ jobs:
         run: |
           python3 harness/pagestore_fixture_identities.py \
             --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
-                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/pgdata-artifacts \
+                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/pgdata-artifacts \
             --format-tool ./pagestore_format_versions
 
       - name: Run standalone test suite
@@ -226,7 +226,7 @@ jobs:
         run: |
           python3 harness/pagestore_fixture.py \
             --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
-                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap \
+                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 \
             --daemon-binary ./pagestore_daemon \
             --client-binary ./pagestore_gc_crash_client \
             --inspect-binary ./pagestore_inspect \
@@ -445,6 +445,7 @@ jobs:
                     contrib/pagestore/fixtures/posix-artifact-lifecycle \
                     contrib/pagestore/fixtures/posix-timeline-delete-holes \
                     contrib/pagestore/fixtures/posix-timeline-delete-holes-seqcap \
+                    contrib/pagestore/fixtures/posix-timeline-delete-holes-forkmeta-v4 \
             --daemon-binary build/contrib/pagestore/pagestore_daemon \
             --client-binary build/contrib/pagestore/pagestore_gc_crash_client \
             --inspect-binary build/contrib/pagestore/pagestore_inspect \

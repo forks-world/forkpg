@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "pagestore_core.h"
+#include "pagestore_admissible.h"
 #include "pagestore_fault.h"
 #include "pagestore_forkmeta_snapshot.h"
 #include "pagestore_manifest.h"
@@ -442,7 +443,7 @@ snapshot_has_plain_grow(const char *directory, const PsKey *key)
 									  sizeof(header) + i * sizeof(rec), &rec,
 									  sizeof(rec)) != 0)
 				break;
-			if (rec.kind == TEST_FEV_GROW && rec.order_id == 0 &&
+			if ((rec.kind & 0x3f) == TEST_FEV_GROW && rec.order_id == 0 &&
 				memcmp(&rec.key, key, sizeof(*key)) == 0)
 			{
 				found = 1;
@@ -493,7 +494,7 @@ source_is_marker_only(const char *store, TestForkMetaRecV2 *marker)
 	close(fd);
 	return n == (ssize_t) sizeof(*marker) &&
 		(marker->magic == TEST_FORK_META_V2_MAGIC ||
-		 marker->magic == TEST_FORK_META_V3_MAGIC) &&
+		 (marker->magic == TEST_FORK_META_V3_MAGIC || marker->magic == 0x344d4b46U)) &&
 		marker->rec_len == sizeof(*marker) &&
 		marker->kind == TEST_FEV_SNAPSHOT_BASE;
 }
@@ -975,8 +976,8 @@ test_reclaimed_ordered_markers_pruned(void)
 		  run_maintenance_until(manifest, 1),
 		  "snapshot after ordered page-version reclamation");
 	markers = snapshot_ordered_marker_count(snapshots, &key, 0, 0);
-	check(markers > 0 && markers < 12 && snapshot_has_plain_grow(snapshots, &key),
-		  "reclaimed growth marker becomes retained ordinary GROW while markers bound");
+	check(markers > 0 && markers < 12,
+		  "retained PAGE GROW reconstructs size while marker count stays bounded");
 	close_runtime();
 	memset(page, 0, sizeof(page));
 	check(ps_core_open(store) == 0 &&
@@ -1055,9 +1056,8 @@ test_inert_markers_compacted_after_cutover(void)
 	check(ps_test_fork_event_count(0, &key, &nevents_before, &nmarkers_before,
 									&ninert_before) &&
 		  nevents_before == 13 && nmarkers_before == 12 &&
-		  ninert_before == 11,
-		  "the CREATE's SET plus 12 live writes (1 activated GROW, 11 inert "
-		  "commit markers) sit in memory pre-cutover");
+		  ninert_before == 0,
+		  "CREATE plus every PAGE GROW stays in memory before cutover");
 	memset(&pin, 0, sizeof(pin));
 	pin.timeline = 0;
 	pin.owner_kind = 1;
@@ -1074,12 +1074,12 @@ test_inert_markers_compacted_after_cutover(void)
 		  run_maintenance_until(manifest, 1),
 		  "snapshot after ordered page-version reclamation");
 	markers = snapshot_ordered_marker_count(snapshots, &key, 0, 0);
-	check(markers > 0 && markers < 11 && snapshot_has_plain_grow(snapshots, &key),
-		  "reclaimed growth marker becomes retained ordinary GROW while markers bound");
+	check(markers > 0 && markers < 11,
+		  "retained PAGE GROW reconstructs size while marker count stays bounded");
 	check(ps_test_fork_event_count(0, &key, &nevents_after, &nmarkers_after,
 									&ninert_after) &&
-		  ninert_after == (uint32_t) markers &&
-		  ninert_after < ninert_before &&
+		  ninert_after == 0 &&
+		  nmarkers_after <= (uint32_t) markers + 1 &&
 		  nevents_after < nevents_before,
 		  "post-cutover compaction drops exactly the durable snapshot's dropped "
 		  "inert markers from memory (fail-before: ninert stayed 11 here)");
@@ -1177,8 +1177,8 @@ test_inert_markers_kept_when_retained(void)
 			  "write ordered growth then later ordered COMMITs for the same block");
 	check(ps_test_fork_event_count(0, &key, &nevents_before, &nmarkers_before,
 									&ninert_before) &&
-		  ninert_before == 11,
-		  "12 live writes leave 11 inert commit markers before cutover");
+		  ninert_before == 0,
+		  "12 live writes retain 12 activated PAGE GROW markers");
 	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
 		  run_maintenance_until(manifest, 1),
 		  "cutover with page versions unreclaimed");
@@ -1247,8 +1247,8 @@ test_inert_markers_kept_on_preserve_survivors(void)
 			  "write ordered growth then later ordered COMMITs, no frontier published");
 	check(ps_test_fork_event_count(0, &key, &nevents_before, &nmarkers_before,
 									&ninert_before) &&
-		  ninert_before == 5,
-		  "6 live writes leave 5 inert commit markers before the forced cutover");
+		  ninert_before == 0,
+		  "6 live writes retain activated PAGE GROW markers");
 	check(create_branch_request(1, 0, 1) &&
 		  meta_request_timeline(1, PS_OP_CREATE, &del_key, 100, 0, 0, 0, NULL) &&
 		  append_relation_timeline(1, &del_key, 0, 0, page, &del_seq) == 0,
@@ -1334,8 +1334,8 @@ test_deleting_fork_flags_cleared_on_failed_build_skip(void)
 		  "publish a frontier for the branch and reclaim old ordered versions");
 	check(ps_test_fork_event_count(1, &key, &nevents_before, &nmarkers_before,
 									&ninert_before) &&
-		  ninert_before == 11,
-		  "12 live writes leave 11 inert commit markers before any cutover");
+		  ninert_before == 0,
+		  "12 live writes retain every PAGE GROW before cutover");
 	/*
 	 * A cutover now would flag some of those 11 as dropped (their versions
 	 * were just reclaimed) but must fail before compaction ever sees the
@@ -2562,8 +2562,8 @@ test_fork_event_index_scaling(void)
 		  "K live writes stay sublinear in scan steps (index, not O(N) scan)");
 
 	check(ps_test_fork_event_count(0, &key, &nevents, &nmarkers, &ninert) &&
-		  nevents == K + 1 && nmarkers == K && ninert == K - 1,
-		  "event/marker/inert counts match the FSM growth+commit shape");
+		  nevents == K + 1 && nmarkers == K && ninert == 0,
+		  "every FSM rewrite retains an activated PAGE GROW marker");
 
 	steps_before = ps_test_fork_event_scan_steps();
 	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
@@ -5290,6 +5290,185 @@ test_timeline_delete_torn_tail_crash_matrix(void)
 	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
 }
 
+static void
+seal_v4_test_record(TestForkMetaRecV2 *rec)
+{
+	const unsigned char *bytes = (const unsigned char *) rec;
+	uint32_t crc = 0xB704CE;
+
+	for (size_t i = 0; i < sizeof(*rec) - 3; i++)
+	{
+		crc ^= (uint32_t) bytes[i] << 16;
+		for (int bit = 0; bit < 8; bit++)
+		{
+			crc <<= 1;
+			if (crc & 0x1000000)
+				crc ^= 0x1864CFB;
+		}
+	}
+	rec->pad[0] = (uint8_t) (crc >> 16);
+	rec->pad[1] = (uint8_t) (crc >> 8);
+	rec->pad[2] = (uint8_t) crc;
+}
+
+static void
+test_mixed_forkmeta_classification(void)
+{
+	char store[] = "/tmp/psforkmetamixedflagsXXXXXX";
+	char source[1024];
+	TestForkMetaRecV2 rec;
+	const uint32_t magics[] = {0x324d4b46U, 0x334d4b46U, 0x344d4b46U,
+		0x344d4b46U, 0x344d4b46U, 0x334d4b46U};
+	const uint8_t kinds[] = {0, 0, 0, 0x40, 0xc0, 1};
+	const int flags[] = {0, 0, 0, PS_ADM_F_META,
+		PS_ADM_F_META | PS_ADM_F_UNSTAMPED, PS_ADM_F_META};
+	const uint8_t invalid[] = {0x80, 0x47, 0x8a, 0x20};
+	off_t valid_size;
+	int fd;
+
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open mixed forkmeta classification store");
+	close_runtime();
+	(void) snprintf(source, sizeof(source), "%s/forkmeta", store);
+	for (unsigned int i = 0; i < sizeof(kinds); i++)
+	{
+		memset(&rec, 0, sizeof(rec));
+		rec.magic = magics[i];
+		rec.rec_len = sizeof(rec);
+		rec.key = (PsKey) {6, 6, 3000 + i, 0, PS_KLASS_RELATION};
+		rec.kind = kinds[i];
+		rec.lsn = 100;
+		rec.admission_seq = 10000 + i;
+		rec.nblocks = 3;
+		if (rec.magic != 0x324d4b46U)
+			seal_v4_test_record(&rec);
+		check(append_source_bytes(source, &rec, sizeof(rec)),
+			  "append valid V2/V3/V4 lifecycle record to mixed log");
+	}
+	check(ps_core_open(store) == 0, "reopen mixed V2/V3/V4 forkmeta log");
+	for (unsigned int i = 0; i < sizeof(kinds); i++)
+	{
+		PsKey key = {6, 6, 3000 + i, 0, PS_KLASS_RELATION};
+
+		check(ps_test_fork_event_flags(0, &key, 10000 + i) == flags[i],
+			  "legacy GROW reloads as PAGE; V4 restores META and UNSTAMPED");
+	}
+	close_runtime();
+	valid_size = file_size(source);
+	for (unsigned int i = 0; i < sizeof(invalid); i++)
+	{
+		rec.magic = 0x344d4b46U;
+		rec.kind = invalid[i];
+		seal_v4_test_record(&rec);
+		check(append_source_bytes(source, &rec, sizeof(rec)) &&
+			  expect_open_failure(store) && file_size(source) == valid_size + sizeof(rec),
+			  "invalid V4 flags or unknown kind fail closed despite a valid CRC");
+		fd = open(source, O_WRONLY);
+		check(fd >= 0 && ftruncate(fd, valid_size) == 0,
+			  "restore valid mixed log after rejection");
+		if (fd >= 0)
+			(void) close(fd);
+	}
+	remove_tree(store);
+}
+
+static void
+test_persisted_event_classification(void)
+{
+	char store[] = "/tmp/psforkmetaflagsXXXXXX";
+	char snapshots[1024], manifest[1200], source[1200];
+	PsKey key = {6, 6, 987, 0, PS_KLASS_RELATION};
+	PsChannel reply, ch;
+	PsRetentionPin pin;
+	unsigned char page[8192];
+	uint64_t create_seq, grow_seq, page_seq;
+	uint32_t nev, markers, inert;
+	TestForkMetaRecV2 record;
+	TestSnapshotHeader header;
+	int fd;
+
+	check(mkdtemp(store) != NULL, "create persisted classification store");
+	(void) snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	(void) snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	(void) snprintf(source, sizeof(source), "%s/forkmeta", store);
+	flush_pages = 1;
+	compact_layers = 0;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &key, 100, 0, 0, 0, &reply),
+		  "create classified fork");
+	create_seq = reply.req_seq;
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_ZEROEXTEND;
+	ch.key = key;
+	ch.nblocks = 10;
+	ch.req_floor_lsn = 500;
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	(void) ps_handle_meta(&ch);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_admission_read_unlock();
+	grow_seq = ch.req_seq;
+	check(ch.status == PS_STATUS_OK && grow_seq > create_seq,
+		  "unstamped ZEROEXTEND honors its explicit request floor");
+	check(ps_test_fork_event_flags(0, &key, grow_seq) ==
+		  (PS_ADM_F_META | PS_ADM_F_UNSTAMPED),
+		  "ZEROEXTEND is META and UNSTAMPED in memory");
+	fd = open(source, O_RDONLY);
+	check(fd >= 0 && pread(fd, &record, sizeof(record),
+		  lseek(fd, 0, SEEK_END) - sizeof(record)) == (ssize_t) sizeof(record) &&
+		  record.magic == 0x344d4b46U && record.kind == 0xc0 && record.lsn == 500,
+		  "V4 persists META, UNSTAMPED and the request floor");
+	if (fd >= 0)
+		(void) close(fd);
+	check(append_relation(&key, 0, 500, page, &page_seq) == 0,
+		  "append PAGE below the size established by ZEROEXTEND");
+	check(ps_test_fork_event_flags(0, &key, page_seq) == 0 &&
+		  ps_test_fork_event_count(0, &key, &nev, &markers, &inert) && nev == 3,
+		  "size-covered PAGE GROW remains a distinct admitted event");
+	for (int i = 0; i < 64; i++)
+		check(append_relation(&key, 0, 500, page, &page_seq) == 0,
+			  "retain every repeated PAGE admission");
+	check(ps_test_fork_event_count(0, &key, &nev, &markers, &inert) && nev == 67,
+		  "PAGE GROW history grows by one event per append before cutover");
+	close_runtime();
+	check(ps_core_open(store) == 0 &&
+		  ps_test_fork_event_flags(0, &key, grow_seq) ==
+		  (PS_ADM_F_META | PS_ADM_F_UNSTAMPED) &&
+		  ps_test_fork_event_flags(0, &key, page_seq) == 0 &&
+		  ps_test_fork_event_count(0, &key, &nev, &markers, &inert) && nev == 67,
+		  "restart preserves classifications and every PAGE GROW admission");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = PS_RETENTION_OWNER_READER;
+	pin.owner_id = 987;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 500;
+	pin.admission_seq = page_seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK,
+		  "register the history horizon used for classification cutover");
+	check(append_growth_batch(2600, 600) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1) &&
+		  read_selected_header(snapshots, &header) == 0 && header.version == 2,
+		  "publish FMS v2 classification payload");
+	check(ps_test_fork_event_flags(0, &key, grow_seq) ==
+		  (PS_ADM_F_META | PS_ADM_F_UNSTAMPED),
+		  "successful snapshot preserves META classification in memory");
+	check(ps_test_fork_event_count(0, &key, &nev, &markers, &inert) && nev <= 3 &&
+		  meta_request(PS_OP_NBLOCKS, &key, UINT64_MAX, 0, 0, 0, &reply) &&
+		  reply.result == 10,
+		  "cutover bounds redundant PAGE GROW history and rebuilds size caches");
+	close_runtime();
+	check(ps_core_open(store) == 0 &&
+		  ps_test_fork_event_flags(0, &key, grow_seq) ==
+		  (PS_ADM_F_META | PS_ADM_F_UNSTAMPED),
+		  "FMS v2 restart preserves META and UNSTAMPED");
+	close_runtime();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -5339,6 +5518,8 @@ main(void)
 	use_layers = 1;
 	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
 		  "arm conservative forkmeta trigger");
+	test_mixed_forkmeta_classification();
+	test_persisted_event_classification();
 	check(ps_core_open(store) == 0, "open runtime cutover store");
 	check(meta_request(PS_OP_CREATE, &page_key, 100, 0, 0, 0, NULL),
 		  "create fork before page history");
@@ -5841,7 +6022,7 @@ main(void)
 								   0, 0, 2, 0, NULL) &&
 			  read_last_source_record(source, &last) && last.timeline == 1 &&
 			  last.key.relNumber == ancestry_key.relNumber &&
-			  last.lsn == page_lsn + 1 && last.kind == TEST_FEV_SET &&
+			  last.lsn == page_lsn + 1 && (last.kind & 0x3f) == TEST_FEV_SET &&
 			  last.nblocks == 2,
 			  "child unstamped mutation orders after newest inherited page state");
 		check(meta_request_timeline(1, PS_OP_NBLOCKS, &ancestry_key,
