@@ -43,10 +43,15 @@ Fixup: `fixup_forkmeta()` -> `fixup_forkmeta_records()`, fuzz_crc_fixup.c:391,44
 
 | Gate | Product file:line | Fixup handling | Probe |
 |---|---|---|---|
-| FKM3 crc-24 (pad's low 3 bytes) | pagestore_core.c:9635 area (`fork_meta_rec_wire_valid`) | Recomputed (fuzz_crc_fixup.c:405-413) | historical, in tree |
+| FKM3/FKM4 crc-24 (pad's low 3 bytes) | pagestore_core.c:9635 area (`fork_meta_rec_wire_valid`) | Recomputed (fuzz_crc_fixup.c:405-413) | historical, in tree |
 | FKM2 `pad` must be exactly zero (no crc to make it self-consistent) | pagestore_core.c (`fork_meta_rec_wire_valid`, FKM2 branch) | Zeroed (fuzz_crc_fixup.c:402-403) | historical (round 4), in tree |
-| magic (FKM2 vs FKM3 selector) | same | left fuzzer-controlled | raw-only by design: format-identity |
+| magic (FKM2/FKM3/FKM4 selector) | same | left fuzzer-controlled | raw-only by design: format-identity |
 | Record 0 must equal the selected snapshot's `FEV_SNAPSHOT_BASE` marker, or `fork_meta_source_conflicts_with_snapshot()`'s silent full-log rewrite kicks in | pagestore_core.c (`fork_meta_snapshot_reconcile_source()`) | **Deliberately not pinned** -- measured with before/after `-runs=0`: pinning record 0's identity made overall coverage *worse* (cov 1925/ft 2018 -> cov 1911/ft 1916), because it stopped the silent-rewrite fallback that currently lets `ps_core_open()` succeed and explore every later open step. See fuzz_crc_fixup.c:414-437's own comment. | raw-only by design, empirically justified in-file |
+
+V4 classification remains fuzzer-controlled: unknown kinds, flags on markers,
+and UNSTAMPED PAGE GROWs are semantic rejections. CRC repair also handles V4
+records; the current fixture's source, checkpoint and tail are included in
+the replay corpus alongside the legacy seeds.
 
 ## forkmeta_snapshot_manifest (forkmeta_snapshots/forkmeta_manifest_v1)
 
