@@ -686,8 +686,16 @@ artifact_has_protocol(uint32_t tl, const PsKey *key)
 	ps_lock_map_rd();
 	do
 	{
-		if (page_find(walk.tl, &meta, PS_ARTIFACT_BEGIN_BLOCK) ||
-			page_find(walk.tl, &meta, PS_ARTIFACT_COMMIT_BLOCK))
+		PageEnt    *begins = page_find(walk.tl, &meta, PS_ARTIFACT_BEGIN_BLOCK);
+		PageEnt    *commits = page_find(walk.tl, &meta, PS_ARTIFACT_COMMIT_BLOCK);
+
+		/* Parent adoption after this edge's branch cut does not make the
+		 * child a managed artifact. Use the same per-hop visibility as
+		 * metadata reads, including the inherited range boundary. */
+		if ((begins && page_select(begins, &walk.cap, walk.inherited_below,
+								   walk.has_inherited_below)) ||
+			(commits && page_select(commits, &walk.cap, walk.inherited_below,
+									walk.has_inherited_below)))
 		{
 			found = 1;
 			break;

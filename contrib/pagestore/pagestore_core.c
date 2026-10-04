@@ -22007,10 +22007,15 @@ ps_handle_meta(PsChannel *ch)
 	 * not invalidate committed bytes behind the publication protocol. */
 	if (artifact_data_key(&ch->key) &&
 		(ch->opcode == PS_OP_UNLINK || ch->opcode == PS_OP_TRUNCATE ||
-		 ch->opcode == PS_OP_ZEROEXTEND || (ch->opcode == PS_OP_CREATE && !ch->is_redo)) &&
+		 ch->opcode == PS_OP_ZEROEXTEND || ch->opcode == PS_OP_CREATE) &&
 		artifact_has_protocol(tl, &ch->key))
 	{
-		ch->status = PS_STATUS_ERROR;
+		/* Redo's ensure-exists request must not publish a local empty fork
+		 * over an inherited COMMIT/DROP. BEGIN/COMMIT owns publication;
+		 * recording SET here would make pending replacement metadata
+		 * definitive before its completion record exists. */
+		if (ch->opcode != PS_OP_CREATE || !ch->is_redo)
+			ch->status = PS_STATUS_ERROR;
 		return 1;
 	}
 
