@@ -72,9 +72,20 @@ typedef struct TestTimelineEvent
 	uint64_t branch_lsn;
 	uint64_t incarnation;
 	uint64_t parent_incarnation;
+	uint64_t branch_seq;
 	uint32_t crc;
 	uint32_t reserved;
 } TestTimelineEvent;
+
+/* The last pre-cap lifecycle shape remains readable in mixed logs. */
+typedef struct TestTimelineEventV2
+{
+	uint32_t magic, rec_len, kind, id;
+	int32_t parent;
+	uint32_t state;
+	uint64_t branch_lsn, incarnation, parent_incarnation;
+	uint32_t crc, reserved;
+} TestTimelineEventV2;
 
 typedef struct TestTimelineEventV1
 {
@@ -4381,9 +4392,101 @@ test_deleting_timeline_page_cleanup_below_watermark_no_resurrection(void)
 	remove_tree(store);
 }
 
+static void
+test_timeline_seqcap_format(void)
+{
+	char store[] = "/tmp/pagestore-timeline-seqcap-XXXXXX";
+	char path[512];
+	TestTimelineEventV2 old;
+	TestTimelineEvent current, mutation;
+	PsTimelineState state;
+	uint64_t incarnation;
+	struct stat st;
+	int fd;
+
+	configure_timeline_core();
+	check(mkdtemp(store) != NULL, "create seqcap format store");
+	(void) snprintf(path, sizeof(path), "%s/timelines", store);
+	memset(&old, 0, sizeof(old));
+	old.magic = TEST_TIMELINE_MAGIC;
+	old.rec_len = sizeof(old);
+	old.kind = 1;
+	old.id = 1;
+	old.parent = 0;
+	old.state = PS_TIMELINE_LIVE;
+	old.branch_lsn = 100;
+	old.incarnation = old.parent_incarnation = 1;
+	old.crc = fnv(&old, sizeof(old));
+	check(write_bytes(path, &old, sizeof(old)) == 0 && ps_core_open(store) == 0,
+		  "load pre-cap 56-byte lifecycle record");
+	check(create_branch(2, 1, 110), "append cap-format child to legacy log");
+	close_store();
+	fd = open(path, O_RDONLY);
+	check(fd >= 0 && pread(fd, &current, sizeof(current), sizeof(old)) ==
+		  (ssize_t) sizeof(current), "read 64-byte cap-format create");
+	if (fd >= 0)
+		(void) close(fd);
+	check(current.rec_len == 64 && current.branch_seq == UINT64_MAX &&
+		  current.id == 2 && current.parent_incarnation == 1,
+		  "new creates persist an unbounded edge cap");
+	check(ps_core_open(store) == 0 && begin_delete(2, 1, NULL),
+		  "mixed lifecycle log supports deletion");
+	for (int i = 0; i < 16; i++)
+		(void) ps_core_maintenance();
+	check(state_of(2, &state, &incarnation) && state == PS_TIMELINE_DELETED &&
+		  create_branch_fenced(2, 1, 120, 2, 1),
+		  "cap-format timeline can be reused after deletion");
+	close_store();
+	check(ps_core_open(store) == 0 && state_of(2, &state, &incarnation) &&
+		  state == PS_TIMELINE_LIVE && incarnation == 2,
+		  "mixed cap-format states and reused create survive restart");
+	close_store();
+
+	/* Valid checksums must not let unsupported semantics through, and a
+	 * rejected complete record must never be repaired as a torn tail. */
+	for (int i = 0; i < 5; i++)
+	{
+		mutation = current;
+		if (i == 0)
+			mutation.branch_seq = 0;
+		else if (i == 1)
+			mutation.branch_seq = UINT64_MAX - 1;
+		else if (i == 2)
+			mutation.kind = 3; /* CAP_ACTIVATION */
+		else if (i == 3)
+			mutation.reserved = 1;
+		mutation.crc = 0;
+		mutation.crc = fnv(&mutation, sizeof(mutation));
+		if (i == 4)
+			mutation.crc ^= 1;
+		check(write_bytes(path, &old, sizeof(old)) == 0 &&
+			  append_bytes(path, &mutation, sizeof(mutation)) == 0 &&
+			  expect_open_failure(store),
+			  "unsupported cap, activation, reserved field or CRC fails closed");
+		check(stat(path, &st) == 0 && st.st_size ==
+			  (off_t) (sizeof(old) + sizeof(mutation)),
+			  "failed cap-format replay preserves complete log bytes");
+	}
+	for (int len = 1; len < (int) sizeof(current); len++)
+	{
+		check(write_bytes(path, &old, sizeof(old)) == 0 &&
+			  append_bytes(path, &current, len) == 0 && ps_core_open(store) == 0,
+			  "every incomplete cap-format tail preserves the legacy prefix");
+		close_store();
+		check(stat(path, &st) == 0 && st.st_size == (off_t) sizeof(old),
+			  "incomplete cap-format tail is truncated at its record boundary");
+	}
+	/* Old complete records must be checked before conversion to V3. */
+	old.crc ^= 1;
+	check(write_bytes(path, &old, sizeof(old)) == 0 && expect_open_failure(store),
+		  "legacy lifecycle CRC remains mandatory during cap normalization");
+	remove_tree(store);
+}
+
 int
 main(void)
 {
+	test_timeline_seqcap_format();
 	test_old_event_replay_derives_reused_parent_incarnation();
 	test_legacy_migration_and_parser_fail_closed();
 	test_delete_discards_unflushed_memtable();

@@ -2741,7 +2741,7 @@ def _timeline_events(store: Path) -> list[dict[str, int]]:
         magic, rec_len = struct.unpack_from("=II", data, offset)
         if magic != TIMELINE_META_MAGIC or rec_len < 8 or offset + rec_len > len(data):
             break
-        if rec_len == 56:
+        if rec_len in (48, 56, 64):
             kind, ident, _parent, state = struct.unpack_from("=IIiI", data, offset + 8)
             incarnation = struct.unpack_from("=Q", data, offset + 32)[0]
             events.append({"kind": kind, "id": ident, "state": state, "incarnation": incarnation})
