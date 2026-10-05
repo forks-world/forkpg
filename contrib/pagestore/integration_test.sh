@@ -1314,7 +1314,39 @@ rm -rf "$PREPSEED"
 # durably mirrored checkpoint redo.  Every bootstrap horizon must come from that
 # same control image; in particular, oldestMulti's member offset is reconstructed
 # from the base + WAL window instead of being guessed by the caller.
+# R2-s checks the real WAL record. An online checkpoint must fail before
+# preparing SLRUs or creating a timeline, including on a directory reuse.
 $P -c "CHECKPOINT;" >/dev/null
+onlineRedo=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
+onlineFork=$($P -c "SELECT pg_current_wal_lsn();")
+ONLINESEED=$(mktemp -d)
+onlineRejected=$($P -v VERBOSITY=verbose -c "SELECT pagestore_prepare_branch_from_control(
+	'$ONLINESEED', 3, 0, '$mxC', '$onlineRedo', '$onlineFork');" 2>&1 || true)
+case "$onlineRejected" in
+	*"55000: safe branch preparation requires a shutdown checkpoint"*) onlineRejected=yes ;;
+	*) onlineRejected=no ;;
+esac
+assert "$onlineRejected" "yes" "control-derived prepare rejects an online checkpoint with SQLSTATE 55000"
+assert "$(find "$ONLINESEED" -type f | wc -l | tr -d ' ')" "0" \
+	"online-checkpoint rejection creates no prepared artifacts"
+assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+	-c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_timeline_state(3);")" "t" \
+	"online-checkpoint rejection creates no store timeline"
+printf '%s\n' 'existing-bootstrap' > "$ONLINESEED/pagestore_branch.bootstrap"
+existingRejected=$($P -c "SELECT pagestore_prepare_branch_from_control(
+	'$ONLINESEED', 3, 0, '$mxC', '$onlineRedo', '$onlineFork');" 2>&1 || true)
+case "$existingRejected" in
+	*"requires a shutdown checkpoint"*) existingRejected=yes ;;
+	*) existingRejected=no ;;
+esac
+assert "$existingRejected" "yes" "online checkpoint cannot bypass validation through directory reuse"
+assert "$(cat "$ONLINESEED/pagestore_branch.bootstrap")" "existing-bootstrap" \
+	"online-checkpoint rejection preserves existing readiness artifacts"
+rm -rf "$ONLINESEED"
+# Match the controller's clean fast-stop/restart sequence. The database state
+# is now IN_PRODUCTION, while its selected WAL record is still SHUTDOWN.
+"$BIN/pg_ctl" -D "$DATA" -m fast -w stop >/dev/null 2>&1
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 read -r autoL autoOldestXid autoNextXid autoOldestCts autoNextCts autoOldestMulti autoNextMulti autoNextMember <<< "$($P -c "
 	SELECT redo_lsn || ' ' || oldest_xid || ' ' || split_part(next_xid, ':', 2) || ' ' ||
 	       CASE WHEN current_setting('track_commit_timestamp')::bool

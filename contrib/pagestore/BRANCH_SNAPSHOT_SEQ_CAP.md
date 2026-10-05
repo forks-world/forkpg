@@ -1058,3 +1058,19 @@ The fixture oracle verifies its owner, generation, resources and LSN across
 two daemon starts. The horizon-v2 archive stays byte-identical, and v3
 retention records/state also seed the fuzz corpus. Finite caps and the P5
 checkpoint registration protocol remain release blockers.
+
+### R2-s shutdown-checkpoint prerequisite
+
+The control-derived branch entry point now requires the verified checkpoint
+WAL record to be `XLOG_CHECKPOINT_SHUTDOWN`, with checkpoint redo equal to its
+record start. It rejects an online checkpoint with SQLSTATE `55000` before
+creating a timeline or changing prepared-directory artifacts. The check uses
+the record type, so the controller's restarted writer is accepted even though
+its control-file database state has returned to in-production.
+
+The shared checkpoint reader exports the verified info code; checkpoint
+selection for base snapshot capture continues to accept online checkpoints.
+The integration test covers online rejection, directory preservation, no
+created timeline, and successful preparation/retry after a clean fast restart.
+This lands only the R2-s prerequisite. R2-x WAL scanning, journaled cleanup,
+G3 registration enforcement and finite branch activation remain pending.
