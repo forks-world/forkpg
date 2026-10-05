@@ -4470,22 +4470,17 @@ typedef struct TimelineMeta
 	uint32_t	state;			/* PsTimelineState; published after durable append */
 	uint64_t	incarnation;		/* nonzero fencing generation */
 	uint64_t	parent_incarnation;	/* immutable generation of parent, or 1 for root */
+	uint64_t	branch_seq;		/* durable edge cap; unbounded until activation */
 } TimelineMeta;
 
 static TimelineMeta timelines[MAX_TIMELINES];
 
-/*
- * branch_seq: the composition edge's S_e (design doc S1.2/S2/S9.3).  P1
- * always returns PS_SEQ_UNBOUNDED here; P3b reads a persisted, activated
- * field once branches carry one.  Keeping this indirection from P1 on means
- * every ancestry walk already composes through it, so P3b only has to
- * change this one function's body.
- */
+/* The persisted edge cap remains unbounded until the activation rollout. */
 static inline uint64_t
 timeline_branch_seq(uint32_t timeline)
 {
-	(void) timeline;
-	return PS_SEQ_UNBOUNDED;
+	return timeline < MAX_TIMELINES && timelines[timeline].defined ?
+		timelines[timeline].branch_seq : PS_SEQ_UNBOUNDED;
 }
 
 /*
@@ -8393,6 +8388,7 @@ timeline_define_incarnation(uint32_t id, int parent, uint64_t branch_lsn,
 		return;
 	timelines[id].parent = parent;
 	timelines[id].branch_lsn = branch_lsn;
+	timelines[id].branch_seq = PS_SEQ_UNBOUNDED;
 	timelines[id].parent_incarnation = parent_incarnation;
 	__atomic_store_n(&timelines[id].incarnation, incarnation, __ATOMIC_RELEASE);
 	__atomic_store_n(&timelines[id].state, PS_TIMELINE_LIVE, __ATOMIC_RELEASE);
@@ -9428,7 +9424,7 @@ typedef struct TimelineRecV2
  * after a legacy-only log has been migrated. */
 #define TIMELINE_META_EVENT_CREATE 1U
 #define TIMELINE_META_EVENT_STATE  2U
-typedef struct TimelineRecEvent
+typedef struct TimelineRecEventV2
 {
 	uint32_t magic;
 	uint32_t rec_len;
@@ -9441,7 +9437,27 @@ typedef struct TimelineRecEvent
 	uint64_t parent_incarnation;
 	uint32_t crc;
 	uint32_t reserved;
-} TimelineRecEvent;
+} TimelineRecEventV2;
+
+/* Format-only rollout: finite caps and activation records require P3b. */
+#define TIMELINE_META_EVENT_CAP_ACTIVATION 3U
+typedef struct TimelineRecEventV3
+{
+	uint32_t magic;
+	uint32_t rec_len;
+	uint32_t kind;
+	uint32_t id;
+	int32_t parent;
+	uint32_t state;
+	uint64_t branch_lsn;
+	uint64_t incarnation;
+	uint64_t parent_incarnation;
+	uint64_t branch_seq;
+	uint32_t crc;
+	uint32_t reserved;
+} TimelineRecEventV3;
+
+_Static_assert(sizeof(TimelineRecEventV3) == 64, "timeline V3 wire size");
 
 /* Event records written before parent incarnation was part of the durable
  * timeline identity.  They remain readable as generation-one ancestry only;
@@ -9473,7 +9489,7 @@ timeline_rec_crc(TimelineRecV2 *rec)
 }
 
 static uint32_t
-timeline_event_crc(TimelineRecEvent *rec)
+timeline_event_crc(TimelineRecEventV2 *rec)
 {
 	uint32_t save = rec->crc;
 	uint32_t crc;
@@ -9482,6 +9498,41 @@ timeline_event_crc(TimelineRecEvent *rec)
 	crc = fnv(rec, sizeof(*rec));
 	rec->crc = save;
 	return crc;
+}
+
+static uint32_t
+timeline_event_v3_crc(TimelineRecEventV3 *rec)
+{
+	uint32_t save = rec->crc;
+	uint32_t crc;
+
+	rec->crc = 0;
+	crc = fnv(rec, sizeof(*rec));
+	rec->crc = save;
+	return crc;
+}
+
+/* Validate the original bytes before normalizing the legacy edge cap. */
+static int
+timeline_event_read(uint64_t off, uint32_t rec_len, TimelineRecEventV3 *rec)
+{
+	if (rec_len == sizeof(TimelineRecEventV2))
+	{
+		TimelineRecEventV2 old;
+		int n = ps_storage->meta_read(off, &old, sizeof(old));
+
+		if (n != (int) sizeof(old))
+			return n < 0 ? -1 : 0;
+		if (old.crc != timeline_event_crc(&old) || old.reserved != 0)
+			return -1;
+		memset(rec, 0, sizeof(*rec));
+		memcpy(rec, &old, offsetof(TimelineRecEventV2, crc));
+		rec->rec_len = sizeof(*rec);
+		rec->branch_seq = PS_SEQ_UNBOUNDED;
+		rec->crc = timeline_event_v3_crc(rec);
+		return sizeof(*rec);
+	}
+	return ps_storage->meta_read(off, rec, sizeof(*rec));
 }
 
 static uint32_t
@@ -9510,7 +9561,7 @@ static int
 timeline_persist_create(uint32_t id, int parent, uint64_t branch_lsn,
 						uint64_t incarnation, uint64_t parent_incarnation)
 {
-	TimelineRecEvent rec;
+	TimelineRecEventV3 rec;
 
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = TIMELINE_META_V2_MAGIC;
@@ -9522,7 +9573,8 @@ timeline_persist_create(uint32_t id, int parent, uint64_t branch_lsn,
 	rec.branch_lsn = branch_lsn;
 	rec.incarnation = incarnation;
 	rec.parent_incarnation = parent_incarnation;
-	rec.crc = timeline_event_crc(&rec);
+	rec.branch_seq = PS_SEQ_UNBOUNDED;
+	rec.crc = timeline_event_v3_crc(&rec);
 
 	return timeline_meta_append(&rec, sizeof(rec));
 }
@@ -9531,7 +9583,7 @@ static int
 timeline_persist_state(uint32_t id, PsTimelineState state,
 						   uint64_t incarnation)
 {
-	TimelineRecEvent rec;
+	TimelineRecEventV3 rec;
 
 	if (id >= MAX_TIMELINES || state < PS_TIMELINE_LIVE ||
 		state > PS_TIMELINE_DELETED || incarnation == 0)
@@ -9546,7 +9598,8 @@ timeline_persist_state(uint32_t id, PsTimelineState state,
 	rec.branch_lsn = timelines[id].branch_lsn;
 	rec.incarnation = incarnation;
 	rec.parent_incarnation = timelines[id].parent_incarnation;
-	rec.crc = timeline_event_crc(&rec);
+	rec.branch_seq = PS_SEQ_UNBOUNDED;
+	rec.crc = timeline_event_v3_crc(&rec);
 
 	return timeline_meta_append(&rec, sizeof(rec));
 }
@@ -12208,7 +12261,8 @@ load_timelines(void)
 			if (magic != TIMELINE_META_V2_MAGIC ||
 				(rec_len != sizeof(TimelineRecV2) &&
 				 rec_len != sizeof(TimelineRecEventV1) &&
-				 rec_len != sizeof(TimelineRecEvent)))
+				 rec_len != sizeof(TimelineRecEventV2) &&
+				 rec_len != sizeof(TimelineRecEventV3)))
 				return -1;
 			if (rec_len == sizeof(TimelineRecV2))
 			{
@@ -12317,8 +12371,8 @@ load_timelines(void)
 			}
 			else
 			{
-				TimelineRecEvent rec;
-				n = ps_storage->meta_read(off, &rec, sizeof(rec));
+				TimelineRecEventV3 rec;
+				n = timeline_event_read(off, rec_len, &rec);
 				if (n != (int) sizeof(rec))
 				{
 					if (n >= 0 && ps_storage->meta_truncate &&
@@ -12328,7 +12382,9 @@ load_timelines(void)
 				}
 				if (rec.magic != TIMELINE_META_V2_MAGIC ||
 					rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
-					rec.crc != timeline_event_crc(&rec) ||
+					rec.crc != timeline_event_v3_crc(&rec) ||
+					rec.kind == TIMELINE_META_EVENT_CAP_ACTIVATION ||
+					rec.branch_seq != PS_SEQ_UNBOUNDED ||
 					rec.id >= MAX_TIMELINES || rec.incarnation == 0 ||
 					rec.state < PS_TIMELINE_LIVE ||
 					rec.state > PS_TIMELINE_DELETED)
@@ -12396,7 +12452,7 @@ load_timelines(void)
 				}
 				else
 					return -1;
-				off += sizeof(rec);
+				off += rec_len;
 			}
 		}
 		return 0;
@@ -24746,7 +24802,7 @@ ps_core_format_identities(const PsFormatIdentity **out)
 		 PS_PAGE_FRONTIER_VERSION},
 		{"walidx_frontier", "walidx-prune.frontiers", PS_WALIDX_FRONTIER_MAGIC,
 		 PS_WALIDX_FRONTIER_VERSION},
-		{"timelines", "timelines record", TIMELINE_META_V2_MAGIC, 2},
+		{"timelines", "timelines record", TIMELINE_META_V2_MAGIC, 3},
 		{"forkmeta", "forkmeta record", FORK_META_V3_MAGIC, 3},
 		{"forkmeta", "forkmeta record (accepted legacy)", FORK_META_V2_MAGIC, 2},
 		{"forkmeta_snapshot", "forkmeta checkpoint/tail payload",

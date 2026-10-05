@@ -109,20 +109,24 @@ Fixup: `fixup_retention_meta()`, fuzz_crc_fixup.c:523.
 Loader: `retention_state_crc()` gate only (single fixed struct).
 Fixup: `fixup_retention_state()`, fuzz_crc_fixup.c:598. No file-size/count gate beyond exact struct size, which the "give up if len is wrong" pattern already covers; magic/version left fuzzer-controlled. No gap.
 
-## timelines (TimelineRecEvent)
+## timelines
 
-Loader: `load_timelines()`, pagestore_core.c:12150 (outer 8-byte magic+rec_len header, then per-shape struct read + validity).
-Fixup: `fixup_timelines()`, fuzz_crc_fixup.c:675.
+Loader: `load_timelines()` in `pagestore_core.c` reads an eight-byte framing
+header before validating each known record shape. `fixup_timelines()` repairs
+the 56-byte lifecycle V2 and 64-byte lifecycle V3 shapes, including mixed logs.
 
-| Gate | Product file:line | Fixup handling | Probe |
-|---|---|---|---|
-| Outer `magic == TIMELINE_META_V2_MAGIC` | pagestore_core.c:12189 | left fuzzer-controlled | raw-only by design: meaningful, independently fuzzable identity field |
-| **Outer `rec_len` must equal exactly one of `sizeof(TimelineRecV2)`/`sizeof(TimelineRecEventV1)`/`sizeof(TimelineRecEvent)` -- else `return -1` for the *entire* file's load** | pagestore_core.c:12191-12192 | **FIXED (round 6)**: pinned to `stride` (= `sizeof(FuzzTimelineRecEvent)`, the one shape this function fixes up) before crc (fuzz_crc_fixup.c:696-697) | `timelines_rec_len` probe (byte-4 XOR mutation, `PS_FUZZ_CRC_FIXUP=always`): before rc=-1 ("refusing to open corrupt timelines metadata" / "load timelines failed"), after opens (reaches "recovered shard 0...") |
-| Per-record `rec.rec_len != sizeof(rec)` | pagestore_core.c:12207,12227,12297 | same fix (the outer/per-record rec_len is the same field in this shape) | same probe |
-| Per-record `reserved` must be zero | pagestore_core.c:12207 (via `TimelineRecEvent.reserved`) | Zeroed before crc (fuzz_crc_fixup.c:698, pre-existing round 3) | historical, in tree |
-| crc | pagestore_core.c:12209 (`timeline_event_crc`) | Recomputed (fuzz_crc_fixup.c:699-700) | historical, in tree |
-| Semantic fields (id/state/incarnation/parent chain) | pagestore_core.c:12227-12330 | left fuzzer-controlled | raw-only by design |
-| Legacy (`TimelineRecV2`/`TimelineRecEventV1`) shapes | pagestore_core.c:12196-12226 | **Not fixed up at all** -- this function only ever targets the current `TimelineRecEvent` shape, stated up front in its own header comment | raw-only by design, pre-existing scoping |
+| Gate | Fixup handling |
+|---|---|
+| Magic | Left fuzzer-controlled; identity rejection is meaningful. |
+| Record length | Pinned to the selected 56- or 64-byte stride. A damaged length in a homogeneous V3 seed is inferred from the buffer length. |
+| Reserved field | Zeroed before checksum repair. |
+| CRC | Recomputed over each complete record with its checksum field zeroed. |
+| V3 finite `branch_seq` | Pinned to infinity in the repaired pass while activation is unsupported; the raw pass exercises finite-cap rejection. |
+| Lifecycle kind, id, state, incarnation and ancestry | Left fuzzer-controlled; semantic rejection is meaningful. |
+| 16-, 32- and 48-byte legacy shapes | Not repaired; covered by the raw pass and compatibility fixtures. |
+
+The gate sweep retains its legacy V2 fixture and allowlist. The V3 fixture's
+timeline log is also included in the replay corpus.
 
 ## page_frontier / walidx_frontier
 

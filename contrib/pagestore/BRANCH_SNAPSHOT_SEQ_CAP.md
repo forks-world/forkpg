@@ -980,3 +980,17 @@ Each item must be confirmed against real code in the named phase PR. Deviations 
 | 26 | P5 | Artifact caps (`committed` / `inflight`): the producer reads with `(C, token)`. Caps are rebuilt from completion records only. |
 | 27 | all | Every new durable record is covered by fault points (torn/failed append poisons as today). Every refusal path has an explicit status code and a test. |
 | 28 | all | Rollout table §9.2 is re-checked against the actual phase contents before each activation phase (P3b, P4, P5). |
+
+### P3a timeline format rollout
+
+The timeline part of P3a writes 64-byte `TimelineRecEventV3` create and state
+records with `branch_seq = UINT64_MAX`. Recovery accepts the previous 16-,
+32-, 48- and 56-byte shapes, validates their original checksums, and maps
+their edges to an unbounded sequence cap. Mixed lifecycle logs keep their
+original record boundaries. Complete records with finite caps or
+`CAP_ACTIVATION` are refused until P3b supports those semantics.
+
+`posix-timeline-delete-holes` remains byte-identical as a legacy fixture;
+`posix-timeline-delete-holes-seqcap` pins timeline identity version 3 and
+checks the workload across restart. The other P3a formats, PAGE GROW history,
+and P3b activation remain pending. This rollout does not fix Bug B yet.

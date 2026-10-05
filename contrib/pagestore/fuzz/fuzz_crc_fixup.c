@@ -648,37 +648,13 @@ fixup_retention_state(uint8_t *buf, size_t len)
 	put_le32(buf + crc_off, fnv1a_step(FNV1A_INIT, buf, crc_off));
 }
 
-/* ---- timelines (pagestore_core.c TimelineRecEvent) ---------------------
- * Fixed 60-byte self-sized records (the V1/legacy shorter shape is not
- * fixed up here -- both stay readable, this just targets the current write
- * shape, still by far the common case in a mutated corpus of V2 seeds).
- * crc = FNV-1a over the whole record with crc temporarily zeroed
- * (timeline_event_crc()), so `reserved` (after crc) is part of the hash
- * input.
- *
- * Proactive audit fix (PR #303 round 3): the timelines replay loop
- * (pagestore_core.c) requires `reserved` to be exactly zero and hard-fails
- * the *entire* load otherwise (`rec.reserved != 0` -> `return -1`, not a
- * per-record skip) -- the same reserved-padding class as the forkmeta/
- * walidx snapshot manifest headers, the walidx watermark, and the wal_store
- * identity file. Zeroed here, before the crc, for the same reason.
- *
- * Codex finding on PR #303 (round 6): a gate ahead of even that one was
- * still open. load_timelines()'s outer loop (pagestore_core.c) reads only
- * an 8-byte magic+rec_len header first and requires rec_len to equal
- * exactly one of three known struct sizes (TimelineRecV2,
- * TimelineRecEventV1, or this current TimelineRecEvent shape) *before*
- * reading the rest of the record at all, let alone checking its crc -- an
- * unrecognized rec_len is not a per-record skip, it is `return -1` for the
- * *entire* file's load, the exact same "whole-file hard fail" shape as the
- * reserved-padding check just above. This function's whole design already
- * commits to treating every stride-aligned chunk as this one current
- * shape (see the file-header comment above), so rec_len is now pinned to
- * that shape's own size for the same reason `reserved` already is:
- * anything else can never satisfy load_timelines()'s outer gate regardless
- * of what the rest of the record says. magic is deliberately left
- * fuzzer-controlled -- unlike rec_len, a wrong magic is a meaningful,
- * independently fuzzable rejection this harness can still reach. */
+/* ---- timelines -------------------------------------------------------
+ * Repair framing, reserved bytes and CRC for the legacy 56-byte and
+ * current 64-byte lifecycle shapes, including mixed logs. The repaired
+ * pass pins current caps to infinity while activation is unsupported;
+ * the raw pass still exercises rejection of finite caps. Magic and the
+ * lifecycle payload remain fuzzer-controlled.
+ */
 typedef struct FuzzTimelineRecEvent
 {
 	uint32_t	magic;
@@ -697,19 +673,51 @@ typedef struct FuzzTimelineRecEvent
 static void
 fixup_timelines(uint8_t *buf, size_t len)
 {
-	size_t		stride = sizeof(FuzzTimelineRecEvent);
-	size_t		crc_off = offsetof(FuzzTimelineRecEvent, crc);
+	size_t off = 0;
+	size_t previous_stride = sizeof(FuzzTimelineRecEvent);
 
-	for (size_t off = 0; off + stride <= len; off += stride)
+	while (off + 8 <= len)
 	{
-		uint32_t	crc;
+		uint32_t framed_len = get_le32(buf + off + 4);
+		size_t stride = framed_len;
+		size_t crc_off;
+		uint32_t crc;
 
-		put_le32(buf + off + offsetof(FuzzTimelineRecEvent, rec_len),
-				 (uint32_t) stride);
-		memset(buf + off + offsetof(FuzzTimelineRecEvent, reserved), 0, 4);
+		if (stride != 56 && stride != 64)
+		{
+			int next56 = off + 56 + 8 <= len &&
+				get_le32(buf + off + 56) == get_le32(buf + off) &&
+				(get_le32(buf + off + 60) == 56 || get_le32(buf + off + 60) == 64);
+			int next64 = off + 64 + 8 <= len &&
+				get_le32(buf + off + 64) == get_le32(buf + off) &&
+				(get_le32(buf + off + 68) == 56 || get_le32(buf + off + 68) == 64);
+
+			/* A length divisible by both shapes cannot identify framing.
+			 * Prefer an intact following header, also in mixed logs. At
+			 * EOF use the remaining record size; otherwise retain the
+			 * previous shape when neither candidate has a clear header. */
+			if (next56 != next64)
+				stride = next64 ? 64 : 56;
+			else if (len - off == 56 || len - off == 64)
+				stride = len - off;
+			else if ((len - off) % 64 == 0 && (len - off) % 56 != 0)
+				stride = 64;
+			else
+				stride = previous_stride;
+		}
+		crc_off = stride - 8;
+
+		if (off + stride > len)
+			break;
+		put_le32(buf + off + 4, (uint32_t) stride);
+		if (stride == 64)
+			memset(buf + off + 48, 0xff, 8); /* branch_seq */
+		memset(buf + off + stride - 4, 0, 4);
 		put_le32(buf + off + crc_off, 0);
 		crc = fnv1a_step(FNV1A_INIT, buf + off, stride);
 		put_le32(buf + off + crc_off, crc);
+		previous_stride = stride;
+		off += stride;
 	}
 }
 
