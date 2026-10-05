@@ -231,7 +231,7 @@ def forkmeta_record_offset(path: Path, rel: int, kind: int) -> int:
     for offset in range(0, len(data) - FORKMETA_RECORD_BYTES + 1,
                         FORKMETA_RECORD_BYTES):
         record = data[offset:offset + FORKMETA_RECORD_BYTES]
-        if struct.unpack_from("=I", record, 20)[0] == rel and record[60] == kind:
+        if struct.unpack_from("=I", record, 20)[0] == rel and (record[60] & 0x3f) == kind:
             return offset
     raise FixtureError(
         f"{path.name} carries no kind-{kind} record for relation {rel}"

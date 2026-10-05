@@ -331,7 +331,7 @@ fork_meta_source_contains(const TestForkMetaRecV2 *wanted)
 			return 0;
 		if (nread != (int) sizeof(magic))
 			return -1;
-		if (magic != TEST_FORK_META_V2_MAGIC && magic != TEST_FORK_META_V3_MAGIC)
+		if (magic != TEST_FORK_META_V2_MAGIC && magic != TEST_FORK_META_V3_MAGIC && magic != 0x344d4b46U)
 			return -1;
 		{
 			TestForkMetaRecV2 rec;
@@ -2131,7 +2131,7 @@ strip_ordered_markers(const char *store, uint32_t timeline)
 			break;
 		if (n != (ssize_t) sizeof(rec) ||
 			(rec.magic != TEST_FORK_META_V2_MAGIC &&
-			 rec.magic != TEST_FORK_META_V3_MAGIC) ||
+			 rec.magic != TEST_FORK_META_V3_MAGIC && rec.magic != 0x344d4b46U) ||
 			rec.rec_len != sizeof(rec))
 		{
 			(void) close(fd);

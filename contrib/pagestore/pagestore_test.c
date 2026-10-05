@@ -2257,7 +2257,7 @@ strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
 
 		if (pread(fd, &first, sizeof(first), in) != (ssize_t) sizeof(first))
 			break;
-		if (first == TEST_FORK_META_V2_MAGIC || first == TEST_FORK_META_V3_MAGIC)
+		if (first == TEST_FORK_META_V2_MAGIC || (first == TEST_FORK_META_V3_MAGIC || first == 0x344d4b46U))
 		{
 			if (pread(fd, &rec2, sizeof(rec2), in) != (ssize_t) sizeof(rec2))
 				break;
@@ -2312,7 +2312,7 @@ strip_bound_forkmeta_markers(const char *store)
 
 		if (pread(fd, &first, sizeof(first), in) != (ssize_t) sizeof(first))
 			break;
-		if (first == TEST_FORK_META_V2_MAGIC || first == TEST_FORK_META_V3_MAGIC)
+		if (first == TEST_FORK_META_V2_MAGIC || (first == TEST_FORK_META_V3_MAGIC || first == 0x344d4b46U))
 		{
 			if (pread(fd, &rec2, sizeof(rec2), in) != (ssize_t) sizeof(rec2))
 				break;
@@ -2447,7 +2447,7 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 		check(fd >= 0 && pread(fd, &rec2, sizeof(rec2), 0) ==
 			  (ssize_t) sizeof(rec2) &&
 			  (rec2.magic == TEST_FORK_META_V2_MAGIC ||
-			   rec2.magic == TEST_FORK_META_V3_MAGIC) &&
+			   (rec2.magic == TEST_FORK_META_V3_MAGIC || rec2.magic == 0x344d4b46U)) &&
 			  rec2.kind == 4,
 			  "migration marker replaces the torn forkmeta prefix");
 		check(fd >= 0 && fstat(fd, &st) == 0 &&

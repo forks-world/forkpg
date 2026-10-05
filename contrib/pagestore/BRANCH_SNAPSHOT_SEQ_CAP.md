@@ -992,5 +992,32 @@ original record boundaries. Complete records with finite caps or
 
 `posix-timeline-delete-holes` remains byte-identical as a legacy fixture;
 `posix-timeline-delete-holes-seqcap` pins timeline identity version 3 and
-checks the workload across restart. The other P3a formats, PAGE GROW history,
-and P3b activation remain pending. This rollout does not fix Bug B yet.
+checks the workload across restart. WAL-index horizon formats, the checkpoint-fence owner, and P3b activation
+remain pending. This rollout does not fix Bug B yet.
+
+### P3a forkmeta classification and PAGE GROW rollout
+
+New source and snapshot records use forkmeta V4, with META (`0x40`) and
+UNSTAMPED (`0x80`) in the kind byte. FMS payload version 2 carries the same
+classification through checkpoint and tail. Legacy V2/V3 GROW records remain
+PAGE, and their SET/DEAD records remain META. Unknown V4 kinds, flags on
+markers, and UNSTAMPED PAGE GROW records fail closed, even with a valid CRC.
+
+IPC version 48 adds `req_floor_lsn`. Unstamped metadata mutations use the
+maximum of the existing operational placement and that floor, and persist
+UNSTAMPED. Explicit LSNs retain their existing placement. Backend relation
+requests clear the new field on channel reuse; clients still use the P0
+stamps until P4.
+
+Every PAGE append now retains a GROW event, including size-covered writes.
+Exact duplicate ordinary PAGE tuples collapse; META ZEROEXTEND no-ops still
+skip insertion. New ordered records always use GROW markers; legacy COMMIT
+markers remain readable. This adds one 40-byte in-memory event per append
+between cutovers. After successful publication, snapshot-pruned PAGE GROWs
+and inert markers are removed and indexes, prefix caches and inherited-page
+sequence maxima are rebuilt. Failed publications leave history intact.
+
+`posix-timeline-delete-holes-seqcap` remains byte-identical as legacy;
+`posix-timeline-delete-holes-forkmeta-v4` pins the current formats. The older
+`posix-forkmeta-crc` fixture was already legacy and is retained unchanged.
+Finite sequence caps remain disabled: Bug B is still a release blocker.

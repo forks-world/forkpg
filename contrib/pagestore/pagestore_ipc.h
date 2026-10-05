@@ -30,7 +30,8 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		47	/* 47: artifact publication and drop operations;
+#define PS_SHM_VERSION		48	/* 48: unstamped metadata request floor;
+								 * 47: artifact publication and drop operations;
 								 * (no bump for the additional PsArtifactRefuseReason
 								 * values or the EXTEND/WRITEV ch->result use added
 								 * after 47: that value set is append-only for the
@@ -438,6 +439,7 @@ typedef struct PsChannel
 	uint32_t	datalen;		/* WAL_APPEND: number of WAL bytes in data[] */
 	uint32_t	pad1;			/* WAL_INDEX_GET: cursor is present */
 	uint64_t	req_lsn;		/* READ_AT/WAL_APPEND: LSN; WAL_SIZE: out end LSN */
+	uint64_t	req_floor_lsn; /* unstamped metadata placement lower bound */
 	uint64_t	req_seq;		/* admission sequence; WAL_INDEX_GET cursor LSN */
 	uint64_t	incarnation;	/* expected timeline incarnation; 0 = legacy inc-1 */
 	uint64_t	request_generation;	/* monotonically advances for every published request */

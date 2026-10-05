@@ -2512,6 +2512,7 @@ FORKMETA_MANIFEST = FORKMETA_SNAPSHOTS / "forkmeta_manifest_v1"
 FORKMETA_PREPARED = FORKMETA_SNAPSHOTS / "forkmeta_prepared_v1"
 FORKMETA_V2_MAGIC = 0x324D4B46
 FORKMETA_V3_MAGIC = 0x334D4B46
+FORKMETA_V4_MAGIC = 0x344D4B46
 FORKMETA_SNAPSHOT_BASE_KIND = 10
 DELETE_BRANCH = 1
 MANIFEST_TMP = "layers.manifest.tmp"
@@ -2762,7 +2763,7 @@ def _forkmeta_timelines(store: Path) -> set[int]:
             magic, rec_len, timeline = struct.unpack_from("=III", data, offset)
             if rec_len != 64 or magic & 0x00FFFFFF != 0x4D4B46:   # "FKM?" family
                 break
-            kind = data[offset + 60]
+            kind = data[offset + 60] & 0x3f
             if kind < 10:                                        # not a snapshot marker
                 owners.add(timeline)
             offset += rec_len
@@ -2898,7 +2899,7 @@ def _forkmeta_source_head(store: Path) -> dict[str, Any] | None:
     key = struct.unpack_from("=IIIiI", record, 12)
     lsn, admission_seq, order_id = struct.unpack_from("=QQQ", record, 32)
     nblocks = struct.unpack_from("=I", record, 56)[0]
-    kind = record[60]
+    kind = record[60] & 0x3f
     pad = record[61:64]
     if not _forkmeta_record_wire_valid(record):
         return None
@@ -2922,10 +2923,18 @@ def _forkmeta_record_wire_valid(record: bytes) -> bool:
     magic, rec_len = struct.unpack_from("=II", record, 0)
     if rec_len != FORKMETA_RECORD_BYTES:
         return False
+    kind = record[60]
+    base = kind & 0x3f
+    if magic != FORKMETA_V4_MAGIC and kind != base:
+        return False
+    if magic == FORKMETA_V4_MAGIC and (
+            base > 10 or (base > 2 and kind != base) or
+            (kind & 0x80 and base == 0 and not kind & 0x40)):
+        return False
     pad = record[61:64]
     if magic == FORKMETA_V2_MAGIC:
         return pad == b"\x00\x00\x00"
-    if magic != FORKMETA_V3_MAGIC:
+    if magic not in (FORKMETA_V3_MAGIC, FORKMETA_V4_MAGIC):
         return False
     crc = 0xB704CE
     for byte in record[:61]:
@@ -2965,7 +2974,7 @@ def _forkmeta_source_records(store: Path, aligned: bool = False) -> list[dict[st
         records.append({
             "timeline": timeline, "key": struct.unpack_from("=IIIiI", record, 12),
             "lsn": lsn, "admission_seq": admission_seq, "order_id": order_id,
-            "nblocks": struct.unpack_from("=I", record, 56)[0], "kind": record[60],
+            "nblocks": struct.unpack_from("=I", record, 56)[0], "kind": record[60] & 0x3f,
         })
     return records
 
@@ -3112,7 +3121,7 @@ def _forkmeta_part_framing(store: Path, record: dict[str, Any], part: str) -> st
     if header is None:
         return f"{path.name} is shorter than its payload header"
     expected_index = 0 if part == "checkpoint" else 1
-    if header["magic"] != FORKMETA_PAYLOAD_MAGIC or header["version"] != 1 or \
+    if header["magic"] != FORKMETA_PAYLOAD_MAGIC or header["version"] not in (1, 2) or \
             header["header_bytes"] != FORKMETA_PAYLOAD_HEADER_BYTES or \
             header["record_bytes"] != FORKMETA_RECORD_BYTES or \
             header["part"] != expected_index or \
@@ -3178,7 +3187,7 @@ def _forkmeta_part_records(store: Path, record: dict[str, Any], part: str) -> li
             "lsn": struct.unpack_from("=Q", chunk, 32)[0],
             "admission_seq": struct.unpack_from("=Q", chunk, 40)[0],
             "order_id": struct.unpack_from("=Q", chunk, 48)[0],
-            "nblocks": struct.unpack_from("=I", chunk, 56)[0], "kind": chunk[60],
+            "nblocks": struct.unpack_from("=I", chunk, 56)[0], "kind": chunk[60] & 0x3f,
             "pad": chunk[61:64],
         })
     return records
@@ -3445,7 +3454,7 @@ def _forkmeta_event_records(store: Path, selected: dict[str, Any] | None,
             rel_number = struct.unpack_from("=I", data, offset + 20)[0]
             record_lsn = struct.unpack_from("=Q", data, offset + 32)[0]
             record_nblocks = struct.unpack_from("=I", data, offset + 56)[0]
-            if data[offset + 60] == kind and rel_number == rel and record_lsn == lsn:
+            if (data[offset + 60] & 0x3f) == kind and rel_number == rel and record_lsn == lsn:
                 if record_nblocks != nblocks:
                     raise OracleMismatch(
                         f"a record of relation {rel}'s event at {lsn} carries {record_nblocks} "

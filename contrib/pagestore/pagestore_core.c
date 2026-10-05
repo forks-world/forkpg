@@ -4330,8 +4330,8 @@ typedef struct ForkEvent
 								 * fork_event_compact_dropped_markers()).
 								 * The other bits classify the event for the
 								 * BRANCH_SNAPSHOT_SEQ_CAP.md S1.1/S1.3 rule;
-								 * they are in-memory-only, recomputed on
-								 * load exactly like the flag they replace,
+								 * META and UNSTAMPED are persisted;
+								 * META_FIRST is recomputed on load,
 								 * and have no effect while every ViewCap's
 								 * seq stays PS_SEQ_UNBOUNDED (P1). */
 } ForkEvent;
@@ -4352,6 +4352,11 @@ _Static_assert(sizeof(ForkEvent) == 40, "ForkEvent grew past its padding");
 #define FEV_SEG_ID 9			/* second record carrying a bound marker's identity */
 #define FEV_SNAPSHOT_BASE 10	/* source-log epoch marker after snapshot cutover */
 
+/* V4 kind-byte classification; marker kinds never carry these flags. */
+#define FEV_W_META 0x40
+#define FEV_W_UNSTAMPED 0x80
+#define FEV_KIND(k) ((k) & 0x3f)
+
 /* ForkEvent.flags bits (design doc S3.2). */
 #define FEV_F_SNAPSHOT_DROPPED	0x01	/* former snapshot_dropped byte */
 #define FEV_F_META				0x02	/* SET/DEAD, or a ZEROEXTEND-origin GROW */
@@ -4361,17 +4366,7 @@ _Static_assert(FEV_F_META == PS_ADM_F_META &&
 			   "FEV_F_* must track pagestore_admissible.h's PS_ADM_F_* "
 			   "bit for bit -- fork_event_hidden() passes ForkEvent.flags "
 			   "straight through with no translation");
-#define FEV_F_UNSTAMPED			0x08	/* a WAL-less (req_lsn == 0) op's event.
-										 * No setter yet in P1: the classifier
-										 * (fork_event_hidden()) and tests
-										 * already handle it, but nothing sets
-										 * it in memory ahead of persisting it,
-										 * to avoid a memory/disk disagreement
-										 * across a restart.  The setter lands
-										 * in P4 together with the persisted
-										 * flag and the client's req_lsn == 0 +
-										 * req_floor_lsn switch (design doc
-										 * S5). */
+#define FEV_F_UNSTAMPED			0x08 /* persisted req_lsn == 0 classification */
 _Static_assert(FEV_F_UNSTAMPED == PS_ADM_F_UNSTAMPED,
 			   "FEV_F_UNSTAMPED must track PS_ADM_F_UNSTAMPED");
 
@@ -6827,11 +6822,36 @@ fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 			   uint32_t nblocks, uint8_t kind, bool meta)
 {
 	uint32_t	i;
-	bool		is_meta = (kind == FEV_SET || kind == FEV_DEAD) ? true : meta;
+	uint8_t wire_flags = kind & (FEV_W_META | FEV_W_UNSTAMPED);
+	bool is_meta;
 
-	if (!fork_event_cache_defer && kind == FEV_GROW &&
+	kind = FEV_KIND(kind);
+	is_meta = kind == FEV_SET || kind == FEV_DEAD || meta ||
+		(wire_flags & FEV_W_META);
+
+	if (!fork_event_cache_defer && is_meta && kind == FEV_GROW &&
 		fork_size_asof_hop(e, lsn, admission_seq) >= nblocks)
 		return false;
+	if (kind == FEV_GROW && !is_meta)
+	{
+		uint32_t end = fork_event_index_usable(e, admission_seq) ?
+			fork_event_upper_bound(e, lsn, admission_seq) : e->nev;
+
+		for (uint32_t j = end; j > 0; j--)
+		{
+			const ForkEvent *v = &e->ev[j - 1];
+
+			if (v->lsn < lsn)
+				break;
+			if (v->lsn == lsn && v->admission_seq == admission_seq &&
+				v->kind == FEV_GROW && v->marker_kind == 0 &&
+				v->nblocks == nblocks && !(v->flags & FEV_F_META))
+				return false;
+			if (fork_event_index_usable(e, admission_seq) &&
+				v->admission_seq < admission_seq)
+				break;
+		}
+	}
 	if (kind != FEV_GROW && lsn > e->last_def_lsn)
 		e->last_def_lsn = lsn;
 	if (e->nev == e->evcap)
@@ -6846,7 +6866,8 @@ fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->ev[i].marker_kind = 0;
-	e->ev[i].flags = is_meta ? FEV_F_META : 0;
+	e->ev[i].flags = (is_meta ? FEV_F_META : 0) |
+		(wire_flags & FEV_W_UNSTAMPED ? FEV_F_UNSTAMPED : 0);
 	e->nev++;
 	if (admission_seq == 0)
 		e->nlegacy_seq++;
@@ -7096,7 +7117,7 @@ fork_event_adopt_orphaned_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
  * and recover()'s deferred look-ahead): fe exists, the record's identity is
  * nonzero and fork_meta_orphan_proven() (a necessary filter only -- see its
  * header comment), and the fork's size at this position already covers the
- * block -- the same decision the live write made (segment_grows == 0) --
+ * block -- the same decision the live write made (extends_uncapped == 0) --
  * with no event already occupying this exact (lsn, admission_seq).  An
  * inert marker never contributes to fork_size_asof_hop() (only GROW/SET/DEAD
  * do), so the only effect of admitting it is to admit the page version.
@@ -8129,6 +8150,26 @@ ps_test_fork_event_scan_steps(void)
 	return fork_event_scan_steps;
 }
 
+/* Test-only: classification reconstructed for an exact admitted event. */
+int
+ps_test_fork_event_flags(uint32_t timeline, const PsKey *key, uint64_t seq)
+{
+	uint32_t shard = ps_shard_of(key);
+	ForkEnt *e;
+	int flags = -1;
+
+	ps_lock_shard_rd(shard);
+	e = fork_find(timeline, key);
+	for (uint32_t i = 0; e != NULL && i < e->nev; i++)
+		if (e->ev[i].admission_seq == seq)
+		{
+			flags = e->ev[i].flags & (FEV_F_META | FEV_F_UNSTAMPED);
+			break;
+		}
+	ps_unlock_shard(shard);
+	return flags;
+}
+
 /* Test-only: current event counts for one fork, under the shard read lock
  * like ps_test_page_version_count(). */
 int
@@ -8185,9 +8226,10 @@ ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
  */
 static int
 fork_grow_with_seq(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
-				   uint64_t lsn, uint64_t admission_seq)
+				   uint64_t lsn, uint64_t admission_seq, bool unstamped)
 {
 	ForkEnt    *e = fork_get_or_create(timeline, key);
+	uint8_t kind = FEV_GROW | FEV_W_META | (unstamped ? FEV_W_UNSTAMPED : 0);
 
 	/*
 	 * Zeroextend has no page record from which recovery can reconstruct its
@@ -8198,9 +8240,9 @@ fork_grow_with_seq(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 	if (fork_size_asof_hop(e, lsn, admission_seq) >= to_nblocks)
 		return 0;			/* no-op: already at or above to_nblocks */
 	if (fork_meta_persist(timeline, key, lsn, admission_seq, to_nblocks,
-						  FEV_GROW) != 0)
+						  kind) != 0)
 		return -1;			/* not durable: do not apply in memory */
-	fork_event_add(e, lsn, admission_seq, to_nblocks, FEV_GROW, true);
+	fork_event_add(e, lsn, admission_seq, to_nblocks, kind, true);
 	return 1;
 }
 
@@ -8217,7 +8259,7 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 		return -1;
 	/* Callers of fork_grow() only need success/failure, not the
 	 * applied-vs-no-op distinction; collapse both non-error outcomes to 0. */
-	return fork_grow_with_seq(timeline, key, to_nblocks, lsn, admission_seq) < 0 ?
+	return fork_grow_with_seq(timeline, key, to_nblocks, lsn, admission_seq, lsn == 0) < 0 ?
 		-1 : 0;
 }
 
@@ -9622,8 +9664,9 @@ typedef struct ForkMetaRecV1
 
 #define FORK_META_V2_MAGIC 0x324d4b46 /* "FKM2": no record checksum (accepted) */
 #define FORK_META_V3_MAGIC 0x334d4b46 /* "FKM3": V2 layout, pad carries CRC-24 */
+#define FORK_META_V4_MAGIC 0x344d4b46 /* "FKM4": V3 layout, durable event flags */
 #define FORK_META_SNAPSHOT_PAYLOAD_MAGIC 0x31534d46 /* "FMS1" */
-#define FORK_META_SNAPSHOT_PAYLOAD_VERSION 1
+#define FORK_META_SNAPSHOT_PAYLOAD_VERSION 2
 #define FORK_META_SNAPSHOT_CHECKPOINT 0
 #define FORK_META_SNAPSHOT_TAIL 1
 
@@ -9686,7 +9729,9 @@ fork_meta_rec_seal(ForkMetaRecV2 *rec)
 {
 	uint32_t	crc;
 
-	rec->magic = FORK_META_V3_MAGIC;
+	rec->magic = FORK_META_V4_MAGIC;
+	if (FEV_KIND(rec->kind) == FEV_SET || FEV_KIND(rec->kind) == FEV_DEAD)
+		rec->kind |= FEV_W_META;
 	crc = fork_meta_rec_crc24(rec);
 	rec->pad[0] = (uint8_t) (crc >> 16);
 	rec->pad[1] = (uint8_t) (crc >> 8);
@@ -9696,7 +9741,8 @@ fork_meta_rec_seal(ForkMetaRecV2 *rec)
 static int
 fork_meta_magic_v2_family(uint32_t magic)
 {
-	return magic == FORK_META_V2_MAGIC || magic == FORK_META_V3_MAGIC;
+	return magic == FORK_META_V2_MAGIC || magic == FORK_META_V3_MAGIC ||
+		magic == FORK_META_V4_MAGIC;
 }
 
 /* Layout and checksum validity of a record read from the source log or a
@@ -9706,9 +9752,17 @@ fork_meta_rec_wire_valid(const ForkMetaRecV2 *rec)
 {
 	if (rec->rec_len != sizeof(*rec))
 		return 0;
+	if (rec->magic != FORK_META_V4_MAGIC && rec->kind != FEV_KIND(rec->kind))
+		return 0;
+	if (rec->magic == FORK_META_V4_MAGIC &&
+		(FEV_KIND(rec->kind) > FEV_SNAPSHOT_BASE ||
+		 (FEV_KIND(rec->kind) > FEV_DEAD && rec->kind != FEV_KIND(rec->kind)) ||
+		 ((rec->kind & FEV_W_UNSTAMPED) && FEV_KIND(rec->kind) == FEV_GROW &&
+		  !(rec->kind & FEV_W_META))))
+		return 0;
 	if (rec->magic == FORK_META_V2_MAGIC)
 		return rec->pad[0] == 0 && rec->pad[1] == 0 && rec->pad[2] == 0;
-	if (rec->magic == FORK_META_V3_MAGIC)
+	if (rec->magic == FORK_META_V3_MAGIC || rec->magic == FORK_META_V4_MAGIC)
 	{
 		uint32_t	crc = fork_meta_rec_crc24(rec);
 
@@ -9799,7 +9853,7 @@ fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 
 	if (fork_meta_poisoned_load())
 		return -1;
-	if (kind <= FEV_DEAD && !fork_meta_mutation_future(lsn, admission_seq))
+	if (FEV_KIND(kind) <= FEV_DEAD && !fork_meta_mutation_future(lsn, admission_seq))
 		return -1;
 
 	memset(&rec, 0, sizeof(rec));
@@ -10263,9 +10317,9 @@ fork_meta_snapshot_record_valid(const ForkMetaRecV2 *records, uint64_t index,
 	if (!fork_meta_rec_wire_valid(rec) ||
 		rec->timeline >= MAX_TIMELINES ||
 		rec->key.klass > PS_KLASS_ARTIFACT ||
-		(!ordered_marker && (rec->kind > FEV_DEAD || rec->order_id != 0)) ||
+		(!ordered_marker && (FEV_KIND(rec->kind) > FEV_DEAD || rec->order_id != 0)) ||
 		(ordered_marker && !fork_meta_ordered_marker_valid(rec, 1)) ||
-		(rec->kind == FEV_DEAD && rec->nblocks != 0))
+		(FEV_KIND(rec->kind) == FEV_DEAD && rec->nblocks != 0))
 	{
 		fprintf(stderr, "pagestore: invalid forkmeta snapshot record part=%u index=%llu kind=%u timeline=%u\n",
 				part, (unsigned long long) index, rec->kind, rec->timeline);
@@ -10392,7 +10446,8 @@ fork_meta_snapshot_load(const char *directory)
 			goto fail;
 		memcpy(&headers[part], data[part], sizeof(headers[part]));
 		if (headers[part].magic != FORK_META_SNAPSHOT_PAYLOAD_MAGIC ||
-			headers[part].version != FORK_META_SNAPSHOT_PAYLOAD_VERSION ||
+			(headers[part].version != 1 &&
+			 headers[part].version != FORK_META_SNAPSHOT_PAYLOAD_VERSION) ||
 			headers[part].header_bytes != sizeof(headers[part]) ||
 			headers[part].part != part ||
 			headers[part].record_bytes != sizeof(ForkMetaRecV2) ||
@@ -10453,9 +10508,8 @@ fork_meta_snapshot_load(const char *directory)
 					records[i].lsn, records[i].nblocks, records[i].kind,
 					records[i].order_id, records[i].admission_seq);
 			else
-				/* Legacy V2/V3 forkmeta carries no META/PAGE distinction
-				 * (design doc S4.2): SET/DEAD are always META regardless of
-				 * this argument, and a plain FEV_GROW is PAGE-class here. */
+				/* fork_event_add decodes V4 flags. Legacy V2/V3 SET/DEAD
+				 * are META and plain GROW is PAGE (design doc S4.2). */
 				fork_event_add(fork_get_or_create(records[i].timeline, &records[i].key),
 							   records[i].lsn, records[i].admission_seq,
 							   records[i].nblocks, records[i].kind, false);
@@ -10505,7 +10559,7 @@ fork_meta_selected_suffix_valid(const ForkMetaRecV2 *rec)
 								fork_meta_snapshot_cutoff_lsn,
 								fork_meta_snapshot_cutoff_seq))
 		return 0;
-	switch (rec->kind)
+	switch (FEV_KIND(rec->kind))
 	{
 		case FEV_GROW:
 			return rec->order_id == 0 && rec->nblocks != 0;
@@ -10805,7 +10859,7 @@ load_fork_meta(void)
 				fork_get_or_create(rec.timeline, &rec.key),
 				rec.lsn, rec.nblocks, rec.kind, rec.order_id,
 				rec.admission_seq);
-		else if (rec.kind <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
+		else if (FEV_KIND(rec.kind) <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
 		{
 			/* Legacy record: same S4.2 mapping as the snapshot-payload path
 			 * above. */
@@ -11468,6 +11522,7 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						events[j].admission_seq = e->ev[i].admission_seq;
 						events[j].nblocks = e->ev[i].nblocks;
 						events[j].kind = e->ev[i].kind;
+						events[j].flags = e->ev[i].flags;
 						indices[j++] = i;
 					}
 				if (!preserve_survivors)
@@ -11596,22 +11651,15 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 					}
 					else
 					{
-						/* Not emitted into either part of this generation.  An
-						 * inert marker (kind > FEV_DEAD) that lands here is
-						 * gone from every durable source once this build
-						 * commits; fork_event_compact_dropped_markers() drops
-						 * it from memory too, right after that commit
-						 * succeeds, so memory keeps matching what the next
-						 * boot rebuilds.  A pruned GROW/SET/DEAD (kind <=
-						 * FEV_DEAD, !keep[i]) also lands here and gets the
-						 * flag, but the compaction pass ignores it (it only
-						 * acts on kind > FEV_DEAD): those stay bounded by
-						 * distinct sizes already, per the header comment
-						 * above fork_event_add(). */
+						/* Remove pruned PAGE GROWs and inert markers from
+						 * memory only after this generation commits. */
 						event->flags |= FEV_F_SNAPSHOT_DROPPED;
 						continue;
 					}
 
+					if (kind <= FEV_DEAD)
+						kind |= (event->flags & FEV_F_META ? FEV_W_META : 0) |
+							(event->flags & FEV_F_UNSTAMPED ? FEV_W_UNSTAMPED : 0);
 					if (fork_meta_vec_record(future ? tail : checkpoint,
 							e->timeline, &e->key, event->lsn,
 							event->admission_seq, order_id,
@@ -11684,37 +11732,9 @@ fail_entry:
 	return 0;
 }
 
-/*
- * Compact one fork's event array in place: drop every event the per-entry
- * loop above just flagged (snapshot_dropped == 1) that is also an inert
- * ordered marker (kind > FEV_DEAD, i.e. never activated to a size event --
- * an activated GROW/SET/DEAD is never flagged, and a pruned GROW/SET/DEAD
- * is flagged but left alone here; see the comment at the flag site).  The
- * remaining events keep their relative order and every cached_* value
- * unchanged: an inert marker never enters the cached prefix fold
- * (fork_event_cache_from() only folds GROW/SET/DEAD) and never sits in
- * def_idx, so removing it changes nothing about any surviving event except
- * its own array slot.  def_idx is rebuilt from the compacted array (a
- * single pass; its capacity only shrinks or stays the same, never grows).
- * A removed event can carry admission_seq == 0 (a legacy V1 record), in
- * which case nlegacy_seq is decremented to match; this can legitimately
- * drive nlegacy_seq to 0 and re-enable the (lsn, admission_seq) position
- * index for this fork (fork_event_index_usable()) for the rest of this
- * daemon lifetime.  That transition is safe: every insertion still goes
- * through fork_event_insert_pos(), which keeps the array in tuple order
- * for every event with a nonzero admission_seq regardless of nlegacy_seq;
- * live admission sequences are allocated monotonically under the shard
- * write lock, so nothing already in the array can insert out of order
- * later; loaded records replay V1 (legacy, seq 0) before V2 (nonzero seq,
- * assigned in increasing order) and each snapshot part is sorted by
- * ascending nonzero seq before append, so the array a legacy fork loads
- * with is already exactly the order the index needs; and a seq-0 event
- * that is a GROW/SET/DEAD (kind <= FEV_DEAD) is never a candidate for
- * removal here (only kind > FEV_DEAD is), so nlegacy_seq only reaches 0
- * once every seq-0 event still in the array is gone -- at that point no
- * interior seq-0 event is left to violate the index's ordering guarantee.
- * O(e->nev); called once per fork per successful cutover.
- */
+/* Drop snapshot-pruned inert markers and PAGE GROW events only after a
+ * successful durable cutover. META history stays intact until capped
+ * pruning is activated. Rebuild every array index and prefix cache below. */
 static void
 fork_event_compact_entry(ForkEnt *e)
 {
@@ -11722,7 +11742,9 @@ fork_event_compact_entry(ForkEnt *e)
 
 	for (uint32_t i = 0; i < e->nev; i++)
 	{
-		if ((e->ev[i].flags & FEV_F_SNAPSHOT_DROPPED) && e->ev[i].kind > FEV_DEAD)
+		if ((e->ev[i].flags & FEV_F_SNAPSHOT_DROPPED) &&
+			(e->ev[i].kind > FEV_DEAD ||
+			 (e->ev[i].kind == FEV_GROW && !(e->ev[i].flags & FEV_F_META))))
 		{
 			if (e->ev[i].admission_seq == 0)
 				e->nlegacy_seq--;
@@ -11742,8 +11764,8 @@ fork_event_compact_entry(ForkEnt *e)
 			e->def_idx[e->ndef++] = i;
 	/* late_meta_idx stores array indexes too; META_FIRST itself travelled
 	 * with each surviving event above, so only the index list needs
-	 * rebuilding (kind <= FEV_DEAD events, which is every META event, are
-	 * never dropped by this pass, so no event's META_FIRST status changes
+	 * rebuilding (META events are never dropped by this pass, so no
+	 * event's META_FIRST status changes
 	 * -- only its slot). */
 	e->nlate_meta = 0;
 	for (uint32_t i = 0; i < e->nev; i++)
@@ -11757,6 +11779,18 @@ fork_event_compact_entry(ForkEnt *e)
 			}
 			e->late_meta_idx[e->nlate_meta++] = i;
 		}
+	fork_event_cache_from(e, 0);
+	e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
+	e->max_inherited_page_seq = 0;
+	{
+		bool has_range;
+		uint64_t B = timeline_inherited_below(e->timeline, &has_range);
+
+		for (uint32_t i = 0; has_range && i < e->nev; i++)
+			if (e->ev[i].kind == FEV_GROW && !(e->ev[i].flags & FEV_F_META) &&
+				e->ev[i].lsn <= B && e->ev[i].admission_seq > e->max_inherited_page_seq)
+				e->max_inherited_page_seq = e->ev[i].admission_seq;
+	}
 	PS_ASSERT(fork_event_check_order(e));
 }
 
@@ -15879,9 +15913,9 @@ fork_meta_source_record_valid(const ForkMetaRecV2 *rec)
 		rec->kind <= FEV_SEG_COMMIT_BOUND;
 	if (ordered_marker)
 		return fork_meta_ordered_marker_valid(rec, 1);
-	if (rec->kind <= FEV_DEAD)
+	if (FEV_KIND(rec->kind) <= FEV_DEAD)
 		return rec->order_id == 0 &&
-			(rec->kind != FEV_DEAD || rec->nblocks == 0);
+			(FEV_KIND(rec->kind) != FEV_DEAD || rec->nblocks == 0);
 	if (rec->kind == FEV_MIGRATING || rec->kind == FEV_MIGRATED)
 	{
 		memset(&zero_key, 0, sizeof(zero_key));
@@ -18504,7 +18538,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	admission_seq;
 	int			clamped = 0;
 	int			ordered_record = 0;
-	int			segment_grows = 0;
+	int			extends_uncapped = 0;
 	int			zero_version = 0;
 	Shard	   *s;
 	ForkEnt    *fe;
@@ -18738,12 +18772,12 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	hdr_grow_lsn = hdr.lsn;
 	page_version = zero_version ? 0 : hdr.lsn;
-	segment_grows = (!fe ||
+	extends_uncapped = (!fe ||
 		fork_size_asof_hop(fe, hdr_grow_lsn, admission_seq) < block + 1);
 	/* An ordered body is acknowledged only together with its bound marker.
 	 * Reject an inadmissible tuple before either header or page bytes reach the
 	 * segment, even when this is a non-growth commit marker. */
-	if ((ordered_record || segment_grows) &&
+	if ((ordered_record || extends_uncapped) &&
 		!fork_meta_mutation_future(hdr_grow_lsn, admission_seq))
 	{
 		*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
@@ -18803,7 +18837,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 */
 	if (ordered_record &&
 		fork_meta_persist_segment(timeline, key, hdr_grow_lsn, block + 1,
-								  segment_grows ? FEV_SEG_GROW : FEV_SEG_COMMIT,
+								  FEV_SEG_GROW,
 								  order_id, admission_seq) != 0)
 	{
 		/* The complete body is not committed without its marker.  Retire this
@@ -18878,16 +18912,14 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * cutover would then publish a plain GROW that recovery can no longer
 	 * match.  Insert exactly what recovery itself rebuilds instead: add the
 	 * bound marker and activate it against this page record.  The marker
-	 * kind must mirror the one just persisted above (same segment_grows
-	 * expression).
+	 * kind mirrors the GROW marker persisted above for every ordered page.
 	 */
 	if (ordered_record)
 	{
 		ForkEnt    *ofe = fork_get_or_create(timeline, key);
 
 		fork_event_add_seg_marker(ofe, hdr_grow_lsn, block + 1,
-								  segment_grows ? FEV_SEG_GROW_BOUND :
-								  FEV_SEG_COMMIT_BOUND,
+								  FEV_SEG_GROW_BOUND,
 								  order_id, admission_seq);
 		(void) fork_event_activate_seg(ofe, hdr_grow_lsn, block + 1,
 									   order_id, admission_seq);
@@ -21807,7 +21839,8 @@ fail:
  * unstamped callers).
  */
 static uint64_t
-fork_op_lsn(uint32_t timeline, const PsKey *key, uint64_t req_lsn)
+fork_op_lsn(uint32_t timeline, const PsKey *key, uint64_t req_lsn,
+			uint64_t req_floor_lsn)
 {
 	uint64_t	newest;
 
@@ -21823,8 +21856,10 @@ fork_op_lsn(uint32_t timeline, const PsKey *key, uint64_t req_lsn)
 	 * rejected below the cutoff by fork_meta_mutation_future(). */
 	if (fork_meta_snapshot_generation != 0 &&
 		newest < fork_meta_snapshot_cutoff_lsn)
-		return fork_meta_snapshot_cutoff_lsn;
-	return newest == UINT64_MAX ? UINT64_MAX : newest + 1;
+		newest = fork_meta_snapshot_cutoff_lsn;
+	else if (newest != UINT64_MAX)
+		newest++;
+	return newest < req_floor_lsn ? req_floor_lsn : newest;
 }
 
 /* Caller holds map_lock for writing and the global admission write lock. */
@@ -22101,7 +22136,7 @@ ps_handle_meta(PsChannel *ch)
 						break;
 				}
 
-				lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
+				lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn, ch->req_floor_lsn);
 				/* XLogReadBufferExtended() asks smgr to ensure the relation fork
 				 * exists before applying every redo record.  That call has the
 				 * record's LSN but is not a relation-creation record: if the fork
@@ -22127,11 +22162,11 @@ ps_handle_meta(PsChannel *ch)
 				}
 				if (!fork_has_create_at(e, lsn))
 				{
-					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET) != 0)
+					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0)) != 0)
 						ch->status = PS_STATUS_ERROR;
 					else
 					{
-						fork_event_add(e, lsn, seq, 0, FEV_SET, true);
+						fork_event_add(e, lsn, seq, 0, FEV_SET | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0), true);
 						if (delayed)
 							fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 						ch->req_seq = seq;
@@ -22201,7 +22236,7 @@ ps_handle_meta(PsChannel *ch)
 			 */
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
-				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
+				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn, ch->req_floor_lsn);
 				uint64_t	seq = admission_seq_alloc();
 				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
 
@@ -22210,11 +22245,11 @@ ps_handle_meta(PsChannel *ch)
 					ch->status = PS_STATUS_ERROR;
 					break;
 				}
-				if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_DEAD) != 0)
+				if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_DEAD | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0)) != 0)
 					ch->status = PS_STATUS_ERROR;
 				else
 				{
-					fork_event_add(e, lsn, seq, 0, FEV_DEAD, true);
+					fork_event_add(e, lsn, seq, 0, FEV_DEAD | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0), true);
 					if (delayed)
 						fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 					ch->req_seq = seq;
@@ -22266,7 +22301,7 @@ ps_handle_meta(PsChannel *ch)
 			 */
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
-				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
+				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn, ch->req_floor_lsn);
 				uint64_t	seq = admission_seq_alloc();
 				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
 
@@ -22276,11 +22311,11 @@ ps_handle_meta(PsChannel *ch)
 					break;
 				}
 				if (fork_meta_persist(tl, &ch->key, lsn, seq, ch->nblocks,
-								  FEV_SET) != 0)
+								  FEV_SET | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0)) != 0)
 					ch->status = PS_STATUS_ERROR;
 				else
 				{
-					fork_event_add(e, lsn, seq, ch->nblocks, FEV_SET, true);
+					fork_event_add(e, lsn, seq, ch->nblocks, FEV_SET | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0), true);
 					if (delayed)
 						fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 					ch->req_seq = seq;
@@ -22305,7 +22340,7 @@ ps_handle_meta(PsChannel *ch)
 			 * otherwise harmless (nothing references it).
 			 */
 			{
-				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
+				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn, ch->req_floor_lsn);
 				uint64_t	seq = admission_seq_alloc();
 				uint32_t	to = ch->blocknum + ch->nblocks;
 				int			grew;
@@ -22319,7 +22354,7 @@ ps_handle_meta(PsChannel *ch)
 					ch->status = PS_STATUS_ERROR;
 					break;
 				}
-				grew = fork_grow_with_seq(tl, &ch->key, to, lsn, seq);
+				grew = fork_grow_with_seq(tl, &ch->key, to, lsn, seq, ch->req_lsn == 0);
 				if (grew < 0)
 					ch->status = PS_STATUS_ERROR;
 				else
@@ -24798,7 +24833,8 @@ ps_core_format_identities(const PsFormatIdentity **out)
 		{"walidx_frontier", "walidx-prune.frontiers", PS_WALIDX_FRONTIER_MAGIC,
 		 PS_WALIDX_FRONTIER_VERSION},
 		{"timelines", "timelines record", TIMELINE_META_V2_MAGIC, 3},
-		{"forkmeta", "forkmeta record", FORK_META_V3_MAGIC, 3},
+		{"forkmeta", "forkmeta record", FORK_META_V4_MAGIC, 4},
+		{"forkmeta", "forkmeta record (accepted legacy)", FORK_META_V3_MAGIC, 3},
 		{"forkmeta", "forkmeta record (accepted legacy)", FORK_META_V2_MAGIC, 2},
 		{"forkmeta_snapshot", "forkmeta checkpoint/tail payload",
 		 FORK_META_SNAPSHOT_PAYLOAD_MAGIC, FORK_META_SNAPSHOT_PAYLOAD_VERSION},
