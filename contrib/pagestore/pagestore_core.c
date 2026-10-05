@@ -936,6 +936,10 @@ admission_seq_observe(uint64_t seq)
 {
 	uint64_t	next = __atomic_load_n(&next_admission_seq, __ATOMIC_RELAXED);
 
+	/* Unbounded view caps are not allocated admission identities. */
+	if (seq == UINT64_MAX)
+		return;
+
 	while (next <= seq && next != UINT64_MAX &&
 		   !__atomic_compare_exchange_n(&next_admission_seq, &next,
 								 seq == UINT64_MAX ? UINT64_MAX : seq + 1,
@@ -13516,8 +13520,10 @@ wal_recover_one(uint32_t tl)
 #define WALIDX_SNAPSHOT_PAYLOAD_VERSION_V1 1
 #define WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 2
 #define WALIDX_SNAPSHOT_PAYLOAD_BYTES_V1 64
-#define WALIDX_SNAPSHOT_PAYLOAD_VERSION 3
-#define WALIDX_SNAPSHOT_PAYLOAD_BYTES 72
+#define WALIDX_SNAPSHOT_PAYLOAD_VERSION_V3 3
+#define WALIDX_SNAPSHOT_PAYLOAD_BYTES_V3 72
+#define WALIDX_SNAPSHOT_PAYLOAD_VERSION 4
+#define WALIDX_SNAPSHOT_PAYLOAD_BYTES 80
 #define WALIDX_SNAPSHOT_DEFAULT_TRIGGER (1024u * 1024u)
 
 typedef struct WalIdxLogHdr
@@ -13570,7 +13576,12 @@ typedef struct WalIdxProgressRec
 	uint64_t	end_lsn;
 	uint64_t	shard_mask[2];
 	uint64_t	shard_offsets[PS_MAX_CHANNELS];
+	uint64_t	horizon_seq;
 } WalIdxProgressRec;
+
+#define WALIDX_PROGRESS_BYTES_V1 offsetof(WalIdxProgressRec, horizon_seq)
+_Static_assert(sizeof(WalIdxProgressRec) == WALIDX_PROGRESS_BYTES_V1 + 8,
+			   "progress v2 appends exactly one horizon sequence cap");
 
 static uint64_t walidx_progress[MAX_TIMELINES];
 static unsigned char walidx_progress_valid[MAX_TIMELINES];
@@ -14137,9 +14148,15 @@ walidx_progress_crc(WalIdxProgressRec *rec)
 	uint32_t	crc;
 
 	rec->crc = 0;
-	crc = fnv(rec, sizeof(*rec));
+	crc = fnv(rec, rec->rec_len);
 	rec->crc = save;
 	return crc;
+}
+
+void
+ps_test_admission_seq_observe(uint64_t seq)
+{
+	admission_seq_observe(seq);
 }
 
 static void
@@ -16420,6 +16437,7 @@ walidx_snapshot_encode_header(unsigned char out[WALIDX_SNAPSHOT_PAYLOAD_BYTES],
 	walidx_put_le64(out + 48, source_offset);
 	walidx_put_le64(out + 56, log_epoch);
 	walidx_put_le32(out + 68, (uint32_t) (nrecords >> 32));
+	walidx_put_le64(out + 72, PS_SEQ_UNBOUNDED);
 	crc = fnv(out, WALIDX_SNAPSHOT_PAYLOAD_BYTES);
 	walidx_put_le32(out + 64, crc);
 }
@@ -16450,6 +16468,9 @@ walidx_snapshot_decode_header(const unsigned char *header, uint64_t available,
 	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 &&
 			 bytes == WALIDX_SNAPSHOT_PAYLOAD_BYTES_V1)
 		crc_offset = 56;
+	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V3 &&
+			 bytes == WALIDX_SNAPSHOT_PAYLOAD_BYTES_V3)
+		crc_offset = 64;
 	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION &&
 			 bytes == WALIDX_SNAPSHOT_PAYLOAD_BYTES)
 		crc_offset = 64;
@@ -16469,15 +16490,17 @@ walidx_snapshot_decode_header(const unsigned char *header, uint64_t available,
 		walidx_get_le64(copy + 40) != end_lsn ||
 		(version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V1 &&
 		 walidx_get_le32(copy + 60) != 0) ||
+		(version == WALIDX_SNAPSHOT_PAYLOAD_VERSION &&
+		 walidx_get_le64(copy + 72) != PS_SEQ_UNBOUNDED) ||
 		fnv(copy, bytes) != stored_crc)
 		return -1;
 	*header_bytes = bytes;
-	*record_bytes = version == WALIDX_SNAPSHOT_PAYLOAD_VERSION ?
+	*record_bytes = version >= WALIDX_SNAPSHOT_PAYLOAD_VERSION_V3 ?
 		sizeof(WalIdxRec) : sizeof(WalIdxRecV1);
 	*nrecords = walidx_get_le32(copy + 20);
 	if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2)
 		*nrecords |= (uint64_t) walidx_get_le32(copy + 60) << 32;
-	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION)
+	else if (version >= WALIDX_SNAPSHOT_PAYLOAD_VERSION_V3)
 		*nrecords |= (uint64_t) walidx_get_le32(copy + 68) << 32;
 	*source_offset = walidx_get_le64(copy + 48);
 	*log_epoch = version >= WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 ?
@@ -16486,6 +16509,25 @@ walidx_snapshot_decode_header(const unsigned char *header, uint64_t available,
 		(*log_epoch != generation || *source_offset != 0))
 		return -1;
 	return 0;
+}
+
+/* Test the private wire codec with a valid CRC, including old V3 headers. */
+int
+ps_test_walidx_snapshot_horizon_header(uint32_t version, uint64_t seq)
+{
+	unsigned char header[WALIDX_SNAPSHOT_PAYLOAD_BYTES];
+	uint32_t header_bytes, record_bytes;
+	uint64_t nrecords, source_offset, log_epoch;
+	uint32_t bytes = version == 3 ? 72 : 80;
+
+	walidx_snapshot_encode_header(header, 0, 0, 0, 1, 0, 16384, 0, 1);
+	walidx_put_le32(header + 4, version);
+	walidx_put_le32(header + 8, bytes);
+	walidx_put_le64(header + 72, seq);
+	walidx_put_le32(header + 64, 0);
+	walidx_put_le32(header + 64, fnv(header, bytes));
+	return walidx_snapshot_decode_header(header, bytes, 0, 0, 1, 0, 16384,
+		&header_bytes, &record_bytes, &nrecords, &source_offset, &log_epoch);
 }
 
 static int
@@ -18123,8 +18165,9 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 				 hdr.rec_len == sizeof(WalIdxRecV1)))
 				rec_len = hdr.rec_len;
 			else if (shard == 0 && hdr.magic == WALIDX_PROGRESS_MAGIC &&
-					 hdr.rec_len == sizeof(WalIdxProgressRec))
-				rec_len = sizeof(WalIdxProgressRec);
+					 (hdr.rec_len == sizeof(WalIdxProgressRec) ||
+					  hdr.rec_len == WALIDX_PROGRESS_BYTES_V1))
+				rec_len = hdr.rec_len;
 			else
 				return -1;
 			if (used - pos < (int) rec_len)
@@ -18164,7 +18207,9 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 				WalIdxProgressRec rec;
 				uint64_t	first;
 
-				memcpy(&rec, buf + pos, sizeof(rec));
+				memset(&rec, 0, sizeof(rec));
+				rec.horizon_seq = PS_SEQ_UNBOUNDED;
+				memcpy(&rec, buf + pos, rec_len);
 				first = wal_log_start(tl);
 				if (!walidx_progress_valid[tl] && first != UINT64_MAX)
 				{
@@ -18188,7 +18233,8 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 						wal_segment_stores[tl].start_lsn)))
 					walidx_progress[tl] = rec.start_lsn;
 				if (rec.magic != WALIDX_PROGRESS_MAGIC ||
-					rec.rec_len != sizeof(rec) || rec.timeline != tl ||
+					rec.rec_len != rec_len || rec.timeline != tl ||
+					rec.horizon_seq != PS_SEQ_UNBOUNDED ||
 					rec.crc != walidx_progress_crc(&rec) ||
 					!walidx_progress_valid[tl] ||
 					rec.start_lsn != walidx_progress[tl] ||
@@ -18281,6 +18327,7 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 		goto out;
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = WALIDX_PROGRESS_MAGIC;
+	rec.horizon_seq = PS_SEQ_UNBOUNDED;
 	rec.rec_len = sizeof(rec);
 	rec.crc = 0;
 	rec.timeline = tl;
@@ -24865,7 +24912,7 @@ ps_core_format_identities(const PsFormatIdentity **out)
 		{"wal_log", "wal_<tl> record", WAL_MAGIC, 0},
 		{"walidx_log", "walidx_<tl>_<shard> record", WALIDX_MAGIC, 0},
 		{"walidx_log", "walidx_<tl>_<shard> progress record",
-		 WALIDX_PROGRESS_MAGIC, 0},
+		 WALIDX_PROGRESS_MAGIC, 2},
 		/* Headerless persisted configuration: the schema number stands in
 		 * for a magic, which is why it reports zero. */
 		{"store_config", ".pagestore-nshards PSS2 checked shard count (legacy decimal accepted)", 0,
