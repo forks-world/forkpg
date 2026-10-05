@@ -5361,7 +5361,7 @@ test_mixed_forkmeta_classification(void)
 		rec.kind = invalid[i];
 		seal_v4_test_record(&rec);
 		check(append_source_bytes(source, &rec, sizeof(rec)) &&
-			  expect_open_failure(store) && file_size(source) == valid_size + sizeof(rec),
+			  expect_open_failure(store) && file_size(source) == valid_size + (off_t) sizeof(rec),
 			  "invalid V4 flags or unknown kind fail closed despite a valid CRC");
 		fd = open(source, O_WRONLY);
 		check(fd >= 0 && ftruncate(fd, valid_size) == 0,
