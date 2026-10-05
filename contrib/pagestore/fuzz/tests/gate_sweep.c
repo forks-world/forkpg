@@ -561,6 +561,46 @@ timeline_framing_regression(void)
 	return 1;
 }
 
+/* WIPG framing mutations must not shift later mixed-version records. */
+static int
+horizon_framing_regression(void)
+{
+	unsigned char pristine[2176], expected[2176], mutated[2176];
+	const uint32_t bad_lengths[] = {0, 55, UINT32_MAX};
+
+	for (unsigned shape = 0; shape < 4; shape++)
+	{
+		uint32_t first = (shape & 1) ? 1088 : 1080;
+		uint32_t second = (shape & 2) ? 1088 : 1080;
+		uint32_t magic = 0x57495047;
+		size_t len = first + second;
+
+		memset(pristine, 0, sizeof(pristine));
+		memcpy(pristine, &magic, 4);
+		memcpy(pristine + 4, &first, 4);
+		memcpy(pristine + first, &magic, 4);
+		memcpy(pristine + first + 4, &second, 4);
+		memcpy(expected, pristine, len);
+		ps_fuzz_crc_fixup("walidx_log_legacy", work_dir, expected, len);
+		for (unsigned record = 0; record < 2; record++)
+			for (unsigned bad = 0; bad < 3; bad++)
+			{
+				size_t off = record ? first : 0;
+
+				memcpy(mutated, pristine, len);
+				memcpy(mutated + off + 4, &bad_lengths[bad], 4);
+				ps_fuzz_crc_fixup("walidx_log_legacy", work_dir, mutated, len);
+				if (memcmp(mutated, expected, len) != 0)
+				{
+					fprintf(stderr, "FAIL: horizon framing shape=%u record=%u bad=%u\n",
+							shape, record, bad_lengths[bad]);
+					return 0;
+				}
+			}
+	}
+	return 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -630,7 +670,7 @@ main(int argc, char **argv)
 	 * exercises the fixed-up half, by construction. */
 	ps_fuzz_global_init();
 	find_work_dir(scratch);
-	if (!timeline_framing_regression())
+	if (!timeline_framing_regression() || !horizon_framing_regression())
 		return 1;
 
 	for (i = 0; i < ps_fuzz_target_count; i++)

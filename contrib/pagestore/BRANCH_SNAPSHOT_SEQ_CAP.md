@@ -992,7 +992,7 @@ original record boundaries. Complete records with finite caps or
 
 `posix-timeline-delete-holes` remains byte-identical as a legacy fixture;
 `posix-timeline-delete-holes-seqcap` pins timeline identity version 3 and
-checks the workload across restart. WAL-index horizon formats, the checkpoint-fence owner, and P3b activation
+checks the workload across restart. The checkpoint-fence owner and P3b activation
 remain pending. This rollout does not fix Bug B yet.
 
 ### P3a forkmeta classification and PAGE GROW rollout
@@ -1021,3 +1021,17 @@ sequence maxima are rebuilt. Failed publications leave history intact.
 `posix-timeline-delete-holes-forkmeta-v4` pins the current formats. The older
 `posix-forkmeta-crc` fixture was already legacy and is retained unchanged.
 Finite sequence caps remain disabled: Bug B is still a release blocker.
+
+### P3a WAL-index horizon format rollout
+
+WIPG v2 appends an eight-byte `horizon_seq` to the 1080-byte legacy progress
+record. WISD v4 extends the V3 snapshot header from 72 to 80 bytes with the
+same field. Both writers persist `UINT64_MAX` until horizon activation.
+Legacy progress and snapshot headers remain readable as uncapped views;
+complete new records with finite caps fail closed even with valid checksums.
+The admission allocator ignores the unbounded sentinel during recovery.
+
+`posix-timeline-delete-holes-forkmeta-v4` remains a legacy archive;
+`posix-timeline-delete-holes-horizon-v2` records the current formats. The
+checkpoint-fence owner and sequence-cap activation remain pending. This
+format rollout does not yet fix Bug B.
