@@ -3814,7 +3814,7 @@ ps_checkpoint_matches_control(const CheckPoint *record,
  */
 static XLogRecPtr
 ps_checkpoint_record_end(XLogRecPtr checkpoint_lsn,
-						 const CheckPoint *expected)
+						 const CheckPoint *expected, uint8 *info_out)
 {
 	ReadLocalXLogPageNoWaitPrivate *pd = palloc0(sizeof(*pd));
 	XLogReaderState *reader;
@@ -3841,6 +3841,8 @@ ps_checkpoint_record_end(XLogRecPtr checkpoint_lsn,
 			(const CheckPoint *) XLogRecGetData(reader), expected))
 	{
 		end = reader->EndRecPtr;
+		if (info_out != NULL)
+			*info_out = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 		matches = true;
 	}
 
@@ -13242,6 +13244,8 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 
 typedef struct PagestoreBranchHorizons
 {
+	XLogRecPtr	checkpoint_lsn;
+	uint8		checkpoint_info;
 	XLogRecPtr	checkpoint_end_lsn;
 	uint64		system_identifier;
 	TransactionId oldest_xid;
@@ -13301,8 +13305,9 @@ pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
 	pagestore_localsvc_store_sync_timeout(PAGESTORE_READER_HORIZON_TIMEOUT_MS);
 
 	memset(h, 0, sizeof(*h));
+	h->checkpoint_lsn = control.checkPoint;
 	h->checkpoint_end_lsn = ps_checkpoint_record_end(control.checkPoint,
-												 checkpoint);
+												 checkpoint, &h->checkpoint_info);
 	h->system_identifier = control.system_identifier;
 	h->oldest_xid = checkpoint->oldestXid;
 	h->next_xid = XidFromFullTransactionId(checkpoint->nextXid);
@@ -13452,7 +13457,7 @@ pagestore_branch_checkpoint(PG_FUNCTION_ARGS)
 						   LSN_FORMAT_ARGS(redo))));
 	pagestore_localsvc_store_sync_timeout(PAGESTORE_READER_HORIZON_TIMEOUT_MS);
 	end = ps_checkpoint_record_end(mirrored.checkPoint,
-								&mirrored.checkPointCopy);
+								&mirrored.checkPointCopy, NULL);
 	pfree(local);
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -13708,6 +13713,19 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 				 errmsg("branch incarnation must be positive")));
 	incarnation = (uint64) incarnation_arg;
 	pagestore_branch_horizons_from_control(base, checkpoint_redo, &h);
+	/* R2-s: an online checkpoint can contain running transactions whose
+	 * later hint updates are unsafe for a frozen branch.  Check the actual
+	 * WAL record, not the control file's current database state: restarting
+	 * a writer changes that state without changing its shutdown checkpoint. */
+	if (h.checkpoint_info != XLOG_CHECKPOINT_SHUTDOWN ||
+		h.checkpoint_lsn != checkpoint_redo)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("safe branch preparation requires a shutdown checkpoint"),
+				 errdetail("Checkpoint record at %X/%08X has info 0x%02X and redo %X/%08X.",
+						   LSN_FORMAT_ARGS(h.checkpoint_lsn), h.checkpoint_info,
+						   LSN_FORMAT_ARGS(checkpoint_redo)),
+				 errhint("Stop the writer cleanly, then prepare the branch through the serialized branch controller.")));
 	if (fork_lsn < h.checkpoint_end_lsn)
 		ereport(ERROR,
 				(errmsg("branch fork LSN does not cover the selected checkpoint"),
