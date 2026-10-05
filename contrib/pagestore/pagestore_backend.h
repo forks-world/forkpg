@@ -191,7 +191,7 @@ extern void pagestore_localsvc_require_branch_timeout(uint32 new_tl,
 														 uint64 target_incarnation,
 														 uint64 parent_incarnation,
 														 int timeout_ms);
-extern void pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
+extern bool pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 												 uint64 branch_lsn,
 												 uint64 target_incarnation,
 												 uint64 parent_incarnation);

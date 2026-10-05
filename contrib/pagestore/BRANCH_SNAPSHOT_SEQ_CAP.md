@@ -1074,3 +1074,40 @@ The integration test covers online rejection, directory preservation, no
 created timeline, and successful preparation/retry after a clean fast restart.
 This lands only the R2-s prerequisite. R2-x WAL scanning, journaled cleanup,
 G3 registration enforcement and finite branch activation remain pending.
+
+
+### R2-x WAL proof and failed-prepare cleanup prerequisite
+
+A new portable branch readiness artifact is published only after a writer-local
+WAL scan proves that no COMMIT, COMMIT PREPARED or ABORT PREPARED record ends
+in the post-fork window. Ordinary ABORT is permitted. The endpoint is sampled
+with `GetXLogInsertEndRecPtr()` after CREATE_BRANCH and flushed before reading;
+this covers reserved insertions without treating the next page header as a
+missing record. The scan starts at the verified checkpoint record, so it also
+covers a transaction record straddling a direct caller's cutoff. It always
+reads local WAL, including when the SLRU seeders read archived store WAL.
+Unreadable or incomplete windows fail closed.
+
+CREATE_BRANCH reports `PS_BRANCH_RESULT_NEW` only after a new durable create.
+The existing field gains this bit without changing the IPC layout; old daemons
+leave it zero. A failing direct prepare removes readiness artifacts, fsyncs the
+directory, then deletes only a timeline newly created by that call. A failure
+on a pre-existing timeline reports its identity without deleting it. A matching
+already-published bootstrap remains an idempotent retry.
+
+Before `branch_prepared`, the controller owns its configured incarnation. A
+prepare error, lost reply, or interrupted journal publication enters
+`r2_cleanup`; recovery cleans up that incarnation instead of replaying prepare.
+The `manifest_removed` step is journaled after directory fsync and before any
+delete, followed by `timeline_deleting`. Crash probes cover both steps. Cleanup
+ends in `r2_failed/restore_services`, whose restoration is also retryable. Only
+after cleanup does the controller restore the writer and materializer. The
+failed journal remains; a rerun needs a new incarnation and receipt path.
+Older controllers reject these additional states. The journal shape and CRC
+remain unchanged.
+
+Finite branch caps remain disabled. The first-statement window snapshot,
+materializer marker proof, G3 gates, capability handshake and atomic finite
+branch activation still belong to P3b. Existing uncapped readiness artifacts
+must be rejected by that activation's safe-path finite-result check. This
+prerequisite does not yet fix Bug B.

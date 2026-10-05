@@ -82,3 +82,5 @@ PAGESTORE_FAULT_POINT(RETENTION_BOOTSTRAP_AFTER_PENDING, "retention_bootstrap.af
 // retention.pending or the log itself.
 PAGESTORE_FAULT_POINT(RETENTION_PENDING_AFTER_CREATE, "retention_pending.after_create", "store", "process_abort", "crash", 1, 1)
 PAGESTORE_FAULT_POINT(RETENTION_PENDING_AFTER_TMP_SYNC, "retention_pending.after_tmp_sync", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_PREPARE_R2_MANIFEST_REMOVED, "branch_prepare.r2_manifest_removed", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_PREPARE_R2_TIMELINE_DELETING, "branch_prepare.r2_timeline_deleting", "branch", "process_abort", "crash", 1, 1)
