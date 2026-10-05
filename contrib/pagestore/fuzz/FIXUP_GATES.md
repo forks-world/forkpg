@@ -396,3 +396,14 @@ identity field, or a genuine semantic/consistency check.
   and requires its `PSS2` prefix, instead of using the fixture's legacy `1\n`.
   Missing or invalid seeds fail the sweep. The allowlist documents malformed
   text, zero shard counts, and trailing garbage; checksum repair stays checked.
+
+### Horizon sequence formats
+
+The WAL-index log fixer handles both 1080-byte WIPG v1 and 1088-byte WIPG
+v2 records, including mixed logs. V2 repaired inputs pin the horizon cap to
+infinity while finite caps remain unsupported; raw inputs retain rejection
+coverage. Snapshot shard fixup handles both 72-byte WISD v3 and 80-byte
+WISD v4 headers and hashes the selected header span. The new horizon
+corpus seeds cover the current progress and snapshot formats; older seeds
+remain unchanged. Gate sweep also checks damaged progress framing in all
+four V1/V2 pairings.
