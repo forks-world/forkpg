@@ -681,7 +681,8 @@ class Daemon:
 def run_client(client: Path, shm: str, mode: str, log: Path,
                payload_identity: dict[str, Any] | None = None,
                role: str = "current",
-               holes: bool = False) -> subprocess.CompletedProcess[str]:
+               holes: bool = False,
+               checkpoint_fence: bool = False) -> subprocess.CompletedProcess[str]:
     """Run the fixture workload; ``payload_identity`` (the capturing build's
     on capture, the fixture's own on check) tells it which WAL page magic
     and block size the shipped WAL carries, ``role`` which objects the
@@ -694,6 +695,7 @@ def run_client(client: Path, shm: str, mode: str, log: Path,
         env["PAGESTORE_FIXTURE_XLOG_MAGIC"] = str(int(payload_identity["xlog_page_magic"]))
         env["PAGESTORE_FIXTURE_XLOG_BLCKSZ"] = str(int(payload_identity["xlog_blcksz"]))
     env["PAGESTORE_FIXTURE_ROLE"] = role
+    env["PAGESTORE_FIXTURE_CHECKPOINT_FENCE"] = "1" if checkpoint_fence else "0"
     if holes:
         env["PAGESTORE_FIXTURE_DELETE_HOLES"] = "1"
     with log.open("a", encoding="utf-8") as output:
@@ -803,6 +805,9 @@ def capture(args: argparse.Namespace) -> int:
             code = daemon.stop()
         if code != 0:
             raise FixtureError(f"daemon did not stop cleanly: status {code}")
+        if args.checkpoint_retention_tool is not None:
+            subprocess.run([str(args.checkpoint_retention_tool),
+                            "--seed-checkpoint-fence", str(store)], check=True)
         identities = format_identities(args.format_tool)
         check_segment_formats(store, identities)
         check_archived_identities(store, identities)
@@ -815,6 +820,7 @@ def capture(args: argparse.Namespace) -> int:
         "name": fixture.name,
         "role": "current",
         "workload": "fixture",
+        "checkpoint_fence": args.checkpoint_retention_tool is not None,
         "daemon_args": DAEMON_ARGS,
         "daemon_env": DAEMON_ENV,
         # the PostgreSQL identity of the payloads inside: a build with another
@@ -903,7 +909,8 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
                 tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-4:]
                 raise FixtureError(f"fixture reopen {generation} refused: {status}; daemon: {tail!r}")
             result = run_client(args.client_binary, shm, "verify", root / "reopen-client.log",
-                                metadata.get("payload_identity"), metadata["role"], holes=holes)
+                                metadata.get("payload_identity"), metadata["role"], holes=holes,
+                                checkpoint_fence=metadata.get("checkpoint_fence", False))
             if result.returncode != 0:
                 tail = (root / "reopen-client.log").read_text(
                     encoding="utf-8", errors="replace").splitlines()[-3:]
@@ -935,7 +942,8 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
             return OPEN_REJECTED
         client_log = root / "mutations" / f"{case['name']}.client.log"
         result = run_client(args.client_binary, shm, "verify", client_log,
-                            metadata.get("payload_identity"), metadata["role"], holes=holes)
+                            metadata.get("payload_identity"), metadata["role"], holes=holes,
+                            checkpoint_fence=metadata.get("checkpoint_fence", False))
         # A mutation the store repairs (a torn append-only tail) resumes the
         # transition it interrupted asynchronously, so the oracle is retried
         # while that can still land; a rejection stays a rejection.
@@ -943,7 +951,8 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
         while result.returncode != 0 and time.monotonic() < deadline and daemon.alive():
             time.sleep(0.5)
             result = run_client(args.client_binary, shm, "verify", client_log,
-                                metadata.get("payload_identity"), metadata["role"], holes=holes)
+                                metadata.get("payload_identity"), metadata["role"], holes=holes,
+                                checkpoint_fence=metadata.get("checkpoint_fence", False))
         if not daemon.alive():
             code = daemon.process.returncode if daemon.process else None
             return f"{CRASHED} (daemon exited {code} under use)"
@@ -1085,11 +1094,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-build-match", action="store_true",
                         help="fail, rather than warn, when no current fixture carries a payload "
                              "the checking build loads")
+    parser.add_argument("--checkpoint-retention-tool", type=Path,
+                        help="offline retention test tool to seed a daemon-owned "
+                             "checkpoint fence during capture")
     parser.add_argument("--only", nargs="*", help="run only these mutation cases")
     parser.add_argument("--keep-failures", type=Path, help="copy failed mutation stores here")
     args = parser.parse_args(argv)
     for name in ("daemon_binary", "client_binary", "inspect_binary", "format_tool",
-                 "postgres_payload_identity_tool", "postgres_payload_identity"):
+                 "postgres_payload_identity_tool", "postgres_payload_identity",
+                 "checkpoint_retention_tool"):
         if getattr(args, name) is not None:
             setattr(args, name, getattr(args, name).resolve())
     try:

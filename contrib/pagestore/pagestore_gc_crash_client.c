@@ -1782,6 +1782,15 @@ fixture_verify(void)
 					   PS_RETENTION_RESOURCE_PAGE_HISTORY, TEST_CUTOFF,
 					   "fixture lost the archived page-history owner's pin",
 					   "fixture changed the archived page-history owner's identity");
+	{
+		const char *checkpoint = getenv("PAGESTORE_FIXTURE_CHECKPOINT_FENCE");
+
+		if (checkpoint != NULL && strcmp(checkpoint, "1") == 0)
+			check_pin_identity(0, PS_RETENTION_OWNER_CHECKPOINT_FENCE, 9001,
+				PS_RETENTION_RESOURCE_ALL, FIXTURE_WAL_REDO + WALIDX_READER_LSN,
+				"fixture lost the archived checkpoint fence",
+				"fixture changed the archived checkpoint owner identity");
+	}
 	set_relation(ch);
 	ch->opcode = PS_OP_WAL_SIZE;
 	if (execute()->status != PS_STATUS_OK || ch->req_lsn != FIXTURE_WAL_END)

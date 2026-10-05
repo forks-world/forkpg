@@ -440,4 +440,9 @@ extern int ps_timeline_request_allowed(uint32_t timeline,
  * the per-shard lock from the final request key, not a client-supplied shard. */
 extern uint32_t ps_shard_of(const PsKey *key);
 
+
+/* Exercise recovery sentinel handling without forging durable page records. */
+extern void ps_test_admission_seq_observe(uint64_t seq);
+extern int ps_test_walidx_snapshot_horizon_header(uint32_t version, uint64_t seq);
+
 #endif							/* PAGESTORE_CORE_H */

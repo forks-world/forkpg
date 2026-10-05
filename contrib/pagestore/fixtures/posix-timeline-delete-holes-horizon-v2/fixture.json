@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "name": "posix-timeline-delete-holes-forkmeta-v4",
+  "name": "posix-timeline-delete-holes-horizon-v2",
   "role": "legacy",
   "workload": "fixture",
   "daemon_args": [

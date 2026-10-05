@@ -781,7 +781,7 @@ fixup_walidx_frontier(uint8_t *buf, size_t len)
  * by magic + declared rec_len exactly as the reader does
  * (WALIDX_MAGIC=="WIDX" with rec_len 64 -> WalIdxRec, rec_len 56 ->
  * legacy WalIdxRecV1; WALIDX_PROGRESS_MAGIC=="WIPG" -> WalIdxProgressRec,
- * fixed 1080 bytes).  Every shape's crc sits at byte offset 8 and is
+ * 1080 bytes in V1 and 1088 in V2).  Every shape's crc sits at byte offset 8 and is
  * FNV-1a over the whole record with crc zeroed
  * (walidx_rec_crc()/walidx_rec_v1_crc()/walidx_progress_crc()); an
  * unrecognized magic/rec_len combination stops the walk (leaves the rest
@@ -790,6 +790,7 @@ fixup_walidx_frontier(uint8_t *buf, size_t len)
 #define WALIDX_PROGRESS_MAGIC_LOCAL 0x57495047u	/* "WIPG" */
 #define WALIDX_REC_BYTES 64u
 #define WALIDX_REC_V1_BYTES 56u
+#define WALIDX_PROGRESS_BYTES_V2 1088u
 #define WALIDX_PROGRESS_BYTES 1080u /* 4*6 + 8+8+16 + PS_MAX_CHANNELS(128)*8 */
 
 /*
@@ -823,7 +824,19 @@ fixup_walidx_log(uint8_t *buf, size_t len, uint32_t expected_timeline)
 			is_v1 = 1;
 		}
 		else if (magic == WALIDX_PROGRESS_MAGIC_LOCAL)
-			stride = WALIDX_PROGRESS_BYTES;
+		{
+			stride = rec_len;
+			if (stride != WALIDX_PROGRESS_BYTES && stride != WALIDX_PROGRESS_BYTES_V2)
+			{
+				size_t next = off + WALIDX_PROGRESS_BYTES_V2;
+				int next_v2 = next + 8 <= len &&
+					(get_le32(buf + next) == WALIDX_MAGIC_LOCAL ||
+					 get_le32(buf + next) == WALIDX_PROGRESS_MAGIC_LOCAL);
+
+				stride = next_v2 || (len - off) % WALIDX_PROGRESS_BYTES_V2 == 0 ?
+					WALIDX_PROGRESS_BYTES_V2 : WALIDX_PROGRESS_BYTES;
+			}
+		}
 		else
 			break;
 		if (off + stride > len)
@@ -844,7 +857,11 @@ fixup_walidx_log(uint8_t *buf, size_t len, uint32_t expected_timeline)
 		 * the rest fuzzer-controlled" shape used throughout this file.
 		 */
 		if (magic == WALIDX_PROGRESS_MAGIC_LOCAL)
-			put_le32(buf + off + 4, WALIDX_PROGRESS_BYTES);
+		{
+			put_le32(buf + off + 4, (uint32_t) stride);
+			if (stride == WALIDX_PROGRESS_BYTES_V2)
+				memset(buf + off + WALIDX_PROGRESS_BYTES, 0xff, 8);
+		}
 		/*
 		 * Codex finding on PR #303 round 4: walidx_recover_one()
 		 * (pagestore_core.c) rejects a V1 (56-byte) record outright when its
@@ -2003,6 +2020,7 @@ fixup_walidx_snapshot_shard(const char *work_dir, uint8_t *buf, size_t len)
 	uint64_t	start_lsn;
 	uint64_t	end_lsn;
 	size_t		off;
+	size_t header_bytes;
 	char		path[4096];
 	unsigned char manifest[WALIDX_SNAPSHOT_MANIFEST_HEADER_BYTES_LOCAL +
 		WALIDX_SNAPSHOT_MANIFEST_MAX_SHARDS_LOCAL *
@@ -2016,6 +2034,8 @@ fixup_walidx_snapshot_shard(const char *work_dir, uint8_t *buf, size_t len)
 
 	if (len < 72)
 		return;
+	header_bytes = len >= 80 && ((len - 80) % 64 == 0 ||
+		get_le32(buf + 4) == 4) ? 80 : 72;
 	manifest_tmpl = ps_fuzz_template_lookup(
 		"walidx_snapshots_0/walidx_manifest_v1", &manifest_tmpl_len);
 	if (manifest_tmpl == NULL ||
@@ -2026,27 +2046,13 @@ fixup_walidx_snapshot_shard(const char *work_dir, uint8_t *buf, size_t len)
 	start_lsn = get_le64(manifest_tmpl + 32);
 	end_lsn = get_le64(manifest_tmpl + 40);
 
-	/*
-	 * Codex finding on PR #303 (round 6, gate-table audit):
-	 * walidx_snapshot_decode_header() (pagestore_core.c) only accepts this
-	 * header's version@4 and "bytes" (header_bytes)@8 as one of three fixed
-	 * pairs -- (V1, 64), (V2, 64), or (current, 72) -- and uses that same
-	 * "bytes" value both as the span it hashes and to pick which of two
-	 * crc offsets (56 or 64) to check against, all before this record's own
-	 * per-field identity/crc checks below ever run. This function already
-	 * commits to only ever fixing up the *current* (72-byte, crc@64) shape
-	 * -- the crc it computes a few lines down is always `fnv1a_step(...,
-	 * buf, 72)` -- so "bytes" is pinned to that shape's own fixed size for
-	 * the same reason a rec_len/struct-size field is pinned elsewhere in
-	 * this file: it is not a meaningful identity value to leave fuzzer-
-	 * controlled on its own, since every record this function actually
-	 * knows how to seal has the same value by construction. version@4 is
-	 * deliberately left alone -- unlike "bytes", it *is* a meaningful,
-	 * independently fuzzable identity field (which shape gets selected at
-	 * all), matching how magic/version are treated everywhere else in this
-	 * file.
-	 */
-	put_le32(buf + 8, 72);		/* header_bytes: this function's one shape */
+	/* Repair the framing for the V3 (72-byte) or V4 (80-byte) payload
+	 * shape. The record-aligned length identifies the added horizon field;
+	 * version remains fuzzer-controlled so unknown versions still reject.
+	 * Pin V4's unsupported finite cap only in the repaired pass. */
+	put_le32(buf + 8, (uint32_t) header_bytes);
+	if (header_bytes == 80)
+		memset(buf + 72, 0xff, 8);		/* header_bytes: this function's one shape */
 	put_le32(buf + 12, 0);		/* timeline 0 */
 	put_le32(buf + 16, 0);		/* shard 0 */
 	for (unsigned i = 0; i < 8; i++)
@@ -2072,9 +2078,9 @@ fixup_walidx_snapshot_shard(const char *work_dir, uint8_t *buf, size_t len)
 	 * expected_len regardless, so it is left alone like every other
 	 * unrecoverable shape in this file.
 	 */
-	if (len >= 72 && (len - 72) % WALIDX_REC_BYTES_LOCAL == 0)
+	if (len >= header_bytes && (len - header_bytes) % WALIDX_REC_BYTES_LOCAL == 0)
 	{
-		uint64_t	derived_nrecords = (uint64_t) (len - 72) /
+		uint64_t	derived_nrecords = (uint64_t) (len - header_bytes) /
 			WALIDX_REC_BYTES_LOCAL;
 
 		put_le32(buf + 20, (uint32_t) derived_nrecords);
@@ -2082,11 +2088,11 @@ fixup_walidx_snapshot_shard(const char *work_dir, uint8_t *buf, size_t len)
 	}
 
 	put_le32(buf + 64, 0);
-	put_le32(buf + 64, fnv1a_step(FNV1A_INIT, buf, 72));
+	put_le32(buf + 64, fnv1a_step(FNV1A_INIT, buf, header_bytes));
 
 	/* Every framed WalIdxRec after the header, regardless of magic (this
 	 * harness's corpus only ever contains the current fixed-size shape). */
-	for (off = 72; off + WALIDX_REC_BYTES_LOCAL <= len;
+	for (off = header_bytes; off + WALIDX_REC_BYTES_LOCAL <= len;
 		 off += WALIDX_REC_BYTES_LOCAL)
 	{
 		uint32_t	crc;

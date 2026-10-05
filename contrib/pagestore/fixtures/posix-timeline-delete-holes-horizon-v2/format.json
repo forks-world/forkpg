@@ -201,13 +201,13 @@
     "family": "retention",
     "artifact": "retention.meta record",
     "magic": "0x4e544552",
-    "version": 3
+    "version": 2
   },
   {
     "family": "retention",
     "artifact": "retention.state",
     "magic": "0x53544552",
-    "version": 3
+    "version": 2
   },
   {
     "family": "slru_mirror",

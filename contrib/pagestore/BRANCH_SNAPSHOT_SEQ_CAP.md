@@ -992,7 +992,7 @@ original record boundaries. Complete records with finite caps or
 
 `posix-timeline-delete-holes` remains byte-identical as a legacy fixture;
 `posix-timeline-delete-holes-seqcap` pins timeline identity version 3 and
-checks the workload across restart. WAL-index horizon formats, the checkpoint-fence owner, and P3b activation
+checks the workload across restart. The checkpoint-fence owner and P3b activation
 remain pending. This rollout does not fix Bug B yet.
 
 ### P3a forkmeta classification and PAGE GROW rollout
@@ -1021,3 +1021,40 @@ sequence maxima are rebuilt. Failed publications leave history intact.
 `posix-timeline-delete-holes-forkmeta-v4` pins the current formats. The older
 `posix-forkmeta-crc` fixture was already legacy and is retained unchanged.
 Finite sequence caps remain disabled: Bug B is still a release blocker.
+
+### P3a WAL-index horizon format rollout
+
+WIPG v2 appends an eight-byte `horizon_seq` to the 1080-byte legacy progress
+record. WISD v4 extends the V3 snapshot header from 72 to 80 bytes with the
+same field. Both writers persist `UINT64_MAX` until horizon activation.
+Legacy progress and snapshot headers remain readable as uncapped views;
+complete new records with finite caps fail closed even with valid checksums.
+The admission allocator ignores the unbounded sentinel during recovery.
+
+`posix-timeline-delete-holes-forkmeta-v4` remains a legacy archive;
+`posix-timeline-delete-holes-horizon-v2` records the horizon rollout and is
+now a legacy archive. Sequence-cap activation remains pending. This
+format rollout does not yet fix Bug B.
+
+### P3a checkpoint-fence owner format rollout
+
+Retention v3 assigns owner kind 4 to `CHECKPOINT_FENCE`. The daemon's
+registry APIs can persist, compact and release these owners. Client IPC
+SET, RESERVE and DROP refuse this namespace before mutation. Read-only
+lookup remains available for inspection. This does not register checkpoint
+pins automatically; the atomic registration and hand-off belong to P5.
+
+V1 migrates to v3 with its original checksums verified; v2 records and
+committed-prefix state remain readable with unchanged framing and hashes.
+Appending v3 to a v2 log is supported, and compaction rewrites it as v3.
+V1/v2 records carrying owner kind 4 are rejected even with valid checksums.
+Older binaries refuse v3 state or records instead of opening an unprotected
+checkpoint owner.
+
+`posix-timeline-delete-holes-checkpoint-fence-v3` is the current archive.
+Capture uses `pagestore_retention_test --seed-checkpoint-fence` on the stopped
+store to write a real daemon-owned pin through the durable registry API.
+The fixture oracle verifies its owner, generation, resources and LSN across
+two daemon starts. The horizon-v2 archive stays byte-identical, and v3
+retention records/state also seed the fuzz corpus. Finite caps and the P5
+checkpoint registration protocol remain release blockers.

@@ -2885,9 +2885,136 @@ test_wal_observation_beats_reader_traffic(void)
 	remove_tree(store);
 }
 
+static uint32_t
+horizon_test_crc(unsigned char *data, size_t len)
+{
+	uint32_t hash = 2166136261U;
+
+	memset(data + 8, 0, 4);
+	for (size_t i = 0; i < len; i++)
+		hash = (hash ^ data[i]) * 16777619U;
+	memcpy(data + 8, &hash, 4);
+	return hash;
+}
+
+static void
+test_horizon_formats(void)
+{
+	char store[] = "/tmp/pagestore-horizon-format-XXXXXX";
+	char path[256];
+	unsigned char record[1088];
+	uint32_t bytes;
+	uint64_t cap;
+	FILE *file;
+	int loaded;
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  append_wal_bytes(0, 0, 16384) && wal_index_progress(0, 0, 8192),
+		  "write progress with unbounded horizon");
+	close_store();
+	snprintf(path, sizeof(path), "%s/walidx_0_0", store);
+	file = fopen(path, "rb");
+	loaded = file != NULL && fread(record, 1, sizeof(record), file) == sizeof(record);
+	check(loaded, "progress v2 has 1088-byte framing");
+	if (!loaded)
+	{
+		if (file) fclose(file);
+		remove_tree(store);
+		return;
+	}
+	fclose(file);
+	memcpy(&cap, record + 1080, 8);
+	check(cap == UINT64_MAX, "progress v2 persists infinity before activation");
+	for (int finite = 0; finite < 2; finite++)
+	{
+		cap = finite ? 7 : 0;
+		memcpy(record + 1080, &cap, 8);
+		(void) horizon_test_crc(record, sizeof(record));
+		file = fopen(path, "wb");
+		check(file != NULL && fwrite(record, 1, sizeof(record), file) == sizeof(record),
+			  "write complete finite-cap record with valid CRC");
+		if (file) fclose(file);
+		check(ps_core_open(store) != 0, "finite progress cap fails closed");
+	}
+	/* Strip only the appended field and reseal the original legacy shape. */
+	bytes = 1080;
+	memcpy(record + 4, &bytes, 4);
+	(void) horizon_test_crc(record, bytes);
+	file = fopen(path, "wb");
+	check(file != NULL && fwrite(record, 1, bytes, file) == bytes,
+		  "write original progress v1 shape");
+	if (file) fclose(file);
+	check(ps_core_open(store) == 0 && wal_index_progress(0, 8192, 16384),
+		  "legacy horizon loads uncapped and accepts a new v2 progress record");
+	close_store();
+	check(ps_core_open(store) == 0, "mixed progress v1/v2 log reopens");
+	ps_test_admission_seq_observe(UINT64_MAX);
+	check(write_relation_page(0, 0, 17000), "sentinel observation cannot exhaust page admission");
+	close_store();
+	remove_tree(store);
+	check(ps_test_walidx_snapshot_horizon_header(3, 0) == 0,
+		  "legacy snapshot v3 remains uncapped");
+	check(ps_test_walidx_snapshot_horizon_header(4, UINT64_MAX) == 0,
+		  "snapshot v4 accepts an unbounded horizon");
+	check(ps_test_walidx_snapshot_horizon_header(4, 0) != 0 &&
+		  ps_test_walidx_snapshot_horizon_header(4, 7) != 0,
+		  "snapshot v4 refuses finite horizon despite valid CRC");
+}
+
+static void
+test_checkpoint_owner_is_daemon_owned(void)
+{
+	char store[] = "/tmp/pagestore-checkpoint-owner-XXXXXX";
+	PsRetentionPin pin = {0, PS_RETENTION_OWNER_CHECKPOINT_FENCE,
+		PS_RETENTION_RESOURCE_ALL, 1, 9001, 100, 1};
+	PsRetentionPin got;
+	const uint32_t ops[] = {PS_OP_RETENTION_PIN_SET,
+		PS_OP_RETENTION_PIN_RESERVE, PS_OP_RETENTION_PIN_DROP};
+	uint64_t before, after;
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		ps_retention_reserve_and_set(&pin) == PS_RETENTION_OK,
+		"seed a daemon-owned checkpoint fence");
+	check(ps_retention_admission_highwater(&before) == 0,
+		"read checkpoint admission highwater");
+	for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++)
+	{
+		PsChannel ch = {0};
+
+		ch.opcode = ops[i];
+		ch.timeline = pin.timeline;
+		ch.blocknum = pin.owner_kind;
+		ch.parent_timeline = pin.resources;
+		ch.old_nblocks = pin.generation;
+		ch.req_seq = pin.owner_id;
+		ch.req_lsn = pin.lsn + 1;
+		ch.nblocks = 2;
+		ch.status = PS_STATUS_OK;
+		ps_lifecycle_read_lock();
+		(void) ps_handle_meta(&ch);
+		ps_lifecycle_read_unlock();
+		check(ch.status == PS_STATUS_ERROR &&
+			ps_retention_lookup(0, pin.owner_kind, pin.owner_id, &got) == 1 &&
+			memcmp(&pin, &got, sizeof(pin)) == 0,
+			"client SET/RESERVE/DROP cannot mutate a checkpoint fence");
+	}
+	check(ps_retention_admission_highwater(&after) == 0 && before == after,
+		"rejected client operations do not reserve durable admission sequences");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		ps_retention_lookup(0, pin.owner_kind, pin.owner_id, &got) == 1 &&
+		memcmp(&pin, &got, sizeof(pin)) == 0,
+		"checkpoint fence remains intact after core restart");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
+	test_horizon_formats();
 	test_no_floor_or_progress();
 	test_preselection_skips_empty_reclaim();
 	test_no_progress_backoff_follows_proof();
@@ -2925,6 +3052,7 @@ main(void)
 	test_failure_backoff();
 	test_concurrent_admission();
 	test_wal_observation_beats_reader_traffic();
+	test_checkpoint_owner_is_daemon_owned();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }
