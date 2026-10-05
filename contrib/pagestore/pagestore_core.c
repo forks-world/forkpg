@@ -22648,7 +22648,8 @@ ps_handle_meta(PsChannel *ch)
 					(uint64_t) ch->pad1 << 32;
 				/* Generation zero exists only for replaying pre-v27 retention
 				 * records.  It is never valid on the current IPC boundary. */
-				if (ch->old_nblocks == 0 || tl >= MAX_TIMELINES)
+				if (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
+					ch->blocknum == PS_RETENTION_OWNER_CHECKPOINT_FENCE)
 					ret = PS_RETENTION_ERROR;
 				else
 				{
@@ -22764,7 +22765,8 @@ ps_handle_meta(PsChannel *ch)
 				pin.generation = ch->old_nblocks;
 				pin.owner_id = ch->req_seq;
 				pin.lsn = ch->req_lsn;
-				if (admission_write_lock() == 0)
+				if (ch->blocknum != PS_RETENTION_OWNER_CHECKPOINT_FENCE &&
+					admission_write_lock() == 0)
 				{
 				seq = admission_seq_alloc();
 				pin.admission_seq = seq;
@@ -22858,6 +22860,11 @@ ps_handle_meta(PsChannel *ch)
 				int			timeline_defined;
 				int			wal_index_pending;
 
+				if (ch->blocknum == PS_RETENTION_OWNER_CHECKPOINT_FENCE)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
 				pthread_rwlock_wrlock(&page_prune_lock);
 				pthread_rwlock_wrlock(&walidx_prune_lock);
 				old_found = ps_retention_lookup(tl, ch->blocknum,

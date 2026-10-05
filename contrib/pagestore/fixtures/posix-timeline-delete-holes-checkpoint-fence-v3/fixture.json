@@ -1,8 +1,9 @@
 {
   "schema": 1,
-  "name": "posix-timeline-delete-holes-horizon-v2",
-  "role": "legacy",
+  "name": "posix-timeline-delete-holes-checkpoint-fence-v3",
+  "role": "current",
   "workload": "fixture",
+  "checkpoint_fence": true,
   "daemon_args": [
     "--page-size",
     "8192",

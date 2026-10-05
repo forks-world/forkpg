@@ -2049,7 +2049,8 @@ fixup_walidx_snapshot_shard(const char *work_dir, uint8_t *buf, size_t len)
 	/* Repair the framing for the V3 (72-byte) or V4 (80-byte) payload
 	 * shape. The record-aligned length identifies the added horizon field;
 	 * version remains fuzzer-controlled so unknown versions still reject.
-	 * Pin V4's unsupported finite cap only in the repaired pass. */	put_le32(buf + 8, (uint32_t) header_bytes);
+	 * Pin V4's unsupported finite cap only in the repaired pass. */
+	put_le32(buf + 8, (uint32_t) header_bytes);
 	if (header_bytes == 80)
 		memset(buf + 72, 0xff, 8);		/* header_bytes: this function's one shape */
 	put_le32(buf + 12, 0);		/* timeline 0 */

@@ -2962,6 +2962,55 @@ test_horizon_formats(void)
 		  "snapshot v4 refuses finite horizon despite valid CRC");
 }
 
+static void
+test_checkpoint_owner_is_daemon_owned(void)
+{
+	char store[] = "/tmp/pagestore-checkpoint-owner-XXXXXX";
+	PsRetentionPin pin = {0, PS_RETENTION_OWNER_CHECKPOINT_FENCE,
+		PS_RETENTION_RESOURCE_ALL, 1, 9001, 100, 1};
+	PsRetentionPin got;
+	const uint32_t ops[] = {PS_OP_RETENTION_PIN_SET,
+		PS_OP_RETENTION_PIN_RESERVE, PS_OP_RETENTION_PIN_DROP};
+	uint64_t before, after;
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		ps_retention_reserve_and_set(&pin) == PS_RETENTION_OK,
+		"seed a daemon-owned checkpoint fence");
+	check(ps_retention_admission_highwater(&before) == 0,
+		"read checkpoint admission highwater");
+	for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++)
+	{
+		PsChannel ch = {0};
+
+		ch.opcode = ops[i];
+		ch.timeline = pin.timeline;
+		ch.blocknum = pin.owner_kind;
+		ch.parent_timeline = pin.resources;
+		ch.old_nblocks = pin.generation;
+		ch.req_seq = pin.owner_id;
+		ch.req_lsn = pin.lsn + 1;
+		ch.nblocks = 2;
+		ch.status = PS_STATUS_OK;
+		ps_lifecycle_read_lock();
+		(void) ps_handle_meta(&ch);
+		ps_lifecycle_read_unlock();
+		check(ch.status == PS_STATUS_ERROR &&
+			ps_retention_lookup(0, pin.owner_kind, pin.owner_id, &got) == 1 &&
+			memcmp(&pin, &got, sizeof(pin)) == 0,
+			"client SET/RESERVE/DROP cannot mutate a checkpoint fence");
+	}
+	check(ps_retention_admission_highwater(&after) == 0 && before == after,
+		"rejected client operations do not reserve durable admission sequences");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		ps_retention_lookup(0, pin.owner_kind, pin.owner_id, &got) == 1 &&
+		memcmp(&pin, &got, sizeof(pin)) == 0,
+		"checkpoint fence remains intact after core restart");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -3003,6 +3052,7 @@ main(void)
 	test_failure_backoff();
 	test_concurrent_admission();
 	test_wal_observation_beats_reader_traffic();
+	test_checkpoint_owner_is_daemon_owned();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

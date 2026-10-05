@@ -60,7 +60,8 @@
 #include "pagestore_format.h"
 
 #define PS_RETENTION_MAGIC		0x4e544552	/* "RETN" */
-#define PS_RETENTION_VERSION	2
+#define PS_RETENTION_VERSION	3
+#define PS_RETENTION_VERSION_V2 2
 #define PS_RETENTION_VERSION_V1 1
 #define PS_RETENTION_FNV_INIT	2166136261u
 #define PS_RETENTION_STATE_MAGIC 0x53544552	/* "RETS" */
@@ -69,8 +70,8 @@
 
 /* What a durable retention.pending marker is in the middle of doing: extend
  * the log in place by one record, replace it wholesale (compaction, and the
- * identical v1 -> v2 migration rewrite), or install retention.state for the
- * first time over an unchanged log (the one-time bootstrap of a v2-format
+ * identical v1 -> current migration rewrite), or install retention.state for the
+ * first time over an unchanged log (the one-time bootstrap of a current-width
  * store that predates the committed-prefix state file).  Bootstrap is not
  * an APPEND: it never grows the log (new_nrecords == old_nrecords), which
  * would otherwise be indistinguishable from a truncated/corrupt intent
@@ -265,7 +266,8 @@ retention_kind_valid(uint32_t kind)
 {
 	return kind == PS_RETENTION_OWNER_READER ||
 		kind == PS_RETENTION_OWNER_MATERIALIZER ||
-		kind == PS_RETENTION_OWNER_CONFIGURED;
+		kind == PS_RETENTION_OWNER_CONFIGURED ||
+		kind == PS_RETENTION_OWNER_CHECKPOINT_FENCE;
 }
 
 static int
@@ -293,9 +295,14 @@ static int
 retention_record_valid(const PsRetentionRecord *rec)
 {
 	if (rec->magic != PS_RETENTION_MAGIC ||
-		rec->version != PS_RETENTION_VERSION ||
+		(rec->version != PS_RETENTION_VERSION &&
+		 rec->version != PS_RETENTION_VERSION_V2) ||
 		rec->len != sizeof(*rec) || rec->pad != 0 ||
 		retention_record_crc(rec) != rec->crc)
+		return 0;
+	/* V2 never assigned the daemon-owned checkpoint namespace. */
+	if (rec->version == PS_RETENTION_VERSION_V2 &&
+		rec->pin.owner_kind == PS_RETENTION_OWNER_CHECKPOINT_FENCE)
 		return 0;
 	if (rec->type == PS_RETENTION_SET)
 		return retention_pin_valid(&rec->pin);
@@ -324,6 +331,7 @@ retention_record_v1_convert(const PsRetentionRecordV1 *old,
 	if (old->magic != PS_RETENTION_MAGIC ||
 		old->version != PS_RETENTION_VERSION_V1 ||
 		old->len != sizeof(*old) || old->pad != 0 ||
+		old->pin.owner_kind == PS_RETENTION_OWNER_CHECKPOINT_FENCE ||
 		retention_record_v1_crc(old) != old->crc)
 		return -1;
 	memset(&pin, 0, sizeof(pin));
@@ -738,7 +746,8 @@ retention_read_state(PsRetentionState *state)
 	if (read(fd, state, sizeof(*state)) != (ssize_t) sizeof(*state) ||
 		read(fd, &extra, 1) != 0 || state->magic != PS_RETENTION_STATE_MAGIC ||
 		(state->version != PS_RETENTION_VERSION &&
-		 state->version != PS_RETENTION_VERSION_V1) ||
+		 state->version != PS_RETENTION_VERSION_V1 &&
+		 state->version != PS_RETENTION_VERSION_V2) ||
 		state->crc != retention_state_crc(state))
 	{
 		errno = EILSEQ;
@@ -938,10 +947,10 @@ retention_make_record(PsRetentionRecord *rec, uint32_t type,
 }
 
 /* Caller holds retention_lock.  Shared by ps_retention_compact() and the
- * fail-safe v1 -> v2 upgrade (retention_rewrite_current()): both replace the
+ * fail-safe v1 -> current upgrade (retention_rewrite_current()): both replace the
  * entire log with one record per live pin/tombstone plus, if any, the
  * admission-reservation high-water record.  Publish the new log before its
- * v2 committed-prefix state, with the durable pending marker making every
+ * current committed-prefix state, with the durable pending marker making every
  * interrupted ordering -- including a second crash during recovery itself --
  * fail closed until ps_retention_open() can reconcile it. */
 /* The hash the rewritten log will have, computed purely from in-memory state
@@ -1144,7 +1153,7 @@ retention_read_pending(PsRetentionPending *out)
 		 out->op != PS_RETENTION_PENDING_COMPACT &&
 		 out->op != PS_RETENTION_PENDING_BOOTSTRAP_STATE) ||
 		/* An append always grows the log by exactly one record; a
-		 * compaction (or the identical v1 -> v2 migration rewrite) rewrites
+		 * compaction (or the identical v1 -> current migration rewrite) rewrites
 		 * the whole log down to one record per live pin/tombstone plus an
 		 * optional admission record, so new_nrecords is typically *smaller*
 		 * than old_nrecords and neither direction is a corruption signal;
@@ -1163,7 +1172,7 @@ retention_read_pending(PsRetentionPending *out)
 
 /* Does retention.meta currently carry the legacy v1 header?  Only ever
  * meaningful for a PS_RETENTION_PENDING_COMPACT intent recorded by the v1 ->
- * v2 migration rewrite: a v1 header proves the migration's rename never
+ * current migration rewrite: a v1 header proves the migration's rename never
  * happened, so the pre-image is untouched and needs no further inspection to
  * roll back to. */
 static int
@@ -1197,14 +1206,14 @@ retention_meta_is_legacy_header(int *is_legacy)
 	return close(fd) == 0 ? 0 : -1;
 }
 
-/* Validate that the first n on-disk v2 records of retention.meta reproduce
+/* Validate that the first n on-disk v2/v3 records of retention.meta reproduce
  * hash exactly, and report the file's current total size.  A missing file
  * reads as zero records, matching an interrupted append/compaction that
  * crashed before retention.meta was ever created.  Read-only: never mutates
  * the live registry.  Returns 1 (prefix matches), 0 (it does not), or -1 on
  * an I/O error unrelated to the comparison itself. */
 static int
-retention_verify_v2_prefix(uint64_t n, uint32_t hash, off_t *size_out)
+retention_verify_current_prefix(uint64_t n, uint32_t hash, off_t *size_out)
 {
 	int			fd;
 	off_t		size;
@@ -1302,7 +1311,7 @@ retention_recover_pending(void)
 			old_ok = 1;
 		else
 		{
-			new_ok = retention_verify_v2_prefix(pending.new_nrecords,
+			new_ok = retention_verify_current_prefix(pending.new_nrecords,
 												pending.new_hash, &size);
 			if (new_ok < 0)
 			{
@@ -1314,7 +1323,7 @@ retention_recover_pending(void)
 				(off_t) (pending.new_nrecords * sizeof(PsRetentionRecord));
 			if (!new_ok)
 			{
-				old_ok = retention_verify_v2_prefix(pending.old_nrecords,
+				old_ok = retention_verify_current_prefix(pending.old_nrecords,
 													pending.old_hash, &size);
 				if (old_ok < 0)
 				{
@@ -1351,7 +1360,7 @@ retention_recover_pending(void)
 		 * trailing record is not given this pass: it is not part of what
 		 * this intent recorded, and only an APPEND intent's own in-flight
 		 * record gets that benefit of the doubt. */
-		prefix_ok = retention_verify_v2_prefix(pending.old_nrecords,
+		prefix_ok = retention_verify_current_prefix(pending.old_nrecords,
 											   pending.old_hash, &size);
 		if (prefix_ok < 0)
 		{
@@ -1373,7 +1382,7 @@ retention_recover_pending(void)
 		 * told the mutation succeeded before the crash, so dropping a
 		 * complete-but-unacknowledged trailing record is always safe and
 		 * strictly simpler than trying to prove it was never observed. */
-		prefix_ok = retention_verify_v2_prefix(pending.old_nrecords,
+		prefix_ok = retention_verify_current_prefix(pending.old_nrecords,
 											   pending.old_hash, &size);
 		if (prefix_ok < 0)
 		{
@@ -1406,7 +1415,7 @@ retention_recover_pending(void)
 				 * publish (an empty tmp file renamed into place); a crash
 				 * after the intent but before that rename can leave
 				 * retention.meta genuinely absent, exactly as if the store
-				 * had never been mutated at all (retention_verify_v2_prefix
+				 * had never been mutated at all (retention_verify_current_prefix
 				 * reports a missing file as a trivial match for zero
 				 * records, which is what routed this case here).  Writing
 				 * retention.state now would leave a store with state but no
@@ -1783,7 +1792,8 @@ ps_retention_open(const char *store_dir)
 		if (header[1] == PS_RETENTION_VERSION_V1 &&
 			header[3] == sizeof(PsRetentionRecordV1))
 			legacy_format = 1;
-		else if (header[1] != PS_RETENTION_VERSION ||
+		else if ((header[1] != PS_RETENTION_VERSION &&
+				  header[1] != PS_RETENTION_VERSION_V2) ||
 				 header[3] != sizeof(PsRetentionRecord))
 		{
 			fprintf(stderr,

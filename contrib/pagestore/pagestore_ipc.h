@@ -343,6 +343,8 @@ typedef enum PsRetentionOwnerKind
 	PS_RETENTION_OWNER_READER = 1,
 	PS_RETENTION_OWNER_MATERIALIZER = 2,
 	PS_RETENTION_OWNER_CONFIGURED = 3,
+	/* Daemon-owned checkpoint artifacts; never mutable through client IPC. */
+	PS_RETENTION_OWNER_CHECKPOINT_FENCE = 4,
 } PsRetentionOwnerKind;
 
 typedef enum PsRetentionResource
