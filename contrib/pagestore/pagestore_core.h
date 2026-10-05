@@ -212,6 +212,10 @@ extern int ps_test_artifact_viewcap_property(uint32_t tl, const PsKey *key,
 											 uint32_t block,
 											 uint64_t lsn_rewrite,
 											 uint64_t lsn_first);
+/* Test-only: PS_ADM_F_META/UNSTAMPED classification for an exact event,
+ * or -1 when it is absent. */
+extern int ps_test_fork_event_flags(uint32_t timeline, const PsKey *key,
+								  uint64_t admission_seq);
 /* Test-only: event counts for one fork (0 if not found).  nmarkers counts
  * marker_kind != 0, ninert counts kind > FEV_DEAD (never activated). */
 extern int ps_test_fork_event_count(uint32_t timeline, const PsKey *key,

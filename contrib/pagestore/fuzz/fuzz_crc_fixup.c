@@ -350,6 +350,7 @@ typedef struct FuzzForkMetaRecV2
 } FuzzForkMetaRecV2;
 
 #define FORK_META_V2_MAGIC_LOCAL 0x324d4b46u /* "FKM2" */
+#define FORK_META_V4_MAGIC_LOCAL 0x344d4b46u
 #define FORK_META_V3_MAGIC_LOCAL 0x334d4b46u /* "FKM3" */
 
 static uint32_t
@@ -419,7 +420,7 @@ fixup_forkmeta_records(uint8_t *buf, size_t len)
 					 (uint32_t) stride);
 			memset(buf + off + crc_off, 0, 3);
 		}
-		else if (magic == FORK_META_V3_MAGIC_LOCAL)
+		else if (magic == FORK_META_V3_MAGIC_LOCAL || magic == FORK_META_V4_MAGIC_LOCAL)
 		{
 			uint32_t	crc;
 
