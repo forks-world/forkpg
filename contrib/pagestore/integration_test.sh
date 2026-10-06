@@ -1511,10 +1511,12 @@ assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
 r2Existing=$($P -c "SELECT pagestore_prepare_branch_from_control(
     '$R2SEED.existing', 41, 0, '$mxC', '$autoL', '$autoFork');" 2>&1 || true)
 case "$r2Existing" in
-    *"transaction completion after the fork"*"timeline already existed"*) r2Existing=yes ;;
+    *"transaction completion after the fork"*"cleanup=complete"*) r2Existing=yes ;;
     *) r2Existing="no: $r2Existing" ;;
 esac
 assert "$r2Existing" "yes" "R2-x reports an unproven existing branch without claiming ownership"
+assert "$([ ! -e "$R2SEED.existing/pagestore_branch.bootstrap" ] && [ ! -e "$R2SEED.existing/pagestore_branch.manifest" ] && echo yes || echo no)" \
+    "yes" "failed retry removes readiness artifacts even though the timeline pre-existed"
 assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
     -c "SELECT state = 'live' FROM pagestore_timeline_state(41);")" \
     "t" "failed direct retry leaves the existing timeline live"

@@ -13751,10 +13751,17 @@ pagestore_branch_remove_readiness(const char *target_dir)
 	fsync_fname(target_dir, true);
 }
 
-/* Return a diagnostic even if cleanup fails, preserving the proof error. */
+/*
+ * Remove the readiness artifacts this call published and, only when the call
+ * created the timeline, delete that exact incarnation.  A pre-existing
+ * timeline is preserved: an old daemon returns the zero "already existed"
+ * result, and that must never authorize deletion.  Return a diagnostic even
+ * if cleanup fails, so the caller can report it while preserving the original
+ * preparation error.
+ */
 static char *
-pagestore_branch_cleanup_created(const char *target_dir, uint32 timeline,
-								uint64 incarnation)
+pagestore_branch_cleanup(const char *target_dir, uint32 timeline,
+						 uint64 incarnation, bool delete_timeline)
 {
 	MemoryContext oldcontext = CurrentMemoryContext;
 	char *volatile result = "complete";
@@ -13762,7 +13769,8 @@ pagestore_branch_cleanup_created(const char *target_dir, uint32 timeline,
 	PG_TRY();
 	{
 		pagestore_branch_remove_readiness(target_dir);
-		if (pagestore_localsvc_begin_delete(timeline, incarnation) != PS_STATUS_OK)
+		if (delete_timeline &&
+			pagestore_localsvc_begin_delete(timeline, incarnation) != PS_STATUS_OK)
 			ereport(ERROR, (errmsg("timeline deletion was refused")));
 	}
 	PG_CATCH();
@@ -13906,31 +13914,38 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	{
 		MemoryContext oldcontext = CurrentMemoryContext;
 
+		/*
+		 * The proof and the bootstrap publication are the two steps that can
+		 * still fail after the timeline and its manifest exist.  On either
+		 * failure, remove the readiness artifacts this call published and
+		 * fsync the directory; delete the timeline only when this call
+		 * created it, so a pre-existing timeline is never destroyed.
+		 */
 		PG_TRY();
 		{
 			pagestore_branch_wal_proof(h.checkpoint_lsn, fork_lsn);
+			pagestore_write_branch_bootstrap(target_dir, new_tl, parent_tl,
+										checkpoint_redo,
+										h.checkpoint_end_lsn, fork_lsn,
+										h.system_identifier);
 		}
 		PG_CATCH();
 		{
-			ErrorData *proof_error;
-			char *cleanup = "not attempted (timeline already existed)";
+			ErrorData *prep_error;
+			char *cleanup;
 
 			MemoryContextSwitchTo(oldcontext);
-			proof_error = CopyErrorData();
+			prep_error = CopyErrorData();
 			FlushErrorState();
-			if (created_new)
-				cleanup = pagestore_branch_cleanup_created(target_dir, new_tl, incarnation);
-			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("%s", proof_error->message),
+			cleanup = pagestore_branch_cleanup(target_dir, new_tl, incarnation,
+											   created_new);
+			ereport(ERROR, (errcode(prep_error->sqlerrcode),
+				errmsg("%s", prep_error->message),
 				errdetail("Branch %u incarnation %llu; cleanup=%s. %s",
 					(uint32) new_tl, (unsigned long long) incarnation, cleanup,
-					proof_error->detail ? proof_error->detail : "")));
+					prep_error->detail ? prep_error->detail : "")));
 		}
 		PG_END_TRY();
-		pagestore_write_branch_bootstrap(target_dir, new_tl, parent_tl,
-									checkpoint_redo,
-									h.checkpoint_end_lsn, fork_lsn,
-									h.system_identifier);
 	}
 	else
 		ereport(ERROR,
