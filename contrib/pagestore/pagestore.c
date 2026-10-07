@@ -204,6 +204,7 @@ PGDLLEXPORT void pagestore_wal_index_worker_main(Datum main_arg);
 
 /* GUC state */
 static bool pagestore_route_all = false;
+static bool pagestore_allow_unsafe_branch_cut = false;
 static bool pagestore_route_user_tablespaces = false;
 static char *pagestore_backend_name = NULL;
 static char *pagestore_walredo_datadir = NULL;
@@ -1411,6 +1412,25 @@ pagestore_retention_owner_lsn(PG_FUNCTION_ARGS)
 	PG_RETURN_NULL();
 }
 
+/* Direct SQL entrypoints cannot establish the controller's G3 proof. */
+static void
+pagestore_require_unsafe_branch_cut(const char *entrypoint)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to create an unsafe pagestore branch")));
+	if (!pagestore_allow_unsafe_branch_cut)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore branch creation outside the controller flow is disabled"),
+				 errdetail("%s does not verify the branch transaction window and hint-bit safety proof.", entrypoint),
+				 errhint("Use pagestore_branch_prepare. For tests only, SET pagestore.allow_unsafe_branch_cut = on.")));
+	ereport(WARNING,
+			(errmsg("UNSAFE pagestore branch cut through %s", entrypoint),
+			 errdetail("The branch may contain parent hint bits written after its fork. Use only test data.")));
+}
+
 /*
  * pagestore_create_branch(new_timeline int, parent_timeline int, lsn pg_lsn)
  *
@@ -1429,6 +1449,8 @@ pagestore_create_branch(PG_FUNCTION_ARGS)
 	int32		parent_tl = PG_GETARG_INT32(1);
 	XLogRecPtr	lsn = PG_GETARG_LSN(2);
 
+	pagestore_require_unsafe_branch_cut("pagestore_create_branch");
+
 	if (new_tl <= 0)
 		ereport(ERROR,
 				(errmsg("pagestore branch timeline must be > 0 (0 is the main timeline)")));
@@ -1439,7 +1461,7 @@ pagestore_create_branch(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/* Explicit control-plane branch creation.  The legacy entrypoint above is
+/* Explicit-incarnation test-only creation.  The legacy entrypoint above is
  * intentionally pinned to incarnation one and therefore cannot authorize a
  * retry after DELETED. */
 PG_FUNCTION_INFO_V1(pagestore_create_branch_with_incarnation);
@@ -1451,6 +1473,8 @@ pagestore_create_branch_with_incarnation(PG_FUNCTION_ARGS)
 	int64		incarnation_arg = PG_GETARG_INT64(2);
 	uint64		incarnation;
 	XLogRecPtr	lsn = PG_GETARG_LSN(3);
+
+	pagestore_require_unsafe_branch_cut("pagestore_create_branch_with_incarnation");
 
 	if (new_tl <= 0 || parent_tl < 0 || incarnation_arg <= 0)
 		ereport(ERROR,
@@ -13700,8 +13724,8 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
  *                          oldest_member bigint, next_member bigint)
  * returns bigint
  *
- * Legacy expert entrypoint.  Keep its ABI for existing operators and tests;
- * new control-plane callers should use pagestore_prepare_branch_from_control.
+ * Test-only expert entrypoint, gated by allow_unsafe_branch_cut.  Production
+ * callers should use the serialized branch controller and its window proof.
  */
 PG_FUNCTION_INFO_V1(pagestore_prepare_branch);
 Datum
@@ -13715,6 +13739,8 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	int64		seeded;
 	char		bootstrap_path[MAXPGPATH];
 	int			pathlen;
+
+	pagestore_require_unsafe_branch_cut("pagestore_prepare_branch");
 
 	seeded = pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
 										base, target,
@@ -14568,6 +14594,15 @@ _PG_init(void)
 							 false,
 							 PGC_POSTMASTER,
 							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pagestore.allow_unsafe_branch_cut",
+							 "UNSAFE, test only: permits branches without the G3 hint-bit proof.",
+							 NULL,
+							 &pagestore_allow_unsafe_branch_cut,
+							 false,
+							 PGC_SUSET,
+							 GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
 							 NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("pagestore.route_user_tablespaces",

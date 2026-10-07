@@ -10,6 +10,8 @@
 #
 #   - a parent runs with route_all=on over an imported store (timeline 0),
 #     shipping WAL and SLRU snapshots;
+#   - the test explicitly permits an unsafe expert cut; production uses the
+#     serialized controller instead;
 #   - pagestore_prepare_branch() seeds the branch SLRUs as of the fork LSN,
 #     forks the store timeline, and publishes the durable manifest;
 #   - the branch datadir is a copy of the cleanly-stopped parent, with the
@@ -141,7 +143,7 @@ nxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
 # prepare needs the (C, L] WAL: it replays from the parent's local pg_wal
 PREP=$(mktemp -d)/prep
 mkdir -p "$PREP"
-seeded=$($P -c "SELECT pagestore_prepare_branch('$PREP', 1, 0, '$bc', '$bL',
+seeded=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch('$PREP', 1, 0, '$bc', '$bL',
 	'3'::xid, '$nxid'::xid, '1'::xid, '1'::xid, '1'::xid, '1'::xid, 0, 0);")
 assert "$([ "${seeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"branch prepared: SLRUs seeded as-of L and store timeline forked ($seeded page(s))"

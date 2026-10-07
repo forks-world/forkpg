@@ -1194,3 +1194,29 @@ change.
 Finite caps remain disabled. G3 entry-point gates, capability/result handshake
 and atomic finite branch activation remain in P3b. This prerequisite does not
 yet resolve Bug B.
+
+### Direct SQL entry gates prerequisite
+
+`pagestore_create_branch`, `pagestore_create_branch_with_incarnation` and
+`pagestore_prepare_branch` now refuse by default before IPC mutations or SLRU /
+readiness-file work. These direct APIs do not establish the controller's G3
+proof. Testing them requires explicit `SET pagestore.allow_unsafe_branch_cut = on`.
+The setting defaults to off, is `PGC_SUSET`, and is excluded from the sample
+configuration and configuration files (`GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE`).
+`ALTER SYSTEM` cannot persist it. Each permitted attempt emits an UNSAFE warning.
+Each API also checks the effective superuser identity independently of the
+setting, so `SET ROLE` cannot reuse a privileged connection's enabled value.
+
+The checked control/window APIs do not consult this flag: shutdown-checkpoint,
+transaction-window, materializer-marker and post-CREATE WAL checks continue to
+apply. The controller/golden scenario uses its normal checked entrypoint with
+unsafe cuts off. Legacy integration and branch-boot tests opt in explicitly
+within the individual SQL session; the separate `branch_gate_test.sh` exercises
+default refusal, role changes, RESET, warnings, actual test timeline creation,
+unchanged readiness files and ALTER SYSTEM refusal in real PostgreSQL.
+
+This prerequisite changes no SQL signature, extension version, persisted
+format, or daemon capability advertisement. The capability/result handshake
+must be activated together with finite branch reads, retention and gates; the
+daemon must not advertise safe caps before those semantics exist. Finite
+activation and Bug B remain pending.
