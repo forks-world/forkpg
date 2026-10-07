@@ -1244,6 +1244,7 @@ class BranchPrepareTests(unittest.TestCase):
         self.assertTrue(preparer.private)
         self.assertTrue(preparer.sql.startswith("SET pagestore.redo_wal_from_store = on;"))
         self.assertIn('"Page Store".pagestore_prepare_branch_from_control(', preparer.sql)
+        self.assertTrue(preparer.sql.endswith(", 1, true)"))
 
     def test_preflight_discovers_and_qualifies_extension_schemas(self):
         config = MODULE.Config.load(self.write_config())

@@ -1111,3 +1111,30 @@ materializer marker proof, G3 gates, capability handshake and atomic finite
 branch activation still belong to P3b. Existing uncapped readiness artifacts
 must be rejected by that activation's safe-path finite-result check. This
 prerequisite does not yet fix Bug B.
+
+### R2-m writer-side materializer proof prerequisite
+
+Extension 1.4 adds an eight-argument overload of
+`pagestore_prepare_branch_from_control`, with `require_materialized boolean`
+after `incarnation`. The serialized controller requires that signature in
+preflight and always passes `true`, including exact-boundary recovery and seed
+verification. Upgrade a writer's installed extension with
+`ALTER EXTENSION pagestore UPDATE TO '1.4'` before using the new controller.
+
+The server reads the active parent timeline's durable materializer marker
+before seeding SLRUs or sending CREATE_BRANCH. A missing/invalid marker or a
+marker below the requested fork fails with SQLSTATE `55000`; no new prepared
+artifacts or timeline are published. The controller's earlier materializer
+wait is still needed for progress, but is not substituted for this server
+check. Directory reuse cannot bypass the check. A marker equal to the fork is
+accepted, as exercised by the paused-materializer golden scenario and its
+crash/recovery continuation.
+
+The six/seven-argument direct-write interfaces retain their legacy contract;
+the new overload with `false` likewise retains it. Declared materializers
+always require the marker regardless of overload. These legacy interfaces
+must still be gated when P3b activates finite branch caps. This prerequisite
+changes no persisted store, bootstrap or controller-journal format and does
+not activate finite caps or resolve Bug B. The first-statement transaction
+snapshot, G3 entry-point gates, capability handshake and atomic finite
+activation remain pending.

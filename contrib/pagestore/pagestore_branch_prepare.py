@@ -872,7 +872,7 @@ class BranchPreparer:
         )
         prepare_signature = self.extension_function(
             self.writer_extension_schema,
-            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)",
+            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)",
         )
         checkpoint_signature = self.extension_function(
             self.writer_extension_schema, "pagestore_branch_checkpoint()"
@@ -1331,7 +1331,7 @@ class BranchPreparer:
                 + sql_literal(fork)
                 + "::pg_lsn, "
                 + str(self.config.new_incarnation)
-                + ")",
+                + ", true)",
                 private=True,
             )
         )

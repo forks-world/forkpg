@@ -286,16 +286,17 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_is_in_recovery();")" "t" \
 	CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.0';
 	ALTER EXTENSION pagestore UPDATE TO '1.1';
 	ALTER EXTENSION pagestore UPDATE TO '1.2';
-	ALTER EXTENSION pagestore UPDATE TO '1.3';" >/dev/null ||
+	ALTER EXTENSION pagestore UPDATE TO '1.3';
+	ALTER EXTENSION pagestore UPDATE TO '1.4';" >/dev/null ||
 fail "could not install the extension upgrade chain"
-assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.3" \
-	"extension upgrades from 1.0 through 1.1 and 1.2 to 1.3"
-api_count=$("${WP[@]}" -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pagestore_ext' AND p.oid IN ('pagestore_ext.pagestore_create_branch_with_incarnation(integer,integer,bigint,pg_lsn)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)'::regprocedure, 'pagestore_ext.pagestore_retention_drop_with_incarnation(integer,integer,bigint,bigint,bigint)'::regprocedure, 'pagestore_ext.pagestore_timeline_state(integer)'::regprocedure, 'pagestore_ext.pagestore_delete_branch(integer,bigint)'::regprocedure);")
-assert_eq "$api_count" "5" "1.3 exposes the branch, retention and timeline lifecycle control APIs after upgrade"
-"${WP[@]}" -c "DROP EXTENSION pagestore; CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.3';" >/dev/null ||
-	fail "could not install a fresh 1.3 extension"
-assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.3" \
-	"fresh extension install uses version 1.3"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.4" \
+	"extension upgrades from 1.0 through 1.1 and 1.2 to 1.4"
+api_count=$("${WP[@]}" -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pagestore_ext' AND p.oid IN ('pagestore_ext.pagestore_create_branch_with_incarnation(integer,integer,bigint,pg_lsn)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)'::regprocedure, 'pagestore_ext.pagestore_retention_drop_with_incarnation(integer,integer,bigint,bigint,bigint)'::regprocedure, 'pagestore_ext.pagestore_timeline_state(integer)'::regprocedure, 'pagestore_ext.pagestore_delete_branch(integer,bigint)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)'::regprocedure);")
+assert_eq "$api_count" "6" "1.4 exposes the branch, retention and timeline lifecycle control APIs after upgrade"
+"${WP[@]}" -c "DROP EXTENSION pagestore; CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.4';" >/dev/null ||
+	fail "could not install a fresh 1.4 extension"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.4" \
+	"fresh extension install uses version 1.4"
 "${WP[@]}" -c "CREATE FUNCTION pagestore_read_at(regclass, int, int, pg_lsn) RETURNS bytea
  AS 'pagestore','pagestore_read_at' LANGUAGE C STRICT;
 CREATE TABLE mvp_golden(id int primary key, note text);" >/dev/null ||
@@ -478,6 +479,38 @@ assert_eq "$("${RWP[@]}" -c "SELECT current_setting('listen_addresses') = ''; ")
 	"crashed controller leaves only the restricted writer reachable"
 assert_eq "$("${MP[@]}" -c "SELECT pagestore_ext.pagestore_retention_owner_lsn(0, 3, 1, $retention_generation) IS NOT NULL;")" "t" \
 	"crashed controller leaves the exact branch retention pin installed"
+
+# The controller's wait is not the server's R2-m proof.  With the materializer
+# paused, request a fork one byte beyond its durable marker.  Refuse before
+# publishing artifacts or creating another timeline, including directory reuse.
+IFS='|' read -r proof_base proof_redo proof_marker <<EOF
+$(python3 -c 'import json, sys
+r = json.load(open(sys.argv[1]))
+print("|".join(r[k] for k in ("base_lsn", "checkpoint_redo_lsn", "fork_lsn")))' \
+    "$PREPARED/pagestore_branch.prepare.json")
+EOF
+assert_eq "$("${RWP[@]}" -c "SELECT materialized_wal_lsn = '$proof_marker'::pg_lsn
+    FROM pagestore_ext.pagestore_materializer_status();")" "t" \
+    "writer observes the paused materializer's durable marker"
+LAGGING_PREPARED="$TMPROOT/lagging-prepared"
+mkdir "$LAGGING_PREPARED" || fail "could not create lagging-materializer test directory"
+for proof_dir in "$LAGGING_PREPARED" "$PREPARED"; do
+    lag_rejected=$("${RWP[@]}" -v VERBOSITY=verbose -c \
+        "SELECT pagestore_ext.pagestore_prepare_branch_from_control(
+        '$proof_dir', 2, 0, '$proof_base', '$proof_redo',
+        '$proof_marker'::pg_lsn + 1, 1, true);" 2>&1) &&
+        fail "branch preparation accepted a fork beyond the materializer marker"
+    case "$lag_rejected" in
+        *"55000: branch fork LSN exceeds the durable materialized horizon"*) ;;
+        *) fail "lagging-materializer rejection did not report the R2-m error: $lag_rejected" ;;
+    esac
+done
+assert_eq "$(find "$LAGGING_PREPARED" -type f | wc -l | tr -d ' ')" "0" \
+    "lagging-materializer rejection creates no prepared artifacts"
+assert_eq "$("${RWP[@]}" -c "SELECT state IS NULL AND incarnation IS NULL
+    FROM pagestore_ext.pagestore_timeline_state(2);")" "t" \
+    "lagging-materializer rejection creates no store timeline"
+echo "ok   - server validates the materializer marker before preparing a controller branch"
 
 # Remove the one-shot report control before the recovery process.  The second
 # controller has no fault environment and therefore cannot consume stale arm
