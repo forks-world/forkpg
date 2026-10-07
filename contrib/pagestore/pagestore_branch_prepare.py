@@ -872,7 +872,7 @@ class BranchPreparer:
         )
         prepare_signature = self.extension_function(
             self.writer_extension_schema,
-            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)",
+            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)",
         )
         checkpoint_signature = self.extension_function(
             self.writer_extension_schema, "pagestore_branch_checkpoint()"
@@ -1331,7 +1331,7 @@ class BranchPreparer:
                 + sql_literal(fork)
                 + "::pg_lsn, "
                 + str(self.config.new_incarnation)
-                + ")",
+                + ", true)",
                 private=True,
             )
         )
@@ -1479,6 +1479,7 @@ class BranchPreparer:
             raise BranchPrepareError("branch journal is not loaded")
         state = self.journal["state"]
         if state == "complete":
+            self.validate_completed_materialization(self.journal["fork_lsn"])
             return dict(self.journal)
         if state == "r2_failed" and self.journal.get("intent") is None:
             raise BranchPrepareError("branch proof failed; rerun with a new incarnation and receipt path")
@@ -1581,22 +1582,20 @@ class BranchPreparer:
                 archived_through_lsn=self.journal["switch_lsn"],
             )
             state = "branch_prepared"
-        if (entered_state in ("branch_prepared", "prepared")
-                and self.verify_seed_against_materializer):
-            # Prepared before verification was requested (or by a run whose
-            # verification we cannot see): the materializer is still paused
-            # at the fork LSN in these states, so re-seed under verification
-            # now -- the server reconstructs and compares every page again
-            # instead of reusing the manifest -- before carrying on.  A
-            # journal that entered at fork_captured was just seeded and
-            # verified above; seeding it again would only unlink and rebuild
-            # a manifest that already stands.
+        if entered_state in ("branch_prepared", "prepared"):
+            # An older controller may have published this state without the
+            # writer-side materializer proof.  Always repeat the checked API
+            # before publishing or restoring services, even without optional
+            # seed verification.  An unavailable upgraded signature fails
+            # closed here.  At fork_captured the same call just ran above.
             seeded = self.prepare_branch(
                 self.journal["base_lsn"],
                 self.journal["checkpoint_redo_lsn"],
                 self.journal["fork_lsn"],
             )
             self.journal_update(state, None, seeded_slru_pages=seeded)
+        if state in ("materializer_resumed", "writer_restored"):
+            self.validate_recovered_materialization(self.journal["fork_lsn"], mode)
         if state in ("materializer_resumed", "writer_restored") and self.verify_seed_against_materializer:
             raise BranchPrepareError(
                 f"branch journal state {state!r} has resumed the materializer past the fork "
@@ -1609,6 +1608,42 @@ class BranchPreparer:
             state = "prepared"
         self.success_restore(run_faults=False)
         return dict(self.journal or {})
+
+    def validate_completed_materialization(self, fork: str) -> None:
+        # A complete receipt can predate the checked prepare API.  Validate
+        # through the surviving writer without altering the receipt/services.
+        mode = self.observe_writer_mode()
+        if mode not in ("normal", "restricted"):
+            raise BranchPrepareError("branch materializer proof requires a reachable writer")
+        private = mode == "restricted"
+        self.writer_extension_schema = self.extension_schema(
+            lambda sql: self.writer_sql(sql, private=private), "writer"
+        )
+        self.validate_recovery_writer(private=private)
+        self.validate_recovered_materialization(fork, mode)
+
+    def validate_recovered_materialization(self, fork: str, mode: str) -> None:
+        # After services resume, only read the store-observed marker.  Reseeding
+        # would race the materializer and the normal writer's transactions.
+        parse_lsn(fork)
+        if mode not in ("restricted", "normal"):
+            raise BranchPrepareError("branch materializer proof requires a reachable writer")
+        signature = self.extension_function(
+            self.writer_extension_schema,
+            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)",
+        )
+        result = last_output_line(self.writer_sql(
+            "SELECT to_regprocedure(" + sql_literal(signature) + ") IS NOT NULL"
+            " AND COALESCE((SELECT materialized_wal_lsn >= "
+            + sql_literal(fork) + "::pg_lsn FROM "
+            + self.extension_function(self.writer_extension_schema,
+                                      "pagestore_materializer_status()")
+            + "), false)", private=mode == "restricted",
+        ))
+        if result != "t":
+            raise BranchPrepareError(
+                "recovered branch requires the checked API and a durable materializer marker covering its fork"
+            )
 
     def restore_services(self) -> list[str]:
         errors: list[str] = []
@@ -1646,6 +1681,7 @@ class BranchPreparer:
                 if not isinstance(fork_lsn, str):
                     raise BranchPrepareError("completed branch receipt has no fork LSN")
                 self.require_fork_on_segment_boundary(fork_lsn)
+                self.validate_completed_materialization(fork_lsn)
                 return existing
             self.journal = existing
             self.restore_ownership_from_journal()

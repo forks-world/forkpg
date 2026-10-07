@@ -1177,6 +1177,8 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_prepare_branch_from_control(text, int, int, pg_lsn, pg_lsn, pg_lsn) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch_from_control' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_prepare_branch_from_control(text, int, int, pg_lsn, pg_lsn, pg_lsn, bigint, bool) RETURNS bigint
+        AS 'pagestore','pagestore_prepare_branch_from_control' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_install_prepared_branch_bootstrap(text, text, int, int, pg_lsn, pg_lsn, pg_lsn) RETURNS void
         AS 'pagestore','pagestore_install_prepared_branch_bootstrap' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_branch_manifest(text, int, int, pg_lsn) RETURNS bool
@@ -1377,6 +1379,22 @@ for ((iteration = 0; iteration < 100; iteration++)); do
         -c "SELECT pagestore_shipped_wal_lsn() >= '$autoFork';" 2>/dev/null)" = "t" ] && break
     sleep 0.1
 done
+# A direct-write test source has no materializer marker.  Opting into the
+# controller contract must refuse before any artifact or timeline is created.
+MISSINGMARKERSEED=$(mktemp -d)
+missingMarker=$($P -v VERBOSITY=verbose -c "SELECT pagestore_prepare_branch_from_control(
+    '$MISSINGMARKERSEED', 6, 0, '$mxC', '$autoL', '$autoFork', 1, true);" 2>&1 || true)
+case "$missingMarker" in
+    *"55000: branch fork LSN exceeds the durable materialized horizon"*) missingMarker=yes ;;
+    *) missingMarker=no ;;
+esac
+assert "$missingMarker" "yes" "controller preparation rejects a missing materializer marker"
+assert "$(find "$MISSINGMARKERSEED" -type f | wc -l | tr -d ' ')" "0" \
+    "missing-marker rejection creates no prepared artifacts"
+assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_timeline_state(6);")" "t" \
+    "missing-marker rejection creates no store timeline"
+rm -rf "$MISSINGMARKERSEED"
 AUTOSEED=$(mktemp -d)
 autoSeeded=$($P -c "SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")

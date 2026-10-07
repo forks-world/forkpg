@@ -724,6 +724,7 @@ class BranchPrepareTests(unittest.TestCase):
                            seeded_slru_pages=1, materializer_resumed=True, writer_restored=True)
             preparer = MidSegmentFork(config, fork)
             preparer.write_journal(journal)
+            preparer.validate_completed_materialization = lambda lsn: None
             if ok:
                 self.assertEqual(preparer.execute()["fork_lsn"], fork)
             else:
@@ -1102,6 +1103,10 @@ class BranchPrepareTests(unittest.TestCase):
                     raise AssertionError(sql)
 
             class Recovery(m.BranchPreparer):
+                def prepare_branch(self, base, redo, fork):
+                    with calls.open("a", encoding="utf-8") as stream:
+                        stream.write(base + "," + redo + "," + fork + "\\n")
+                    return 7
                 def wal_segment_size(self):
                     return 0x40
 
@@ -1216,7 +1221,8 @@ class BranchPrepareTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     (self.root / "prepare.calls").read_text(encoding="utf-8").count("0/10,0/20,0/40"),
-                    points.index((point, crashed_state)) + 1,
+                    points.index((point, crashed_state)) + 1
+                    + min(points.index((point, crashed_state)) + 1, 2),
                 )
 
     def test_wait_does_not_swallow_cancellation(self):
@@ -1228,6 +1234,98 @@ class BranchPrepareTests(unittest.TestCase):
 
         with self.assertRaisesRegex(MODULE.CancelledError, "cancelled"):
             preparer.wait_until("cancellation", cancel)
+
+    def test_prepared_recovery_revalidates_without_seed_verification(self):
+        config = MODULE.Config.load(self.write_config())
+        for state in ("branch_prepared", "prepared"):
+            for outcome in ("3", "missing upgraded API", "marker below fork"):
+                with self.subTest(state=state, outcome=outcome):
+                    preparer = MODULE.BranchPreparer(config)
+                    preparer.writer_extension_schema = '"writer"'
+                    journal = preparer.new_journal()
+                    journal.update(state=state, intent=None, base_lsn="0/10",
+                                   checkpoint_redo_lsn="0/20", fork_lsn="0/40",
+                                   pause_owned=True, writer_owned=True,
+                                   restricted_writer_running=True, retention_owned=True)
+                    preparer.write_journal(journal)
+                    original_journal = config.receipt_file.read_bytes()
+                    preparer.discover_recovery_services = lambda: None
+                    preparer.observe_recovery_ownership = lambda: "restricted"
+                    preparer.require_fork_on_segment_boundary = lambda lsn: None
+                    queries = []
+                    restored = []
+
+                    def writer_sql(sql, *, private=False):
+                        queries.append((sql, private))
+                        if outcome != "3":
+                            raise MODULE.BranchPrepareError(outcome)
+                        return outcome
+
+                    preparer.writer_sql = writer_sql
+                    preparer.success_restore = lambda run_faults=True: restored.append(True)
+                    if outcome == "3":
+                        preparer.recover_journal()
+                        self.assertEqual(preparer.journal["seeded_slru_pages"], 3)
+                        self.assertEqual(restored, [True])
+                    else:
+                        with self.assertRaisesRegex(MODULE.BranchPrepareError, outcome):
+                            preparer.recover_journal()
+                        self.assertEqual(preparer.journal["state"], state)
+                        self.assertEqual(config.receipt_file.read_bytes(), original_journal)
+                        self.assertEqual(restored, [])
+                    self.assertEqual(len(queries), 1)
+                    self.assertTrue(queries[0][1])
+                    self.assertIn('"writer".pagestore_prepare_branch_from_control(', queries[0][0])
+                    self.assertTrue(queries[0][0].endswith(", 1, true)"))
+
+    def test_post_resume_recovery_checks_marker_on_surviving_writer(self):
+        config = MODULE.Config.load(self.write_config())
+        for state in ("materializer_resumed", "writer_restored", "complete"):
+            for mode in ("restricted", "normal"):
+                for result in ("t", "f", "", "SQL error"):
+                    with self.subTest(state=state, mode=mode, result=result):
+                        preparer = MODULE.BranchPreparer(config)
+                        preparer.writer_extension_schema = '"writer"'
+                        journal = preparer.new_journal()
+                        journal.update(state=state, intent=None, fork_lsn="0/40")
+                        preparer.write_journal(journal)
+                        original_journal = config.receipt_file.read_bytes()
+                        preparer.discover_recovery_services = lambda: None
+                        preparer.observe_recovery_ownership = lambda: mode
+                        preparer.require_fork_on_segment_boundary = lambda lsn: None
+                        queries = []
+                        restored = []
+
+                        def writer_sql(sql, *, private=False):
+                            queries.append((sql, private))
+                            if result == "SQL error":
+                                raise MODULE.BranchPrepareError("SQL error")
+                            return result
+
+                        preparer.writer_sql = writer_sql
+                        preparer.observe_writer_mode = lambda: mode
+                        preparer.extension_schema = lambda query, role: '"writer"'
+                        preparer.validate_recovery_writer = lambda private: None
+                        recover = preparer.execute if state == "complete" else preparer.recover_journal
+                        preparer.prepare_branch = mock.Mock(side_effect=AssertionError("must not reseed"))
+                        preparer.success_restore = lambda run_faults=True: restored.append(True)
+                        if result == "t":
+                            recover()
+                            self.assertEqual(restored, [] if state == "complete" else [True])
+                            if state == "complete":
+                                self.assertEqual(config.receipt_file.read_bytes(), original_journal)
+                        else:
+                            with self.assertRaises(MODULE.BranchPrepareError):
+                                recover()
+                            self.assertEqual(config.receipt_file.read_bytes(), original_journal)
+                            self.assertEqual(restored, [])
+                        preparer.prepare_branch.assert_not_called()
+                        self.assertEqual(len(queries), 1)
+                        self.assertEqual(queries[0][1], mode == "restricted")
+                        self.assertIn('to_regprocedure(', queries[0][0])
+                        self.assertIn('bigint,boolean)', queries[0][0])
+                        self.assertIn('"writer".pagestore_materializer_status()', queries[0][0])
+                        self.assertIn("materialized_wal_lsn >= '0/40'::pg_lsn", queries[0][0])
 
     def test_prepare_branch_reads_wal_from_store(self):
         config = MODULE.Config.load(self.write_config())
@@ -1244,6 +1342,7 @@ class BranchPrepareTests(unittest.TestCase):
         self.assertTrue(preparer.private)
         self.assertTrue(preparer.sql.startswith("SET pagestore.redo_wal_from_store = on;"))
         self.assertIn('"Page Store".pagestore_prepare_branch_from_control(', preparer.sql)
+        self.assertTrue(preparer.sql.endswith(", 1, true)"))
 
     def test_preflight_discovers_and_qualifies_extension_schemas(self):
         config = MODULE.Config.load(self.write_config())

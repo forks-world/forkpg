@@ -13791,7 +13791,12 @@ pagestore_branch_cleanup(const char *target_dir, uint32 timeline,
  * pagestore_prepare_branch_from_control(target_dir text, new_timeline int,
  *                                       parent_timeline int, base pg_lsn,
  *                                       checkpoint_redo pg_lsn,
- *                                       fork_lsn pg_lsn) returns bigint
+ *                                       fork_lsn pg_lsn [, incarnation bigint
+ *                                       [, require_materialized boolean]])
+ * returns bigint
+ *
+ * The serialized controller passes require_materialized=true so the writer
+ * verifies the store-observed restartpoint marker before creating a branch.
  *
  * Control-derived entrypoint: the caller supplies the proven exact base
  * snapshot cutoff C, a durably mirrored checkpoint redo R, and a materialized
@@ -13814,7 +13819,8 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	XLogRecPtr	base = PG_GETARG_LSN(3);
 	XLogRecPtr	checkpoint_redo = PG_GETARG_LSN(4);
 	XLogRecPtr	fork_lsn = PG_GETARG_LSN(5);
-	int64		incarnation_arg = PG_NARGS() == 7 ? PG_GETARG_INT64(6) : 1;
+	int64		incarnation_arg = PG_NARGS() >= 7 ? PG_GETARG_INT64(6) : 1;
+	bool		require_materialized = PG_NARGS() >= 8 && PG_GETARG_BOOL(7);
 	uint64		incarnation;
 	uint64		parent_incarnation;
 	XLogRecPtr	materialized;
@@ -13864,18 +13870,20 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 							   LSN_FORMAT_ARGS(fork_lsn),
 							   LSN_FORMAT_ARGS(h.checkpoint_end_lsn))));
 	/*
-	 * The declared materializer can only fork at a restartpoint marker: that is
-	 * the point through which its replayed relation pages are durable.  Other
-	 * direct-write computes synchronously persist each routed page, including
-	 * pages whose WAL record is still in the current unarchived segment.  They
-	 * therefore need no materializer-watermark bound.
+	 * R2-m: the serialized controller's writer does not publish relation
+	 * pages.  Verify the store-observed marker here, before seeding SLRUs or
+	 * CREATE_BRANCH, rather than trusting the controller's earlier wait.
+	 * Missing or invalid markers read as InvalidXLogRecPtr and fail closed.
+	 * Legacy direct-write callers retain their existing contract until finite
+	 * branch activation; a declared materializer always needs this bound.
 	 */
-	if (pagestore_materializer)
+	if (require_materialized || pagestore_materializer)
 	{
 		materialized = pagestore_materialized_wal_lsn_internal();
-		if (fork_lsn > materialized)
+		if (XLogRecPtrIsInvalid(materialized) || fork_lsn > materialized)
 			ereport(ERROR,
-					(errmsg("branch fork LSN exceeds the durable materialized horizon"),
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("branch fork LSN exceeds the durable materialized horizon"),
 					 errdetail("Fork %X/%08X exceeds materialized horizon %X/%08X.",
 							   LSN_FORMAT_ARGS(fork_lsn),
 							   LSN_FORMAT_ARGS(materialized))));
