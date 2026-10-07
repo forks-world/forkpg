@@ -1581,16 +1581,12 @@ class BranchPreparer:
                 archived_through_lsn=self.journal["switch_lsn"],
             )
             state = "branch_prepared"
-        if (entered_state in ("branch_prepared", "prepared")
-                and self.verify_seed_against_materializer):
-            # Prepared before verification was requested (or by a run whose
-            # verification we cannot see): the materializer is still paused
-            # at the fork LSN in these states, so re-seed under verification
-            # now -- the server reconstructs and compares every page again
-            # instead of reusing the manifest -- before carrying on.  A
-            # journal that entered at fork_captured was just seeded and
-            # verified above; seeding it again would only unlink and rebuild
-            # a manifest that already stands.
+        if entered_state in ("branch_prepared", "prepared"):
+            # An older controller may have published this state without the
+            # writer-side materializer proof.  Always repeat the checked API
+            # before publishing or restoring services, even without optional
+            # seed verification.  An unavailable upgraded signature fails
+            # closed here.  At fork_captured the same call just ran above.
             seeded = self.prepare_branch(
                 self.journal["base_lsn"],
                 self.journal["checkpoint_redo_lsn"],
