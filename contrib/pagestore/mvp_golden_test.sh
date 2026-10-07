@@ -555,7 +555,7 @@ echo "ok   - serialized branch window selected C=$base_lsn R=$checkpoint_redo E=
 # prepare API.  Revalidate through the normal writer, with no SLRU reseeding.
 cp "$PREPARED/pagestore_branch.prepare.json" "$TMPROOT/completed-journal.json" ||
     fail "could not preserve the completed journal for recovery tests"
-for recovered_state in materializer_resumed writer_restored; do
+for recovered_state in materializer_resumed writer_restored complete; do
     for marker_ok in false true; do
         python3 - "$TMPROOT/completed-journal.json" "$PREPARED/pagestore_branch.prepare.json" \
             "$BIN" "$recovered_state" "$marker_ok" "$(wal_segment_size "$WRITER")" <<'PYRECOVER' || fail "could not construct the post-resume recovery journal"
@@ -590,7 +590,7 @@ PYRECOVER
 done
 cp "$TMPROOT/completed-journal.json" "$PREPARED/pagestore_branch.prepare.json" ||
     fail "could not restore the completed journal"
-echo "ok   - both post-resume recovery states validate the marker through the normal writer"
+echo "ok   - post-resume and completed journals validate the marker through the normal writer"
 # The persisted-format fixture for the controller's JSON artifacts
 # (harness/pagestore_controller_fixture.py --capture) takes what this real
 # controller run left behind: its configuration, the completed journal and

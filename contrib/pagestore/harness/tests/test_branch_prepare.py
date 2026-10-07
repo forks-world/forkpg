@@ -724,6 +724,7 @@ class BranchPrepareTests(unittest.TestCase):
                            seeded_slru_pages=1, materializer_resumed=True, writer_restored=True)
             preparer = MidSegmentFork(config, fork)
             preparer.write_journal(journal)
+            preparer.validate_completed_materialization = lambda lsn: None
             if ok:
                 self.assertEqual(preparer.execute()["fork_lsn"], fork)
             else:
@@ -1279,7 +1280,7 @@ class BranchPrepareTests(unittest.TestCase):
 
     def test_post_resume_recovery_checks_marker_on_surviving_writer(self):
         config = MODULE.Config.load(self.write_config())
-        for state in ("materializer_resumed", "writer_restored"):
+        for state in ("materializer_resumed", "writer_restored", "complete"):
             for mode in ("restricted", "normal"):
                 for result in ("t", "f", "", "SQL error"):
                     with self.subTest(state=state, mode=mode, result=result):
@@ -1302,14 +1303,20 @@ class BranchPrepareTests(unittest.TestCase):
                             return result
 
                         preparer.writer_sql = writer_sql
+                        preparer.observe_writer_mode = lambda: mode
+                        preparer.extension_schema = lambda query, role: '"writer"'
+                        preparer.validate_recovery_writer = lambda private: None
+                        recover = preparer.execute if state == "complete" else preparer.recover_journal
                         preparer.prepare_branch = mock.Mock(side_effect=AssertionError("must not reseed"))
                         preparer.success_restore = lambda run_faults=True: restored.append(True)
                         if result == "t":
-                            preparer.recover_journal()
-                            self.assertEqual(restored, [True])
+                            recover()
+                            self.assertEqual(restored, [] if state == "complete" else [True])
+                            if state == "complete":
+                                self.assertEqual(config.receipt_file.read_bytes(), original_journal)
                         else:
                             with self.assertRaises(MODULE.BranchPrepareError):
-                                preparer.recover_journal()
+                                recover()
                             self.assertEqual(config.receipt_file.read_bytes(), original_journal)
                             self.assertEqual(restored, [])
                         preparer.prepare_branch.assert_not_called()

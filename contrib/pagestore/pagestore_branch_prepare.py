@@ -1479,6 +1479,7 @@ class BranchPreparer:
             raise BranchPrepareError("branch journal is not loaded")
         state = self.journal["state"]
         if state == "complete":
+            self.validate_completed_materialization(self.journal["fork_lsn"])
             return dict(self.journal)
         if state == "r2_failed" and self.journal.get("intent") is None:
             raise BranchPrepareError("branch proof failed; rerun with a new incarnation and receipt path")
@@ -1608,6 +1609,19 @@ class BranchPreparer:
         self.success_restore(run_faults=False)
         return dict(self.journal or {})
 
+    def validate_completed_materialization(self, fork: str) -> None:
+        # A complete receipt can predate the checked prepare API.  Validate
+        # through the surviving writer without altering the receipt/services.
+        mode = self.observe_writer_mode()
+        if mode not in ("normal", "restricted"):
+            raise BranchPrepareError("branch materializer proof requires a reachable writer")
+        private = mode == "restricted"
+        self.writer_extension_schema = self.extension_schema(
+            lambda sql: self.writer_sql(sql, private=private), "writer"
+        )
+        self.validate_recovery_writer(private=private)
+        self.validate_recovered_materialization(fork, mode)
+
     def validate_recovered_materialization(self, fork: str, mode: str) -> None:
         # After services resume, only read the store-observed marker.  Reseeding
         # would race the materializer and the normal writer's transactions.
@@ -1667,6 +1681,7 @@ class BranchPreparer:
                 if not isinstance(fork_lsn, str):
                     raise BranchPrepareError("completed branch receipt has no fork LSN")
                 self.require_fork_on_segment_boundary(fork_lsn)
+                self.validate_completed_materialization(fork_lsn)
                 return existing
             self.journal = existing
             self.restore_ownership_from_journal()
