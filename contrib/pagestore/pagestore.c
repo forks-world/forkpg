@@ -98,6 +98,7 @@
 #include "utils/pg_lsn.h"
 #include "utils/plancache.h"
 #include "utils/rel.h"
+#include "utils/xid8.h"
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/wait_classes.h"
@@ -13250,6 +13251,7 @@ typedef struct PagestoreBranchHorizons
 	uint64		system_identifier;
 	TransactionId oldest_xid;
 	TransactionId next_xid;
+	FullTransactionId checkpoint_next_xid;
 	TransactionId oldest_commit_ts_xid;
 	TransactionId next_commit_ts_xid;
 	MultiXactId oldest_multi;
@@ -13311,6 +13313,7 @@ pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
 	h->system_identifier = control.system_identifier;
 	h->oldest_xid = checkpoint->oldestXid;
 	h->next_xid = XidFromFullTransactionId(checkpoint->nextXid);
+	h->checkpoint_next_xid = checkpoint->nextXid;
 	if (!TransactionIdIsNormal(h->oldest_xid) ||
 		!TransactionIdIsNormal(h->next_xid) ||
 		TransactionIdFollows(h->oldest_xid, h->next_xid))
@@ -13396,6 +13399,82 @@ pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
 				(errmsg("checkpoint has invalid multixact member horizons [%lld, %lld)",
 						(long long) h->oldest_member,
 						(long long) h->next_member)));
+}
+
+/* Early diagnostics only: the post-CREATE local WAL scan remains the proof. */
+static int
+pagestore_branch_prepared_count(void)
+{
+	int count;
+	bool isnull;
+	Datum value;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect SPI for branch transaction window");
+	if (SPI_execute("SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_prepared_xacts",
+					true, 1) != SPI_OK_SELECT || SPI_processed != 1)
+		elog(ERROR, "could not read prepared transactions for branch window");
+	value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+	if (isnull)
+		elog(ERROR, "prepared transaction count is null");
+	count = DatumGetInt32(value);
+	SPI_finish();
+	return count;
+}
+
+static void
+pagestore_branch_check_window(FullTransactionId expected_next, int expected_prepared)
+{
+	int prepared = pagestore_branch_prepared_count();
+	FullTransactionId current_next = ReadNextFullTransactionId();
+	if (!FullTransactionIdEquals(current_next, expected_next) ||
+		expected_prepared != 0 || prepared != expected_prepared)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("restricted writer changed since the branch window was opened"),
+				 errdetail("Next XID is " UINT64_FORMAT " (expected " UINT64_FORMAT
+						   "); prepared transactions %d (expected %d).",
+						   U64FromFullTransactionId(current_next),
+						   U64FromFullTransactionId(expected_next), prepared, expected_prepared)));
+}
+
+/* First SQL statement after the controller's read-only isolation health check. */
+PG_FUNCTION_INFO_V1(pagestore_branch_window_open);
+Datum
+pagestore_branch_window_open(PG_FUNCTION_ARGS)
+{
+	ControlFileData *control;
+	bool crc_ok;
+	uint8 info;
+	TupleDesc tupdesc;
+	HeapTuple tuple;
+	Datum values[3];
+	bool nulls[3] = {false, false, false};
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					   errmsg("must be superuser to open a pagestore branch window")));
+	pagestore_require_localsvc_monitoring();
+	if (RecoveryInProgress() || pagestore_localsvc_read_lsn() != 0)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					   errmsg("branch transaction window requires an unpinned writer")));
+	control = get_controlfile(DataDir, &crc_ok);
+	if (!crc_ok)
+		ereport(ERROR, (errmsg("local pg_control has an invalid CRC")));
+	(void) ps_checkpoint_record_end(control->checkPoint, &control->checkPointCopy, &info);
+	if (info != XLOG_CHECKPOINT_SHUTDOWN || control->checkPoint != control->checkPointCopy.redo)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					   errmsg("safe branch preparation requires a shutdown checkpoint")));
+	pagestore_branch_check_window(control->checkPointCopy.nextXid, 0);
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+	values[0] = LSNGetDatum(control->checkPointCopy.redo);
+	values[1] = FullTransactionIdGetDatum(control->checkPointCopy.nextXid);
+	values[2] = Int32GetDatum(0);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	pfree(control);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
 
 /*
@@ -13805,13 +13884,29 @@ pagestore_branch_cleanup(const char *target_dir, uint32 timeline,
  * checkpoint/control state at R; the store branch is cut at L, where no
  * admission-sequence tie remains.  Retrying the operation is idempotent
  * through the same prepared-manifest and CREATE_BRANCH checks as the legacy
- * entrypoint.  The control plane must keep the parent quiescent between the
- * selected checkpoint and L; automatically establishing that quiesce together
- * with the proven base snapshot is the remaining producer-side protocol.
+ * entrypoint.  The serialized controller owns the parent quiesce and journals
+ * its transaction window; legacy callers must establish their own quiesce
+ * between the selected checkpoint and L.
  */
+static Datum pagestore_prepare_branch_from_control_impl(FunctionCallInfo fcinfo, bool window);
+
 PG_FUNCTION_INFO_V1(pagestore_prepare_branch_from_control);
 Datum
 pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
+{
+	return pagestore_prepare_branch_from_control_impl(fcinfo, false);
+}
+
+/* A new C symbol makes SQL upgrades fail closed against an older library. */
+PG_FUNCTION_INFO_V1(pagestore_prepare_branch_from_window);
+Datum
+pagestore_prepare_branch_from_window(PG_FUNCTION_ARGS)
+{
+	return pagestore_prepare_branch_from_control_impl(fcinfo, true);
+}
+
+static Datum
+pagestore_prepare_branch_from_control_impl(FunctionCallInfo fcinfo, bool window)
 {
 	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	int32		new_tl = PG_GETARG_INT32(1);
@@ -13820,7 +13915,7 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	XLogRecPtr	checkpoint_redo = PG_GETARG_LSN(4);
 	XLogRecPtr	fork_lsn = PG_GETARG_LSN(5);
 	int64		incarnation_arg = PG_NARGS() >= 7 ? PG_GETARG_INT64(6) : 1;
-	bool		require_materialized = PG_NARGS() >= 8 && PG_GETARG_BOOL(7);
+	bool		require_materialized = window || (PG_NARGS() == 8 && PG_GETARG_BOOL(7));
 	uint64		incarnation;
 	uint64		parent_incarnation;
 	XLogRecPtr	materialized;
@@ -13835,6 +13930,14 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to prepare a branch")));
+	if (window)
+	{
+		pagestore_require_localsvc_monitoring();
+		if (RecoveryInProgress() || pagestore_localsvc_read_lsn() != 0)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						   errmsg("branch transaction window requires an unpinned writer")));
+	}
+
 	if (new_tl <= 0 || parent_tl < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -13869,6 +13972,20 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 				 errdetail("Fork %X/%08X precedes checkpoint record end %X/%08X.",
 							   LSN_FORMAT_ARGS(fork_lsn),
 							   LSN_FORMAT_ARGS(h.checkpoint_end_lsn))));
+	if (window)
+	{
+		FullTransactionId expected_next = PG_GETARG_FULLTRANSACTIONID(7);
+		int expected_prepared = PG_GETARG_INT32(8);
+
+		if (!FullTransactionIdIsNormal(expected_next) || expected_prepared != 0)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						   errmsg("invalid branch transaction window snapshot")));
+		if (!FullTransactionIdEquals(expected_next, h.checkpoint_next_xid))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						   errmsg("branch window snapshot does not match the selected checkpoint")));
+		pagestore_branch_check_window(expected_next, expected_prepared);
+	}
+
 	/*
 	 * R2-m: the serialized controller's writer does not publish relation
 	 * pages.  Verify the store-observed marker here, before seeding SLRUs or

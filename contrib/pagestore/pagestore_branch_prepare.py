@@ -36,7 +36,7 @@ LEGACY_RECEIPT_SCHEMA = 1
 JOURNAL_OPERATION = "pagestore_branch_prepare"
 JOURNAL_STATES = {
     "started", "preflight_complete", "base_captured", "writer_stopped",
-    "writer_restricted", "checkpoint_selected", "checkpoint_archived",
+    "writer_restricted", "window_opened", "checkpoint_selected", "checkpoint_archived",
     "fork_captured", "branch_prepared", "prepared", "materializer_resumed",
     "writer_restored", "complete", "r2_cleanup", "r2_failed",
 }
@@ -446,6 +446,7 @@ class BranchPreparer:
             "state": "started",
             "intent": "preflight",
             "base_lsn": None,
+            "window_snapshot": None,
             "checkpoint_redo_lsn": None,
             "checkpoint_end_lsn": None,
             "switch_lsn": None,
@@ -498,6 +499,18 @@ class BranchPreparer:
         ):
             if not isinstance(value[field], bool):
                 raise BranchPrepareError(f"branch journal {field} is invalid")
+        snapshot = value["window_snapshot"]
+        if snapshot is not None:
+            self.validate_window_snapshot(snapshot)
+        if value["state"] in {
+            "window_opened", "checkpoint_selected", "checkpoint_archived",
+            "fork_captured", "branch_prepared", "prepared",
+            "materializer_resumed", "writer_restored", "complete",
+        }:
+            self.validate_window_snapshot(snapshot)
+            redo = value.get("checkpoint_redo_lsn")
+            if redo is not None and parse_lsn(redo) != parse_lsn(snapshot["checkpoint_redo_lsn"]):
+                raise BranchPrepareError("branch journal checkpoint differs from its window snapshot")
         return value
 
     def write_journal(self, journal: dict[str, Any] | None = None) -> None:
@@ -872,7 +885,10 @@ class BranchPreparer:
         )
         prepare_signature = self.extension_function(
             self.writer_extension_schema,
-            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)",
+            "pagestore_prepare_branch_from_window(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,xid8,integer)",
+        )
+        window_signature = self.extension_function(
+            self.writer_extension_schema, "pagestore_branch_window_open()"
         )
         checkpoint_signature = self.extension_function(
             self.writer_extension_schema, "pagestore_branch_checkpoint()"
@@ -904,6 +920,7 @@ class BranchPreparer:
                 " AND to_regprocedure("
                 + sql_literal(checkpoint_signature)
                 + ") IS NOT NULL"
+                " AND to_regprocedure(" + sql_literal(window_signature) + ") IS NOT NULL"
                 " AND NOT EXISTS (SELECT 1 FROM pg_tablespace"
                 " WHERE spcname NOT IN ('pg_default', 'pg_global'))"
             )
@@ -1201,6 +1218,46 @@ class BranchPreparer:
         if healthy != "t":
             raise BranchPrepareError("restricted writer failed its isolation health check")
 
+    def open_branch_window(self) -> dict[str, Any]:
+        output = last_output_line(self.writer_sql(
+            "SELECT * FROM " + self.extension_function(
+                self.writer_extension_schema, "pagestore_branch_window_open()"
+            ), private=True,
+        ))
+        fields = output.split("|")
+        if len(fields) != 3:
+            raise BranchPrepareError(f"unexpected branch window result: {output}")
+        try:
+            prepared = int(fields[2])
+        except ValueError as error:
+            raise BranchPrepareError(f"unexpected branch window result: {output}") from error
+        snapshot = {"checkpoint_redo_lsn": fields[0], "next_xid": fields[1],
+                    "prepared_count": prepared}
+        self.validate_window_snapshot(snapshot)
+        return snapshot
+
+    @staticmethod
+    def validate_window_snapshot(snapshot: Any) -> None:
+        if (not isinstance(snapshot, dict) or set(snapshot) != {
+                "checkpoint_redo_lsn", "next_xid", "prepared_count"}):
+            raise BranchPrepareError("branch transaction window snapshot is missing or invalid")
+        redo = snapshot["checkpoint_redo_lsn"]
+        xid = snapshot["next_xid"]
+        prepared = snapshot["prepared_count"]
+        if not isinstance(redo, str) or parse_lsn(redo) == 0:
+            raise BranchPrepareError("branch window checkpoint redo is invalid")
+        if (not isinstance(xid, str) or not xid.isascii() or not xid.isdecimal()
+                or not 3 <= int(xid) <= (1 << 64) - 1
+                or (int(xid) & 0xffffffff) < 3):
+            raise BranchPrepareError("branch window full next XID is invalid")
+        if not isinstance(prepared, int) or isinstance(prepared, bool) or prepared != 0:
+            raise BranchPrepareError("branch window must have no prepared transactions")
+
+    def branch_window_snapshot(self) -> dict[str, Any]:
+        snapshot = self.journal.get("window_snapshot") if self.journal else None
+        self.validate_window_snapshot(snapshot)
+        return snapshot
+
     def select_checkpoint(self) -> tuple[str, str]:
         # The fast stop that established writer ownership already completed a
         # shutdown checkpoint after draining every public client.  The server
@@ -1302,6 +1359,9 @@ class BranchPreparer:
         )
 
     def prepare_branch(self, base: str, redo: str, fork: str) -> int:
+        snapshot = self.branch_window_snapshot()
+        if parse_lsn(redo) != parse_lsn(snapshot["checkpoint_redo_lsn"]):
+            raise BranchPrepareError("branch window checkpoint changed before preparation")
         reference = ""
         if self.verify_seed_against_materializer:
             # the comparison report is a NOTICE; a role or database that
@@ -1320,7 +1380,7 @@ class BranchPreparer:
                 "SELECT "
                 + self.extension_function(
                     self.writer_extension_schema,
-                    "pagestore_prepare_branch_from_control(",
+                    "pagestore_prepare_branch_from_window(",
                 )
                 + sql_literal(str(self.config.prepared_dir))
                 + f", {self.config.new_timeline}, {self.config.parent_timeline}, "
@@ -1331,7 +1391,8 @@ class BranchPreparer:
                 + sql_literal(fork)
                 + "::pg_lsn, "
                 + str(self.config.new_incarnation)
-                + ", true)",
+                + ", " + sql_literal(snapshot["next_xid"]) + "::xid8, "
+                + str(snapshot["prepared_count"]) + ")",
                 private=True,
             )
         )
@@ -1514,7 +1575,7 @@ class BranchPreparer:
                 raise
         if state in {
             "started", "preflight_complete", "base_captured", "writer_stopped",
-            "writer_restricted", "checkpoint_selected", "checkpoint_archived",
+            "writer_restricted", "window_opened", "checkpoint_selected", "checkpoint_archived",
         }:
             try:
                 self.restore_ambiguous_services(mode)
@@ -1630,7 +1691,7 @@ class BranchPreparer:
             raise BranchPrepareError("branch materializer proof requires a reachable writer")
         signature = self.extension_function(
             self.writer_extension_schema,
-            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)",
+            "pagestore_prepare_branch_from_window(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,xid8,integer)",
         )
         result = last_output_line(self.writer_sql(
             "SELECT to_regprocedure(" + sql_literal(signature) + ") IS NOT NULL"
@@ -1717,8 +1778,13 @@ class BranchPreparer:
                 writer_owned=self.writer_owned,
                 restricted_writer_running=self.restricted_writer_running,
             )
-            self.journal_update("writer_restricted", "select_checkpoint")
+            self.journal_update("writer_restricted", "open_branch_window")
+            snapshot = self.open_branch_window()
+            self.journal_update("window_opened", None, window_snapshot=snapshot)
+            self.journal_update("window_opened", "select_checkpoint")
             redo, checkpoint_end = self.select_checkpoint()
+            if parse_lsn(redo) != parse_lsn(snapshot["checkpoint_redo_lsn"]):
+                raise BranchPrepareError("writer checkpoint changed since the branch window was opened")
             if parse_lsn(base) > parse_lsn(redo):
                 raise BranchPrepareError("proven SLRU base follows the selected checkpoint")
             self.journal_update(

@@ -1149,3 +1149,48 @@ changes no persisted store, bootstrap or controller-journal format and does
 not activate finite caps or resolve Bug B. The first-statement transaction
 snapshot, G3 entry-point gates, capability handshake and atomic finite
 activation remain pending.
+
+### Restricted writer transaction-window prerequisite
+
+Extension 1.5 adds `pagestore_branch_window_open()` and
+`pagestore_prepare_branch_from_window(..., incarnation bigint,
+expected_next_xid xid8, expected_prepared_count integer)`. They use new C
+symbols, so installing the new SQL against an older loaded library fails
+rather than quietly interpreting additional arguments as a legacy prepare.
+
+The controller calls window-open as its first SQL statement after the
+restricted writer's read-only isolation health check. The function verifies
+the local shutdown checkpoint, requires the current full next XID to equal
+that checkpoint's `nextXid`, and requires zero cluster-wide prepared
+transactions. It returns the checkpoint redo, full next XID and zero prepared
+count. The controller durably journals this snapshot in `window_opened` before
+selecting/archiving the checkpoint or waiting for materialization; checkpoint
+selection must retain that same redo. `next_xid` is a decimal string in JSON
+and an `xid8` in SQL, preserving all 64 bits.
+
+The checked prepare repeats the full-XID and prepared-count checks, binds the
+expected XID to the selected checkpoint, and requires the materializer marker.
+All these checks precede SLRU seeding and CREATE_BRANCH, including retries.
+The writer-local post-CREATE WAL scan remains authoritative: these early checks
+are diagnostics, not a replacement for the completion-record proof. Recovery
+uses the journaled snapshot and never samples a replacement window. An
+interrupted `window_opened` state has no safe exact-boundary continuation;
+recovery restores owned services and refuses rather than selecting a new cut.
+After services resume, including terminal receipt retries, the existing
+read-only marker validation requires the new checked API without trying to
+compare a legitimately advancing writer with the original transaction state.
+
+The branch journal moves from schema 2 to 3 and adds `window_snapshot` to its
+closed key set and CRC. Schemas 1 and 2 are explicitly refused; no snapshot can
+be manufactured for an old journal. Finish/recover in-flight schema-2 operations
+with the previous controller before upgrading. Keep old completed receipts as
+legacy evidence; the new controller cannot recertify them. A fresh operation
+needs a new receipt path and an unused timeline/incarnation identity. Upgrade
+the writer's extension to 1.5 and use the matching controller/library together.
+The controller JSON fixture is recaptured from the real golden scenario and
+pins the schema-2 refusal. Store, control/SLRU and bootstrap layouts do not
+change.
+
+Finite caps remain disabled. G3 entry-point gates, capability/result handshake
+and atomic finite branch activation remain in P3b. This prerequisite does not
+yet resolve Bug B.

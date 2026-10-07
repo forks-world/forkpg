@@ -343,7 +343,7 @@ class BranchPrepareTests(unittest.TestCase):
 
         preparer = EarlyRecovery(config)
         preparer.journal = preparer.new_journal()
-        preparer.journal.update(
+        preparer.journal.update(window_snapshot=dict(checkpoint_redo_lsn="0/20", next_xid="3", prepared_count=0),
             state="writer_stopped", intent="start_restricted_writer",
             retention_generation=1, retention_owned=True,
             pause_owned=True, writer_owned=True, restricted_writer_running=True,
@@ -398,6 +398,7 @@ class BranchPrepareTests(unittest.TestCase):
             ("preflight_complete", "capture_base", True, "normal"),
             ("preflight_complete", "install_retention", True, "normal"),
             ("base_captured", "stop_writer", False, "stopped"),
+            ("window_opened", "select_checkpoint", False, "restricted"),
             ("checkpoint_archived", "capture_fork", True, "restricted"),
         )
         for state, intent, paused, writer in cases:
@@ -405,7 +406,7 @@ class BranchPrepareTests(unittest.TestCase):
                 service.update(paused=paused, writer=writer)
                 preparer = IntentRecovery(config)
                 preparer.journal = preparer.new_journal()
-                preparer.journal.update(
+                preparer.journal.update(window_snapshot=dict(checkpoint_redo_lsn="0/20", next_xid="3", prepared_count=0),
                     state=state,
                     intent=intent,
                     retention_generation=1,
@@ -544,6 +545,10 @@ class BranchPrepareTests(unittest.TestCase):
             def start_restricted_writer(self):
                 self.events.append("start-restricted")
 
+            def open_branch_window(self):
+                self.events.append("window")
+                return dict(checkpoint_redo_lsn="0/20", next_xid="3", prepared_count=0)
+
             def select_checkpoint(self):
                 self.events.append("checkpoint")
                 return "0/20", "0/30"
@@ -577,6 +582,7 @@ class BranchPrepareTests(unittest.TestCase):
                 "resume-base",
                 "stop-writer",
                 "start-restricted",
+                "window",
                 "checkpoint",
                 "archive",
                 "wait:0/00000040",
@@ -685,6 +691,9 @@ class BranchPrepareTests(unittest.TestCase):
             def start_restricted_writer(self):
                 pass
 
+            def open_branch_window(self):
+                return dict(checkpoint_redo_lsn="1/DD000028", next_xid="3", prepared_count=0)
+
             def select_checkpoint(self):
                 return "1/DD000028", "1/DD0000A8"
 
@@ -718,7 +727,7 @@ class BranchPrepareTests(unittest.TestCase):
         # one at a boundary is still returned as is
         for fork, ok in (("1/DD0000E0", False), ("1/DE000000", True)):
             journal = MidSegmentFork(config, fork).new_journal()
-            journal.update(state="complete", intent=None, base_lsn="0/10",
+            journal.update(window_snapshot=dict(checkpoint_redo_lsn="1/DD000028", next_xid="3", prepared_count=0), state="complete", intent=None, base_lsn="0/10",
                            checkpoint_redo_lsn="1/DD000028", checkpoint_end_lsn="1/DD0000A8",
                            switch_lsn="1/DD0000F8", fork_lsn=fork, archived_through_lsn="1/DD0000F8",
                            seeded_slru_pages=1, materializer_resumed=True, writer_restored=True)
@@ -734,7 +743,7 @@ class BranchPrepareTests(unittest.TestCase):
 
         for state in ("fork_captured", "branch_prepared", "prepared", "materializer_resumed"):
             journal = MidSegmentFork(config, "1/DD0000E0").new_journal()
-            journal.update(state=state, intent=None, base_lsn="0/10", checkpoint_redo_lsn="1/DD000028",
+            journal.update(window_snapshot=dict(checkpoint_redo_lsn="1/DD000028", next_xid="3", prepared_count=0), state=state, intent=None, base_lsn="0/10", checkpoint_redo_lsn="1/DD000028",
                            checkpoint_end_lsn="1/DD0000A8", switch_lsn="1/DD0000F8",
                            fork_lsn="1/DD0000E0", archived_through_lsn="1/DD0000F8",
                            pause_owned=True, writer_owned=True,
@@ -777,6 +786,9 @@ class BranchPrepareTests(unittest.TestCase):
 
             def start_restricted_writer(self):
                 pass
+
+            def open_branch_window(self):
+                return dict(checkpoint_redo_lsn="0/20", next_xid="3", prepared_count=0)
 
             def select_checkpoint(self):
                 return "0/20", "0/30"
@@ -821,6 +833,9 @@ class BranchPrepareTests(unittest.TestCase):
             def start_restricted_writer(self):
                 pass
 
+            def open_branch_window(self):
+                return dict(checkpoint_redo_lsn="0/20", next_xid="3", prepared_count=0)
+
             def select_checkpoint(self):
                 raise MODULE.CancelledError("cancelled")
 
@@ -859,6 +874,9 @@ class BranchPrepareTests(unittest.TestCase):
             def start_restricted_writer(self):
                 self.writer_owned = True
                 self.restricted_writer_running = True
+
+            def open_branch_window(self):
+                return dict(checkpoint_redo_lsn="0/20", next_xid="3", prepared_count=0)
 
             def select_checkpoint(self):
                 return "0/20", "0/30"
@@ -1069,6 +1087,9 @@ class BranchPrepareTests(unittest.TestCase):
                     self.writer_owned = True
                     self.restricted_writer_running = True
                     set_service(writer_mode="restricted")
+                def open_branch_window(self):
+                    return dict(checkpoint_redo_lsn="0/20", next_xid="3", prepared_count=0)
+
                 def select_checkpoint(self):
                     return "0/20", "0/30"
                 def archive_checkpoint(self):
@@ -1243,7 +1264,7 @@ class BranchPrepareTests(unittest.TestCase):
                     preparer = MODULE.BranchPreparer(config)
                     preparer.writer_extension_schema = '"writer"'
                     journal = preparer.new_journal()
-                    journal.update(state=state, intent=None, base_lsn="0/10",
+                    journal.update(window_snapshot=dict(checkpoint_redo_lsn="0/20", next_xid="3", prepared_count=0), state=state, intent=None, base_lsn="0/10",
                                    checkpoint_redo_lsn="0/20", fork_lsn="0/40",
                                    pause_owned=True, writer_owned=True,
                                    restricted_writer_running=True, retention_owned=True)
@@ -1275,8 +1296,8 @@ class BranchPrepareTests(unittest.TestCase):
                         self.assertEqual(restored, [])
                     self.assertEqual(len(queries), 1)
                     self.assertTrue(queries[0][1])
-                    self.assertIn('"writer".pagestore_prepare_branch_from_control(', queries[0][0])
-                    self.assertTrue(queries[0][0].endswith(", 1, true)"))
+                    self.assertIn('"writer".pagestore_prepare_branch_from_window(', queries[0][0])
+                    self.assertTrue(queries[0][0].endswith(", 1, '3'::xid8, 0)"))
 
     def test_post_resume_recovery_checks_marker_on_surviving_writer(self):
         config = MODULE.Config.load(self.write_config())
@@ -1287,7 +1308,7 @@ class BranchPrepareTests(unittest.TestCase):
                         preparer = MODULE.BranchPreparer(config)
                         preparer.writer_extension_schema = '"writer"'
                         journal = preparer.new_journal()
-                        journal.update(state=state, intent=None, fork_lsn="0/40")
+                        journal.update(window_snapshot=dict(checkpoint_redo_lsn="0/20", next_xid="3", prepared_count=0), state=state, intent=None, fork_lsn="0/40")
                         preparer.write_journal(journal)
                         original_journal = config.receipt_file.read_bytes()
                         preparer.discover_recovery_services = lambda: None
@@ -1323,9 +1344,68 @@ class BranchPrepareTests(unittest.TestCase):
                         self.assertEqual(len(queries), 1)
                         self.assertEqual(queries[0][1], mode == "restricted")
                         self.assertIn('to_regprocedure(', queries[0][0])
-                        self.assertIn('bigint,boolean)', queries[0][0])
+                        self.assertIn('bigint,xid8,integer)', queries[0][0])
                         self.assertIn('"writer".pagestore_materializer_status()', queries[0][0])
                         self.assertIn("materialized_wal_lsn >= '0/40'::pg_lsn", queries[0][0])
+
+    def test_open_branch_window_preserves_full_xid_and_private_connection(self):
+        config = MODULE.Config.load(self.write_config())
+        preparer = MODULE.BranchPreparer(config)
+        preparer.writer_extension_schema = '"Page Store"'
+        preparer.writer_sql = mock.Mock(return_value="0/20|4294967299|0\n")
+        self.assertEqual(preparer.open_branch_window(), dict(
+            checkpoint_redo_lsn="0/20", next_xid="4294967299", prepared_count=0))
+        preparer.writer_sql.assert_called_once_with(
+            'SELECT * FROM "Page Store".pagestore_branch_window_open()', private=True)
+        for result in ("0/20|3|1", "0/20|3|garbage", "0/0|3|0", "0/20|4294967296|0",
+                       "0/20|-3|0", "0/20|18446744073709551616|0", "0/20|3"):
+            with self.subTest(result=result):
+                preparer.writer_sql.return_value = result
+                with self.assertRaises(MODULE.BranchPrepareError):
+                    preparer.open_branch_window()
+
+    def test_window_snapshot_is_required_and_bound_to_checkpoint(self):
+        config = MODULE.Config.load(self.write_config())
+        preparer = MODULE.BranchPreparer(config)
+        preparer.writer_sql = mock.Mock(side_effect=AssertionError("must not send prepare"))
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "snapshot is missing"):
+            preparer.prepare_branch("0/10", "0/20", "0/40")
+        preparer.journal = preparer.new_journal()
+        preparer.journal["window_snapshot"] = dict(
+            checkpoint_redo_lsn="0/21", next_xid="3", prepared_count=0)
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "checkpoint changed"):
+            preparer.prepare_branch("0/10", "0/20", "0/40")
+        preparer.writer_sql.assert_not_called()
+
+    def test_journal_window_snapshot_is_checked_after_crc(self):
+        config = MODULE.Config.load(self.write_config())
+        preparer = MODULE.BranchPreparer(config)
+        good = dict(checkpoint_redo_lsn="0/20", next_xid="4294967299", prepared_count=0)
+        for snapshot in (good, None, dict(good, next_xid=True),
+                         dict(good, prepared_count=1), dict(good, checkpoint_redo_lsn="0/21")):
+            with self.subTest(snapshot=snapshot):
+                journal = preparer.new_journal()
+                journal.update(state="prepared", intent=None, checkpoint_redo_lsn="0/20",
+                               window_snapshot=snapshot)
+                preparer.write_journal(journal)
+                if snapshot == good:
+                    self.assertEqual(preparer.read_journal()["window_snapshot"], good)
+                else:
+                    with self.assertRaises(MODULE.BranchPrepareError):
+                        preparer.read_journal()
+
+    def test_old_journal_schema_is_refused_without_mutation(self):
+        config = MODULE.Config.load(self.write_config())
+        preparer = MODULE.BranchPreparer(config)
+        journal = preparer.new_journal()
+        journal["schema"] = 2
+        journal.pop("window_snapshot")
+        journal["crc32"] = MODULE.artifact_schema.artifact_crc(journal)
+        config.receipt_file.write_text(json.dumps(journal))
+        original = config.receipt_file.read_bytes()
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "schema 2 is unsupported"):
+            preparer.read_journal()
+        self.assertEqual(config.receipt_file.read_bytes(), original)
 
     def test_prepare_branch_reads_wal_from_store(self):
         config = MODULE.Config.load(self.write_config())
@@ -1338,11 +1418,13 @@ class BranchPrepareTests(unittest.TestCase):
 
         preparer = RecordingPreparer(config)
         preparer.writer_extension_schema = '"Page Store"'
+        preparer.journal = preparer.new_journal()
+        preparer.journal["window_snapshot"] = dict(checkpoint_redo_lsn="0/2", next_xid="3", prepared_count=0)
         self.assertEqual(preparer.prepare_branch("0/1", "0/2", "0/3"), 1)
         self.assertTrue(preparer.private)
         self.assertTrue(preparer.sql.startswith("SET pagestore.redo_wal_from_store = on;"))
-        self.assertIn('"Page Store".pagestore_prepare_branch_from_control(', preparer.sql)
-        self.assertTrue(preparer.sql.endswith(", 1, true)"))
+        self.assertIn('"Page Store".pagestore_prepare_branch_from_window(', preparer.sql)
+        self.assertTrue(preparer.sql.endswith(", 1, '3'::xid8, 0)"))
 
     def test_preflight_discovers_and_qualifies_extension_schemas(self):
         config = MODULE.Config.load(self.write_config())
