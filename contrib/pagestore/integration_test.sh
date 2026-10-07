@@ -1179,6 +1179,10 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_prepare_branch_from_control' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_prepare_branch_from_control(text, int, int, pg_lsn, pg_lsn, pg_lsn, bigint, bool) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch_from_control' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_branch_window_open(OUT checkpoint_redo_lsn pg_lsn, OUT next_xid xid8, OUT prepared_count int) RETURNS record
+        AS 'pagestore','pagestore_branch_window_open' LANGUAGE C;
+       CREATE FUNCTION pagestore_prepare_branch_from_window(text, int, int, pg_lsn, pg_lsn, pg_lsn, bigint, xid8, int) RETURNS bigint
+        AS 'pagestore','pagestore_prepare_branch_from_window' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_install_prepared_branch_bootstrap(text, text, int, int, pg_lsn, pg_lsn, pg_lsn) RETURNS void
         AS 'pagestore','pagestore_install_prepared_branch_bootstrap' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_branch_manifest(text, int, int, pg_lsn) RETURNS bool
@@ -1320,6 +1324,12 @@ rm -rf "$PREPSEED"
 # R2-s checks the real WAL record. An online checkpoint must fail before
 # preparing SLRUs or creating a timeline, including on a directory reuse.
 $P -c "CHECKPOINT;" >/dev/null
+windowOnline=$($P -c "SELECT * FROM pagestore_branch_window_open();" 2>&1 || true)
+case "$windowOnline" in
+    *"safe branch preparation requires a shutdown checkpoint"*) windowOnline=yes ;;
+    *) windowOnline=no ;;
+esac
+assert "$windowOnline" "yes" "transaction window refuses an online checkpoint"
 onlineRedo=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
 onlineFork=$($P -c "SELECT pg_current_wal_lsn();")
 ONLINESEED=$(mktemp -d)
@@ -1363,6 +1373,11 @@ read -r autoL autoOldestXid autoNextXid autoOldestCts autoNextCts autoOldestMult
 	            ELSE '0' END || ' ' ||
 	       oldest_multi_xid || ' ' || next_multixact_id || ' ' || next_multi_offset
 	FROM pg_control_checkpoint();")"
+IFS='|' read -r autoWindowRedo autoWindowXid autoWindowPrepared <<< "$($P -c "SELECT * FROM pagestore_branch_window_open();")"
+assert "$autoWindowRedo" "$autoL" "transaction window selects the shutdown checkpoint redo"
+assert "$autoWindowPrepared" "0" "transaction window requires no prepared transactions"
+assert "$($P -c "SELECT '$autoWindowXid'::xid8 = pg_snapshot_xmax(pg_current_snapshot());")" "t" \
+    "transaction window preserves the full next XID without assigning one"
 if [ "$autoOldestMulti" = "$autoNextMulti" ]; then
 	autoOldestMember=$autoNextMember
 else
@@ -1395,6 +1410,29 @@ assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
     -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_timeline_state(6);")" "t" \
     "missing-marker rejection creates no store timeline"
 rm -rf "$MISSINGMARKERSEED"
+WINDOWREJECT=$(mktemp -d)
+windowEpoch=$($P -c "SELECT pagestore_prepare_branch_from_window(
+    '$WINDOWREJECT', 7, 0, '$mxC', '$autoL', '$autoFork', 1,
+    (('$autoWindowXid'::text::numeric + 4294967296)::text)::xid8, 0);" 2>&1 || true)
+case "$windowEpoch" in
+    *"branch window snapshot does not match the selected checkpoint"*) windowEpoch=yes ;;
+    *) windowEpoch=no ;;
+esac
+assert "$windowEpoch" "yes" "transaction window compares the full XID epoch"
+$P -c "BEGIN; SELECT pg_current_xact_id(); ROLLBACK;" >/dev/null
+windowChanged=$($P -v VERBOSITY=verbose -c "SELECT pagestore_prepare_branch_from_window(
+    '$WINDOWREJECT', 7, 0, '$mxC', '$autoL', '$autoFork', 1, '$autoWindowXid', 0);" 2>&1 || true)
+case "$windowChanged" in
+    *"55000: restricted writer changed since the branch window was opened"*) windowChanged=yes ;;
+    *) windowChanged=no ;;
+esac
+assert "$windowChanged" "yes" "transaction window rejects an XID allocated by an aborted transaction"
+assert "$(find "$WINDOWREJECT" -type f | wc -l | tr -d ' ')" "0" \
+    "transaction-window rejection creates no prepared artifacts"
+assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_timeline_state(7);")" "t" \
+    "transaction-window rejection creates no store timeline"
+rm -rf "$WINDOWREJECT"
 AUTOSEED=$(mktemp -d)
 autoSeeded=$($P -c "SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")
@@ -1570,6 +1608,21 @@ assert "$([ -s "$R2SEED.abort/pagestore_branch.bootstrap" ] && echo yes || echo 
     -c "SELECT pagestore_delete_branch(41, 1); SELECT pagestore_delete_branch(44, 1);" >/dev/null
 rm -rf "$R2SEED" "$R2SEED.existing" "$R2SEED.prepared" "$R2SEED.prepared-abort" "$R2SEED.abort"
 rm -rf "$AUTOSEED"
+
+# Prepared transactions survive clean shutdown; window opening must inspect
+# them independently of the checkpoint's unchanged full next XID.
+$P -c "BEGIN; SELECT pg_current_xact_id(); PREPARE TRANSACTION 'window_open_prepared';" >/dev/null
+"$BIN/pg_ctl" -D "$DATA" -m fast -w stop >/dev/null 2>&1
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+windowPrepared=$($P -c "SELECT * FROM pagestore_branch_window_open();" 2>&1 || true)
+case "$windowPrepared" in
+    *"prepared transactions 1 (expected 0)"*) windowPrepared=yes ;;
+    *) windowPrepared=no ;;
+esac
+assert "$windowPrepared" "yes" "transaction window rejects a prepared transaction surviving shutdown"
+$P -c "ROLLBACK PREPARED 'window_open_prepared';" >/dev/null
+assert "$($P -c "SELECT prepared_count FROM pagestore_branch_window_open();")" "0" \
+    "transaction window opens after the surviving prepared transaction is resolved"
 
 # --- 26. pg_control mirror: control writes publish LSN-versioned store images ---
 # Every UpdateControlFile() queues the just-written image (versioned by the LSN

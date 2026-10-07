@@ -287,16 +287,17 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_is_in_recovery();")" "t" \
 	ALTER EXTENSION pagestore UPDATE TO '1.1';
 	ALTER EXTENSION pagestore UPDATE TO '1.2';
 	ALTER EXTENSION pagestore UPDATE TO '1.3';
-	ALTER EXTENSION pagestore UPDATE TO '1.4';" >/dev/null ||
+	ALTER EXTENSION pagestore UPDATE TO '1.4';
+	ALTER EXTENSION pagestore UPDATE TO '1.5';" >/dev/null ||
 fail "could not install the extension upgrade chain"
-assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.4" \
-	"extension upgrades from 1.0 through 1.1 and 1.2 to 1.4"
-api_count=$("${WP[@]}" -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pagestore_ext' AND p.oid IN ('pagestore_ext.pagestore_create_branch_with_incarnation(integer,integer,bigint,pg_lsn)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)'::regprocedure, 'pagestore_ext.pagestore_retention_drop_with_incarnation(integer,integer,bigint,bigint,bigint)'::regprocedure, 'pagestore_ext.pagestore_timeline_state(integer)'::regprocedure, 'pagestore_ext.pagestore_delete_branch(integer,bigint)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)'::regprocedure);")
-assert_eq "$api_count" "6" "1.4 exposes the branch, retention and timeline lifecycle control APIs after upgrade"
-"${WP[@]}" -c "DROP EXTENSION pagestore; CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.4';" >/dev/null ||
-	fail "could not install a fresh 1.4 extension"
-assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.4" \
-	"fresh extension install uses version 1.4"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.5" \
+	"extension upgrades from 1.0 through 1.1 and 1.2 to 1.5"
+api_count=$("${WP[@]}" -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pagestore_ext' AND p.oid IN ('pagestore_ext.pagestore_create_branch_with_incarnation(integer,integer,bigint,pg_lsn)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)'::regprocedure, 'pagestore_ext.pagestore_retention_drop_with_incarnation(integer,integer,bigint,bigint,bigint)'::regprocedure, 'pagestore_ext.pagestore_timeline_state(integer)'::regprocedure, 'pagestore_ext.pagestore_delete_branch(integer,bigint)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)'::regprocedure, 'pagestore_ext.pagestore_branch_window_open()'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_window(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,xid8,integer)'::regprocedure);")
+assert_eq "$api_count" "8" "1.5 exposes the branch, retention and timeline lifecycle control APIs after upgrade"
+"${WP[@]}" -c "DROP EXTENSION pagestore; CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.5';" >/dev/null ||
+	fail "could not install a fresh 1.5 extension"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.5" \
+	"fresh extension install uses version 1.5"
 "${WP[@]}" -c "CREATE FUNCTION pagestore_read_at(regclass, int, int, pg_lsn) RETURNS bytea
  AS 'pagestore','pagestore_read_at' LANGUAGE C STRICT;
 CREATE TABLE mvp_golden(id int primary key, note text);" >/dev/null ||
@@ -458,7 +459,11 @@ import sys
 from pathlib import Path
 
 journal = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert journal["schema"] == 3
 assert journal["state"] == "prepared"
+window = journal["window_snapshot"]
+assert window["checkpoint_redo_lsn"] == journal["checkpoint_redo_lsn"]
+assert int(window["next_xid"]) >= 3 and window["prepared_count"] == 0
 assert journal["retention_owned"] is True
 assert journal["retention_set_attempted"] is True
 assert journal["pause_owned"] is True
@@ -483,10 +488,11 @@ assert_eq "$("${MP[@]}" -c "SELECT pagestore_ext.pagestore_retention_owner_lsn(0
 # The controller's wait is not the server's R2-m proof.  With the materializer
 # paused, request a fork one byte beyond its durable marker.  Refuse before
 # publishing artifacts or creating another timeline, including directory reuse.
-IFS='|' read -r proof_base proof_redo proof_marker <<EOF
+IFS='|' read -r proof_base proof_redo proof_marker proof_xid <<EOF
 $(python3 -c 'import json, sys
 r = json.load(open(sys.argv[1]))
-print("|".join(r[k] for k in ("base_lsn", "checkpoint_redo_lsn", "fork_lsn")))' \
+print("|".join(r[k] for k in ("base_lsn", "checkpoint_redo_lsn", "fork_lsn"))
+      + "|" + r["window_snapshot"]["next_xid"])' \
     "$PREPARED/pagestore_branch.prepare.json")
 EOF
 assert_eq "$("${RWP[@]}" -c "SELECT materialized_wal_lsn = '$proof_marker'::pg_lsn
@@ -494,6 +500,15 @@ assert_eq "$("${RWP[@]}" -c "SELECT materialized_wal_lsn = '$proof_marker'::pg_l
     "writer observes the paused materializer's durable marker"
 LAGGING_PREPARED="$TMPROOT/lagging-prepared"
 mkdir "$LAGGING_PREPARED" || fail "could not create lagging-materializer test directory"
+materializer_rejected=$("${MP[@]}" -v VERBOSITY=verbose -c \
+    "SELECT pagestore_ext.pagestore_prepare_branch_from_window(
+    '$LAGGING_PREPARED', 2, 0, '$proof_base', '$proof_redo', '$proof_marker', 1, '$proof_xid', 0);" 2>&1) &&
+    fail "checked window preparation accepted a recovery materializer"
+case "$materializer_rejected" in
+    *"55000: branch transaction window requires an unpinned writer"*) ;;
+    *) fail "checked window preparation did not reject the recovery role: $materializer_rejected" ;;
+esac
+echo "ok   - checked window preparation rejects a recovery role before touching branch state"
 for proof_dir in "$LAGGING_PREPARED" "$PREPARED"; do
     lag_rejected=$("${RWP[@]}" -v VERBOSITY=verbose -c \
         "SELECT pagestore_ext.pagestore_prepare_branch_from_control(
