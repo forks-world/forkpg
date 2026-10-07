@@ -1593,6 +1593,8 @@ class BranchPreparer:
                 self.journal["fork_lsn"],
             )
             self.journal_update(state, None, seeded_slru_pages=seeded)
+        if state in ("materializer_resumed", "writer_restored"):
+            self.validate_recovered_materialization(self.journal["fork_lsn"], mode)
         if state in ("materializer_resumed", "writer_restored") and self.verify_seed_against_materializer:
             raise BranchPrepareError(
                 f"branch journal state {state!r} has resumed the materializer past the fork "
@@ -1605,6 +1607,29 @@ class BranchPreparer:
             state = "prepared"
         self.success_restore(run_faults=False)
         return dict(self.journal or {})
+
+    def validate_recovered_materialization(self, fork: str, mode: str) -> None:
+        # After services resume, only read the store-observed marker.  Reseeding
+        # would race the materializer and the normal writer's transactions.
+        parse_lsn(fork)
+        if mode not in ("restricted", "normal"):
+            raise BranchPrepareError("branch materializer proof requires a reachable writer")
+        signature = self.extension_function(
+            self.writer_extension_schema,
+            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)",
+        )
+        result = last_output_line(self.writer_sql(
+            "SELECT to_regprocedure(" + sql_literal(signature) + ") IS NOT NULL"
+            " AND COALESCE((SELECT materialized_wal_lsn >= "
+            + sql_literal(fork) + "::pg_lsn FROM "
+            + self.extension_function(self.writer_extension_schema,
+                                      "pagestore_materializer_status()")
+            + "), false)", private=mode == "restricted",
+        ))
+        if result != "t":
+            raise BranchPrepareError(
+                "recovered branch requires the checked API and a durable materializer marker covering its fork"
+            )
 
     def restore_services(self) -> list[str]:
         errors: list[str] = []

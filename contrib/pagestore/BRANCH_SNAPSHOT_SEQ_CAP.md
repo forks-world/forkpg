@@ -1122,7 +1122,12 @@ verification. Recovery of `branch_prepared` or `prepared` journals repeats
 this checked call even when optional seed verification is disabled, before
 publishing or restoring services. A missing upgraded API or a rejected marker
 leaves the journal and service fences in place instead of completing an old
-unchecked preparation. Upgrade a writer's installed extension with
+unchecked preparation. For `materializer_resumed` and `writer_restored`,
+recovery checks the upgraded signature and store-observed marker through the
+surviving restricted or normal writer connection before completion. This
+read-only check avoids reseeding while services are running; a missing API,
+missing marker, or marker below the journaled fork leaves the journal unchanged.
+Upgrade a writer's installed extension with
 `ALTER EXTENSION pagestore UPDATE TO '1.4'` before using the new controller.
 
 The server reads the active parent timeline's durable materializer marker
