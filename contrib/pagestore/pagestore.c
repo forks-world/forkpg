@@ -13481,7 +13481,8 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 							  TransactionId next_commit_ts_xid,
 							  MultiXactId oldest_multi,
 							  MultiXactId next_multi,
-							  int64 oldest_member, int64 next_member)
+							  int64 oldest_member, int64 next_member,
+								  bool *created_new)
 {
 	int64		seeded;
 	char		manifest_path[MAXPGPATH];
@@ -13547,9 +13548,11 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 												   oldest_member, next_member,
 												   &seeded))
 	{
-		pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-										 (uint64) target, incarnation,
-										 parent_incarnation);
+		bool created = pagestore_localsvc_create_branch((uint32) new_tl,
+			(uint32) parent_tl, (uint64) target, incarnation, parent_incarnation);
+
+		if (created_new != NULL)
+			*created_new = created;
 		return seeded;
 	}
 
@@ -13579,9 +13582,13 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 											  next_commit_ts_xid,
 											  oldest_multi, next_multi,
 											  oldest_member, next_member);
-	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-									 (uint64) target, incarnation,
-									 parent_incarnation);
+	{
+		bool created = pagestore_localsvc_create_branch((uint32) new_tl,
+			(uint32) parent_tl, (uint64) target, incarnation, parent_incarnation);
+
+		if (created_new != NULL)
+			*created_new = created;
+	}
 
 	/*
 	 * Publish the manifest only after the store-side timeline exists: the
@@ -13641,7 +13648,7 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 											PG_GETARG_TRANSACTIONID(9),
 											PG_GETARG_TRANSACTIONID(10),
 											PG_GETARG_INT64(11),
-											PG_GETARG_INT64(12));
+											PG_GETARG_INT64(12), NULL);
 
 	/* The expert ABI does not produce the catalog/control-bound artifact. */
 	pathlen = snprintf(bootstrap_path, sizeof(bootstrap_path), "%s/%s",
@@ -13655,6 +13662,129 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 				 errmsg("could not remove stale branch bootstrap artifact \"%s\": %m",
 						bootstrap_path)));
 	PG_RETURN_INT64(seeded);
+}
+
+/* R2-x uses the writer's local WAL even when SLRU reconstruction reads
+ * archived WAL from the store.  A commit not archived yet still matters. */
+static void
+pagestore_branch_wal_proof(XLogRecPtr checkpoint_lsn, XLogRecPtr fork_lsn)
+{
+	XLogRecPtr end = GetXLogInsertEndRecPtr();
+	XLogRecPtr volatile scanned = fork_lsn;
+	XLogRecPtr volatile unsafe_lsn = InvalidXLogRecPtr;
+	uint8 volatile unsafe_info = 0;
+	ReadLocalXLogPageNoWaitPrivate *pd;
+	XLogReaderState *reader;
+	char *errm = NULL;
+
+	if (RecoveryInProgress() || end < fork_lsn)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("branch WAL proof requires a writer whose WAL covers the fork")));
+	XLogFlush(end);
+	if (end == fork_lsn)
+		return;
+	pd = palloc0(sizeof(*pd));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+		XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+			.segment_open = &wal_segment_open, .segment_close = &wal_segment_close), pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+	PG_TRY();
+	{
+		/* The verified checkpoint is a known record boundary. Starting
+		 * there also covers records straddling an arbitrary direct-call
+		 * cutoff, including continuations from an earlier WAL segment. */
+		XLogBeginRead(reader, checkpoint_lsn);
+		while (XLogReadRecord(reader, &errm) != NULL)
+		{
+			uint8 info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+
+			CHECK_FOR_INTERRUPTS();
+			if (reader->EndRecPtr > fork_lsn &&
+				XLogRecGetRmid(reader) == RM_XACT_ID &&
+				(info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED ||
+				 info == XLOG_XACT_ABORT_PREPARED))
+			{
+				unsafe_lsn = reader->ReadRecPtr;
+				unsafe_info = info;
+				break;
+			}
+			scanned = MAXALIGN(reader->EndRecPtr);
+			if (scanned >= end)
+				break;
+		}
+	}
+	PG_FINALLY();
+	{
+		XLogReaderFree(reader);
+		pfree(pd);
+	}
+	PG_END_TRY();
+	if (!XLogRecPtrIsInvalid(unsafe_lsn))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("branch WAL proof found a transaction completion after the fork"),
+			errdetail("WAL record at %X/%08X has transaction info 0x%02X; fork is %X/%08X.",
+				LSN_FORMAT_ARGS(unsafe_lsn), unsafe_info, LSN_FORMAT_ARGS(fork_lsn))));
+	if (scanned < end)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("branch WAL proof could not read the complete post-fork window"),
+			errdetail("Scanned through %X/%08X; required %X/%08X.",
+				LSN_FORMAT_ARGS(scanned), LSN_FORMAT_ARGS(end))));
+}
+
+static void
+pagestore_branch_remove_readiness(const char *target_dir)
+{
+	const char *names[] = {PAGESTORE_BRANCH_BOOTSTRAP_FILE,
+		"pagestore_branch.manifest"};
+	char path[MAXPGPATH];
+
+	for (unsigned i = 0; i < lengthof(names); i++)
+	{
+		int len = snprintf(path, sizeof(path), "%s/%s", target_dir, names[i]);
+
+		PS_CHECK_PATH_FORMAT(len, path);
+		if (unlink(path) != 0 && errno != ENOENT)
+			ereport(ERROR, (errcode_for_file_access(),
+				errmsg("could not remove branch readiness artifact \"%s\": %m", path)));
+	}
+	fsync_fname(target_dir, true);
+}
+
+/*
+ * Remove the readiness artifacts this call published and, only when the call
+ * created the timeline, delete that exact incarnation.  A pre-existing
+ * timeline is preserved: an old daemon returns the zero "already existed"
+ * result, and that must never authorize deletion.  Return a diagnostic even
+ * if cleanup fails, so the caller can report it while preserving the original
+ * preparation error.
+ */
+static char *
+pagestore_branch_cleanup(const char *target_dir, uint32 timeline,
+						 uint64 incarnation, bool delete_timeline)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	char *volatile result = "complete";
+
+	PG_TRY();
+	{
+		pagestore_branch_remove_readiness(target_dir);
+		if (delete_timeline &&
+			pagestore_localsvc_begin_delete(timeline, incarnation) != PS_STATUS_OK)
+			ereport(ERROR, (errmsg("timeline deletion was refused")));
+	}
+	PG_CATCH();
+	{
+		ErrorData *error;
+
+		MemoryContextSwitchTo(oldcontext);
+		error = CopyErrorData();
+		FlushErrorState();
+		result = pstrdup(error->message);
+		FreeErrorData(error);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 /*
@@ -13689,6 +13819,7 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	uint64		parent_incarnation;
 	XLogRecPtr	materialized;
 	PagestoreBranchHorizons h;
+	bool		created_new = false;
 	int64		seeded;
 	char		bootstrap_path[MAXPGPATH];
 	PagestoreBranchBootstrapHeader *existing_header;
@@ -13757,7 +13888,7 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 											h.oldest_commit_ts_xid,
 											h.next_commit_ts_xid,
 											h.oldest_multi, h.next_multi,
-											h.oldest_member, h.next_member);
+											h.oldest_member, h.next_member, &created_new);
 	/*
 	 * The portable artifact is its own readiness marker in the prepared dir.
 	 * Publish it only after the SLRU manifest exists, and bind its checksum to
@@ -13780,10 +13911,42 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 		pfree(existing);
 	}
 	else if (errno == ENOENT)
-		pagestore_write_branch_bootstrap(target_dir, new_tl, parent_tl,
-									checkpoint_redo,
-									h.checkpoint_end_lsn, fork_lsn,
-									h.system_identifier);
+	{
+		MemoryContext oldcontext = CurrentMemoryContext;
+
+		/*
+		 * The proof and the bootstrap publication are the two steps that can
+		 * still fail after the timeline and its manifest exist.  On either
+		 * failure, remove the readiness artifacts this call published and
+		 * fsync the directory; delete the timeline only when this call
+		 * created it, so a pre-existing timeline is never destroyed.
+		 */
+		PG_TRY();
+		{
+			pagestore_branch_wal_proof(h.checkpoint_lsn, fork_lsn);
+			pagestore_write_branch_bootstrap(target_dir, new_tl, parent_tl,
+										checkpoint_redo,
+										h.checkpoint_end_lsn, fork_lsn,
+										h.system_identifier);
+		}
+		PG_CATCH();
+		{
+			ErrorData *prep_error;
+			char *cleanup;
+
+			MemoryContextSwitchTo(oldcontext);
+			prep_error = CopyErrorData();
+			FlushErrorState();
+			cleanup = pagestore_branch_cleanup(target_dir, new_tl, incarnation,
+											   created_new);
+			ereport(ERROR, (errcode(prep_error->sqlerrcode),
+				errmsg("%s", prep_error->message),
+				errdetail("Branch %u incarnation %llu; cleanup=%s. %s",
+					(uint32) new_tl, (unsigned long long) incarnation, cleanup,
+					prep_error->detail ? prep_error->detail : "")));
+		}
+		PG_END_TRY();
+	}
 	else
 		ereport(ERROR,
 				(errcode_for_file_access(),

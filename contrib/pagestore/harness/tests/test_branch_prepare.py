@@ -801,8 +801,8 @@ class BranchPrepareTests(unittest.TestCase):
             preparer.execute()
         self.assertFalse(preparer.restored)
         journal = MODULE.BranchPreparer(config).read_journal()
-        self.assertEqual(journal["state"], "fork_captured")
-        self.assertEqual(journal["intent"], "prepare_branch")
+        self.assertEqual(journal["state"], "r2_cleanup")
+        self.assertEqual(journal["intent"], "manifest_removed")
 
     def test_execute_removes_safe_journal_before_propagating_cancellation(self):
         config = MODULE.Config.load(self.write_config())
@@ -831,7 +831,7 @@ class BranchPrepareTests(unittest.TestCase):
             preparer.execute()
         self.assertFalse(config.receipt_file.exists())
 
-    def test_failed_prepared_journal_write_retries_exact_fenced_boundary(self):
+    def test_failed_prepared_journal_write_cleans_unpublished_incarnation(self):
         config = MODULE.Config.load(self.write_config())
         calls = []
 
@@ -840,6 +840,8 @@ class BranchPrepareTests(unittest.TestCase):
                 super().__init__(branch_config)
                 self.fail_publish = fail_publish
                 self.restored = False
+                self.writer_extension_schema = '"writer"'
+                self.config.prepared_dir.mkdir(exist_ok=True)
 
             def preflight(self):
                 pass
@@ -882,6 +884,10 @@ class BranchPrepareTests(unittest.TestCase):
                     raise OSError("journal publication lost after prepare commit")
                 return super().journal_update(state, intent, **values)
 
+            def writer_sql(self, sql, private=False):
+                self.assert_cleanup_order = not (self.config.prepared_dir / "pagestore_branch.manifest").exists()
+                return "deleting"
+
             def restore_services(self):
                 self.restored = True
                 return []
@@ -901,15 +907,97 @@ class BranchPrepareTests(unittest.TestCase):
         first = AmbiguousPreparer(config, fail_publish=True)
         with self.assertRaisesRegex(MODULE.BranchPrepareError, "journal publication lost"):
             first.execute()
-        self.assertFalse(first.restored)
+        self.assertTrue(first.restored)
         durable = MODULE.BranchPreparer(config).read_journal()
-        self.assertEqual(durable["state"], "fork_captured")
-        self.assertEqual(durable["intent"], "prepare_branch")
+        self.assertEqual(durable["state"], "r2_failed")
+        self.assertEqual(durable["intent"], None)
 
         second = AmbiguousPreparer(config)
-        receipt = second.execute()
-        self.assertEqual(receipt["state"], "complete")
-        self.assertEqual(calls, [("0/10", "0/20", "0/40"), ("0/10", "0/20", "0/40")])
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "new incarnation"):
+            second.execute()
+        self.assertTrue(first.assert_cleanup_order)
+        self.assertEqual(calls, [("0/10", "0/20", "0/40")])
+
+    def test_r2_cleanup_crash_boundaries_resume_in_order(self):
+        for point in ("branch_prepare.r2_manifest_removed",
+                      "branch_prepare.r2_timeline_deleting"):
+            with self.subTest(point=point):
+                config = MODULE.Config.load(self.write_config())
+                config.prepared_dir.mkdir(exist_ok=True)
+                for name in ("pagestore_branch.bootstrap", "pagestore_branch.manifest"):
+                    (config.prepared_dir / name).write_text("unpublished")
+                first = MODULE.BranchPreparer(config)
+                first.writer_extension_schema = '"writer"'
+                first.write_journal(first.new_journal())
+                first.journal_update("r2_cleanup", "remove_readiness")
+                deletes = []
+
+                def delete(sql, private=False):
+                    self.assertFalse((config.prepared_dir / "pagestore_branch.bootstrap").exists())
+                    self.assertFalse((config.prepared_dir / "pagestore_branch.manifest").exists())
+                    persisted = MODULE.BranchPreparer(config).read_journal()
+                    self.assertEqual(persisted["intent"], "manifest_removed")
+                    self.assertIn(str(config.new_incarnation), sql)
+                    deletes.append(sql)
+                    return "deleting"
+
+                def crash(name):
+                    if name == point:
+                        raise RuntimeError("process died")
+
+                first.writer_sql = delete
+                first.fault = crash
+                with self.assertRaisesRegex(RuntimeError, "process died"):
+                    first.cleanup_failed_branch()
+                second = MODULE.BranchPreparer(config)
+                second.journal = second.read_journal()
+                second.writer_extension_schema = '"writer"'
+                second.writer_sql = delete
+                second.cleanup_failed_branch()
+                self.assertEqual(second.read_journal()["state"], "r2_failed")
+                self.assertEqual(len(deletes), 1)
+                config.receipt_file.unlink()
+
+    def test_r2_services_restoration_failure_can_resume(self):
+        config = MODULE.Config.load(self.write_config())
+        first = MODULE.BranchPreparer(config)
+        first.write_journal(first.new_journal())
+        first.journal_update("r2_failed", "restore_services")
+        first.restore_services = lambda: ["writer unavailable"]
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "writer unavailable"):
+            first.restore_failed_branch_services()
+        second = MODULE.BranchPreparer(config)
+        second.journal = second.read_journal()
+        self.assertEqual(second.journal["intent"], "restore_services")
+        second.discover_recovery_services = lambda: None
+        second.observe_recovery_ownership = lambda: "restricted"
+        second.restore_services = lambda: []
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "new incarnation"):
+            second.recover_journal()
+        self.assertEqual(second.read_journal()["state"], "r2_failed")
+        self.assertIsNone(second.read_journal()["intent"])
+        self.assertTrue(second.read_journal()["writer_restored"])
+
+    def test_ambiguous_prepare_recovery_cleans_instead_of_retrying(self):
+        config = MODULE.Config.load(self.write_config())
+        config.prepared_dir.mkdir(exist_ok=True)
+        (config.prepared_dir / "pagestore_branch.bootstrap").write_text("unpublished")
+        preparer = MODULE.BranchPreparer(config)
+        preparer.write_journal(preparer.new_journal())
+        preparer.journal_update("fork_captured", "prepare_branch", fork_lsn="0/1000000")
+        preparer.writer_extension_schema = '"writer"'
+        preparer.discover_recovery_services = lambda: None
+        preparer.observe_recovery_ownership = lambda: "restricted"
+        preparer.prepare_branch = mock.Mock(side_effect=AssertionError("must not prepare"))
+        preparer.writer_sql = mock.Mock(return_value="absent")
+        preparer.restore_services = mock.Mock(return_value=[])
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "ambiguous branch preparation cleaned up"):
+            preparer.recover_journal()
+        preparer.prepare_branch.assert_not_called()
+        preparer.writer_sql.assert_called_once()
+        preparer.restore_services.assert_called_once()
+        self.assertFalse((config.prepared_dir / "pagestore_branch.bootstrap").exists())
+        self.assertEqual(preparer.read_journal()["state"], "r2_failed")
 
     def test_journal_rejects_legacy_incomplete_corrupt_and_identity_mismatch(self):
         config = MODULE.Config.load(self.write_config())

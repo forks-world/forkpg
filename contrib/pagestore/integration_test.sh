@@ -218,6 +218,7 @@ pagestore.slru_mirror = on
 pagestore.auto_wal_index = on
 pagestore.wal_index_max_lag_mb = 1
 io_method = sync
+max_prepared_transactions = 10
 wal_keep_size = 512MB	# appliers replay (C, L] from local pg_wal across restarts
 archive_mode = on
 archive_library = 'pagestore'
@@ -1366,7 +1367,16 @@ else
 	autoOldestMember=$($P -c "SELECT pagestore_multixact_offset_asof(
 		'$autoOldestMulti'::xid, '$mxC', '$autoL');")
 fi
-autoFork=$($P -c "SELECT pg_current_wal_lsn();")
+# Archive the checkpoint segment; the post-cut transaction below stays in
+# the next, unarchived segment. R2-x must still read it in store-WAL mode.
+$P -c "SELECT pg_switch_wal();" >/dev/null
+autoFork=$($P -c "SELECT lsn - (pg_walfile_name_offset(lsn)).file_offset
+    FROM (SELECT pg_current_wal_insert_lsn() AS lsn) p;")
+for ((iteration = 0; iteration < 100; iteration++)); do
+    [ "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+        -c "SELECT pagestore_shipped_wal_lsn() >= '$autoFork';" 2>/dev/null)" = "t" ] && break
+    sleep 0.1
+done
 AUTOSEED=$(mktemp -d)
 autoSeeded=$($P -c "SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")
@@ -1413,6 +1423,7 @@ assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::js
 	"$autoFork" "control-derived prepare forks at the separate materialized boundary"
 assert "$([ -s "$AUTOSEED/pagestore_branch.bootstrap" ] && echo present || echo absent)" \
 	"present" "control-derived prepare publishes the portable catalog bootstrap artifact"
+autoRecovery=$(python3 -c 'import struct,sys; e=struct.unpack("<3Q",open(sys.argv[1],"rb").read(24))[1];print(f"{e>>32:X}/{e&0xffffffff:08X}")' "$AUTOSEED/pagestore_branch.bootstrap")
 bootstrapMd5=$(md5sum "$AUTOSEED/pagestore_branch.bootstrap" | awk '{print $1}')
 autoRetry=$($P -c "SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")
@@ -1421,7 +1432,7 @@ assert "$autoRetry" "$autoSeeded" \
 assert "$(md5sum "$AUTOSEED/pagestore_branch.bootstrap" | awk '{print $1}')" \
 	"$bootstrapMd5" "control-derived prepare retry reproduces the same bootstrap artifact"
 portableTsError=$($P -c "SELECT pagestore_install_prepared_branch_bootstrap(
-	'$AUTOSEED', '$AUTOSEED.target', 3, 0, '$autoL', '$autoFork', '$autoFork');" \
+	'$AUTOSEED', '$AUTOSEED.target', 3, 0, '$autoL', '$autoRecovery', '$autoFork');" \
 	2>&1 || true)
 case "$portableTsError" in
 	*"does not yet support user tablespaces"*) portableTsRejected=yes ;;
@@ -1434,7 +1445,7 @@ cp -a "$AUTOSEED/." "$CORRUPTBOOT/"
 printf '\001' | dd of="$CORRUPTBOOT/pagestore_branch.bootstrap" bs=1 seek=80 \
 	conv=notrunc status=none
 corruptBootstrap=$($P -c "SELECT pagestore_install_prepared_branch_bootstrap(
-	'$CORRUPTBOOT', '$CORRUPTBOOT.target', 3, 0, '$autoL', '$autoFork', '$autoFork');" \
+	'$CORRUPTBOOT', '$CORRUPTBOOT.target', 3, 0, '$autoL', '$autoRecovery', '$autoFork');" \
 	2>&1 || true)
 case "$corruptBootstrap" in
 	*"invalid checksum"*) corruptRejected=yes ;;
@@ -1446,7 +1457,7 @@ MIXEDBOOT=$(mktemp -d)
 cp -a "$AUTOSEED/." "$MIXEDBOOT/"
 printf '\n' >> "$MIXEDBOOT/pagestore_branch.manifest"
 mixedBootstrap=$($P -c "SELECT pagestore_install_prepared_branch_bootstrap(
-	'$MIXEDBOOT', '$MIXEDBOOT.target', 3, 0, '$autoL', '$autoFork', '$autoFork');" \
+	'$MIXEDBOOT', '$MIXEDBOOT.target', 3, 0, '$autoL', '$autoRecovery', '$autoFork');" \
 	2>&1 || true)
 case "$mixedBootstrap" in
 	*"does not match the prepared branch manifest"*) mixedRejected=yes ;;
@@ -1476,6 +1487,70 @@ badAuto=$($P -c "SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED.bad', 4, 0, '$mxC', '$autoL'::pg_lsn + 1, '$autoFork');" 2>/dev/null || echo ERROR)
 assert "$badAuto" "ERROR" \
 	"control-derived prepare rejects a target without an exact checkpoint control state"
+# R2-x: a commit made after L can leave pre-S hint updates. It is unsafe
+# even when it has not yet been archived and the seeder uses store WAL.
+$P -c "CREATE TABLE r2_wal_probe (id int);" >/dev/null
+R2SEED=$(mktemp -d)
+mkdir "$R2SEED.existing" "$R2SEED.prepared" "$R2SEED.prepared-abort" "$R2SEED.abort"
+r2Commit=$($P -c "SET pagestore.redo_wal_from_store = on;
+    SELECT pagestore_prepare_branch_from_control(
+        '$R2SEED', 40, 0, '$mxC', '$autoL', '$autoFork');" 2>&1 || true)
+case "$r2Commit" in
+    *"transaction completion after the fork"*"cleanup=complete"*) r2Commit=yes ;;
+    *) r2Commit=no ;;
+esac
+assert "$r2Commit" "yes" "R2-x rejects an unarchived commit despite store-WAL seeding"
+assert "$([ ! -e "$R2SEED/pagestore_branch.bootstrap" ] && [ ! -e "$R2SEED/pagestore_branch.manifest" ] && echo yes || echo no)" \
+    "yes" "failed new branch proof removes readiness artifacts before deletion"
+assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -c "SELECT state IN ('deleting','deleted') FROM pagestore_timeline_state(40);")" \
+    "t" "failed new branch proof durably deletes its own timeline"
+# An exact retry must not delete a timeline this SQL call did not create.
+"$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -c "SELECT pagestore_create_branch_with_incarnation(41, 0, 1, '$autoFork');" >/dev/null
+r2Existing=$($P -c "SELECT pagestore_prepare_branch_from_control(
+    '$R2SEED.existing', 41, 0, '$mxC', '$autoL', '$autoFork');" 2>&1 || true)
+case "$r2Existing" in
+    *"transaction completion after the fork"*"cleanup=complete"*) r2Existing=yes ;;
+    *) r2Existing="no: $r2Existing" ;;
+esac
+assert "$r2Existing" "yes" "R2-x reports an unproven existing branch without claiming ownership"
+assert "$([ ! -e "$R2SEED.existing/pagestore_branch.bootstrap" ] && [ ! -e "$R2SEED.existing/pagestore_branch.manifest" ] && echo yes || echo no)" \
+    "yes" "failed retry removes readiness artifacts even though the timeline pre-existed"
+assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -c "SELECT state = 'live' FROM pagestore_timeline_state(41);")" \
+    "t" "failed direct retry leaves the existing timeline live"
+# Prepared transactions can survive a shutdown checkpoint. Their completion
+# is dangerous even though COMMIT PREPARED does not allocate a new XID.
+$P -c "BEGIN; INSERT INTO r2_wal_probe VALUES (1); PREPARE TRANSACTION 'r2_commit';" >/dev/null
+r2Fork=$($P -c "SELECT pg_current_wal_insert_lsn();")
+$P -c "COMMIT PREPARED 'r2_commit';" >/dev/null
+r2Prepared=$($P -c "SELECT pagestore_prepare_branch_from_control(
+    '$R2SEED.prepared', 42, 0, '$mxC', '$autoL', '$r2Fork');" 2>&1 || true)
+case "$r2Prepared" in
+    *"transaction completion after the fork"*"info 0x30"*) r2Prepared=yes ;;
+    *) r2Prepared="no: $r2Prepared" ;;
+esac
+assert "$r2Prepared" "yes" "R2-x rejects COMMIT PREPARED after the cut"
+$P -c "BEGIN; INSERT INTO r2_wal_probe VALUES (2); PREPARE TRANSACTION 'r2_abort';" >/dev/null
+r2Fork=$($P -c "SELECT pg_current_wal_insert_lsn();")
+$P -c "ROLLBACK PREPARED 'r2_abort';" >/dev/null
+r2PreparedAbort=$($P -c "SELECT pagestore_prepare_branch_from_control(
+    '$R2SEED.prepared-abort', 43, 0, '$mxC', '$autoL', '$r2Fork');" 2>&1 || true)
+case "$r2PreparedAbort" in
+    *"transaction completion after the fork"*"info 0x40"*) r2PreparedAbort=yes ;;
+    *) r2PreparedAbort="no: $r2PreparedAbort" ;;
+esac
+assert "$r2PreparedAbort" "yes" "R2-x rejects ABORT PREPARED after the cut"
+r2Fork=$($P -c "SELECT pg_current_wal_insert_lsn();")
+$P -c "BEGIN; INSERT INTO r2_wal_probe VALUES (3); ROLLBACK;" >/dev/null
+r2Abort=$($P -c "SELECT pagestore_prepare_branch_from_control(
+    '$R2SEED.abort', 44, 0, '$mxC', '$autoL', '$r2Fork');" 2>&1 || true)
+assert "$([ -s "$R2SEED.abort/pagestore_branch.bootstrap" ] && echo yes || echo no)" \
+    "yes" "R2-x permits an ordinary aborted transaction in the post-fork window ($r2Abort)"
+"$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -c "SELECT pagestore_delete_branch(41, 1); SELECT pagestore_delete_branch(44, 1);" >/dev/null
+rm -rf "$R2SEED" "$R2SEED.existing" "$R2SEED.prepared" "$R2SEED.prepared-abort" "$R2SEED.abort"
 rm -rf "$AUTOSEED"
 
 # --- 26. pg_control mirror: control writes publish LSN-versioned store images ---

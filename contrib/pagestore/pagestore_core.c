@@ -22425,6 +22425,8 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t new_incarnation;
 				uint64_t parent_incarnation;
 
+				ch->result = 0;
+
 				if (!branch_create_request_ok(ch->timeline,
 										(int) ch->parent_timeline, ch->req_lsn,
 										ch->incarnation, ch->req_seq,
@@ -22459,6 +22461,7 @@ ps_handle_meta(PsChannel *ch)
 											(int) ch->parent_timeline, ch->req_lsn,
 											new_incarnation, parent_incarnation);
 					ch->incarnation = new_incarnation;
+					ch->result = PS_BRANCH_RESULT_NEW;
 				}
 				else
 					ch->status = PS_STATUS_ERROR;

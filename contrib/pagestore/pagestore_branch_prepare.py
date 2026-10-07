@@ -38,7 +38,7 @@ JOURNAL_STATES = {
     "started", "preflight_complete", "base_captured", "writer_stopped",
     "writer_restricted", "checkpoint_selected", "checkpoint_archived",
     "fork_captured", "branch_prepared", "prepared", "materializer_resumed",
-    "writer_restored", "complete",
+    "writer_restored", "complete", "r2_cleanup", "r2_failed",
 }
 JOURNAL_KEYS = set(artifact_schema.BRANCH_JOURNAL_KEYS)
 SAFE_POSTGRES_OPTION_PATH = re.compile(r"^[A-Za-z0-9_./-]+$")
@@ -833,7 +833,7 @@ class BranchPreparer:
             and self.journal is not None
             and self.journal["state"] in {
                 "fork_captured", "branch_prepared", "prepared",
-                "materializer_resumed", "writer_restored",
+                "materializer_resumed", "writer_restored", "r2_cleanup", "r2_failed",
             }
             and self.journal["restricted_writer_running"]
         ):
@@ -1428,14 +1428,74 @@ class BranchPreparer:
             writer_owned=False, restricted_writer_running=False,
         )
 
+    def cleanup_failed_branch(self) -> None:
+        """Invalidate our unpublished directory before deleting our incarnation."""
+        if self.journal is None or self.journal["state"] != "r2_cleanup":
+            raise BranchPrepareError("R2 cleanup requires its durable journal state")
+        intent = self.journal.get("intent")
+        if intent not in {"remove_readiness", "manifest_removed", "timeline_deleting"}:
+            raise BranchPrepareError("R2 cleanup journal has an invalid intent")
+        if intent == "remove_readiness":
+            for name in ("pagestore_branch.bootstrap", "pagestore_branch.manifest"):
+                try:
+                    (self.config.prepared_dir / name).unlink()
+                except FileNotFoundError:
+                    pass
+            fd = os.open(self.config.prepared_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            self.journal_update("r2_cleanup", "manifest_removed")
+            self.fault("branch_prepare.r2_manifest_removed")
+        if self.journal.get("intent") == "manifest_removed":
+            delete = self.extension_function(self.writer_extension_schema,
+                                             "pagestore_delete_branch(")
+            state = self.extension_function(self.writer_extension_schema,
+                                            "pagestore_timeline_state(")
+            result = last_output_line(self.writer_sql(
+                "SELECT CASE WHEN incarnation IS NULL THEN 'absent' ELSE "
+                + delete + f"{self.config.new_timeline}, {self.config.new_incarnation}) END "
+                + "FROM " + state + f"{self.config.new_timeline})",
+                private=self.restricted_writer_running))
+            if result not in {"absent", "deleting", "deleted"}:
+                raise BranchPrepareError(f"unexpected R2 deletion result: {result}")
+            self.journal_update("r2_cleanup", "timeline_deleting")
+            self.fault("branch_prepare.r2_timeline_deleting")
+        self.journal_update("r2_failed", "restore_services")
+
+    def restore_failed_branch_services(self) -> None:
+        self.journal_update("r2_failed", "restore_services")
+        errors = self.restore_services()
+        if errors:
+            raise BranchPrepareError("R2 services restoration failed: " + "; ".join(errors))
+        self.journal_update("r2_failed", None, pause_owned=False, writer_owned=False,
+                            restricted_writer_running=False, retention_owned=False,
+                            retention_set_attempted=False, materializer_resumed=True,
+                            writer_restored=True)
+
     def recover_journal(self) -> dict[str, Any]:
         if self.journal is None:
             raise BranchPrepareError("branch journal is not loaded")
         state = self.journal["state"]
         if state == "complete":
             return dict(self.journal)
+        if state == "r2_failed" and self.journal.get("intent") is None:
+            raise BranchPrepareError("branch proof failed; rerun with a new incarnation and receipt path")
         self.discover_recovery_services()
         mode = self.observe_recovery_ownership()
+        if state == "r2_failed":
+            if self.journal.get("intent") != "restore_services":
+                raise BranchPrepareError("R2 failed journal has an invalid restoration intent")
+            self.restore_failed_branch_services()
+            raise BranchPrepareError("branch proof failed; rerun with a new incarnation and receipt path")
+        if state == "r2_cleanup" or (state == "fork_captured" and
+                                     self.journal.get("intent") == "prepare_branch"):
+            if state != "r2_cleanup":
+                self.journal_update("r2_cleanup", "remove_readiness")
+            self.cleanup_failed_branch()
+            self.restore_failed_branch_services()
+            raise BranchPrepareError("ambiguous branch preparation cleaned up; rerun with a new incarnation and receipt path")
         # A journal an older controller left with a fork inside a WAL segment
         # describes a branch that can never boot, whether or not its receipt
         # was already published.  Refuse to seed, publish or complete it;
@@ -1677,11 +1737,23 @@ class BranchPreparer:
         except BaseException as error:
             failure = error
 
+        if failure is not None and self.journal is not None and (
+            self.journal["state"] == "fork_captured" and
+            self.journal.get("intent") == "prepare_branch"
+        ):
+            try:
+                self.journal_update("r2_cleanup", "remove_readiness")
+                self.cleanup_failed_branch()
+                self.restore_failed_branch_services()
+            except BaseException as cleanup_error:
+                failure = BranchPrepareError(f"{failure}; R2 cleanup failed: {cleanup_error}")
+
         preserve_prepare_fence = (
             self.journal is not None
-            and self.journal.get("intent") in {
-                "prepare_branch", "publish_prepared_receipt",
-            }
+            and (self.journal["state"] in {"r2_cleanup", "r2_failed"}
+                 or self.journal.get("intent") in {
+                     "prepare_branch", "publish_prepared_receipt",
+                 })
         )
         cleanup_errors = (
             []
@@ -1704,7 +1776,7 @@ class BranchPreparer:
                 "state"
             ) in {
                 "branch_prepared", "prepared", "materializer_resumed",
-                "writer_restored", "complete",
+                "writer_restored", "complete", "r2_failed",
             }
             if not cleanup_errors and not prepared_boundary and not preserve_prepare_fence:
                 try:
@@ -1714,7 +1786,10 @@ class BranchPreparer:
             if isinstance(failure, (KeyboardInterrupt, CancelledError)):
                 raise failure
             if preserve_prepare_fence:
-                detail += "; recovery journal retained and services remain fenced"
+                if self.journal["state"] == "r2_failed" and self.journal.get("intent") is None:
+                    detail += "; failed-operation journal retained; rerun with a new incarnation and receipt path"
+                else:
+                    detail += "; recovery journal retained and services remain fenced"
             raise BranchPrepareError(f"{failure}{detail}") from failure
         if cleanup_errors:
             raise BranchPrepareError("; ".join(cleanup_errors))

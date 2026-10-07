@@ -30,7 +30,9 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		48	/* 48: unstamped metadata request floor;
+#define PS_SHM_VERSION		48	/* CREATE_BRANCH result bit 0 reports a new create
+								 * (no layout change; old daemons return zero).
+								 * 48: unstamped metadata request floor;
 								 * 47: artifact publication and drop operations;
 								 * (no bump for the additional PsArtifactRefuseReason
 								 * values or the EXTEND/WRITEV ch->result use added
@@ -335,6 +337,8 @@ typedef struct PsWalIndexEntry
 	uint64_t	lsn;
 	uint64_t	end_lsn;		/* record EndRecPtr; zero for legacy unknown */
 } PsWalIndexEntry;
+
+#define PS_BRANCH_RESULT_NEW (1u << 0)
 
 /* Retention owners are intentionally few: structural branch pins are derived
  * from timeline metadata instead of duplicated in this mutable registry. */

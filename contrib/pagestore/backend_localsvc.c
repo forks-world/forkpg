@@ -1566,7 +1566,7 @@ pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
  * for the pagestore_create_branch() SQL function.
  */
-void
+bool
 pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 								 uint64 branch_lsn, uint64 target_incarnation,
 								 uint64 parent_incarnation)
@@ -1582,7 +1582,9 @@ pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 	ch->req_lsn = branch_lsn;
 	ch->incarnation = target_incarnation;
 	ch->req_seq = parent_incarnation;
+	ch->result = 0;
 	ls_exec(ch);
+	return (ch->result & PS_BRANCH_RESULT_NEW) != 0;
 }
 
 /*
