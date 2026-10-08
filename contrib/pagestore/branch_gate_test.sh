@@ -55,6 +55,7 @@ listen_addresses = ''
 unix_socket_directories = '$SOCKET'
 port = 5439
 dynamic_shared_memory_type = mmap
+pagestore.allow_unsafe_branch_cut = on
 EOF
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1 || fail "could not start PostgreSQL"
 P=("$BIN/psql" -X -h "$SOCKET" -p 5439 -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -v VERBOSITY=verbose)
@@ -73,6 +74,16 @@ reject() {
     [[ "$output" == *"$expected"* ]] || fail "unexpected rejection: $output"
 }
 [ "$("${P[@]}" -c "SHOW pagestore.allow_unsafe_branch_cut;")" = off ] || fail "unsafe cut is not off by default"
+# The preload replaces a configuration-file placeholder. Rejected values may
+# produce a startup warning rather than prevent startup, but must stay off.
+grep -q 'Unsafe branch cuts require an explicit session SET' "$DATA/server.log" || fail "configuration opt-in was not rejected"
+sed -i '/^pagestore.allow_unsafe_branch_cut = on$/d' "$DATA/postgresql.conf"
+reject "ALTER ROLE postgres SET pagestore.allow_unsafe_branch_cut=on;" "Unsafe branch cuts require an explicit session SET"
+reject "ALTER DATABASE postgres SET pagestore.allow_unsafe_branch_cut=on;" "Unsafe branch cuts require an explicit session SET"
+if output=$(PGOPTIONS='-c pagestore.allow_unsafe_branch_cut=on' "${P[@]}" -c 'SHOW pagestore.allow_unsafe_branch_cut;' 2>&1); then
+    fail "connection options enabled unsafe cuts: $output"
+fi
+[[ "$output" == *"Unsafe branch cuts require an explicit session SET"* ]] || fail "unexpected connection rejection: $output"
 # Valid create identities must fail before any IPC mutation. The invalid
 # legacy prepare proves refusal precedes argument validation and file writes.
 calls=(

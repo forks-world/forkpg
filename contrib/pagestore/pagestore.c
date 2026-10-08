@@ -851,6 +851,18 @@ pagestore_branch_routing_active(void)
 /* --- GUC plumbing ------------------------------------------------------- */
 
 static bool
+check_allow_unsafe_branch_cut(bool *newval, void **extra, GucSource source)
+{
+	/* Persistent defaults and connection options must never enable this. */
+	if (*newval && source != PGC_S_SESSION)
+	{
+		GUC_check_errdetail("Unsafe branch cuts require an explicit session SET.");
+		return false;
+	}
+	return true;
+}
+
+static bool
 check_backend_name(char **newval, void **extra, GucSource source)
 {
 	if (*newval == NULL || pagestore_lookup_backend(*newval) == NULL)
@@ -14603,7 +14615,7 @@ _PG_init(void)
 							 false,
 							 PGC_SUSET,
 							 GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
-							 NULL, NULL, NULL);
+							 check_allow_unsafe_branch_cut, NULL, NULL);
 
 	DefineCustomBoolVariable("pagestore.route_user_tablespaces",
 							 "Route relations in user-created tablespaces through the pagestore backend.",
