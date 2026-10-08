@@ -549,6 +549,9 @@ jobs:
             --build build \
             ${{ (github.ref_name == 'pagestore' || (startsWith(github.ref_name, 'branchdb_') && steps.release-plan.outputs.supported == 'true') || (github.event_name == 'pull_request' && (github.base_ref == 'pagestore' || (startsWith(github.base_ref, 'branchdb_') && steps.release-plan.outputs.supported == 'true')))) && '--require-build-match' || '' }}
 
+      - name: Check G3 branch SQL entry gates
+        run: contrib/pagestore/branch_gate_test.sh "$(pwd)/build"
+
       - name: Run pagestore integration test
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"
 

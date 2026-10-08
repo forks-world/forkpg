@@ -760,7 +760,7 @@ boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
 # committed, so booting on the prepared pg_xact -- not the parent's copied one
 # -- is what makes row1 visible.
 SEEDOUT=$(mktemp -d)
-seeded_b=$($P -c "SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL',
+seeded_b=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL',
 	'3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, '1'::xid, '1'::xid, 0, 0);")
 assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"branch prepared via base snapshot + (C,L] replay ($seeded_b SLRU page(s))"
@@ -1257,7 +1257,7 @@ rm -rf "$BOOTSEED"
 # must leave a durable manifest next to the seeded SLRUs; that manifest is the handoff
 # artifact for the later pg_control/bootstrap step.
 PREPSEED=$(mktemp -d)
-prepSeeded=$($P -c "SELECT pagestore_prepare_branch('$PREPSEED', 2, 0, '$mxC', '$mxL',
+prepSeeded=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch('$PREPSEED', 2, 0, '$mxC', '$mxL',
 	'3'::xid, '$bootNext'::xid, '$ctsA'::xid, '$cts_next'::text::xid, '$mA'::xid, '$mxNext'::xid, $mOff, $((mOff + mxMembers)));")
 assert "$([ "${prepSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
 	"branch prepare seeded all bootstrap SLRUs and forked a store timeline ($prepSeeded page(s))"
@@ -1524,7 +1524,7 @@ assert "$mixedRejected" "yes" \
 rm -rf "$MIXEDBOOT"
 LEGACYREUSE=$(mktemp -d)
 cp -a "$AUTOSEED/." "$LEGACYREUSE/"
-legacyReuse=$($P -c "SELECT pagestore_prepare_branch(
+legacyReuse=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch(
 	'$LEGACYREUSE', 3, 0, '$mxC', '$autoFork',
 	'$autoOldestXid'::xid, '$autoNextXid'::xid,
 	'$autoOldestCts'::xid, '$autoNextCts'::xid,
@@ -1563,7 +1563,7 @@ assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
     "t" "failed new branch proof durably deletes its own timeline"
 # An exact retry must not delete a timeline this SQL call did not create.
 "$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
-    -c "SELECT pagestore_create_branch_with_incarnation(41, 0, 1, '$autoFork');" >/dev/null
+    -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_create_branch_with_incarnation(41, 0, 1, '$autoFork');" >/dev/null
 r2Existing=$($P -c "SELECT pagestore_prepare_branch_from_control(
     '$R2SEED.existing', 41, 0, '$mxC', '$autoL', '$autoFork');" 2>&1 || true)
 case "$r2Existing" in
