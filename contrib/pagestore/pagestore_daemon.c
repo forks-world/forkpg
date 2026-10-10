@@ -1561,7 +1561,8 @@ main(int argc, char **argv)
 	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
-	hdr->frontend_capabilities = PS_FRONTEND_CAP_RELATION_INSPECTION;
+	hdr->frontend_capabilities = PS_FRONTEND_CAP_RELATION_INSPECTION |
+		PS_FRONTEND_CAP_BRANCH_SEQ;
 	hdr->daemon_instance = new_daemon_instance();
 	daemon_hdr = hdr;
 	ps_core_set_metrics_header(hdr);

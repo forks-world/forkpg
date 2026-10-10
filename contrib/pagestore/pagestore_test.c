@@ -1341,6 +1341,7 @@ op_create_branch(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 	uint64_t	parent_incarnation = op_timeline_incarnation(parent_tl);
 
+	ch->is_redo = 0;
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
@@ -1357,6 +1358,7 @@ op_create_branch_status(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 	uint64_t	parent_incarnation = op_timeline_incarnation(parent_tl);
 
+	ch->is_redo = 0;
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
@@ -6274,6 +6276,264 @@ run_stress_suite(const char *daemon_path, const char *tmpbase)
 #undef NREADERS
 }
 
+static uint32_t
+op_create_branch_proven(uint32_t child, uint32_t parent, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	uint64_t	incarnation = op_timeline_incarnation(parent);
+	uint32_t	result;
+
+	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->timeline = child;
+	ch->parent_timeline = parent;
+	ch->req_lsn = lsn;
+	ch->req_seq = incarnation;
+	ch->incarnation = 0;
+	ch->is_redo = PS_BRANCH_R2_PROVEN;
+	cl_exec();
+	result = ch->result;
+	check(ch->status == PS_STATUS_OK && (result & PS_BRANCH_RESULT_FINITE),
+		  "checked branch creation returns a finite edge");
+	ch->is_redo = 0;
+	return result;
+}
+
+static void
+check_bugb_control_image(uint32_t timeline, const char *label)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->timeline = timeline;
+	ch->incarnation = 0;
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = 0;
+	ch->req_lsn = 1500;
+	/* Explicitly reset every other request field: the channel is reused
+	 * across ops, and PS_OP_READ_AT echoes its *own* resolved admission_seq
+	 * back into ch->req_seq on success (pagestore_daemon.c, PS_OP_READ_AT
+	 * case).  A prior relation READ_AT on this same channel therefore
+	 * leaves ch->req_seq holding that read's resolved admission_seq, which
+	 * page_visible()/read_resolve_version() treat as an input seq_cap for
+	 * the *next* request at the same LSN -- silently hiding this control
+	 * image's own (newer) admission_seq if the leftover value is smaller. */
+	ch->req_seq = 0;
+	ch->is_redo = 0;
+	ch->skip_fsync = 0;
+	ch->nblocks = 0;
+	ch->old_nblocks = 0;
+	ch->parent_timeline = 0;
+	ch->datalen = 0;
+	ch->pad1 = 0;
+	cl_exec();
+	check(ch->status == PS_STATUS_OK && ch->result != 0 && ch->data[0] == 0,
+		  "control image: %s does not see the post-fork same-version rewrite",
+		  label);
+}
+
+static void
+check_bugb_state(uint32_t ps, unsigned char *rb)
+{
+	ps_channel(cl_shm, cl_chan)->is_redo = 0;
+	op_read_tl(4, 108, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x51), "nested branch hides its parent's local same-position rewrite");
+	op_read_tl(1, 108, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x52), "nested parent keeps newest local bytes");
+	/* A first WAL page arriving after the cut still belongs to the
+	 * inclusive fork LSN; a rewrite at an occupied position does not. */
+	check(op_nblocks_tl(1, 100, 0) == 2,
+		  "rel100: a genuine first admission exactly at L is visible to the branch (got %u)",
+		  op_nblocks_tl(1, 100, 0));
+	op_read_at_tl(1, 100, 0, 1, 1500, rb);
+	check(page_has_tag(rb, ps, 0x20),
+		  "rel100: branch sees the new block's real bytes, admitted exactly at L");
+
+	for (uint32_t rel = 101; rel < 107; rel++)
+		check(op_nblocks_tl(1, rel, 0) == 1,
+			  "rel%u: branch stays frozen at its pre-fork size (got %u)",
+			  rel, op_nblocks_tl(1, rel, 0));
+	op_read_at_tl(1, 100, 0, 0, 1500, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel100: branch's pre-existing block0 unaffected by the post-fork EXTEND at L");
+	op_read_at_tl(1, 103, 0, 0, 1500, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel103: branch does not see the post-fork same-lsn rewrite (hint-bit case)");
+	op_read_at_tl(1, 104, 0, 0, 1500, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel104: WAL-less rewrite was already safe, branch still unaffected");
+
+	/* grandchild (timeline 2, child of branch 1 at 1800): its projected cap
+	 * onto the root is the same 1500 fork point branch 1 has (branch 1's
+	 * own branch_lsn is the tighter bound), so it sees the same genuine
+	 * first admission and stays frozen against the same rewrites. */
+	check(op_nblocks_tl(2, 100, 0) == 2,
+		  "rel100: grandchild also sees the genuine first admission at L (got %u)",
+		  op_nblocks_tl(2, 100, 0));
+	for (uint32_t rel = 101; rel < 107; rel++)
+		check(op_nblocks_tl(2, rel, 0) == 1,
+			  "rel%u: grandchild branch also stays frozen at pre-fork size", rel);
+	op_read_tl(2, 103, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel103: grandchild does not see the post-fork same-lsn rewrite either");
+	/* Checked last, matching the order the post-fork mutations were applied
+	 * in (run_bugb_suite() writes the control image rewrite after all the
+	 * other leak shapes): reuses the client channel after a run of relation
+	 * NBLOCKS/READ_AT calls, so it also exercises that check_bugb_control_image()
+	 * resets every request field of its own rather than relying on a fresh
+	 * channel. */
+	check_bugb_control_image(1, "branch");
+}
+
+
+static void
+run_bugb_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	unsigned char *p,
+			   *rb;
+
+	fprintf(stderr, "== Bug B: post-fork same-position snapshot caps ==\n");
+
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugb", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugb", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	p = malloc(ps);
+	rb = malloc(ps);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	/* seven pre-fork relations on the root, block0 written at P=1000 */
+	for (uint32_t rel = 100; rel < 107; rel++)
+	{
+		op_create_at(rel, 0, 1000);
+		fill_page(p, ps, 1000, 0x10);
+		op_write_tl(0, rel, 0, 0, p);
+	}
+
+	/* the control image legitimately established at exactly L, as part of
+	 * branch preparation (same shape as a materializer's env_materialize) --
+	 * must happen BEFORE the branch so the branch's frozen view has
+	 * something real at that version to protect. */
+	memset(p, 0, ps);
+	op_write_control(0, p, 1500);
+
+	/* branch 1 off root at L=1500; grandchild 2 off branch 1 at 1800 --
+	 * both must freeze the SAME root-level relations at the SAME size. */
+	op_create_branch_proven(1, 0, 1500);
+	op_create_branch_proven(2, 1, 1800);
+	check((op_create_branch_proven(1, 0, 1500) & PS_BRANCH_RESULT_NEW) == 0,
+		  "finite exact retry preserves the original edge");
+	check(op_create_branch_status(1, 0, 1500) == PS_STATUS_ERROR,
+		  "legacy caller cannot retry a finite branch");
+	check(op_create_branch_proven(3, 0, 1500) & PS_BRANCH_RESULT_NEW,
+		  "same-LSN independent branch has its own finite cut");
+	check(op_retention_set(1, PS_RETENTION_OWNER_READER, 88100, 1,
+						  PS_RETENTION_RESOURCE_PAGE_HISTORY, 1200) == PS_STATUS_OK,
+		  "new descendant pin registers a narrower view before reclamation");
+	check(op_retention_drop(1, PS_RETENTION_OWNER_READER, 88100, 1) == PS_STATUS_OK,
+		  "release the narrow descendant test pin");
+	for (uint32_t rel = 100; rel < 107; rel++)
+	{
+		check(op_nblocks_tl(1, rel, 0) == 1,
+			  "rel%u: branch starts at the pre-fork size", rel);
+		check(op_nblocks_tl(2, rel, 0) == 1,
+			  "rel%u: grandchild starts at the pre-fork size", rel);
+	}
+
+	fill_page(p, ps, 2500, 0x51);
+	op_write_tl(1, 108, 0, 0, p);
+	op_create_branch_proven(4, 1, 2600);
+	fill_page(p, ps, 2500, 0x52);
+	op_write_tl(1, 108, 0, 0, p);
+	/* --- post-fork parent mutations: the eight bugb_repro.c leak shapes --- */
+	fill_page(p, ps, 1500, 0x20);
+	check(op_write_tl_status(0, 100, 0, 1, p) == PS_STATUS_OK,
+		  "rel100: EXTEND a new block at exactly the branch cap L");
+	op_zeroextend_at(101, 0, 1, 3, 1000);	/* stale req_lsn==P, collides with rel101's own CREATE */
+	op_zeroextend(102, 0, 1, 3);			/* unstamped req_lsn==0 */
+	fill_page(p, ps, 1000, 0x30);
+	check(op_write_tl_status(0, 103, 0, 0, p) == PS_STATUS_OK,
+		  "rel103: WRITEV rewrites block0 keeping its old pd_lsn (hint-bit case)");
+	fill_page(p, ps, 0, 0x40);
+	check(op_write_tl_status(0, 104, 0, 0, p) == PS_STATUS_OK,
+		  "rel104: WAL-less WRITEV rewrite (already-safe negative control)");
+	op_truncate_at(105, 0, 0, 1000);		/* stale req_lsn==P, collides with rel105's own CREATE */
+	memset(p, 0, ps);
+	check(op_write_tl_status(0, 106, 0, 1, p) == PS_STATUS_OK,
+		  "rel106: all-zero-page EXTEND (already-safe negative control)");
+	memset(p, 0x77, ps);
+	op_write_control(0, p, 1500);			/* post-fork rewrite at the SAME version -- must not leak */
+
+	op_read_tl(0, 103, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x30), "parent newest retains the rewrite bytes and ordering");
+	check_bugb_state(ps, rb);
+
+	/* clean restart */
+	client_detach();
+	stop_daemon(dpid);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_tl(0, 103, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x30), "parent newest retains the rewrite bytes and ordering");
+	check_bugb_state(ps, rb);
+	fprintf(stderr, "  (reverified after clean restart)\n");
+
+	/* crash restart */
+	client_detach();
+	kill(dpid, SIGKILL);
+	{
+		int status;
+
+		waitpid(dpid, &status, 0);
+	}
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_tl(0, 103, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x30), "parent newest retains the rewrite bytes and ordering");
+	check_bugb_state(ps, rb);
+	fprintf(stderr, "  (reverified after crash restart)\n");
+
+	/* Merge and reclaim page history under the structural branch fences. */
+	for (uint32_t block = 1; block <= 48; block++)
+	{
+		fill_page(p, ps, 5000 + block, (unsigned char) block);
+		op_write_tl(0, 107, 0, block, p);
+	}
+	check(wait_for_compacted_layers(store, 3 * test_nshards),
+		  "Bug B suite: forced compaction reaches a bounded compacted layer set");
+	client_detach();
+	stop_daemon(dpid);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_tl(0, 103, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x30), "parent newest retains the rewrite bytes and ordering");
+	check_bugb_state(ps, rb);
+	fprintf(stderr, "  (reverified after forced page compaction)\n");
+
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	free(p);
+	free(rb);
+}
+
+
 int
 main(int argc, char **argv)
 {
@@ -6302,6 +6562,13 @@ main(int argc, char **argv)
 	{
 		perror("mkdtemp");
 		return 2;
+	}
+	if (getenv("PAGESTORE_TEST_BUGB_ONLY"))
+	{
+		run_bugb_suite(daemon_path, tmpbase);
+		rm_rf(tmpbase);
+		fprintf(stderr, "%d checks, %d failed\n", tests_run, tests_failed);
+		return tests_failed ? 1 : 0;
 	}
 	check_inspector_seqlock();
 	check_daemon_waits_for_shared_init_lock(daemon_path, tmpbase);
@@ -6341,6 +6608,7 @@ main(int argc, char **argv)
 
 	/* branch / snapshot isolation (page-size independent, run once) */
 	run_branch_suite(daemon_path, tmpbase);
+	run_bugb_suite(daemon_path, tmpbase);
 
 	/* shipped-WAL durability */
 	run_wal_suite(daemon_path, tmpbase);

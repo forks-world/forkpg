@@ -1137,3 +1137,19 @@ Performance refinements such as size-tiered compaction, layer key-range pruning,
 bloom filters, per-shard layer maps, asynchronous POSIX I/O, and explicit
 CPU/IO scheduling remain important, but they follow the functional and
 operational gates above unless measurement shows they block the MVP scenario.
+
+## Branch snapshot correctness: finite branch activation
+
+The controller-created branch path now freezes same-position ancestor rewrites
+with a durable admission-sequence cap (Bug B, P3b in
+`BRANCH_SNAPSHOT_SEQ_CAP.md`). Parent newest ordering is unchanged. The cap is
+used by reads and reclamation together, and physical layer reads retrieve the
+selected version identity after restart. Control-image and redo-note pairs are
+retained for the frozen view, including across forkmeta cutovers.
+
+Use the matching 1.6 extension/library, controller and POSIX daemon. Raw branch
+SQL and the older control-derived overloads require a session-only unsafe
+opt-in. Old unbounded branches remain legacy data; completed receipts are
+checked for a finite edge and cannot recertify them. An activated store cannot
+be opened by the earlier format-only daemon. Independent reader-pin and
+WAL-index-horizon activation (P5) is not included in this branch-only fix.

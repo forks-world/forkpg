@@ -1347,6 +1347,7 @@ class BranchPrepareTests(unittest.TestCase):
                         self.assertIn('bigint,xid8,integer)', queries[0][0])
                         self.assertIn('"writer".pagestore_materializer_status()', queries[0][0])
                         self.assertIn("materialized_wal_lsn >= '0/40'::pg_lsn", queries[0][0])
+                        self.assertIn('"writer".pagestore_branch_snapshot_is_safe(', queries[0][0])
 
     def test_open_branch_window_preserves_full_xid_and_private_connection(self):
         config = MODULE.Config.load(self.write_config())

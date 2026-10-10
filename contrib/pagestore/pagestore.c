@@ -2130,6 +2130,23 @@ pagestore_require_localsvc_monitoring(void)
 				 errmsg("pagestore WAL monitoring requires the localsvc backend")));
 }
 
+/* Read-only certification for recovered/completed controller receipts. */
+PG_FUNCTION_INFO_V1(pagestore_branch_snapshot_is_safe);
+Datum
+pagestore_branch_snapshot_is_safe(PG_FUNCTION_ARGS)
+{
+	int32		timeline = PG_GETARG_INT32(0);
+	int64		incarnation = PG_GETARG_INT64(1);
+
+	pagestore_require_localsvc_monitoring();
+	if (timeline <= 0 || incarnation <= 0)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid branch timeline identity")));
+	PG_RETURN_BOOL(pagestore_localsvc_branch_is_finite((uint32) timeline,
+													   (uint64) incarnation));
+}
+
+
 static void
 pagestore_require_materializer(void)
 {
@@ -13597,7 +13614,7 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 							  MultiXactId oldest_multi,
 							  MultiXactId next_multi,
 							  int64 oldest_member, int64 next_member,
-								  bool *created_new)
+								  bool *created_new, bool proven)
 {
 	int64		seeded;
 	char		manifest_path[MAXPGPATH];
@@ -13663,7 +13680,8 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 												   oldest_member, next_member,
 												   &seeded))
 	{
-		bool created = pagestore_localsvc_create_branch((uint32) new_tl,
+		bool created = (proven ? pagestore_localsvc_create_branch_proven :
+						pagestore_localsvc_create_branch)((uint32) new_tl,
 			(uint32) parent_tl, (uint64) target, incarnation, parent_incarnation);
 
 		if (created_new != NULL)
@@ -13698,7 +13716,8 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 											  oldest_multi, next_multi,
 											  oldest_member, next_member);
 	{
-		bool created = pagestore_localsvc_create_branch((uint32) new_tl,
+		bool created = (proven ? pagestore_localsvc_create_branch_proven :
+						pagestore_localsvc_create_branch)((uint32) new_tl,
 			(uint32) parent_tl, (uint64) target, incarnation, parent_incarnation);
 
 		if (created_new != NULL)
@@ -13765,7 +13784,7 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 											PG_GETARG_TRANSACTIONID(9),
 											PG_GETARG_TRANSACTIONID(10),
 											PG_GETARG_INT64(11),
-											PG_GETARG_INT64(12), NULL);
+											PG_GETARG_INT64(12), NULL, false);
 
 	/* The expert ABI does not produce the catalog/control-bound artifact. */
 	pathlen = snprintf(bootstrap_path, sizeof(bootstrap_path), "%s/%s",
@@ -14044,6 +14063,9 @@ pagestore_prepare_branch_from_control_impl(FunctionCallInfo fcinfo, bool window)
 							   LSN_FORMAT_ARGS(materialized))));
 	}
 
+	if (!window)
+		pagestore_require_unsafe_branch_cut("pagestore_prepare_branch_from_control");
+
 	seeded = pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
 										base, fork_lsn, incarnation,
 										parent_incarnation,
@@ -14051,7 +14073,7 @@ pagestore_prepare_branch_from_control_impl(FunctionCallInfo fcinfo, bool window)
 											h.oldest_commit_ts_xid,
 											h.next_commit_ts_xid,
 											h.oldest_multi, h.next_multi,
-											h.oldest_member, h.next_member, &created_new);
+											h.oldest_member, h.next_member, &created_new, window);
 	/*
 	 * The portable artifact is its own readiness marker in the prepared dir.
 	 * Publish it only after the SLRU manifest exists, and bind its checksum to

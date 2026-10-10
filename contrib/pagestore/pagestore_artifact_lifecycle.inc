@@ -279,7 +279,7 @@ struct ArtifactPruneCache
 		PsArtifactLifecycle record;
 	}		   *intervals;
 	uint32_t	nintervals;
-	PsPruneFence *legacy;
+	PsHistoryFence *legacy;
 	uint32_t	nlegacy;
 };
 
@@ -296,7 +296,7 @@ artifact_prune_cache_free(ArtifactPruneCache *cache)
 
 static int
 artifact_prune_cache_build(uint32_t tl, const PsKey *data, uint64_t floor,
-						   const PsPruneFence *fences, uint32_t nfences, ArtifactPruneCache **out)
+						   const PsHistoryFence *fences, uint32_t nfences, ArtifactPruneCache **out)
 {
 	PsKey		meta = artifact_meta_key(data);
 	PageEnt    *begins = page_find(tl, &meta, PS_ARTIFACT_BEGIN_BLOCK);
@@ -330,8 +330,12 @@ artifact_prune_cache_build(uint32_t tl, const PsKey *data, uint64_t floor,
 		selected[i] = commits->vers[i].lsn > floor;
 	for (uint32_t h = 0; h <= nfences; h++)
 	{
-		PsPruneFence horizon = h == 0 ? (PsPruneFence) {floor, 0} : fences[h - 1];
-		PageVer    *commit = commits ? page_visible(commits, horizon.lsn, horizon.admission_seq) : NULL;
+		PsHistoryFence horizon = h == 0 ?
+			(PsHistoryFence) {floor, PS_SEQ_UNBOUNDED, PS_SEQ_UNBOUNDED} : fences[h - 1];
+		ViewCap cap = {horizon.lsn, horizon.seq, horizon.admission_seq, false};
+		bool has_B;
+		uint64_t B = timeline_inherited_below(tl, &has_B);
+		PageVer *commit = commits ? page_select(commits, &cap, B, has_B) : NULL;
 
 		if (commit)
 			selected[commit - commits->vers] = 1;
@@ -386,7 +390,7 @@ artifact_prune_at(const PsPruneVersion *versions, uint32_t n,
 static int
 artifact_prune_versions(uint32_t tl, const PsKey *key, uint32_t block,
 						const PsPruneVersion *versions, uint32_t nversions, uint64_t floor,
-						const PsPruneFence *fences, uint32_t nfences, unsigned char *keep,
+						const PsHistoryFence *fences, uint32_t nfences, unsigned char *keep,
 						ArtifactPruneCache **cachep)
 {
 	PsKey		data = *key;
@@ -445,11 +449,27 @@ artifact_prune_versions(uint32_t tl, const PsKey *key, uint32_t block,
 	if (key->klass != PS_KLASS_ARTIFACT)
 		for (uint32_t h = 0; h < cache->nlegacy; h++)
 		{
-			int			i = artifact_prune_at(versions, nversions, cache->legacy[h].lsn,
-											  cache->legacy[h].admission_seq);
+			PsHistoryFence f = cache->legacy[h];
+			PsAdmitCap cap = {f.lsn, f.seq, f.admission_seq};
+			bool has_B;
+			uint64_t B = timeline_inherited_below(tl, &has_B);
+			uint64_t position = UINT64_MAX;
+			uint64_t minimum_seq = 0;
+			int i = -1;
 
-			while (i >= 0 && versions[i].admission_seq >= cache->first)
-				i--;
+			for (uint32_t j = 0; j < nversions; j++)
+			{
+				if (j == 0 || versions[j].lsn != position)
+				{
+					position = versions[j].lsn;
+					minimum_seq = versions[j].admission_seq;
+				}
+				if (versions[j].admission_seq < cache->first &&
+					ps_version_admissible(versions[j].lsn, versions[j].admission_seq,
+										  versions[j].admission_seq == minimum_seq,
+										  &cap, B, has_B))
+					i = (int) j;
+			}
 			if (i >= 0)
 				keep[i] = 1;
 		}

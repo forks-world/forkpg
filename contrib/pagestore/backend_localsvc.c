@@ -1566,16 +1566,20 @@ pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
  * for the pagestore_create_branch() SQL function.
  */
-bool
-pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
-								 uint64 branch_lsn, uint64 target_incarnation,
-								 uint64 parent_incarnation)
+static bool
+pagestore_localsvc_create_branch_impl(uint32 new_tl, uint32 parent_tl,
+									  uint64 branch_lsn, uint64 target_incarnation,
+									  uint64 parent_incarnation, bool proven)
 {
 	PsChannel  *ch = ls_chan();
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("branch creation");
 
+	if (proven && (((PsShmHeader *) ls_shm)->frontend_capabilities &
+				   PS_FRONTEND_CAP_BRANCH_SEQ) == 0)
+		ereport(ERROR, (errmsg("pagestore daemon does not support safe branch sequence caps")));
+	ch->is_redo = proven ? PS_BRANCH_R2_PROVEN : 0;
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
@@ -1584,7 +1588,28 @@ pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 	ch->req_seq = parent_incarnation;
 	ch->result = 0;
 	ls_exec(ch);
+	if (proven && (ch->result & PS_BRANCH_RESULT_FINITE) == 0)
+		ereport(ERROR, (errmsg("safe branch preparation refused an unbounded legacy branch"),
+						errhint("Use a fresh timeline and receipt path.")));
 	return (ch->result & PS_BRANCH_RESULT_NEW) != 0;
+}
+
+bool
+pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
+								 uint64 branch_lsn, uint64 target_incarnation,
+								 uint64 parent_incarnation)
+{
+	return pagestore_localsvc_create_branch_impl(new_tl, parent_tl, branch_lsn,
+												 target_incarnation, parent_incarnation, false);
+}
+
+bool
+pagestore_localsvc_create_branch_proven(uint32 new_tl, uint32 parent_tl,
+										uint64 branch_lsn, uint64 target_incarnation,
+										uint64 parent_incarnation)
+{
+	return pagestore_localsvc_create_branch_impl(new_tl, parent_tl, branch_lsn,
+												 target_incarnation, parent_incarnation, true);
 }
 
 /*
@@ -1986,6 +2011,25 @@ pagestore_localsvc_timeline_info(uint32 timeline, uint32 *parent_timeline,
 	*branch_lsn = ch->req_lsn;
 	*parent_incarnation = ch->req_seq;
 	return true;
+}
+
+bool
+pagestore_localsvc_branch_is_finite(uint32 timeline, uint64 incarnation)
+{
+	PsChannel  *ch = ls_chan();
+
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_BRANCH_SEQ) == 0)
+		return false;
+	ch->opcode = PS_OP_TIMELINE_INFO;
+	ch->timeline = timeline;
+	ch->incarnation = incarnation;
+	ch->req_lsn = 0;
+	ch->req_seq = 0;
+	ch->req_floor_lsn = 0;
+	ch->result = 0;
+	ls_exec(ch);
+	return ch->result != 0 && ch->req_floor_lsn != 0 &&
+		ch->req_floor_lsn != UINT64_MAX;
 }
 
 uint8

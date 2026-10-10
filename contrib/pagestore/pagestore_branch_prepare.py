@@ -921,6 +921,9 @@ class BranchPreparer:
                 + sql_literal(checkpoint_signature)
                 + ") IS NOT NULL"
                 " AND to_regprocedure(" + sql_literal(window_signature) + ") IS NOT NULL"
+                " AND to_regprocedure("
+                + sql_literal(self.extension_function(self.writer_extension_schema,
+                    "pagestore_branch_snapshot_is_safe(integer,bigint)")) + ") IS NOT NULL"
                 " AND NOT EXISTS (SELECT 1 FROM pg_tablespace"
                 " WHERE spcname NOT IN ('pg_default', 'pg_global'))"
             )
@@ -1699,11 +1702,14 @@ class BranchPreparer:
             + sql_literal(fork) + "::pg_lsn FROM "
             + self.extension_function(self.writer_extension_schema,
                                       "pagestore_materializer_status()")
-            + "), false)", private=mode == "restricted",
+            + "), false) AND "
+            + self.extension_function(self.writer_extension_schema, "pagestore_branch_snapshot_is_safe(")
+            + str(self.config.new_timeline) + ", " + str(self.config.new_incarnation) + ")",
+            private=mode == "restricted",
         ))
         if result != "t":
             raise BranchPrepareError(
-                "recovered branch requires the checked API and a durable materializer marker covering its fork"
+                "recovered branch requires the checked API, a finite snapshot cap and a durable materializer marker covering its fork"
             )
 
     def restore_services(self) -> list[str]:

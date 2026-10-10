@@ -150,7 +150,8 @@ typedef enum PsOpcode
 	PS_OP_CHECK_BRANCH,			/* validate timeline creation request, no mutation */
 	PS_OP_REQUIRE_BRANCH,		/* require existing timeline ancestry metadata */
 	PS_OP_CREATE_BRANCH,		/* create timeline from parent_timeline @ req_lsn */
-	PS_OP_TIMELINE_INFO,		/* return parent/fork metadata; result says has-parent */
+	PS_OP_TIMELINE_INFO,		/* parent/fork metadata; result says has-parent;
+								 * capable daemons return branch S in req_floor_lsn */
 	PS_OP_WAL_APPEND,			/* append datalen WAL bytes at LSN req_lsn (timeline) */
 	PS_OP_WAL_SIZE,				/* return end LSN of the timeline's WAL in req_lsn */
 	PS_OP_WAL_READ,				/* read datalen WAL bytes from LSN req_lsn into data */
@@ -339,6 +340,11 @@ typedef struct PsWalIndexEntry
 } PsWalIndexEntry;
 
 #define PS_BRANCH_RESULT_NEW (1u << 0)
+#define PS_BRANCH_RESULT_FINITE (1u << 1)
+#define PS_BRANCH_REFUSE_UNPROVEN_RETRY (1u << 2)
+/* Exact magic, never a reused boolean is_redo value. */
+#define PS_BRANCH_R2_PROVEN UINT32_C(0x52325042)
+#define PS_FRONTEND_CAP_BRANCH_SEQ (UINT32_C(1) << 1)
 
 /* Retention owners are intentionally few: structural branch pins are derived
  * from timeline metadata instead of duplicated in this mutable registry. */

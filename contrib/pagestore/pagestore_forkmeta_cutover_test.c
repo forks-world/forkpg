@@ -11,6 +11,7 @@
 
 #include "pagestore_core.h"
 #include "pagestore_admissible.h"
+#include "pagestore_artifact_format.h"
 #include "pagestore_fault.h"
 #include "pagestore_forkmeta_snapshot.h"
 #include "pagestore_manifest.h"
@@ -5469,6 +5470,147 @@ test_persisted_event_classification(void)
 	remove_tree(store);
 }
 
+static int
+finite_test_control_pair(uint64_t version, uint64_t redo, unsigned char tag)
+{
+	PsKey key = {0};
+	unsigned char page[8192];
+	int ok;
+
+	key.klass = PS_KLASS_CONTROL;
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	memset(page, 0, sizeof(page));
+	memcpy(page, &redo, sizeof(redo));
+	ps_artifact_trailer_set(page, PS_REDO_NOTE_MAGIC, PS_REDO_NOTE_VERSION);
+	ok = append_page(0, &key, PS_REDO_NOTE_BLOCK, page, version, NULL) == 0;
+	memset(page, tag, sizeof(page));
+	ok = ok && append_page(0, &key, PS_CONTROL_IMAGE_BLOCK, page, version, NULL) == 0;
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_admission_read_unlock();
+	return ok;
+}
+
+/* Production branch caps must survive page and forkmeta reclamation together. */
+static void
+test_finite_branch_cutovers(void)
+{
+	char		store[] = "/tmp/pagestore-finite-branch.XXXXXX";
+	char		snapshots[1024],
+				manifest[1024],
+				frontier[1024];
+	PsKey		key = {1, 1, 33000, 0, PS_KLASS_RELATION};
+	PsKey		churn = {1, 1, 33001, 0, PS_KLASS_RELATION};
+	PsKey control = {0};
+	unsigned char page[8192];
+	PsRetentionPin pin = {0};
+	PsChannel	ch = {0};
+	TestSnapshotHeader header;
+	uint64_t	seq = 0;
+
+	check(mkdtemp(store) != NULL, "create finite-branch cutover store");
+	snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	flush_pages = 1;
+	compact_layers = 0;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
+		  append_relation_tag(&key, 0, 100, page, 0x11, NULL) == 0,
+		  "seed root page before finite branch cut");
+	control.klass = PS_KLASS_CONTROL;
+	check(finite_test_control_pair(100, 100, 0x71) &&
+		  finite_test_control_pair(150, 100, 0x61), "seed pre-cut control image and redo note");
+	ch.opcode = PS_OP_CREATE_BRANCH;
+	ch.timeline = 1;
+	ch.parent_timeline = 0;
+	ch.req_lsn = 200;
+	ch.is_redo = PS_BRANCH_R2_PROVEN;
+	ps_admission_read_lock();
+	ps_lock_shard_wr(0);
+	ps_lock_map_wr();
+	ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_unlock_shard(0);
+	ps_admission_read_unlock();
+	check(ch.status == PS_STATUS_OK &&
+		  ch.result == (PS_BRANCH_RESULT_NEW | PS_BRANCH_RESULT_FINITE),
+		  "create finite structural fence through production metadata path");
+	check(finite_test_control_pair(100, 100, 0x72) &&
+		  finite_test_control_pair(150, 120, 0x62) &&
+		  finite_test_control_pair(3000, 500, 0x63),
+		  "rewrite control pair at the occupied position, then advance checkpoint");
+	check(append_relation_tag(&key, 0, 100, page, 0x22, NULL) == 0 &&
+		  append_relation_tag(&key, 1, 150, page, 0x33, NULL) == 0 &&
+		  append_relation_tag(&key, 1, 150, page, 0x44, NULL) == 0 &&
+		  meta_request(PS_OP_TRUNCATE, &key, 100, 0, 0, 0, NULL),
+		  "late same-position rewrites and truncate on parent");
+	check(meta_request(PS_OP_CREATE, &churn, 500, 0, 0, 0, NULL) &&
+		  append_relation(&churn, 0, 500, page, &seq) == 0,
+		  "establish operational history above branch");
+	pin.timeline = 0;
+	pin.owner_kind = PS_RETENTION_OWNER_CONFIGURED;
+	pin.owner_id = 33000;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 500;
+	pin.admission_seq = seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "reclaim root history while finite branch retains older view");
+	for (uint32_t round = 0; round < 2; round++)
+	{
+		if (round != 0)
+		{
+			check(append_relation(&churn, 0, 600, page, &seq) == 0,
+				  "advance operational history for second snapshot");
+			pin.lsn = 600;
+			pin.admission_seq = seq;
+			check(ps_retention_set(&pin) == PS_RETENTION_OK,
+				  "advance configured floor above the retained finite branch");
+			for (unsigned int turn = 0; turn < 8; turn++)
+				ps_core_maintenance();
+		}
+		check(append_growth_batch(33100 + round * 100, 1000 + round * 100) &&
+			  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
+			  "generate forkmeta cutover work");
+		if (round == 0)
+			check(run_maintenance_until(manifest, 1), "publish first finite-cap snapshot");
+		else
+			check(generation_advances_past(snapshots, header.generation),
+				  "publish second finite-cap snapshot");
+		check(read_selected_header(snapshots, &header) == 0,
+			  "read finite-cap snapshot generation");
+		check(read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x11, "finite branch keeps pre-S bytes after cutover");
+		check(read_resolve(1, &key, 1, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x33, "late first arrival remains visible; rewrite hidden");
+		check(read_resolve(1, &control, PS_CONTROL_IMAGE_BLOCK, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x61, "branch control image survives same-LSN pair pruning");
+		{
+			uint64_t observed_redo;
+			int found = read_resolve(1, &control, PS_REDO_NOTE_BLOCK, UINT64_MAX, 0, page, NULL);
+			memcpy(&observed_redo, page, sizeof(observed_redo));
+			check(found == 1 && observed_redo == 100,
+				  "branch control note stays paired with the old image");
+		}
+		check(read_resolve(1, &control, PS_CONTROL_IMAGE_BLOCK, 100, 0, page, NULL) == 1 &&
+			  page[128] == 0x71, "exact-redo twin stays frozen below the branch's fork LSN");
+		check(meta_request_timeline(1, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &ch) &&
+			  ch.result == 2, "finite branch keeps size despite hidden parent truncate");
+		close_runtime();
+		check(ps_core_open(store) == 0 &&
+			  read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x11 &&
+			  read_resolve(1, &key, 1, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x33,
+			  "recovered capped pages match live cutover state");
+	}
+	close_runtime();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -6037,6 +6179,7 @@ main(void)
 	test_deletion_filtered_forkmeta_commit_shape();
 	test_reclaimed_ordered_markers_pruned();
 	test_inert_markers_compacted_after_cutover();
+	test_finite_branch_cutovers();
 	test_inert_markers_kept_when_retained();
 	test_inert_markers_kept_on_preserve_survivors();
 	test_deleting_fork_flags_cleared_on_failed_build_skip();
