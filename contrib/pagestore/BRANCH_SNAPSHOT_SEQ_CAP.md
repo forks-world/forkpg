@@ -1283,3 +1283,22 @@ Local validation of this change (2026-10-10, cassert build):
   original `d700edac807` core, including same-position page/control rewrites
   and nested branch-local rewrites. The corrected core passes after restart
   and compaction. These local tests do not constitute release qualification.
+
+## P4 implementation: client unstamped metadata
+
+The localsvc client now sends WAL-less CREATE/TRUNCATE/UNLINK fallbacks and
+ZEROEXTEND with `req_lsn = 0` and `req_floor_lsn = now + 1`. Startup uses its
+current replay record pointer; other recovery backends use the replay pointer,
+and normal backends use the insert pointer. The floor rejects sentinel overflow.
+Real WAL-driven metadata and transaction-end UNLINK keep their record identity
+and a zero floor. Channel initialization clears both fields between operations.
+
+The POSIX daemon already persists these requests as UNSTAMPED in FKM4 and
+composes their admission sequence with finite branch caps. No new IPC layout,
+version or durable format is introduced. Existing P0 clients remain accepted;
+pre-P3a daemons cannot attach to the current channel layout. P5 atomic pins and
+WAL-index/artifact activation remain separate.
+
+The in-engine regression checks both the pre-create historical horizon and the
+actual FKM4 ZEROEXTEND record: UNSTAMPED, nonzero admission sequence, and an LSN
+strictly above the previously sampled insert position.

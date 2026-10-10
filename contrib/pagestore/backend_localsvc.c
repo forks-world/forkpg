@@ -757,56 +757,40 @@ ls_pinned_read_seq(void)
  * WAL-less mutations (unlogged relations) can leave all of these at older
  * records; their content is not LSN-ordered to begin with.
  */
-static uint64
-ls_op_lsn(bool is_unlink)
+/* A WAL-less mutation has no record identity. Keep its real-time lower
+ * bound separate so the daemon persists UNSTAMPED and orders finite branch
+ * views by admission sequence instead of treating a synthetic label as WAL. */
+static void
+ls_unstamped_lsn(PsChannel *ch)
 {
+	uint64 now;
+
 	if (AmStartupProcess())
-		return (uint64) GetCurrentReplayRecPtr(NULL);
-	if (XactLastRecEnd != 0)
-		return (uint64) XactLastRecEnd;
-	if (is_unlink)
-		return (uint64) Max(XactLastCommitEnd, XactLastAbortEnd);
-	/*
-	 * +1: a branch cut is chosen at some LSN L that is, by construction, <=
-	 * whatever this backend's own "now" reads as at cut time (a cut cannot
-	 * be picked ahead of the position it is derived from).  On an idle
-	 * cluster/replica that "now" reader (GetXLogInsertRecPtr, or
-	 * GetXLogReplayRecPtr below) does not itself advance -- it only reads an
-	 * existing pointer -- so a WAL-less mutation racing a cut can read back
-	 * exactly L, not something > L.  The fork/ancestry admission check
-	 * (fork_meta_event_future) treats lsn == cutoff_lsn as still within the
-	 * parent's history (admission_seq breaks that tie, and a WAL-less
-	 * mutation carries no admission_seq of its own), so an unstamped +0
-	 * value at exactly L would still leak a post-cut mutation into the
-	 * branch (Codex review finding 4100769750 on PR #296).  +1 makes the
-	 * stamp strictly greater than any cut derived from the pre-mutation
-	 * reading, which is all the ordering guarantee this fallback ever had:
-	 * GetXLogInsertRecPtr()/GetXLogReplayRecPtr() only bound "not earlier
-	 * than now," never "later than now," so nothing downstream may rely on
-	 * this LSN being record-aligned or corresponding to an actual WAL
-	 * record; it is used purely as a comparable ordering key (as
-	 * fork_meta_event_future's raw uint64 comparison already assumes), so
-	 * advancing it by 1 cannot violate any structural WAL invariant.
-	 *
-	 * The cost is symmetric: a WAL-less mutation that happened BEFORE an
-	 * idle-cluster cut can now also read back L and get stamped L+1,
-	 * landing just outside a branch that should have included it.  In
-	 * practice this can only affect RELPERSISTENCE_UNLOGGED relations --
-	 * pagestore_which() leaves temp relations (backend !=
-	 * INVALID_PROC_NUMBER) on local md storage, so they never reach this
-	 * backend at all -- and every server start (including a branch's own
-	 * boot) unconditionally calls ResetUnloggedRelations() to recreate each
-	 * unlogged relation's main fork from its init fork, which -- unlike the
-	 * main fork -- is always WAL-logged (see
-	 * heapam_relation_set_new_filelocator's explicit log_smgrcreate(...,
-	 * INIT_FORKNUM) call) and therefore never takes this fallback at all.
-	 * So a branch never actually depends on this main-fork stamp landing on
-	 * the correct side of the cut; its content is rebuilt from the
-	 * accurately-stamped init fork on boot regardless.
-	 */
-	if (RecoveryInProgress())
-		return (uint64) GetXLogReplayRecPtr(NULL) + 1;
-	return (uint64) GetXLogInsertRecPtr() + 1;
+		now = (uint64) GetCurrentReplayRecPtr(NULL);
+	else if (RecoveryInProgress())
+		now = (uint64) GetXLogReplayRecPtr(NULL);
+	else
+		now = (uint64) GetXLogInsertRecPtr();
+	if (now >= UINT64_MAX - 1)
+		ereport(ERROR, (errmsg("pagestore metadata time floor exhausted")));
+	ch->req_lsn = 0;
+	ch->req_floor_lsn = now + 1;
+}
+
+static void
+ls_op_lsn(PsChannel *ch, bool is_unlink)
+{
+	ch->req_floor_lsn = 0;
+	if (AmStartupProcess())
+		ch->req_lsn = (uint64) GetCurrentReplayRecPtr(NULL);
+	else if (XactLastRecEnd != 0)
+		ch->req_lsn = (uint64) XactLastRecEnd;
+	else if (is_unlink)
+		ch->req_lsn = (uint64) Max(XactLastCommitEnd, XactLastAbortEnd);
+	else
+		ch->req_lsn = 0;
+	if (ch->req_lsn == 0)
+		ls_unstamped_lsn(ch);
 }
 
 /* A materializer is writable, not a pinned reader, but during recovery it
@@ -854,7 +838,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo,
 
 	ch->opcode = PS_OP_CREATE;
 	ch->is_redo = isRedoEnsure ? 2 : (isRedo ? 1 : 0);
-	ch->req_lsn = ls_op_lsn(false);
+	ls_op_lsn(ch, false);
 	ls_exec(ch);
 }
 
@@ -884,7 +868,7 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 
 	ch->opcode = PS_OP_UNLINK;
 	ch->is_redo = isRedo ? 1 : 0;
-	ch->req_lsn = ls_op_lsn(true);
+	ls_op_lsn(ch, true);
 
 	/* WAL redo must fail if its durable DEAD event cannot be recorded. */
 	if (isRedo)
@@ -937,7 +921,7 @@ ls_truncate(const PageStoreRelKey *key, void *localreln,
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->old_nblocks = old_blocks;
 	ch->nblocks = nblocks;
-	ch->req_lsn = ls_op_lsn(false);
+	ls_op_lsn(ch, false);
 	ls_exec(ch);
 }
 
@@ -1061,13 +1045,8 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
 	ch->skip_fsync = skipFsync ? 1 : 0;
-	/*
-	 * Zero-extends have no WAL record of their own (the extension is
-	 * implied by later content); the insert position is the best honest
-	 * upper bound, and never-written blocks read as zeros either way.
-	 */
-	ch->req_lsn = RecoveryInProgress() ?
-		(uint64) GetCurrentReplayRecPtr(NULL) : (uint64) GetXLogInsertRecPtr();
+	/* ZEROEXTEND has no WAL record of its own, including during replay. */
+	ls_unstamped_lsn(ch);
 	ls_exec(ch);
 }
 
