@@ -5497,7 +5497,7 @@ test_finite_branch_cutovers(void)
 {
 	char		store[] = "/tmp/pagestore-finite-branch.XXXXXX";
 	char		snapshots[1024],
-				manifest[1024],
+				manifest[2048],
 				frontier[1024];
 	PsKey		key = {1, 1, 33000, 0, PS_KLASS_RELATION};
 	PsKey		churn = {1, 1, 33001, 0, PS_KLASS_RELATION};
