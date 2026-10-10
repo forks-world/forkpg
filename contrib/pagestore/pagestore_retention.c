@@ -2219,6 +2219,19 @@ ps_retention_get(uint32_t index, PsRetentionPin *pin_out, uint32_t *count_out)
 	return rc;
 }
 
+/* Constant-time cache validation; no owner scan or allocation. */
+int
+ps_retention_epoch(uint64_t *epoch_out)
+{
+	int rc;
+
+	pthread_mutex_lock(&retention_lock);
+	rc = retention_is_poisoned ? PS_RETENTION_ERROR : PS_RETENTION_OK;
+	*epoch_out = retention_mutation_epoch;
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
 int
 ps_retention_get_consistent(uint32_t index, uint64_t *epoch_io,
 							PsRetentionPin *pin_out, uint32_t *count_out)

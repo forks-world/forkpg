@@ -25,6 +25,7 @@ extern int ps_retention_reserve_admission_seq(uint64_t admission_seq);
 extern int ps_retention_admission_highwater(uint64_t *admission_seq_out);
 extern int ps_retention_drop(uint32_t timeline, uint32_t owner_kind,
 								 uint64_t owner_id, uint32_t generation);
+extern int ps_retention_epoch(uint64_t *epoch_out);
 extern int ps_retention_count(uint32_t *count_out);
 extern int ps_retention_get(uint32_t index, PsRetentionPin *pin_out,
 								 uint32_t *count_out);

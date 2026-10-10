@@ -937,11 +937,11 @@ img_idx_cache_get(const PsLayerDesc *layer, uint64_t file_size,
 	return e;
 }
 
-int
-ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
+static int
+image_layer_lookup_impl(const PsLayerDesc *layer, const PsKey *key,
 					  uint32_t block, uint64_t read_lsn, uint64_t read_seq,
 					  void *out, uint32_t page_size, uint64_t *out_lsn,
-					  uint64_t *out_seq)
+					  uint64_t *out_seq, int exact)
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsImgFooter foot;
@@ -1016,10 +1016,12 @@ retry:
 				break;
 			continue;
 		}
-		if (idx[i].lsn <= read_lsn &&
-			(idx[i].lsn < read_lsn || read_seq == 0 ||
-			 idx[i].admission_seq == 0 ||
-			 idx[i].admission_seq <= read_seq) &&
+		if ((exact ? (idx[i].lsn == read_lsn &&
+				  idx[i].admission_seq == read_seq) :
+			 (idx[i].lsn <= read_lsn &&
+			  (idx[i].lsn < read_lsn || read_seq == 0 ||
+			   idx[i].admission_seq == 0 ||
+			   idx[i].admission_seq <= read_seq))) &&
 			(!found || idx[i].lsn > best_lsn ||
 			 (idx[i].lsn == best_lsn && idx[i].admission_seq >= best_seq)))
 		{
@@ -1058,4 +1060,23 @@ out:
 	if (cached != NULL)
 		img_idx_cache_release(cached);
 	return rc;
+}
+
+/* Exact identity lookup includes legacy sequence zero; it is never a wildcard. */
+int
+ps_image_layer_lookup_exact(const PsLayerDesc *layer, const PsKey *key,
+		uint32_t block, uint64_t lsn, uint64_t seq, void *out,
+		uint32_t page_size, uint64_t *out_lsn, uint64_t *out_seq)
+{
+	return image_layer_lookup_impl(layer, key, block, lsn, seq, out,
+			page_size, out_lsn, out_seq, 1);
+}
+
+int
+ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
+		uint32_t block, uint64_t lsn, uint64_t seq, void *out,
+		uint32_t page_size, uint64_t *out_lsn, uint64_t *out_seq)
+{
+	return image_layer_lookup_impl(layer, key, block, lsn, seq, out,
+			page_size, out_lsn, out_seq, 0);
 }

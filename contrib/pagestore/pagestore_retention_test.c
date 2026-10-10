@@ -322,6 +322,21 @@ main(int argc, char **argv)
 	legacy.owner_id = 41;
 	legacy.lsn = 80;
 	legacy.admission_seq = 1;
+	{
+		uint64_t before, after, stable;
+
+		check(ps_retention_epoch(&before) == 0 &&
+			  ps_retention_epoch(&stable) == 0 && before == stable,
+			  "registry epoch stays stable across reads");
+		check(ps_retention_set(&legacy) == 0 &&
+			  ps_retention_epoch(&after) == 0 && after != before,
+			  "owner SET invalidates registration caches");
+		before = after;
+		check(ps_retention_drop(legacy.timeline, legacy.owner_kind,
+			  legacy.owner_id, legacy.generation) == 0 &&
+			  ps_retention_epoch(&after) == 0 && after != before,
+			  "owner DROP invalidates registration caches");
+	}
 	check(ps_retention_set(&legacy) == PS_RETENTION_OK &&
 		  ps_retention_drop(legacy.timeline, legacy.owner_kind, legacy.owner_id,
 							legacy.generation) == PS_RETENTION_OK,

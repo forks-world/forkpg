@@ -1333,7 +1333,7 @@ assert "$windowOnline" "yes" "transaction window refuses an online checkpoint"
 onlineRedo=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
 onlineFork=$($P -c "SELECT pg_current_wal_lsn();")
 ONLINESEED=$(mktemp -d)
-onlineRejected=$($P -v VERBOSITY=verbose -c "SELECT pagestore_prepare_branch_from_control(
+onlineRejected=$($P -v VERBOSITY=verbose -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
 	'$ONLINESEED', 3, 0, '$mxC', '$onlineRedo', '$onlineFork');" 2>&1 || true)
 case "$onlineRejected" in
 	*"55000: safe branch preparation requires a shutdown checkpoint"*) onlineRejected=yes ;;
@@ -1346,7 +1346,7 @@ assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
 	-c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_timeline_state(3);")" "t" \
 	"online-checkpoint rejection creates no store timeline"
 printf '%s\n' 'existing-bootstrap' > "$ONLINESEED/pagestore_branch.bootstrap"
-existingRejected=$($P -c "SELECT pagestore_prepare_branch_from_control(
+existingRejected=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
 	'$ONLINESEED', 3, 0, '$mxC', '$onlineRedo', '$onlineFork');" 2>&1 || true)
 case "$existingRejected" in
 	*"requires a shutdown checkpoint"*) existingRejected=yes ;;
@@ -1397,7 +1397,7 @@ done
 # A direct-write test source has no materializer marker.  Opting into the
 # controller contract must refuse before any artifact or timeline is created.
 MISSINGMARKERSEED=$(mktemp -d)
-missingMarker=$($P -v VERBOSITY=verbose -c "SELECT pagestore_prepare_branch_from_control(
+missingMarker=$($P -v VERBOSITY=verbose -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
     '$MISSINGMARKERSEED', 6, 0, '$mxC', '$autoL', '$autoFork', 1, true);" 2>&1 || true)
 case "$missingMarker" in
     *"55000: branch fork LSN exceeds the durable materialized horizon"*) missingMarker=yes ;;
@@ -1410,6 +1410,52 @@ assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
     -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_timeline_state(6);")" "t" \
     "missing-marker rejection creates no store timeline"
 rm -rf "$MISSINGMARKERSEED"
+# Simulate an older daemon advertising no finite-branch capability. Read the
+# actual C layout instead of embedding a shared-memory offset in the test.
+CAPTEST=$(mktemp -d)
+cc -I"$SCRIPT_DIR" -x c -o "$CAPTEST/capability" - <<'C'
+#include <stddef.h>
+#include <stdio.h>
+#include "pagestore_ipc.h"
+int main(void) {
+    printf("%zu %u\n", offsetof(PsShmHeader, frontend_capabilities),
+           PS_FRONTEND_CAP_BRANCH_SEQ);
+    return 0;
+}
+C
+read -r cap_offset cap_bit < <("$CAPTEST/capability")
+mkdir "$CAPTEST/prepared"
+printf 'existing manifest\n' > "$CAPTEST/prepared/pagestore_branch.manifest"
+printf 'existing seed\n' > "$CAPTEST/prepared/seed"
+cap_before=$(python3 - "$SHM_PATH" "$cap_offset" "$cap_bit" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    caps, = struct.unpack('=I', f.read(4))
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', caps & ~int(sys.argv[3])))
+    print(caps)
+PYTHON
+)
+capRejected=$($P -c "SELECT pagestore_prepare_branch_from_window(
+    '$CAPTEST/prepared', 7, 0, '$mxC', '$autoL', '$autoFork', 1,
+    '$autoWindowXid', 0);" 2>&1 || true)
+# Restore the capability before assertions or any subsequent SQL.
+python3 - "$SHM_PATH" "$cap_offset" "$cap_before" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', int(sys.argv[3])))
+PYTHON
+case "$capRejected" in
+    *"daemon does not support safe branch sequence caps"*) capRejected=yes ;;
+    *) capRejected=no ;;
+esac
+assert "$capRejected" "yes" "checked preparation rejects a daemon without finite-branch capability"
+assert "$(cat "$CAPTEST/prepared/pagestore_branch.manifest")" "existing manifest"     "capability rejection preserves the existing prepared manifest"
+assert "$(cat "$CAPTEST/prepared/seed")" "existing seed"     "capability rejection preserves existing seeded bytes"
+assert "$(find "$CAPTEST/prepared" -type f | wc -l | tr -d ' ')" "2"     "capability rejection creates no prepared artifacts"
+rm -rf "$CAPTEST"
 WINDOWREJECT=$(mktemp -d)
 windowEpoch=$($P -c "SELECT pagestore_prepare_branch_from_window(
     '$WINDOWREJECT', 7, 0, '$mxC', '$autoL', '$autoFork', 1,
@@ -1434,7 +1480,7 @@ assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
     "transaction-window rejection creates no store timeline"
 rm -rf "$WINDOWREJECT"
 AUTOSEED=$(mktemp -d)
-autoSeeded=$($P -c "SELECT pagestore_prepare_branch_from_control(
+autoSeeded=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")
 assert "$([ "${autoSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
 	"control-derived prepare seeded all branch SLRUs ($autoSeeded page(s))"
@@ -1481,7 +1527,7 @@ assert "$([ -s "$AUTOSEED/pagestore_branch.bootstrap" ] && echo present || echo 
 	"present" "control-derived prepare publishes the portable catalog bootstrap artifact"
 autoRecovery=$(python3 -c 'import struct,sys; e=struct.unpack("<3Q",open(sys.argv[1],"rb").read(24))[1];print(f"{e>>32:X}/{e&0xffffffff:08X}")' "$AUTOSEED/pagestore_branch.bootstrap")
 bootstrapMd5=$(md5sum "$AUTOSEED/pagestore_branch.bootstrap" | awk '{print $1}')
-autoRetry=$($P -c "SELECT pagestore_prepare_branch_from_control(
+autoRetry=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")
 assert "$autoRetry" "$autoSeeded" \
 	"control-derived prepare retry is idempotent"
@@ -1535,11 +1581,11 @@ assert "$legacyReuse" "$autoSeeded" \
 assert "$([ -e "$LEGACYREUSE/pagestore_branch.bootstrap" ] && echo present || echo absent)" \
 	"absent" "legacy expert prepare removes a stale portable bootstrap marker"
 rm -rf "$LEGACYREUSE"
-shortFork=$($P -c "SELECT pagestore_prepare_branch_from_control(
+shortFork=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED.short', 4, 0, '$mxC', '$autoL', '$autoL');" 2>/dev/null || echo ERROR)
 assert "$shortFork" "ERROR" \
 	"control-derived prepare rejects a fork that does not cover the checkpoint record"
-badAuto=$($P -c "SELECT pagestore_prepare_branch_from_control(
+badAuto=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED.bad', 4, 0, '$mxC', '$autoL'::pg_lsn + 1, '$autoFork');" 2>/dev/null || echo ERROR)
 assert "$badAuto" "ERROR" \
 	"control-derived prepare rejects a target without an exact checkpoint control state"
@@ -1549,7 +1595,7 @@ $P -c "CREATE TABLE r2_wal_probe (id int);" >/dev/null
 R2SEED=$(mktemp -d)
 mkdir "$R2SEED.existing" "$R2SEED.prepared" "$R2SEED.prepared-abort" "$R2SEED.abort"
 r2Commit=$($P -c "SET pagestore.redo_wal_from_store = on;
-    SELECT pagestore_prepare_branch_from_control(
+    SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
         '$R2SEED', 40, 0, '$mxC', '$autoL', '$autoFork');" 2>&1 || true)
 case "$r2Commit" in
     *"transaction completion after the fork"*"cleanup=complete"*) r2Commit=yes ;;
@@ -1564,7 +1610,7 @@ assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
 # An exact retry must not delete a timeline this SQL call did not create.
 "$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
     -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_create_branch_with_incarnation(41, 0, 1, '$autoFork');" >/dev/null
-r2Existing=$($P -c "SELECT pagestore_prepare_branch_from_control(
+r2Existing=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
     '$R2SEED.existing', 41, 0, '$mxC', '$autoL', '$autoFork');" 2>&1 || true)
 case "$r2Existing" in
     *"transaction completion after the fork"*"cleanup=complete"*) r2Existing=yes ;;
@@ -1581,7 +1627,7 @@ assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
 $P -c "BEGIN; INSERT INTO r2_wal_probe VALUES (1); PREPARE TRANSACTION 'r2_commit';" >/dev/null
 r2Fork=$($P -c "SELECT pg_current_wal_insert_lsn();")
 $P -c "COMMIT PREPARED 'r2_commit';" >/dev/null
-r2Prepared=$($P -c "SELECT pagestore_prepare_branch_from_control(
+r2Prepared=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
     '$R2SEED.prepared', 42, 0, '$mxC', '$autoL', '$r2Fork');" 2>&1 || true)
 case "$r2Prepared" in
     *"transaction completion after the fork"*"info 0x30"*) r2Prepared=yes ;;
@@ -1591,7 +1637,7 @@ assert "$r2Prepared" "yes" "R2-x rejects COMMIT PREPARED after the cut"
 $P -c "BEGIN; INSERT INTO r2_wal_probe VALUES (2); PREPARE TRANSACTION 'r2_abort';" >/dev/null
 r2Fork=$($P -c "SELECT pg_current_wal_insert_lsn();")
 $P -c "ROLLBACK PREPARED 'r2_abort';" >/dev/null
-r2PreparedAbort=$($P -c "SELECT pagestore_prepare_branch_from_control(
+r2PreparedAbort=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
     '$R2SEED.prepared-abort', 43, 0, '$mxC', '$autoL', '$r2Fork');" 2>&1 || true)
 case "$r2PreparedAbort" in
     *"transaction completion after the fork"*"info 0x40"*) r2PreparedAbort=yes ;;
@@ -1600,7 +1646,7 @@ esac
 assert "$r2PreparedAbort" "yes" "R2-x rejects ABORT PREPARED after the cut"
 r2Fork=$($P -c "SELECT pg_current_wal_insert_lsn();")
 $P -c "BEGIN; INSERT INTO r2_wal_probe VALUES (3); ROLLBACK;" >/dev/null
-r2Abort=$($P -c "SELECT pagestore_prepare_branch_from_control(
+r2Abort=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
     '$R2SEED.abort', 44, 0, '$mxC', '$autoL', '$r2Fork');" 2>&1 || true)
 assert "$([ -s "$R2SEED.abort/pagestore_branch.bootstrap" ] && echo yes || echo no)" \
     "yes" "R2-x permits an ordinary aborted transaction in the post-fork window ($r2Abort)"

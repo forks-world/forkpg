@@ -288,16 +288,17 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_is_in_recovery();")" "t" \
 	ALTER EXTENSION pagestore UPDATE TO '1.2';
 	ALTER EXTENSION pagestore UPDATE TO '1.3';
 	ALTER EXTENSION pagestore UPDATE TO '1.4';
-	ALTER EXTENSION pagestore UPDATE TO '1.5';" >/dev/null ||
+	ALTER EXTENSION pagestore UPDATE TO '1.5';
+    ALTER EXTENSION pagestore UPDATE TO '1.6';" >/dev/null ||
 fail "could not install the extension upgrade chain"
-assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.5" \
-	"extension upgrades from 1.0 through 1.1 and 1.2 to 1.5"
-api_count=$("${WP[@]}" -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pagestore_ext' AND p.oid IN ('pagestore_ext.pagestore_create_branch_with_incarnation(integer,integer,bigint,pg_lsn)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)'::regprocedure, 'pagestore_ext.pagestore_retention_drop_with_incarnation(integer,integer,bigint,bigint,bigint)'::regprocedure, 'pagestore_ext.pagestore_timeline_state(integer)'::regprocedure, 'pagestore_ext.pagestore_delete_branch(integer,bigint)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)'::regprocedure, 'pagestore_ext.pagestore_branch_window_open()'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_window(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,xid8,integer)'::regprocedure);")
-assert_eq "$api_count" "8" "1.5 exposes the branch, retention and timeline lifecycle control APIs after upgrade"
-"${WP[@]}" -c "DROP EXTENSION pagestore; CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.5';" >/dev/null ||
-	fail "could not install a fresh 1.5 extension"
-assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.5" \
-	"fresh extension install uses version 1.5"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.6" \
+	"extension upgrades from 1.0 through 1.1 and 1.2 to 1.6"
+api_count=$("${WP[@]}" -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pagestore_ext' AND p.oid IN ('pagestore_ext.pagestore_create_branch_with_incarnation(integer,integer,bigint,pg_lsn)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)'::regprocedure, 'pagestore_ext.pagestore_retention_drop_with_incarnation(integer,integer,bigint,bigint,bigint)'::regprocedure, 'pagestore_ext.pagestore_timeline_state(integer)'::regprocedure, 'pagestore_ext.pagestore_delete_branch(integer,bigint)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)'::regprocedure, 'pagestore_ext.pagestore_branch_window_open()'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_window(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,xid8,integer)'::regprocedure, 'pagestore_ext.pagestore_branch_snapshot_is_safe(integer,bigint)'::regprocedure);")
+assert_eq "$api_count" "9" "1.6 exposes the branch, retention and timeline lifecycle control APIs after upgrade"
+"${WP[@]}" -c "DROP EXTENSION pagestore; CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.6';" >/dev/null ||
+	fail "could not install a fresh 1.6 extension"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.6" \
+	"fresh extension install uses version 1.6"
 "${WP[@]}" -c "CREATE FUNCTION pagestore_read_at(regclass, int, int, pg_lsn) RETURNS bytea
  AS 'pagestore','pagestore_read_at' LANGUAGE C STRICT;
 CREATE TABLE mvp_golden(id int primary key, note text);" >/dev/null ||
@@ -606,6 +607,16 @@ done
 cp "$TMPROOT/completed-journal.json" "$PREPARED/pagestore_branch.prepare.json" ||
     fail "could not restore the completed journal"
 echo "ok   - post-resume and completed journals validate the marker through the normal writer"
+assert_eq "$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_branch_snapshot_is_safe(1, 1);")" "t" \
+    "completed controller receipt names a durable finite branch"
+"${WP[@]}" -q -c "SET pagestore.allow_unsafe_branch_cut = on;
+    SELECT pagestore_ext.pagestore_create_branch_with_incarnation(98, 0, 1, '$proof_marker');" >/dev/null ||
+    fail "could not create the explicit legacy test branch"
+assert_eq "$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_branch_snapshot_is_safe(98, 1);")" "f" \
+    "unsafe legacy branch cannot be certified by the controller"
+"${WP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch(98, 1);" >/dev/null ||
+    fail "could not delete the explicit legacy test branch"
+
 # The persisted-format fixture for the controller's JSON artifacts
 # (harness/pagestore_controller_fixture.py --capture) takes what this real
 # controller run left behind: its configuration, the completed journal and

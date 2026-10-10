@@ -195,6 +195,11 @@ extern bool pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 												 uint64 branch_lsn,
 												 uint64 target_incarnation,
 												 uint64 parent_incarnation);
+extern void pagestore_localsvc_require_branch_seq(void);
+extern bool pagestore_localsvc_create_branch_proven(uint32 new_tl, uint32 parent_tl,
+												   uint64 branch_lsn, uint64 target_incarnation,
+												   uint64 parent_incarnation);
+extern bool pagestore_localsvc_branch_is_finite(uint32 timeline, uint64 incarnation);
 extern void pagestore_localsvc_detach(void);
 extern void pagestore_localsvc_wal_append(uint64 start_lsn, const void *data,
 										  uint32 len);

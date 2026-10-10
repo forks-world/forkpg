@@ -1223,3 +1223,63 @@ format, or daemon capability advertisement. The capability/result handshake
 must be activated together with finite branch reads, retention and gates; the
 daemon must not advertise safe caps before those semantics exist. Finite
 activation and Bug B remain pending.
+
+### P3b: atomic branch snapshot activation
+
+Checked window preparation now requests a finite branch edge using the exact
+`R2_PROVEN` IPC magic. The POSIX daemon advertises `PS_FRONTEND_CAP_BRANCH_SEQ`,
+records a canonical `CAP_ACTIVATION{BRANCH}` epoch before its first finite
+CREATE, allocates S while all shards and the map are locked, and persists S
+with the branch identity. Exact retries keep S; callers without the proof
+magic cannot retry a finite edge. The checked client rejects old daemons and
+unbounded legacy results before publishing readiness. Shutdown-checkpoint,
+transaction-window, materializer and post-CREATE local-WAL proofs remain
+mandatory. The older control-derived SQL overloads now require the same
+session-only unsafe opt-in as the raw direct entry points.
+
+Read ancestry and page/control/forkmeta retention use the same composed
+`(L,S,X)` cap and inherited-range boundary. Physical memtable/layer reads use
+the selected `(LSN, admission_seq)` identity, including control redo notes;
+they cannot substitute a newer same-LSN tuple after recovery. Relation queries
+with a finite positional cap must match a registered structural or projected
+page-history view. A control restore may impose an additional earlier LSN
+search bound on its branch-owned cap to load the retained exact-redo twin.
+
+The forkmeta publisher supplies full masks and derived cutoff masks to the
+capped planner. After publication, in-memory pruning follows that exact
+snapshot, rebuilding META_FIRST and its indexes as recovery does. WAL-index
+replacement-base planning shares the page planner; it does not use a death or
+an inferred missing-block base that an active finite view hides. Ordered
+operational writes remain strictly above positional fences.
+
+Extension **1.6** adds `pagestore_branch_snapshot_is_safe(timeline, incarnation)`
+for read-only receipt validation. The controller requires this API in preflight
+and checks the finite edge alongside materialization during post-resume and
+completed-receipt recovery. Upgrade with `ALTER EXTENSION pagestore UPDATE TO
+'1.6'` and deploy the matching library/controller/daemon together. Activation
+uses the existing V3 timeline layout; a P3a binary refuses the activation epoch
+and cannot downgrade an activated store. Branches created before activation or
+through unsafe SQL stay unbounded and are not certified; use a fresh branch and
+receipt to obtain a safe snapshot.
+
+This activates **branch** views only. P4's unstamped-client transition and P5's
+independent pin, WAL-index-horizon and artifact activation are still separate
+work. Legacy exact-LSN pin semantics are unchanged.
+
+Regression coverage includes the original daemon leak shapes, parent ordering,
+nested local rewrites, exact retry/mixed callers, clean and crash restarts,
+physical layer reads, and two page/forkmeta cutovers that preserve both frozen
+pages and their control-image/redo-note pair. The golden PostgreSQL scenario
+also checks the 1.6 upgrade and that an unsafe legacy edge fails certification.
+
+Local validation of this change (2026-10-10, cassert build):
+
+- Full Meson `setup` + `pagestore` suites: 109/109 passed.
+- Four-shard focused Bug B IPC regression: 129 checks, zero failures; the
+  single-shard case is also part of the standalone Meson suite.
+- `integration_test.sh`, `mvp_golden_test.sh`, `branch_gate_test.sh`, and
+  `branch_boot_test.sh`: passed with the matching build.
+- The focused regression reproduces the visibility failures using the
+  original `d700edac807` core, including same-position page/control rewrites
+  and nested branch-local rewrites. The corrected core passes after restart
+  and compaction. These local tests do not constitute release qualification.

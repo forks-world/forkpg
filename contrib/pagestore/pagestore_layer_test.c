@@ -54,6 +54,35 @@ main(void)
 		return 2;
 	}
 
+	/* Upgraded stores retain sequence-zero tuples alongside same-LSN rewrites.
+	 * Exact reads must find the old identity, including when another layer
+	 * contains only the rewrite (which must be a miss rather than an error). */
+	{
+		PsLayerDesc legacy;
+		PsImgRec recs[2] = {
+			{.key = k5, .block = 0, .lsn = 100, .admission_seq = 0, .page = pg[0]},
+			{.key = k5, .block = 0, .lsn = 100, .admission_seq = 9, .page = pg[1]},
+		};
+		uint64_t lsn, seq;
+
+		memset(pg[0], 0x71, psz);
+		memset(pg[1], 0x72, psz);
+		check(ps_image_layer_write(700, 0, recs, 2, psz, &legacy) == 0,
+			  "write legacy identity and same-LSN rewrite");
+		check(ps_image_layer_lookup_exact(&legacy, &k5, 0, 100, 0, out,
+			  psz, &lsn, &seq) == 1 && lsn == 100 && seq == 0 && out[128] == 0x71,
+			  "exact lookup preserves sequence-zero bytes");
+		check(ps_image_layer_lookup(&legacy, &k5, 0, 100, 0, out,
+			  psz, &lsn, &seq) == 1 && seq == 9 && out[128] == 0x72,
+			  "uncapped lookup still selects newest rewrite");
+		check(ps_image_layer_lookup_exact(&legacy, &k5, 0, 100, 8, out,
+			  psz, NULL, NULL) == 0, "missing exact identity does not substitute older tuple");
+		check(ps_image_layer_write(701, 0, recs + 1, 1, psz, &legacy) == 0,
+			  "write rewrite-only layer");
+		check(ps_image_layer_lookup_exact(&legacy, &k5, 0, 100, 0, out,
+			  psz, NULL, NULL) == 0, "rewrite-only layer misses sequence-zero identity");
+	}
+
 	/* versions (out of insertion order on purpose):
 	 *   (5,0)@100=0xA1  (5,0)@200=0xA2  (5,0)@300=0xA3
 	 *   (5,1)@150=0xB1  (6,0)@250=0xC1 */

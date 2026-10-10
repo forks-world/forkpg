@@ -64,6 +64,47 @@
 #include "pagestore_forkmeta_prune.h"
 #include "pagestore_forkmeta_snapshot.h"
 
+/* In-memory history fences carry both positional and exact-LSN bounds.
+ * Durable page frontiers and format records retain their two-word layout. */
+typedef struct PsHistoryFence
+{
+	uint64_t lsn;
+	uint64_t admission_seq; /* X; UINT64_MAX means unbounded */
+	uint64_t seq;           /* S; UINT64_MAX means unbounded */
+} PsHistoryFence;
+
+static inline PsViewFence
+history_fence_view(PsHistoryFence f)
+{
+	return (PsViewFence)
+	{
+		f.lsn, f.seq, f.admission_seq
+	};
+}
+
+static int
+history_prune_plan(const PsPruneVersion *versions, uint32_t n,
+				   PsPruneFence floor, const PsHistoryFence *fences,
+				   uint32_t nfences, uint64_t inherited_below,
+				   int has_inherited_below, unsigned char *keep)
+{
+	PsViewFence local[8] = {{0}};
+	PsViewFence *views = nfences > 8 ? malloc((size_t) nfences * sizeof(*views)) : local;
+	int			rc;
+
+	if (views == NULL)
+		return -1;
+	for (uint32_t i = 0; i < nfences; i++)
+		views[i] = history_fence_view(fences[i]);
+	rc = ps_page_prune_plan_capped(versions, n, floor, views, nfences,
+								   inherited_below, has_inherited_below, keep, NULL);
+	if (views != local)
+		free(views);
+	return rc;
+}
+
+static inline uint64_t timeline_inherited_below(uint32_t tl, bool *has_range);
+
 /*
  * Debug-only invariant checks, matching the project's cassert convention:
  * live only when meson.build's PAGESTORE_ASSERT_CHECKING is defined (its
@@ -250,6 +291,7 @@ static uint64_t inspection_mutation_epoch;
 static uint64_t inspection_published_epoch;
 static uint64_t inspection_next_refresh_ns;
 static volatile int inspection_timeline_cache_dirty = 1;
+static uint64_t page_view_timeline_epoch;
 static int inspection_timeline_cache_valid;
 static int inspection_timeline_cache_retention_usable;
 static uint64_t inspection_timeline_cache_retention_epoch;
@@ -292,7 +334,7 @@ static void inspection_metrics_changed(void);
 static void inspection_timeline_cache_changed(void);
 static void publish_inspection_metrics(int force);
 static int branch_frontiers_allow(int parent, uint64_t branch_lsn);
-static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+static int page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 								 uint32_t *nfences_out);
 static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
 								   uint32_t *nfences_out);
@@ -816,11 +858,11 @@ typedef struct ArtifactPruneCache ArtifactPruneCache;
 static void artifact_prune_cache_free(ArtifactPruneCache *cache);
 static int artifact_prune_versions(uint32_t timeline, const PsKey *key,
 	uint32_t block, const PsPruneVersion *versions, uint32_t nversions,
-	uint64_t floor, const PsPruneFence *fences, uint32_t nfences,
+	uint64_t floor, const PsHistoryFence *fences, uint32_t nfences,
 	unsigned char *keep, ArtifactPruneCache **cache);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 									uint64_t admission_seq);
-static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+static int control_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 								uint32_t *nfences_out);
 /* Retention plan for one control block chain.  Blocks 0-2 (image, redo-floor
  * note, admission fence) are written as a same-version group and follow the
@@ -853,12 +895,13 @@ typedef struct PsControlChainPlan
 
 static int control_chain_plan(uint32_t timeline, const PsKey *key,
 							  uint32_t block, uint64_t floor,
-							  const PsPruneFence *fences, uint32_t nfences,
+							  const PsHistoryFence *fences, uint32_t nfences,
 							  PsControlChainPlan *plan);
 struct PageEnt;
 static int control_chain_keeps(const PsControlChainPlan *plan,
 							   const struct PageEnt *entry, uint32_t block,
-							   const PsPruneVersion *v);
+							   const PsPruneVersion *v,
+							   const PsHistoryFence *fences, uint32_t nfences);
 static struct PageEnt *page_find(uint32_t timeline, const PsKey *key, uint32_t block);
 static int prune_version_cmp(const void *va, const void *vb);
 struct PageVer;
@@ -875,14 +918,14 @@ static uint64_t walidx_progress_read(uint32_t tl);
 static int prune_version_needed(uint32_t timeline, const PsKey *key, uint32_t block,
 								const PsPruneVersion *versions, uint32_t n,
 								uint32_t idx, uint64_t floor,
-								const PsPruneFence *fences, uint32_t nfences);
+								const PsHistoryFence *fences, uint32_t nfences);
 static int retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
 											  uint64_t *floor_out, int map_locked,
 											  uint64_t *pin_floor_out,
 											  uint32_t *note_timeline_out,
 											  uint64_t *note_lsn_out,
 											  uint64_t *note_seq_out);
-static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+static int page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 							 uint32_t *nfences_out);
 
 #define PS_WALIDX_FRONTIER_MAGIC 0x46584957U /* "WIXF" */
@@ -3257,7 +3300,7 @@ artifact_generation_at(const uint64_t *generations, uint32_t ngenerations,
  */
 static uint32_t
 artifact_required_generations(const uint64_t *generations, uint32_t ngenerations,
-							  uint64_t floor, const PsPruneFence *fences,
+							  uint64_t floor, const PsHistoryFence *fences,
 							  uint32_t nfences, int replay_base,
 							  uint64_t *required)
 {
@@ -3348,9 +3391,11 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	PsImgRec   *dropped;
 	uint32_t	out = 0;
 	uint32_t	ndropped = 0;
-	PsPruneFence *fences = NULL;
+	bool has_B;
+	uint64_t B = timeline_inherited_below(timeline, &has_B);
+	PsHistoryFence *fences = NULL;
 	uint32_t	nfences = 0;
-	PsPruneFence *control_fences = NULL;
+	PsHistoryFence *control_fences = NULL;
 	uint32_t	ncontrol_fences = 0;
 	uint64_t   *obj_generations = NULL;
 	uint32_t	obj_ngenerations = 0;
@@ -3409,7 +3454,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		return -1;
 	}
 	for (uint32_t i = 0; i < nfences; i++)
-		vfences[i] = ps_prune_fence_to_view(fences[i]);
+		vfences[i] = history_fence_view(fences[i]);
 	for (uint32_t i = 0; i < *nrec; i++)
 	{
 		order[i].key = recs[i].key;
@@ -3527,8 +3572,8 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				 * version collapses to the newest tuple like any other. */
 				for (uint32_t i = first; i < end; i++)
 					versions[i - first] = order[i].version;
-				if (ps_page_prune_plan(versions, end - first, plan_floor,
-									   fences, nfences, keep) < 0)
+				if (history_prune_plan(versions, end - first, plan_floor,
+								   fences, nfences, B, has_B, keep) < 0)
 					memset(keep, 1, end - first);
 				/* A page copy below the floor is kept only when it belongs to
 				 * the newest generation at or below some retained horizon;
@@ -3603,7 +3648,8 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				for (uint32_t i = first; i < end; i++)
 					keep[i - first] = control_chain_keeps(&plan, entry,
 														  order[first].block,
-														  &order[i].version);
+													  &order[i].version,
+													  control_fences, ncontrol_fences);
 			}
 			free(plan.chain);
 			free(plan.kept);
@@ -3615,11 +3661,8 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			 * P2 (design doc S3.5, checklist item 8): route relation pages
 			 * through the closure-aware planner so a position closure
 			 * requires cannot be dropped by the forkmeta-invalidation check
-			 * below.  Every fence here still carries S = PS_PRUNE_SEQ_
-			 * UNBOUNDED (ps_prune_fence_to_view()), so closure never
-			 * actually triggers yet (no behaviour change: closure_protect
-			 * comes back all-zero) -- this only wires the mechanism through
-			 * for when a finite-S fence source lands (P5 activation).
+			 * below. Checked branch edges now supply finite S, including
+			 * the minimum-sequence facts needed by future late arrivals.
 			 * vfences and closure_protect are the function-scope buffers
 			 * allocated once above (Codex 4114217409); this group only
 			 * touches their [0, end - first) prefix.
@@ -3628,7 +3671,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 
 			rc = ps_page_prune_plan_capped(versions, end - first,
 										   (PsPruneFence) {floor, UINT64_MAX},
-										   vfences, nfences, 0, 0, keep,
+										   vfences, nfences, B, has_B, keep,
 										   closure_protect);
 			if (rc < 0)
 			{
@@ -4289,6 +4332,8 @@ viewcap_compose(ViewCap c, uint64_t edge_lsn, uint64_t edge_seq)
 	return r;
 }
 
+static int page_view_registered(uint32_t timeline, const ViewCap *cap);
+
 /* Hash entry: all versions of one (timeline, key, block), in arrival order. */
 typedef struct PageEnt
 {
@@ -4473,8 +4518,9 @@ typedef struct TimelineMeta
 } TimelineMeta;
 
 static TimelineMeta timelines[MAX_TIMELINES];
+static int branch_caps_active;
 
-/* The persisted edge cap remains unbounded until the activation rollout. */
+/* Legacy edges stay unbounded; checked creates persist a finite edge cap. */
 static inline uint64_t
 timeline_branch_seq(uint32_t timeline)
 {
@@ -8690,8 +8736,8 @@ tl_walk_next(TlWalk *w)
  * every ancestor position reached by its capped read, not merely at the
  * child's own frontier. */
 static int
-page_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn,
-						  uint64_t read_seq)
+page_frontier_ancestry_check(uint32_t reader_timeline, uint64_t read_lsn,
+							uint64_t read_seq, bool require_registered)
 {
 	TlWalk		w = tl_walk_first_cap(reader_timeline,
 									  viewcap_from_request(read_lsn, read_seq));
@@ -8701,11 +8747,27 @@ page_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn,
 		uint64_t	seq_cap = w.cap.strict_seq == PS_SEQ_UNBOUNDED ?
 			0 : w.cap.strict_seq;
 
-		if (!page_frontier_allows(w.tl, reader_timeline, w.lsn, seq_cap))
+		if ((require_registered && !page_view_registered(w.tl, &w.cap)) ||
+			!page_frontier_allows(w.tl, reader_timeline, w.lsn, seq_cap))
 			return 0;
 		if (!tl_walk_next(&w))
 			return 1;
 	}
+}
+
+static int
+page_frontier_ancestry_allows(uint32_t timeline, uint64_t lsn, uint64_t seq)
+{
+	return page_frontier_ancestry_check(timeline, lsn, seq, true);
+}
+
+/* SET/RESERVE establish the registration while admission and prune write
+ * locks exclude GC. They check retained history, not a registration that
+ * cannot exist until this operation publishes it. */
+static int
+page_frontier_ancestry_admits(uint32_t timeline, uint64_t lsn, uint64_t seq)
+{
+	return page_frontier_ancestry_check(timeline, lsn, seq, false);
 }
 
 /*
@@ -8725,10 +8787,11 @@ fork_asof_query_allowed(uint32_t reader_timeline, uint64_t read_lsn,
 
 	if (page_frontier_ancestry_allows(reader_timeline, read_lsn, read_seq))
 		return 1;
-	w = tl_walk_first(reader_timeline, read_lsn);
+	w = tl_walk_first_cap(reader_timeline, viewcap_from_request(read_lsn, read_seq));
 	for (;;)
 	{
-		if (!walidx_frontier_exception_active(w.tl, w.lsn))
+		if (!page_view_registered(w.tl, &w.cap) ||
+			!walidx_frontier_exception_active(w.tl, w.lsn))
 			return 0;
 		if (!tl_walk_next(&w))
 			return 1;
@@ -8923,7 +8986,8 @@ branch_frontiers_allow(int parent, uint64_t branch_lsn)
 		if (!timelines[t].defined ||
 			!wal_reclaim_frontier_ancestry_allows((uint32_t) t, cap) ||
 			walidx_frontier_publication_pending((uint32_t) t) ||
-			cap < page_frontier_current((uint32_t) t).lsn ||
+			(cap < page_frontier_current((uint32_t) t).lsn &&
+			 !page_frontier_structural_fence_active((uint32_t) parent, (uint32_t) t, cap)) ||
 			(cap < walidx_frontier_current((uint32_t) t) &&
 			 !walidx_frontier_exception_active((uint32_t) t, cap)))
 			return 0;
@@ -9131,6 +9195,8 @@ read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
 		PageEnt    *e = page_find(w.tl, key, block);
 		PageVer    *v = e ? page_select(e, &w.cap, w.inherited_below,
 										w.has_inherited_below) : NULL;
+		if (key->klass == PS_KLASS_RELATION && !page_view_registered(w.tl, &w.cap))
+			return -2;
 		if (artifact_data_key(key))
 		{
 			int state = artifact_visible(w.tl, key, block, &w.cap,
@@ -9485,7 +9551,7 @@ typedef struct TimelineRecEventV2
 	uint32_t reserved;
 } TimelineRecEventV2;
 
-/* Format-only rollout: finite caps and activation records require P3b. */
+/* Branch activation is durable so a format-only binary refuses this store. */
 #define TIMELINE_META_EVENT_CAP_ACTIVATION 3U
 typedef struct TimelineRecEventV3
 {
@@ -9603,9 +9669,31 @@ timeline_meta_append(const void *data, uint32_t len)
 	return rc;
 }
 
+/* Durable epoch precedes the first finite edge. Previous binaries reject it,
+ * even if the following CREATE was torn or the finite branch was deleted. */
+static int
+timeline_activate_branch_caps(void)
+{
+	TimelineRecEventV3 rec;
+
+	if (branch_caps_active)
+		return 0;
+	memset(&rec, 0, sizeof(rec));
+	rec.magic = TIMELINE_META_V2_MAGIC;
+	rec.rec_len = sizeof(rec);
+	rec.kind = TIMELINE_META_EVENT_CAP_ACTIVATION;
+	rec.parent = -1;
+	rec.branch_seq = PS_SEQ_UNBOUNDED;
+	rec.crc = timeline_event_v3_crc(&rec);
+	if (timeline_meta_append(&rec, sizeof(rec)) != 0)
+		return -1;
+	branch_caps_active = 1;
+	return 0;
+}
+
 static int
 timeline_persist_create(uint32_t id, int parent, uint64_t branch_lsn,
-						uint64_t incarnation, uint64_t parent_incarnation)
+						uint64_t incarnation, uint64_t parent_incarnation, uint64_t branch_seq)
 {
 	TimelineRecEventV3 rec;
 
@@ -9619,7 +9707,7 @@ timeline_persist_create(uint32_t id, int parent, uint64_t branch_lsn,
 	rec.branch_lsn = branch_lsn;
 	rec.incarnation = incarnation;
 	rec.parent_incarnation = parent_incarnation;
-	rec.branch_seq = PS_SEQ_UNBOUNDED;
+	rec.branch_seq = branch_seq;
 	rec.crc = timeline_event_v3_crc(&rec);
 
 	return timeline_meta_append(&rec, sizeof(rec));
@@ -9644,7 +9732,7 @@ timeline_persist_state(uint32_t id, PsTimelineState state,
 	rec.branch_lsn = timelines[id].branch_lsn;
 	rec.incarnation = incarnation;
 	rec.parent_incarnation = timelines[id].parent_incarnation;
-	rec.branch_seq = PS_SEQ_UNBOUNDED;
+	rec.branch_seq = timeline_branch_seq(id);
 	rec.crc = timeline_event_v3_crc(&rec);
 
 	return timeline_meta_append(&rec, sizeof(rec));
@@ -11482,8 +11570,8 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 				PsForkMetaEvent *events = NULL;
 				unsigned char *keep = NULL;
 				uint32_t *indices = NULL;
-				PsPruneFence *raw_fences = NULL;
-				PsForkMetaFence *fences = NULL;
+				PsHistoryFence *raw_fences = NULL;
+				PsForkMetaViewFence *fences = NULL;
 				uint32_t nitems = 0, nfences = 0;
 				int planned;
 				int deleting = filter_deleting &&
@@ -11543,7 +11631,7 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						free(wfences);
 						goto fail_entry;
 					}
-					fences = malloc((size_t) (nfences + nwfences + 1) *
+					fences = malloc((size_t) (2 * nfences + nwfences + 1) *
 									sizeof(*fences));
 					if (fences == NULL)
 					{
@@ -11551,15 +11639,15 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						goto fail_entry;
 					}
 					for (uint32_t i = 0; i < nfences; i++)
-						if (raw_fences[i].lsn < cutoff.lsn ||
-							(raw_fences[i].lsn == cutoff.lsn &&
-							 raw_fences[i].admission_seq != 0 &&
-							 raw_fences[i].admission_seq <= cutoff.admission_seq))
-						{
-							fences[out].lsn = raw_fences[i].lsn;
-							fences[out].admission_seq = raw_fences[i].admission_seq;
-							out++;
-						}
+					{
+						PsHistoryFence f = raw_fences[i];
+						PsForkMetaViewFence v = {f.lsn, f.seq, f.admission_seq};
+						if (f.lsn < cutoff.lsn ||
+							(f.lsn == cutoff.lsn && f.admission_seq <= cutoff.admission_seq))
+							fences[out++] = v;
+						out += ps_forkmeta_derive_fences(&v, 1,
+							(PsForkMetaFence) {cutoff.lsn, cutoff.admission_seq}, &fences[out]);
+					}
 					/* Every WAL-index horizon (owner pins carrying the WAL
 					 * index, branch caps, and the shipper's progress) is a
 					 * fork-history horizon too: WAL-index compaction judges a
@@ -11577,7 +11665,8 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						if (lsn != 0 && lsn < cutoff.lsn)
 						{
 							fences[out].lsn = lsn;
-							fences[out].admission_seq = 0;
+							fences[out].seq = PS_SEQ_UNBOUNDED;
+							fences[out].strict_seq = PS_SEQ_UNBOUNDED;
 							out++;
 						}
 					}
@@ -11603,9 +11692,10 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 					}
 					fork_meta_required_fences(e, indices, nitems, walidx_pages,
 											  nwalidx_pages, required);
-					planned = ps_forkmeta_prune_plan_required(events, nitems,
+					planned = ps_forkmeta_prune_plan_capped(events, nitems,
 						(PsForkMetaFence) {cutoff.lsn, cutoff.admission_seq},
-						fences, nfences, required, planned_keep);
+						fences, nfences, timelines[e->timeline].branch_lsn,
+						timelines[e->timeline].parent >= 0, required, planned_keep);
 					free(required);
 					if (planned < 0)
 					{
@@ -11736,9 +11826,9 @@ fail_entry:
 	return 0;
 }
 
-/* Drop snapshot-pruned inert markers and PAGE GROW events only after a
- * successful durable cutover. META history stays intact until capped
- * pruning is activated. Rebuild every array index and prefix cache below. */
+/* Drop snapshot-pruned events only after a successful durable cutover.
+ * Once branch caps activate, META history follows the durable capped plan
+ * too. Rebuild every array index and prefix cache below. */
 static void
 fork_event_compact_entry(ForkEnt *e)
 {
@@ -11747,7 +11837,7 @@ fork_event_compact_entry(ForkEnt *e)
 	for (uint32_t i = 0; i < e->nev; i++)
 	{
 		if ((e->ev[i].flags & FEV_F_SNAPSHOT_DROPPED) &&
-			(e->ev[i].kind > FEV_DEAD ||
+			(branch_caps_active || e->ev[i].kind > FEV_DEAD ||
 			 (e->ev[i].kind == FEV_GROW && !(e->ev[i].flags & FEV_F_META))))
 		{
 			if (e->ev[i].admission_seq == 0)
@@ -11768,9 +11858,15 @@ fork_event_compact_entry(ForkEnt *e)
 			e->def_idx[e->ndef++] = i;
 	/* late_meta_idx stores array indexes too; META_FIRST itself travelled
 	 * with each surviving event above, so only the index list needs
-	 * rebuilding (META events are never dropped by this pass, so no
-	 * event's META_FIRST status changes
-	 * -- only its slot). */
+	 * rebuilding. The capped planner's closure preserves META_FIRST for
+	 * every retained position that a finite view can still escape into. */
+	if (branch_caps_active)
+		fork_event_recompute_meta_first(e);
+	e->max_meta_seq = 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+		if ((e->ev[i].flags & (FEV_F_META | FEV_F_UNSTAMPED)) &&
+			e->ev[i].admission_seq > e->max_meta_seq)
+			e->max_meta_seq = e->ev[i].admission_seq;
 	e->nlate_meta = 0;
 	for (uint32_t i = 0; i < e->nev; i++)
 		if ((e->ev[i].flags & FEV_F_META) && !(e->ev[i].flags & FEV_F_META_FIRST))
@@ -12418,11 +12514,24 @@ load_timelines(void)
 						break;
 					return -1;
 				}
+				if (rec.kind == TIMELINE_META_EVENT_CAP_ACTIVATION)
+				{
+					if (rec.magic != TIMELINE_META_V2_MAGIC ||
+						rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
+						rec.crc != timeline_event_v3_crc(&rec) || branch_caps_active ||
+						rec.id != 0 || rec.parent != -1 || rec.state != 0 ||
+						rec.branch_lsn != 0 || rec.incarnation != 0 ||
+						rec.parent_incarnation != 0 || rec.branch_seq != PS_SEQ_UNBOUNDED)
+						return -1;
+					branch_caps_active = 1;
+					off += rec_len;
+					continue;
+				}
 				if (rec.magic != TIMELINE_META_V2_MAGIC ||
 					rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
 					rec.crc != timeline_event_v3_crc(&rec) ||
-					rec.kind == TIMELINE_META_EVENT_CAP_ACTIVATION ||
-					rec.branch_seq != PS_SEQ_UNBOUNDED ||
+					(rec.branch_seq != PS_SEQ_UNBOUNDED &&
+					 (!branch_caps_active || rec.branch_seq == 0)) ||
 					rec.id >= MAX_TIMELINES || rec.incarnation == 0 ||
 					rec.state < PS_TIMELINE_LIVE ||
 					rec.state > PS_TIMELINE_DELETED)
@@ -12463,6 +12572,9 @@ load_timelines(void)
 					}
 					else
 						return -1;
+					timelines[rec.id].branch_seq = rec.branch_seq;
+					if (rec.branch_seq != PS_SEQ_UNBOUNDED)
+						admission_seq_observe(rec.branch_seq);
 				}
 				else if (rec.kind == TIMELINE_META_EVENT_STATE)
 				{
@@ -12470,6 +12582,7 @@ load_timelines(void)
 
 					if (!timelines[rec.id].defined ||
 						timelines[rec.id].parent != rec.parent ||
+						timeline_branch_seq(rec.id) != rec.branch_seq ||
 						timelines[rec.id].branch_lsn != rec.branch_lsn ||
 						timelines[rec.id].parent_incarnation !=
 							rec.parent_incarnation ||
@@ -13763,6 +13876,7 @@ inspection_metrics_changed(void)
 static void
 inspection_timeline_cache_changed(void)
 {
+	__atomic_add_fetch(&page_view_timeline_epoch, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&inspection_timeline_cache_dirty, 1, __ATOMIC_RELEASE);
 	inspection_metrics_changed();
 }
@@ -14505,7 +14619,7 @@ walidx_protected_horizons_build(uint32_t tl, uint64_t **set_out,
 								uint32_t *n_out, WalIdxMatGrant **grants_out,
 								uint32_t *ngrants_out)
 {
-	PsPruneFence *fences = NULL;
+	PsHistoryFence *fences = NULL;
 	uint32_t	nfences = 0;
 	uint64_t   *protected_set;
 	uint32_t	nprotected = 0;
@@ -15089,7 +15203,7 @@ wal_segment_reclaim_one(void)
 			(pin_floor == 0 || retention_floor < pin_floor) && note_lsn != 0)
 		{
 			uint64_t	page_history_floor = 0;
-			PsPruneFence *cfences = NULL;
+			PsHistoryFence *cfences = NULL;
 			uint32_t	ncfences = 0;
 			int			note_rc;
 
@@ -16862,10 +16976,50 @@ fork_meta_required_fences(const ForkEnt *e, const uint32_t *indices,
  *         directly.
  */
 static int
+walidx_death_visible_to_fences(const ForkEnt *f, uint32_t idx,
+							   const PsHistoryFence *fences, uint32_t nfences)
+{
+	bool		has_B;
+	uint64_t	B = timeline_inherited_below(f->timeline, &has_B);
+
+	for (uint32_t i = 0; i < nfences; i++)
+	{
+		ViewCap		cap = {fences[i].lsn, fences[i].seq, fences[i].admission_seq, false};
+
+		if (f->ev[idx].lsn <= cap.lsn && cap.seq != PS_SEQ_UNBOUNDED &&
+			fork_event_hidden(f, idx, &cap, B, has_B))
+			return 0;
+	}
+	return 1;
+}
+
+static int
+walidx_absent_at_fences(const ForkEnt *f, uint32_t block, uint64_t horizon,
+						const PsHistoryFence *fences, uint32_t nfences)
+{
+	bool		has_B;
+	uint64_t	B = timeline_inherited_below(f->timeline, &has_B);
+
+	for (uint32_t i = 0; i < nfences; i++)
+	{
+		ViewCap		cap = {fences[i].lsn, fences[i].seq, fences[i].admission_seq, false};
+		uint32_t	nb = 0;
+		int			state;
+
+		if (cap.lsn != horizon || cap.seq == PS_SEQ_UNBOUNDED)
+			continue;
+		state = fork_asof_hop(f, &cap, B, has_B, &nb);
+		if (state != FORK_HOP_DEAD && (state != FORK_HOP_DEF || nb > block))
+			return 0;
+	}
+	return 1;
+}
+
+static int
 walidx_plan_bases_build(uint32_t tl)
 {
 	uint64_t	floor = 0;
-	PsPruneFence *fences = NULL;
+	PsHistoryFence *fences = NULL;
 	uint32_t	nfences = 0;
 	uint64_t   *horizons = NULL;
 	uint32_t	nhorizons = 0;
@@ -16944,6 +17098,7 @@ walidx_plan_bases_build(uint32_t tl)
 				if (f != NULL)
 					for (uint32_t i = 0; i < f->nev; i++)
 						if (f->ev[i].lsn != 0 &&
+							walidx_death_visible_to_fences(f, i, fences, nfences) &&
 							(f->ev[i].kind == FEV_DEAD ||
 							 (f->ev[i].kind == FEV_SET &&
 							  f->ev[i].nblocks <= e->block)))
@@ -16956,8 +17111,9 @@ walidx_plan_bases_build(uint32_t tl)
 						int			state = horizons[i] == 0 ? FORK_HOP_NONE :
 						fork_asof_hop(f, &hc, 0, false, &nb);
 
-						if (state == FORK_HOP_DEAD ||
-							(state == FORK_HOP_DEF && nb <= e->block))
+						if ((state == FORK_HOP_DEAD ||
+							 (state == FORK_HOP_DEF && nb <= e->block)) &&
+							walidx_absent_at_fences(f, e->block, horizons[i], fences, nfences))
 							ndeaths++;
 					}
 				n = p != NULL && p->nver > 0 ? (uint32_t) p->nver : 0;
@@ -16986,9 +17142,9 @@ walidx_plan_bases_build(uint32_t tl)
 					qsort(chain, n, sizeof(*chain), prune_version_cmp);
 				if (n == 0 || floor == 0)
 					memset(keep, 1, n != 0 ? n : 1);
-				else if (ps_page_prune_plan(chain, n,
-											(PsPruneFence) {floor, UINT64_MAX},
-											fences, nfences, keep) < 0)
+				else if (history_prune_plan(chain, n, (PsPruneFence) {floor, UINT64_MAX},
+										fences, nfences, timelines[tl].branch_lsn,
+										timelines[tl].parent >= 0, keep) < 0)
 				{
 					free(chain);
 					free(keep);
@@ -17013,6 +17169,7 @@ walidx_plan_bases_build(uint32_t tl)
 				{
 					for (uint32_t i = 0; i < f->nev; i++)
 						if (f->ev[i].lsn != 0 &&
+							walidx_death_visible_to_fences(f, i, fences, nfences) &&
 							(f->ev[i].kind == FEV_DEAD ||
 							 (f->ev[i].kind == FEV_SET &&
 							  f->ev[i].nblocks <= e->block)))
@@ -17024,8 +17181,9 @@ walidx_plan_bases_build(uint32_t tl)
 						int			state = horizons[i] == 0 ? FORK_HOP_NONE :
 						fork_asof_hop(f, &hc, 0, false, &nb);
 
-						if (state == FORK_HOP_DEAD ||
-							(state == FORK_HOP_DEF && nb <= e->block))
+						if ((state == FORK_HOP_DEAD ||
+							 (state == FORK_HOP_DEF && nb <= e->block)) &&
+							walidx_absent_at_fences(f, e->block, horizons[i], fences, nfences))
 							deaths[ndeaths_out++] = horizons[i];
 					}
 				}
@@ -18773,7 +18931,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		hdr.lsn = fork_meta_snapshot_cutoff_lsn;
 	if (ordered_record)
 	{
-		PsPruneFence *fences = NULL;
+		PsHistoryFence *fences = NULL;
 		uint32_t nfences = 0;
 		uint64_t newest;
 		int rc;
@@ -18804,7 +18962,8 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 			if (hdr.lsn < fences[i].lsn)
 				hdr.lsn = fences[i].lsn;
 			if (hdr.lsn == fences[i].lsn &&
-				admission_seq <= fences[i].admission_seq)
+				(fences[i].seq != PS_SEQ_UNBOUNDED ||
+				 admission_seq <= fences[i].admission_seq))
 			{
 				if (hdr.lsn == UINT64_MAX)
 				{
@@ -19167,7 +19326,7 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		was_verified = d->data_verified;
 		if (!was_verified && layer_verified_lookup(d, 0))
 			d->data_verified = true;
-		lookup = ps_image_layer_lookup(d, key, block, read_lsn, read_seq, tmp,
+		lookup = ps_image_layer_lookup_exact(d, key, block, read_lsn, read_seq, tmp,
 									   page_size, &l, &a);
 
 		/* this caller cannot write the map: park what the lookup verified,
@@ -19321,7 +19480,15 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * before a remote layer read can block. */
 	ps_lock_map_rd();
 	do
+	{
+		if (key->klass == PS_KLASS_RELATION &&
+			!page_view_registered(w.tl, &w.cap))
+		{
+			ps_unlock_map();
+			return -2;
+		}
 		walk[levels++] = w;
+	}
 	while (levels < MAX_TIMELINES && tl_walk_next(&w));
 	ps_unlock_map();
 
@@ -19423,7 +19590,7 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 				return 1;
 
 			if (s->memtable && !poisoned &&
-				ps_memtable_lookup(s->memtable, tl, key, block, rl, seq_cap,
+				ps_memtable_lookup(s->memtable, tl, key, block, pv->lsn, pv->admission_seq,
 								   &l, &a, out) &&
 				l == pv->lsn && a == pv->admission_seq)
 			{
@@ -19432,8 +19599,8 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 			}
 			else if (pv->seg < 0)
 			{
-				int		layer_result = layer_map_lookup(tl, key, block, rl,
-															seq_cap, pv->lsn, &l, &a, out);
+				int		layer_result = layer_map_lookup(tl, key, block, pv->lsn,
+												pv->admission_seq, pv->lsn, &l, &a, out);
 
 				if (layer_result < 0)
 					return -1;
@@ -19629,7 +19796,7 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 				{
 					uint64_t	layer_lsn;
 
-				if (layer_map_lookup(w.tl, &key, 1, v->lsn, 0, v->lsn,
+				if (layer_map_lookup(w.tl, &key, 1, v->lsn, v->admission_seq, v->lsn,
 									 &layer_lsn, NULL, tmp) != 1 ||
 						layer_lsn != v->lsn)
 					{
@@ -19716,7 +19883,7 @@ control_note_redo(uint32_t timeline, const PsKey *key, const PageVer *v,
 		uint64_t	layer_lsn;
 
 		if (layer_map_lookup_locked(timeline, key, PS_CONTROL_NOTE_BLOCK,
-									v->lsn, 0, v->lsn, &layer_lsn, NULL,
+									v->lsn, v->admission_seq, v->lsn, &layer_lsn, NULL,
 									tmp) != 1 ||
 			layer_lsn != v->lsn)
 			return -1;
@@ -19841,7 +20008,7 @@ wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
 			{
 				uint64_t layer_lsn;
 
-				if (layer_map_lookup(timeline, &key, 1, v->lsn, 0, v->lsn,
+				if (layer_map_lookup(timeline, &key, 1, v->lsn, v->admission_seq, v->lsn,
 								 &layer_lsn, NULL, tmp) != 1 ||
 					layer_lsn != v->lsn)
 					return -1;
@@ -19896,6 +20063,25 @@ retention_floor_add(uint64_t candidate, uint64_t *floor)
 /* Project one descendant LSN onto target's physical history.  Caller holds
  * map-rd.  Return 1 if target is an ancestor (including self), else 0. */
 static int
+retention_project_cap(uint32_t descendant, uint32_t target, ViewCap *cap)
+{
+	uint32_t	current = descendant;
+
+	for (uint32_t hops = 0; hops < MAX_TIMELINES; hops++)
+	{
+		if (current == target)
+			return 1;
+		if (current >= MAX_TIMELINES || !timelines[current].defined ||
+			!timeline_has_parent(current))
+			return 0;
+		*cap = viewcap_compose(*cap, timelines[current].branch_lsn,
+							   timeline_branch_seq(current));
+		current = (uint32_t) timelines[current].parent;
+	}
+	return 0;
+}
+
+static int
 retention_project_lsn(uint32_t descendant, uint32_t target, uint64_t *lsn)
 {
 	uint32_t	current = descendant;
@@ -19940,7 +20126,7 @@ prune_version_cmp(const void *va, const void *vb)
  */
 static int
 control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
-				   uint64_t floor, const PsPruneFence *fences,
+				   uint64_t floor, const PsHistoryFence *fences,
 				   uint32_t nfences, PsControlChainPlan *plan)
 {
 	PageEnt    *e = page_find(timeline, key, block);
@@ -19994,8 +20180,9 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	qsort(plan->chain, n, sizeof(*plan->chain), prune_version_cmp);
 	plan->nchain = n;
-	if (ps_page_prune_plan(plan->chain, n, (PsPruneFence) {floor, UINT64_MAX},
-						   fences, nfences, keep) < 0)
+	if (history_prune_plan(plan->chain, n, (PsPruneFence) {floor, UINT64_MAX},
+						  fences, nfences, timelines[timeline].branch_lsn,
+						  timelines[timeline].parent >= 0, keep) < 0)
 	{
 		free(plan->chain);
 		free(plan->kept);
@@ -20078,6 +20265,48 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 				plan->nkept++;
 			}
 		}
+		/* A branch restores the exact-redo twin, which may be older than
+		 * the image selected at L. Select that twin under the branch's S;
+		 * a post-S rewrite of the twin cannot replace it. */
+		for (uint32_t f = 0; notes != NULL && f < nfences; f++)
+		{
+			ViewCap cap = {fences[f].lsn, fences[f].seq, fences[f].admission_seq, false};
+			bool has_B;
+			uint64_t B = timeline_inherited_below(timeline, &has_B);
+			PageVer *note;
+			PageVer *twin;
+			uint64_t redo;
+			bool already = false;
+
+			if (cap.seq == PS_SEQ_UNBOUNDED)
+				continue;
+			note = page_select(notes, &cap, B, has_B);
+			if (note == NULL)
+				continue;
+			if (control_note_redo(timeline, key, note, tmp, &redo) != 0)
+			{
+				free(tmp);
+				free(plan->chain);
+				free(plan->kept);
+				free(plan->pending);
+				memset(plan, 0, sizeof(*plan));
+				return -1;
+			}
+			if (redo == 0 || redo > cap.lsn)
+				continue;
+			if (redo < cap.lsn)
+				cap.strict_seq = PS_SEQ_UNBOUNDED;
+			cap.lsn = redo;
+			twin = page_select(e, &cap, B, has_B);
+			if (twin == NULL || twin->lsn != redo || !walidx_base_version_durable(twin))
+				continue;
+			for (uint32_t j = 0; j < plan->nkept; j++)
+				if (plan->kept[j].lsn == twin->lsn &&
+					plan->kept[j].admission_seq == twin->admission_seq)
+					already = true;
+			if (!already)
+				plan->kept[plan->nkept++] = (PsPruneVersion) {twin->lsn, twin->admission_seq};
+		}
 		free(tmp);
 	}
 	plan->valid = 1;
@@ -20100,38 +20329,63 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
  */
 static int
 control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
-					uint32_t block, const PsPruneVersion *v)
+					uint32_t block, const PsPruneVersion *v,
+					const PsHistoryFence *fences, uint32_t nfences)
 {
 	int			lsn_retained = 0;
-	uint64_t	newest_seq = 0;
-	int			have_newest = 0;
 
 	if (!plan->valid)
 		return 1;
-	/*
-	 * One retained version LSN can carry more than one planned tuple: a
-	 * record-less pre-checkpoint state image (DB_SHUTDOWNING) and the
-	 * checkpoint's exact-redo twin both sit at the checkpoint redo, and a
-	 * mirror retry appends the same LSN under a new admission sequence.
-	 * Only the newest admission sequence at that LSN is authoritative (the
-	 * read path resolves an uncapped lookup to the greatest tuple), so find
-	 * it across the whole kept set rather than returning on the first LSN
-	 * match: the old short-circuit kept the first same-LSN tuple, which for
-	 * a shutdown checkpoint kept the stale pre-checkpoint image and dropped
-	 * the exact-redo twin the branch controller must restore.
-	 */
+	/* A finite branch can retain several identities at the same LSN.
+	 * Without a positional consumer, duplicate checkpoint retries still
+	 * collapse to the newest authoritative image. Paired blocks also keep
+	 * the selected note/fence and its minimum-sequence closure. */
 	for (uint32_t i = 0; i < plan->nkept; i++)
 		if (plan->kept[i].lsn == v->lsn)
 		{
-			if (!have_newest || plan->kept[i].admission_seq > newest_seq)
-			{
-				newest_seq = plan->kept[i].admission_seq;
-				have_newest = 1;
-			}
 			lsn_retained = 1;
 		}
 	if (block == PS_CONTROL_IMAGE_BLOCK || block >= PS_CONTROL_PAIRED_BLOCKS)
-		return have_newest && newest_seq == v->admission_seq;
+	{
+		uint64_t newest = 0;
+		bool exact = false;
+		bool positional = false;
+		for (uint32_t i = 0; i < plan->nkept; i++)
+			if (plan->kept[i].lsn == v->lsn)
+			{
+				if (plan->kept[i].admission_seq > newest)
+					newest = plan->kept[i].admission_seq;
+				if (plan->kept[i].admission_seq == v->admission_seq)
+					exact = true;
+			}
+		for (uint32_t i = 0; i < nfences; i++)
+			if (fences[i].seq != PS_SEQ_UNBOUNDED && v->lsn <= fences[i].lsn)
+				positional = true;
+		return exact && (positional || newest == v->admission_seq);
+	}
+	if (lsn_retained && entry != NULL)
+	{
+		bool has_B;
+		uint64_t B = timeline_inherited_below(entry->timeline, &has_B);
+		for (uint32_t i = 0; i < nfences; i++)
+		{
+			ViewCap cap = {fences[i].lsn, fences[i].seq, fences[i].admission_seq, false};
+			PageVer *selected;
+			bool minimum = true;
+			if (cap.seq == PS_SEQ_UNBOUNDED || v->lsn > cap.lsn)
+				continue;
+			selected = page_select(entry, &cap, B, has_B);
+			if (selected && selected->lsn == v->lsn &&
+				selected->admission_seq == v->admission_seq)
+				return 1;
+			for (int j = 0; j < entry->nver; j++)
+				if (entry->vers[j].lsn == v->lsn &&
+					entry->vers[j].admission_seq < v->admission_seq)
+					minimum = false;
+			if (minimum && (!has_B || v->lsn > B))
+				return 1; /* position closure for paired note/fence blocks */
+		}
+	}
 	if (!lsn_retained)
 	{
 		int			in_flight = 0;
@@ -20172,40 +20426,46 @@ control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
 static int
 prune_version_needed(uint32_t timeline, const PsKey *key, uint32_t block,
 					 const PsPruneVersion *versions, uint32_t n, uint32_t idx,
-					 uint64_t floor, const PsPruneFence *fences,
+					 uint64_t floor, const PsHistoryFence *fences,
 					 uint32_t nfences)
 {
 	const ForkEnt *fe = fork_find(timeline, key);
+	bool has_B;
+	uint64_t B = timeline_inherited_below(timeline, &has_B);
 
 	if (fe == NULL || fe->ndef == 0)
 		return 1;
 	for (uint32_t h = 0; h <= nfences; h++)
 	{
-		PsPruneFence horizon = h == 0 ? (PsPruneFence) {floor, 0} : fences[h - 1];
-		int			visible = -1;
-		PageVer		pv;
+		PsHistoryFence f = h == 0 ?
+			(PsHistoryFence) {floor, PS_SEQ_UNBOUNDED, PS_SEQ_UNBOUNDED} : fences[h - 1];
+		ViewCap hc = {f.lsn, f.seq, f.admission_seq, f.seq == PS_SEQ_UNBOUNDED};
+		PsAdmitCap ac = {hc.lsn, hc.seq, hc.strict_seq};
+		int visible = -1;
+		PageVer pv;
+		uint64_t position = UINT64_MAX;
+		uint64_t minimum_seq = 0;
 
-		if (h != 0 && horizon.admission_seq == UINT64_MAX)
-			horizon.admission_seq = 0;
 		for (uint32_t i = 0; i < n; i++)
-			if (versions[i].lsn <= horizon.lsn &&
-				(versions[i].lsn < horizon.lsn || horizon.admission_seq == 0 ||
-				 versions[i].admission_seq == 0 ||
-				 versions[i].admission_seq <= horizon.admission_seq))
+		{
+			bool first;
+			if (i == 0 || versions[i].lsn != position)
+			{
+				position = versions[i].lsn;
+				minimum_seq = versions[i].admission_seq;
+			}
+			first = versions[i].admission_seq == minimum_seq;
+			if (ps_version_admissible(versions[i].lsn, versions[i].admission_seq,
+									  first, &ac, B, has_B))
 				visible = (int) i;
-			else if (versions[i].lsn > horizon.lsn)
-				break;
+		}
 		if (visible != (int) idx)
 			continue;
 		memset(&pv, 0, sizeof(pv));
 		pv.lsn = versions[idx].lsn;
 		pv.admission_seq = versions[idx].admission_seq;
-		{
-			ViewCap		hc = viewcap_lsn_seq(horizon.lsn, horizon.admission_seq);
-
-			if (!fork_page_invalidated(fe, block, &pv, &hc, 0, false))
-				return 1;
-		}
+		if (!fork_page_invalidated(fe, block, &pv, &hc, B, has_B))
+			return 1;
 	}
 	return 0;
 }
@@ -20468,12 +20728,12 @@ artifact_fence_snapshot(uint32_t timeline, uint64_t **lsns_out,
 /* Caller holds map-rd or map-wr.  Callers that act on the snapshot also
  * fence pin mutations with admission-rd or the page-prune read fence. */
 static int
-page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 				  uint32_t *nfences_out)
 {
 	PsRetentionPin *pins = NULL;
 	uint32_t npins = 0;
-	PsPruneFence *fences;
+	PsHistoryFence *fences;
 	uint32_t nfences = 0;
 
 	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
@@ -20487,28 +20747,25 @@ page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 	for (uint32_t i = 0; i < npins; i++)
 		if ((pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
 		{
-			uint64_t projected = pins[i].lsn;
+			ViewCap cap = viewcap_from_request(pins[i].lsn, pins[i].admission_seq);
 
-			if (retention_project_lsn(pins[i].timeline, timeline, &projected))
+			if (retention_project_cap(pins[i].timeline, timeline, &cap))
 			{
-				fences[nfences].lsn = projected;
-				fences[nfences].admission_seq = projected == pins[i].lsn &&
-					pins[i].admission_seq != 0 ? pins[i].admission_seq : UINT64_MAX;
+				fences[nfences] = (PsHistoryFence) {cap.lsn, cap.strict_seq, cap.seq};
 				nfences++;
 			}
 		}
 	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
 	{
-		uint64_t cap = UINT64_MAX;
+		ViewCap cap = viewcap_from_request(UINT64_MAX, 0);
 		PsTimelineState state;
 
 		if (candidate != timeline && timelines[candidate].defined &&
 			ps_timeline_state(candidate, &state, NULL) &&
 			state != PS_TIMELINE_DELETED &&
-			retention_project_lsn(candidate, timeline, &cap))
+			retention_project_cap(candidate, timeline, &cap))
 		{
-			fences[nfences].lsn = cap;
-			fences[nfences].admission_seq = UINT64_MAX;
+			fences[nfences] = (PsHistoryFence) {cap.lsn, cap.strict_seq, cap.seq};
 			nfences++;
 		}
 	}
@@ -20518,6 +20775,69 @@ page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 	return 0;
 }
 
+/* map lock held; positional caps must name a registered retained view. */
+static int
+page_view_registered(uint32_t timeline, const ViewCap *cap)
+{
+	/* Per worker bounded cache: mutation epochs invalidate both positive and
+	 * negative answers. The map lock fences timeline changes; admission/page
+	 * prune locks fence owner mutations for callers acting on this answer. */
+	static __thread struct {
+		uint32_t timeline;
+		ViewCap cap;
+		uint64_t timeline_epoch, retention_epoch;
+		int valid, found;
+	} cache[16];
+	static __thread unsigned victim;
+	PsHistoryFence *fences = NULL;
+	uint32_t nfences = 0;
+	uint64_t retention_epoch, timeline_epoch;
+	int found = 0;
+	unsigned slot;
+
+	/* Exact-LSN request caps retain their pre-P5 admission contract. */
+	if (cap->seq == PS_SEQ_UNBOUNDED)
+		return 1;
+	if (timeline_meta_poisoned_load() ||
+		ps_retention_epoch(&retention_epoch) != 0)
+		return 0;
+	timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	for (unsigned i = 0; i < 16; i++)
+		if (cache[i].valid && cache[i].timeline == timeline &&
+			cache[i].timeline_epoch == timeline_epoch &&
+			cache[i].retention_epoch == retention_epoch &&
+			cache[i].cap.lsn == cap->lsn &&
+			cache[i].cap.seq == cap->seq &&
+			cache[i].cap.strict_seq == cap->strict_seq)
+			return cache[i].found;
+	if (page_prune_fences(timeline, &fences, &nfences) != 0)
+		return 0;
+	for (uint32_t i = 0; i < nfences; i++)
+		if (fences[i].lsn == cap->lsn && fences[i].seq == cap->seq &&
+			fences[i].admission_seq == cap->strict_seq)
+		{
+			found = 1;
+			break;
+		}
+	free(fences);
+	/* Do not publish a snapshot raced by a registry mutation. */
+	{
+		uint64_t after;
+
+		if (ps_retention_epoch(&after) == 0 && after == retention_epoch)
+		{
+			slot = victim++ % 16;
+			cache[slot].timeline = timeline;
+			cache[slot].cap = *cap;
+			cache[slot].timeline_epoch = timeline_epoch;
+			cache[slot].retention_epoch = retention_epoch;
+			cache[slot].found = found;
+			cache[slot].valid = 1;
+		}
+	}
+	return found;
+}
+
 /*
  * Control-object versions are retained by the same operational floor as
  * relation pages, but their discrete fences are every retained WAL boundary:
@@ -20525,17 +20845,17 @@ page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
  * branch cap.  A reader or branch restores pg_control as-of its horizon, so
  * the newest control image and redo-floor note at or below each boundary must
  * survive, while versions above the operational floor stay eligible for later
- * owners.  Fences are LSN-only so the image and its same-version note always
- * receive the same keep decision.  Caller holds map-wr and the page-prune
+ * owners. Branch fences carry their positional cap; legacy control-owner
+ * pins stay LSN-only. Caller holds map-wr and the page-prune
  * read fence.
  */
 static int
-control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+control_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 					 uint32_t *nfences_out)
 {
 	PsRetentionPin *pins = NULL;
 	uint32_t npins = 0;
-	PsPruneFence *fences;
+	PsHistoryFence *fences;
 	uint32_t nfences = 0;
 
 	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
@@ -20550,27 +20870,25 @@ control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 		if ((pins[i].resources & (PS_RETENTION_RESOURCE_PAGE_HISTORY |
 								  PS_RETENTION_RESOURCE_WAL)) != 0)
 		{
-			uint64_t projected = pins[i].lsn;
+			ViewCap cap = viewcap_from_request(pins[i].lsn, 0);
 
-			if (retention_project_lsn(pins[i].timeline, timeline, &projected))
+			if (retention_project_cap(pins[i].timeline, timeline, &cap))
 			{
-				fences[nfences].lsn = projected;
-				fences[nfences].admission_seq = UINT64_MAX;
+				fences[nfences] = (PsHistoryFence) {cap.lsn, cap.strict_seq, cap.seq};
 				nfences++;
 			}
 		}
 	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
 	{
-		uint64_t cap = UINT64_MAX;
+		ViewCap cap = viewcap_from_request(UINT64_MAX, 0);
 		PsTimelineState state;
 
 		if (candidate != timeline && timelines[candidate].defined &&
 			ps_timeline_state(candidate, &state, NULL) &&
 			state != PS_TIMELINE_DELETED &&
-			retention_project_lsn(candidate, timeline, &cap))
+			retention_project_cap(candidate, timeline, &cap))
 		{
-			fences[nfences].lsn = cap;
-			fences[nfences].admission_seq = UINT64_MAX;
+			fences[nfences] = (PsHistoryFence) {cap.lsn, cap.strict_seq, cap.seq};
 			nfences++;
 		}
 	}
@@ -20593,7 +20911,7 @@ control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 		}
 		if (nartifacts != 0)
 		{
-			PsPruneFence *grown = realloc(fences,
+			PsHistoryFence *grown = realloc(fences,
 										  (size_t) (npins + MAX_TIMELINES +
 													nartifacts) * sizeof(*fences));
 
@@ -20608,6 +20926,7 @@ control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 			{
 				fences[nfences].lsn = artifacts[i];
 				fences[nfences].admission_seq = UINT64_MAX;
+				fences[nfences].seq = PS_SEQ_UNBOUNDED;
 				nfences++;
 			}
 		}
@@ -22424,6 +22743,8 @@ ps_handle_meta(PsChannel *ch)
 			{
 				uint64_t new_incarnation;
 				uint64_t parent_incarnation;
+				uint64_t branch_seq = PS_SEQ_UNBOUNDED;
+				bool proven = ch->is_redo == PS_BRANCH_R2_PROVEN;
 
 				ch->result = 0;
 
@@ -22447,12 +22768,31 @@ ps_handle_meta(PsChannel *ch)
 					__atomic_load_n(&timelines[ch->timeline].state,
 												__ATOMIC_ACQUIRE) == PS_TIMELINE_LIVE)
 				{
+					if (timeline_branch_seq(ch->timeline) != PS_SEQ_UNBOUNDED)
+					{
+						if (!proven)
+						{
+							ch->status = PS_STATUS_ERROR;
+							ch->result = PS_BRANCH_REFUSE_UNPROVEN_RETRY;
+							break;
+						}
+						ch->result = PS_BRANCH_RESULT_FINITE;
+					}
 					ch->incarnation = new_incarnation;
-					break; /* explicitly idempotent exact retry */
+					break; /* exact retry preserves the original S */
+				}
+				if (proven)
+				{
+					if (timeline_activate_branch_caps() != 0 ||
+						(branch_seq = admission_seq_alloc()) == 0)
+					{
+						ch->status = PS_STATUS_ERROR;
+						break;
+					}
 				}
 				if (timeline_persist_create(ch->timeline,
 										(int) ch->parent_timeline, ch->req_lsn,
-										new_incarnation, parent_incarnation) == 0)
+										new_incarnation, parent_incarnation, branch_seq) == 0)
 				{
 					if (__atomic_load_n(&timelines[ch->timeline].state,
 												__ATOMIC_ACQUIRE) == PS_TIMELINE_DELETED)
@@ -22461,7 +22801,9 @@ ps_handle_meta(PsChannel *ch)
 											(int) ch->parent_timeline, ch->req_lsn,
 											new_incarnation, parent_incarnation);
 					ch->incarnation = new_incarnation;
-					ch->result = PS_BRANCH_RESULT_NEW;
+					timelines[ch->timeline].branch_seq = branch_seq;
+					ch->result = PS_BRANCH_RESULT_NEW |
+						(branch_seq != PS_SEQ_UNBOUNDED ? PS_BRANCH_RESULT_FINITE : 0);
 				}
 				else
 					ch->status = PS_STATUS_ERROR;
@@ -22505,6 +22847,7 @@ ps_handle_meta(PsChannel *ch)
 				ch->parent_timeline = (uint32_t) timelines[tl].parent;
 				ch->req_lsn = timelines[tl].branch_lsn;
 				ch->req_seq = timelines[tl].parent_incarnation;
+				ch->req_floor_lsn = timeline_branch_seq(tl);
 			}
 			break;
 		case PS_OP_BEGIN_DELETE:
@@ -22676,7 +23019,7 @@ ps_handle_meta(PsChannel *ch)
 					/* Recheck LIVE under map_lock while admission write is held;
 					 * this serializes the owner update with BEGIN_DELETE. */
 					page_history_allowed = timeline_live &&
-						page_frontier_ancestry_allows(tl, pin.lsn,
+						page_frontier_ancestry_admits(tl, pin.lsn,
 							pin.admission_seq);
 					wal_allowed = timeline_live &&
 						wal_reclaim_frontier_ancestry_allows(tl, pin.lsn);
@@ -22796,7 +23139,7 @@ ps_handle_meta(PsChannel *ch)
 					/* Recheck LIVE under map_lock after admission write, not merely
 					 * defined, so BEGIN_DELETE cannot race this owner publication. */
 					page_history_allowed = timeline_live &&
-						page_frontier_ancestry_allows(tl, pin.lsn,
+						page_frontier_ancestry_admits(tl, pin.lsn,
 							pin.admission_seq);
 					wal_allowed = timeline_live &&
 						wal_reclaim_frontier_ancestry_allows(tl, pin.lsn);
@@ -24358,10 +24701,12 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	memset(wal_covered_valid, 0, sizeof(wal_covered_valid));
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
+	branch_caps_active = 0;
 	memset(inspection_timeline_cache, 0,
 		   sizeof(inspection_timeline_cache));
 	inspection_timeline_cache_valid = 0;
 	inspection_timeline_cache_retention_usable = 0;
+	__atomic_add_fetch(&page_view_timeline_epoch, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&inspection_timeline_cache_dirty, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_meta_poisoned, 0, __ATOMIC_RELEASE);
 	memset(timeline_used, 0, sizeof(timeline_used));
