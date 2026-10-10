@@ -291,6 +291,7 @@ static uint64_t inspection_mutation_epoch;
 static uint64_t inspection_published_epoch;
 static uint64_t inspection_next_refresh_ns;
 static volatile int inspection_timeline_cache_dirty = 1;
+static uint64_t page_view_timeline_epoch;
 static int inspection_timeline_cache_valid;
 static int inspection_timeline_cache_retention_usable;
 static uint64_t inspection_timeline_cache_retention_epoch;
@@ -13875,6 +13876,7 @@ inspection_metrics_changed(void)
 static void
 inspection_timeline_cache_changed(void)
 {
+	__atomic_add_fetch(&page_view_timeline_epoch, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&inspection_timeline_cache_dirty, 1, __ATOMIC_RELEASE);
 	inspection_metrics_changed();
 }
@@ -19324,7 +19326,7 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		was_verified = d->data_verified;
 		if (!was_verified && layer_verified_lookup(d, 0))
 			d->data_verified = true;
-		lookup = ps_image_layer_lookup(d, key, block, read_lsn, read_seq, tmp,
+		lookup = ps_image_layer_lookup_exact(d, key, block, read_lsn, read_seq, tmp,
 									   page_size, &l, &a);
 
 		/* this caller cannot write the map: park what the lookup verified,
@@ -20777,13 +20779,37 @@ page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 static int
 page_view_registered(uint32_t timeline, const ViewCap *cap)
 {
+	/* Per worker bounded cache: mutation epochs invalidate both positive and
+	 * negative answers. The map lock fences timeline changes; admission/page
+	 * prune locks fence owner mutations for callers acting on this answer. */
+	static __thread struct {
+		uint32_t timeline;
+		ViewCap cap;
+		uint64_t timeline_epoch, retention_epoch;
+		int valid, found;
+	} cache[16];
+	static __thread unsigned victim;
 	PsHistoryFence *fences = NULL;
-	uint32_t	nfences = 0;
-	int			found = 0;
+	uint32_t nfences = 0;
+	uint64_t retention_epoch, timeline_epoch;
+	int found = 0;
+	unsigned slot;
 
 	/* Exact-LSN request caps retain their pre-P5 admission contract. */
 	if (cap->seq == PS_SEQ_UNBOUNDED)
 		return 1;
+	if (timeline_meta_poisoned_load() ||
+		ps_retention_epoch(&retention_epoch) != 0)
+		return 0;
+	timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	for (unsigned i = 0; i < 16; i++)
+		if (cache[i].valid && cache[i].timeline == timeline &&
+			cache[i].timeline_epoch == timeline_epoch &&
+			cache[i].retention_epoch == retention_epoch &&
+			cache[i].cap.lsn == cap->lsn &&
+			cache[i].cap.seq == cap->seq &&
+			cache[i].cap.strict_seq == cap->strict_seq)
+			return cache[i].found;
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return 0;
 	for (uint32_t i = 0; i < nfences; i++)
@@ -20794,6 +20820,21 @@ page_view_registered(uint32_t timeline, const ViewCap *cap)
 			break;
 		}
 	free(fences);
+	/* Do not publish a snapshot raced by a registry mutation. */
+	{
+		uint64_t after;
+
+		if (ps_retention_epoch(&after) == 0 && after == retention_epoch)
+		{
+			slot = victim++ % 16;
+			cache[slot].timeline = timeline;
+			cache[slot].cap = *cap;
+			cache[slot].timeline_epoch = timeline_epoch;
+			cache[slot].retention_epoch = retention_epoch;
+			cache[slot].found = found;
+			cache[slot].valid = 1;
+		}
+	}
 	return found;
 }
 
@@ -24665,6 +24706,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		   sizeof(inspection_timeline_cache));
 	inspection_timeline_cache_valid = 0;
 	inspection_timeline_cache_retention_usable = 0;
+	__atomic_add_fetch(&page_view_timeline_epoch, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&inspection_timeline_cache_dirty, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_meta_poisoned, 0, __ATOMIC_RELEASE);
 	memset(timeline_used, 0, sizeof(timeline_used));
