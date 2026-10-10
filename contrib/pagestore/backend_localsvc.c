@@ -1179,6 +1179,16 @@ pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
 	return 1;
 }
 
+/* Read-only compatibility preflight for safe preparation and creation. */
+void
+pagestore_localsvc_require_branch_seq(void)
+{
+	(void) ls_chan();
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities &
+		 PS_FRONTEND_CAP_BRANCH_SEQ) == 0)
+		ereport(ERROR, (errmsg("pagestore daemon does not support safe branch sequence caps")));
+}
+
 /*
  * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
@@ -1576,9 +1586,8 @@ pagestore_localsvc_create_branch_impl(uint32 new_tl, uint32 parent_tl,
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("branch creation");
 
-	if (proven && (((PsShmHeader *) ls_shm)->frontend_capabilities &
-				   PS_FRONTEND_CAP_BRANCH_SEQ) == 0)
-		ereport(ERROR, (errmsg("pagestore daemon does not support safe branch sequence caps")));
+	if (proven)
+		pagestore_localsvc_require_branch_seq();
 	ch->is_redo = proven ? PS_BRANCH_R2_PROVEN : 0;
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;

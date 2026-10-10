@@ -1410,6 +1410,52 @@ assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
     -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_timeline_state(6);")" "t" \
     "missing-marker rejection creates no store timeline"
 rm -rf "$MISSINGMARKERSEED"
+# Simulate an older daemon advertising no finite-branch capability. Read the
+# actual C layout instead of embedding a shared-memory offset in the test.
+CAPTEST=$(mktemp -d)
+cc -I"$SCRIPT_DIR" -x c -o "$CAPTEST/capability" - <<'C'
+#include <stddef.h>
+#include <stdio.h>
+#include "pagestore_ipc.h"
+int main(void) {
+    printf("%zu %u\n", offsetof(PsShmHeader, frontend_capabilities),
+           PS_FRONTEND_CAP_BRANCH_SEQ);
+    return 0;
+}
+C
+read -r cap_offset cap_bit < <("$CAPTEST/capability")
+mkdir "$CAPTEST/prepared"
+printf 'existing manifest\n' > "$CAPTEST/prepared/pagestore_branch.manifest"
+printf 'existing seed\n' > "$CAPTEST/prepared/seed"
+cap_before=$(python3 - "$SHM_PATH" "$cap_offset" "$cap_bit" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    caps, = struct.unpack('=I', f.read(4))
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', caps & ~int(sys.argv[3])))
+    print(caps)
+PYTHON
+)
+capRejected=$($P -c "SELECT pagestore_prepare_branch_from_window(
+    '$CAPTEST/prepared', 7, 0, '$mxC', '$autoL', '$autoFork', 1,
+    '$autoWindowXid', 0);" 2>&1 || true)
+# Restore the capability before assertions or any subsequent SQL.
+python3 - "$SHM_PATH" "$cap_offset" "$cap_before" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', int(sys.argv[3])))
+PYTHON
+case "$capRejected" in
+    *"daemon does not support safe branch sequence caps"*) capRejected=yes ;;
+    *) capRejected=no ;;
+esac
+assert "$capRejected" "yes" "checked preparation rejects a daemon without finite-branch capability"
+assert "$(cat "$CAPTEST/prepared/pagestore_branch.manifest")" "existing manifest"     "capability rejection preserves the existing prepared manifest"
+assert "$(cat "$CAPTEST/prepared/seed")" "existing seed"     "capability rejection preserves existing seeded bytes"
+assert "$(find "$CAPTEST/prepared" -type f | wc -l | tr -d ' ')" "2"     "capability rejection creates no prepared artifacts"
+rm -rf "$CAPTEST"
 WINDOWREJECT=$(mktemp -d)
 windowEpoch=$($P -c "SELECT pagestore_prepare_branch_from_window(
     '$WINDOWREJECT', 7, 0, '$mxC', '$autoL', '$autoFork', 1,

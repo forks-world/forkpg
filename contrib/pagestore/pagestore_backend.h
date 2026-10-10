@@ -195,6 +195,7 @@ extern bool pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 												 uint64 branch_lsn,
 												 uint64 target_incarnation,
 												 uint64 parent_incarnation);
+extern void pagestore_localsvc_require_branch_seq(void);
 extern bool pagestore_localsvc_create_branch_proven(uint32 new_tl, uint32 parent_tl,
 												   uint64 branch_lsn, uint64 target_incarnation,
 												   uint64 parent_incarnation);

@@ -13990,6 +13990,9 @@ pagestore_prepare_branch_from_control_impl(FunctionCallInfo fcinfo, bool window)
 	if (window)
 	{
 		pagestore_require_localsvc_monitoring();
+		/* Reject mixed-version deployments before any preparation can unlink
+		 * the old manifest or reseed a reusable directory. CREATE rechecks. */
+		pagestore_localsvc_require_branch_seq();
 		if (RecoveryInProgress() || pagestore_localsvc_read_lsn() != 0)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						   errmsg("branch transaction window requires an unpinned writer")));
