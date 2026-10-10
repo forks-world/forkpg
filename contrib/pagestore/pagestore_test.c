@@ -6393,6 +6393,8 @@ run_bugb_suite(const char *daemon_path, const char *tmpbase)
 	char		store[256];
 	pid_t		dpid;
 	uint32_t	ps = 8192;
+	uint64_t compactions = 0, before_compactions = 0;
+	uint64_t scanned = 0, kept = 0, deleted = 0;
 	unsigned char *p,
 			   *rb;
 
@@ -6505,14 +6507,22 @@ run_bugb_suite(const char *daemon_path, const char *tmpbase)
 	check_bugb_state(ps, rb);
 	fprintf(stderr, "  (reverified after crash restart)\n");
 
-	/* Merge and reclaim page history under the structural branch fences. */
+	/* Compaction is per timeline/shard: the store-wide file count includes
+	 * child layers and cannot prove a root pass completed. Require a new
+	 * accounted pass that actually discards obsolete versions instead. */
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 88101, 1,
+		  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) == PS_STATUS_OK,
+		  "Bug B suite: advance page floor above the finite branch snapshots");
+	check(read_pruning_metrics(shm, &before_compactions, &scanned, &kept, &deleted),
+		  "Bug B suite: sample compaction counter before forced reclamation");
 	for (uint32_t block = 1; block <= 48; block++)
 	{
 		fill_page(p, ps, 5000 + block, (unsigned char) block);
 		op_write_tl(0, 107, 0, block, p);
 	}
-	check(wait_for_compacted_layers(store, 3 * test_nshards),
-		  "Bug B suite: forced compaction reaches a bounded compacted layer set");
+	check(wait_for_accounted_pruning_metrics(shm, before_compactions + 1,
+		  &compactions, &scanned, &kept, &deleted),
+		  "Bug B suite: forced compaction completes an accounted reclamation pass");
 	client_detach();
 	stop_daemon(dpid);
 	ps_shm_unlink(shm);
