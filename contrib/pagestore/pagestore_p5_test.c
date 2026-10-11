@@ -203,6 +203,79 @@ test_wal_first_arrival(void)
 	}
 }
 
+static void
+test_checkpoint_retry(void)
+{
+	char store[] = "/tmp/pagestore-p5-checkpoint-retry-XXXXXX";
+	uint64_t prior, current, retry;
+	PsRetentionPin slots[2];
+
+	check(mkdtemp(store) && ps_core_open(store) == 0, "open checkpoint retry store");
+	prior = ps_admission_barrier_register(0, 200);
+	current = ps_admission_barrier_register(0, 300);
+	retry = ps_admission_barrier_register(0, 300);
+	check(prior && current && retry > current, "retry the current checkpoint barrier");
+	check(ps_retention_checkpoint_lookup(0, 1, &slots[0]) == 1 &&
+		  ps_retention_checkpoint_lookup(0, 2, &slots[1]) == 1 &&
+		  slots[0].lsn != slots[1].lsn,
+		  "same-R retry keeps two distinct checkpoint slots");
+	ps_core_close();
+	check(ps_core_open(store) == 0 && ps_admission_barrier_register(0, 300),
+		  "checkpoint retry after restart retains the prior slot");
+	check(set_pin(8001, 200, prior, PS_RETENTION_RESOURCE_PAGE_HISTORY) == PS_STATUS_OK,
+		  "handoff from the prior checkpoint remains possible after same-R retries");
+	ps_core_close();
+	remove_store(store);
+}
+
+static void
+test_late_wal_reserve(void)
+{
+	char store[] = "/tmp/pagestore-p5-late-wal-XXXXXX";
+	PsKey relation = {.klass = PS_KLASS_RELATION, .relNumber = 89};
+	PsChannel ch = {.opcode = PS_OP_CREATE, .key = relation, .req_lsn = 50};
+	PsRetentionPin pin;
+
+	check(mkdtemp(store) && ps_core_open(store) == 0, "open late WAL-index reserve store");
+	ps_lock_shard_wr(ps_shard_of(&relation));
+	ps_handle_meta(&ch);
+	ps_unlock_shard(ps_shard_of(&relation));
+	check(ch.status == PS_STATUS_OK, "create late-reserve relation");
+	write_value(&relation, 100, 0x81);
+	write_value(&relation, 100, 0x82);
+	write_value(&relation, 200, 0x83);
+	pin = (PsRetentionPin) {0, PS_RETENTION_OWNER_READER,
+		PS_RETENTION_RESOURCE_PAGE_HISTORY, 1, 8101, 300, ps_admission_barrier()};
+	check(ps_retention_set(&pin) == 0, "advance page floor before WAL-index reserve");
+	for (unsigned i = 0; i < 32; i++)
+		ps_core_maintenance();
+	check(ps_test_page_version_count(0, &relation, 0) == 1,
+		  "page compaction has already removed the old first arrival");
+	for (unsigned restart = 0; restart < 2; restart++)
+	{
+		ch = (PsChannel) {.opcode = PS_OP_RETENTION_PIN_RESERVE, .timeline = 0,
+			.blocknum = PS_RETENTION_OWNER_READER, .old_nblocks = 1,
+			.parent_timeline = PS_RETENTION_RESOURCE_WAL_INDEX,
+			.req_seq = 8102 + restart, .req_lsn = 150};
+		ps_handle_meta(&ch);
+		check(ch.status == PS_STATUS_ERROR,
+			  "WAL-index-only reserve refuses reclaimed page history");
+		ch.req_lsn = 350;
+		ch.status = PS_STATUS_OK;
+		ps_handle_meta(&ch);
+		check(ch.status == PS_STATUS_OK,
+			  "WAL-index-only reserve admits available page history");
+		check(ps_retention_lookup(0, PS_RETENTION_OWNER_READER, 8102 + restart, &pin) == 1 &&
+			  pin.resources == PS_RETENTION_RESOURCE_WAL_INDEX &&
+			  read_value(&relation, 350, pin.admission_seq, -2),
+			  "page admission validation does not grant WAL-only owners relation reads");
+		ps_core_close();
+		if (!restart)
+			check(ps_core_open(store) == 0, "reopen late-reserve store");
+	}
+	remove_store(store);
+}
+
 static int
 begin_delete(uint32_t timeline, uint64_t incarnation, uint32_t *reason)
 {
@@ -385,6 +458,8 @@ main(int argc, char **argv)
 	test_legacy_upgrade();
 	test_wal_first_arrival();
 	test_checkpoint_delete();
+	test_checkpoint_retry();
+	test_late_wal_reserve();
 	check(mkdtemp(store) && ps_core_open(store) == 0, "open P5 store");
 	{
 		PsChannel	ch = {.opcode = PS_OP_CREATE, .key = relation, .req_lsn = 50};

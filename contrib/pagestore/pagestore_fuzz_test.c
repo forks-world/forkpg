@@ -2013,7 +2013,13 @@ observe_admission_barrier(const char *phase, uint64_t *seq_out)
 		if (seq > g_last_admission_seq)
 			g_last_admission_seq = seq;
 		{
-			unsigned	slot = g_checkpoint_pins[0].admission_seq == 0 ? 0 :
+			/* Retry publication at the same WAL boundary without consuming
+			 * the prior distinct checkpoint's slot. */
+			unsigned	slot = g_checkpoint_pins[0].admission_seq &&
+				g_checkpoint_pins[0].lsn == g_tl[0].wal_end ? 0 :
+				g_checkpoint_pins[1].admission_seq &&
+				g_checkpoint_pins[1].lsn == g_tl[0].wal_end ? 1 :
+				g_checkpoint_pins[0].admission_seq == 0 ? 0 :
 				g_checkpoint_pins[1].admission_seq == 0 ? 1 :
 				g_checkpoint_pins[0].admission_seq < g_checkpoint_pins[1].admission_seq ? 0 : 1;
 			PsRetentionPin *pin = &g_checkpoint_pins[slot];

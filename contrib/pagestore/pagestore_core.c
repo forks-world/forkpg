@@ -21221,7 +21221,12 @@ ps_admission_barrier_register(uint32_t timeline, uint64_t lsn)
 			goto out;
 		found[i] = slots[i].resources != 0;
 	}
-	slot = found[0] != 1 ? 0 : found[1] != 1 ? 1 :
+	/* A failed CONTROL publication retries the same checkpoint.  Refresh
+	 * its existing slot before considering eviction, so retries cannot
+	 * consume the slot that still protects the prior distinct checkpoint. */
+	slot = found[0] && slots[0].lsn == lsn ? 0 :
+		found[1] && slots[1].lsn == lsn ? 1 :
+		found[0] != 1 ? 0 : found[1] != 1 ? 1 :
 		slots[0].admission_seq < slots[1].admission_seq ? 0 : 1;
 	if (slots[slot].generation == UINT32_MAX)
 		goto out;
@@ -23561,9 +23566,13 @@ ps_handle_meta(PsChannel *ch)
 					wal_index_pending = wal_index_pending &&
 						((((old_found == 1 ? old_pin.resources : 0) |
 						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0);
+					/* A fresh WAL-index view also depends on retained
+					 * first-arrival page identities.  This validates
+					 * storage history without granting PAGE authority. */
 					if (timeline_live &&
 						(((pin.resources &
-						   PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0) ||
+						   (PS_RETENTION_RESOURCE_PAGE_HISTORY |
+							PS_RETENTION_RESOURCE_WAL_INDEX)) == 0) ||
 						 page_history_allowed) &&
 						(((pin.resources & PS_RETENTION_RESOURCE_WAL) == 0) ||
 						 wal_allowed) &&

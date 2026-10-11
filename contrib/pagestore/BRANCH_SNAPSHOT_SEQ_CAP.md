@@ -1383,3 +1383,11 @@ weakening atomic reader admission. Mirror failures also restore the caller's
 memory context before retaining ErrorData and reporting a warning, so repeated
 failures remain retryable. The MVP golden scenario asserts that branch
 checkpoint mirrors succeed across promotion, local writes and compute restart.
+
+Checkpoint barrier retries refresh an existing same-R slot before evicting a
+prior distinct checkpoint, including after restart. Fresh WAL_INDEX reserves
+validate page ancestry frontiers as well as WAL-index frontiers: a new owner
+cannot reconstruct a lost first-arrival identity after page compaction. This
+storage admission check does not grant PAGE_HISTORY authority. Regressions
+reproduce four failures without these guards and cover prior-checkpoint handoff,
+restart, late reserve refusal and valid WAL-only reserves without relation reads.
