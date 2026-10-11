@@ -938,6 +938,12 @@ if host_machine.endian() == 'little'
 # after a persisted-format bump; each of those tests only compares its own
 # fixture against the compiled identities, so the two drifting apart was
 # only caught on the base branch after merge (PR #263).
+test('pagestore_capture_source',
+  pagestore_harness_python,
+  args: files('harness/tests/test_capture_source.py'),
+  suite: ['pagestore'],
+  timeout: 30,
+)
 test('pagestore_fixture_identities',
   pagestore_harness_python,
   args: [files('harness/pagestore_fixture_identities.py'),

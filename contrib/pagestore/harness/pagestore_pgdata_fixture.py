@@ -46,6 +46,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pagestore_harness as harness  # noqa: E402
+from pagestore_capture_source import (CaptureSourceError, add_capture_source_argument,
+                                      capture_source, validate_capture_source)  # noqa: E402
 from pagestore_fixture import Daemon, build_payload_identity  # noqa: E402
 
 FIXTURE_JSON = "fixture.json"
@@ -360,6 +362,7 @@ MUTATIONS: list[dict[str, Any]] = [
 
 def capture(args: argparse.Namespace) -> int:
     fixture: Path = args.capture
+    provenance = capture_source(args, fixture)
     source: Path = args.source
     identity = json.loads((source / IDENTITY_JSON).read_text(encoding="utf-8"))
     check_identity_record(identity)
@@ -422,6 +425,8 @@ def capture(args: argparse.Namespace) -> int:
         "artifacts": {name: rel for name, (_, rel) in ARTIFACTS.items()},
         "files": names,
     }
+    if provenance is not None:
+        metadata["capture_source"] = provenance
     if pg_identity is not None:
         metadata["pg_identity"] = pg_identity
     (fixture / FIXTURE_JSON).write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -433,6 +438,8 @@ def capture(args: argparse.Namespace) -> int:
 
 def fixture_metadata(fixture: Path) -> dict[str, Any]:
     metadata = json.loads((fixture / FIXTURE_JSON).read_text(encoding="utf-8"))
+    if "capture_source" in metadata:
+        validate_capture_source(metadata["capture_source"])
     if metadata.get("schema") != 1 or metadata.get("name") != fixture.name:
         raise FixtureError(f"{fixture / FIXTURE_JSON} does not describe {fixture.name}")
     role = metadata.get("role", "current")
@@ -628,7 +635,10 @@ def main(argv: list[str] | None = None) -> int:
                              "checked)")
     parser.add_argument("--only", nargs="*", help="run only these mutation cases")
     parser.add_argument("--keep-failures", type=Path, help="copy a failed check's tree here")
+    add_capture_source_argument(parser)
     args = parser.parse_args(argv)
+    if args.capture_source is not None and args.capture is None:
+        parser.error("--capture-source requires --capture")
     for name in ("format_tool", "build", "source", "capture", "keep_failures",
                  "postgres_payload_identity", "postgres_payload_identity_tool"):
         if getattr(args, name) is not None:
@@ -637,7 +647,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--capture needs --source")
     try:
         return capture(args) if args.capture else check(args)
-    except FixtureError as error:
+    except (FixtureError, CaptureSourceError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 

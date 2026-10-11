@@ -4,6 +4,12 @@
   "role": "current",
   "workload": "fixture",
   "checkpoint_fence": true,
+  "capture_source": {
+    "pagestore_sha": "fb4f2b3cd2e4c74ddec8b27076762d41bb99744f",
+    "postgres_core_sha": "396c50337686342dcb9493306f95d3c17f09a653",
+    "postgres_major": 18,
+    "cassert": true
+  },
   "daemon_args": [
     "--page-size",
     "8192",
@@ -68,11 +74,5 @@
     "walidx_snapshots_0",
     "walidx_snapshots_0/walidx_manifest_v1",
     "walidx_snapshots_0/walidxg1_00000000000000000001_000"
-  ],
-  "capture_source": {
-    "pagestore_sha": "fb4f2b3cd2e4c74ddec8b27076762d41bb99744f",
-    "postgres_core_sha": "396c50337686342dcb9493306f95d3c17f09a653",
-    "postgres_major": 18,
-    "cassert": true
-  }
+  ]
 }

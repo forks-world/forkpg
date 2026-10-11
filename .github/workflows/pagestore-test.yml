@@ -214,6 +214,10 @@ jobs:
             --inspect-binary ./pagestore_inspect \
             --format-tool ./pagestore_format_versions
 
+      - name: Check fixture capture provenance guards
+        working-directory: contrib/pagestore
+        run: python3 harness/tests/test_capture_source.py
+
       - name: Check data-directory artifact identities against the fixture
         working-directory: contrib/pagestore
         run: |

@@ -43,15 +43,15 @@
     "reader/pagestore_reader.manifest",
     "reader/pagestore_reader.snapshot"
   ],
-  "pg_identity": {
-    "pg_control_version": 1902,
-    "xlog_page_magic": 53536,
-    "catalog_version_no": 202606091
-  },
   "capture_source": {
     "pagestore_sha": "fb4f2b3cd2e4c74ddec8b27076762d41bb99744f",
     "postgres_core_sha": "fb4f2b3cd2e4c74ddec8b27076762d41bb99744f",
     "postgres_major": 19,
     "cassert": true
+  },
+  "pg_identity": {
+    "pg_control_version": 1902,
+    "xlog_page_magic": 53536,
+    "catalog_version_no": 202606091
   }
 }
