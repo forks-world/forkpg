@@ -130,6 +130,8 @@ static uint32	ls_nshards = 1;
 #define LS_MAX_TIMELINES	1024
 static uint64	localsvc_bound_incarnation[LS_MAX_TIMELINES];
 static bool	localsvc_incarnation_bound[LS_MAX_TIMELINES];
+/* Validated branch cut, inherited by children with the immutable binding. */
+static uint64	localsvc_checkpoint_floor[LS_MAX_TIMELINES];
 
 /* max logical pages that fit in one transfer (io_unit) for this engine */
 #define LS_MAX_PAGES_PER_OP		(PS_IO_UNIT / BLCKSZ)
@@ -1212,6 +1214,10 @@ pagestore_localsvc_require_branch_timeout(uint32 new_tl, uint32 parent_tl,
 	ch->incarnation = target_incarnation;
 	ch->req_seq = parent_incarnation;
 	ls_exec_timeout(ch, timeout_ms);
+	if (new_tl < LS_MAX_TIMELINES &&
+		localsvc_incarnation_bound[new_tl] &&
+		localsvc_bound_incarnation[new_tl] == target_incarnation)
+		localsvc_checkpoint_floor[new_tl] = branch_lsn;
 }
 
 /*
@@ -1249,6 +1255,14 @@ pagestore_localsvc_admission_fence_begin(uint64 redo_lsn, uint64 *token)
 	uint64		epoch;
 
 	*token = 0;
+	/* PITR promotion can checkpoint below the store branch cut.  Such a
+	 * checkpoint still needs its writer CONTROL mirror, but cannot name a
+	 * reader view of the retained ancestry.  Avoid opening a gate that the
+	 * atomic barrier must reject.  This cache requires no IPC in the hook's
+	 * critical section and was populated by startup manifest validation. */
+	if (localsvc_timeline > 0 && localsvc_timeline < LS_MAX_TIMELINES &&
+		redo_lsn < localsvc_checkpoint_floor[localsvc_timeline])
+		return false;
 	if (ls_shm == NULL)
 		return false;
 	hdr = (PsShmHeader *) ls_shm;
@@ -2300,6 +2314,14 @@ pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 	 * req_lsn (the caller's cutoff/dirtying/update LSN), so it reads back
 	 * as-of an LSN >= that version; ignored for relations (pd_lsn).
 	 */
+	/* A promoted branch may still emit CONTROL updates below its store cut.
+	 * Order those local mutations at the cut, like copied relation pages,
+	 * so a new control block can grow after forkmeta has reclaimed the
+	 * pre-cut prefix.  The payload retains the actual checkpoint/redo LSN. */
+	if (klass == PS_KLASS_CONTROL && localsvc_timeline > 0 &&
+		localsvc_timeline < LS_MAX_TIMELINES &&
+		version < localsvc_checkpoint_floor[localsvc_timeline])
+		version = localsvc_checkpoint_floor[localsvc_timeline];
 	ch->req_lsn = version;
 	ch->req_seq = 0;
 	ch->parent_timeline = 0;	/* never an automatic generation */

@@ -443,10 +443,10 @@ ps_control_drain(void)
 	PG_CATCH();
 	{
 		ErrorData  *edata;
-		MemoryContext ecxt = MemoryContextSwitchTo(drain_cxt);
 
+		/* FlushErrorState does not restore the context for a later retry. */
+		MemoryContextSwitchTo(drain_cxt);
 		edata = CopyErrorData();
-		MemoryContextSwitchTo(ecxt);
 
 		/*
 		 * A user cancellation or backend termination raised from inside the
@@ -461,7 +461,6 @@ ps_control_drain(void)
 			FreeErrorData(edata);
 			PG_RE_THROW();
 		}
-		FreeErrorData(edata);
 
 		/*
 		 * Swallow store failures: the queue was not advanced, so every image
@@ -474,7 +473,9 @@ ps_control_drain(void)
 		FlushErrorState();
 		ereport(WARNING,
 				(errmsg("pagestore: pg_control mirror ship failed; %d image(s) remain queued",
-						ps_control_queue_count)));
+						ps_control_queue_count),
+				 errdetail_internal("%s", edata->message)));
+		FreeErrorData(edata);
 	}
 	PG_END_TRY();
 }

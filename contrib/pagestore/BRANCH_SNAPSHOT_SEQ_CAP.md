@@ -1373,3 +1373,13 @@ catalog hint FPIs do not enter the reader seed's post-R WAL. Expanded regression
 reproduce 14 failures against the original P5 core and pass with these fixes,
 including WAL-only first-arrival pruning, legacy CONTROL retries, deletion veto,
 incarnation reuse and crash recovery between DELETING and checkpoint retirement.
+
+PITR promotion can produce branch checkpoint redo below the store fork cut.
+Startup caches the validated cut with the immutable incarnation binding. Such
+checkpoints mirror writer CONTROL at the cut (preserving the real redo and
+checkpoint in the payload), and do not advertise a reader fence below it.
+This keeps new CONTROL blocks beyond forkmeta's reclaimed prefix without
+weakening atomic reader admission. Mirror failures also restore the caller's
+memory context before retaining ErrorData and reporting a warning, so repeated
+failures remain retryable. The MVP golden scenario asserts that branch
+checkpoint mirrors succeed across promotion, local writes and compute restart.
