@@ -357,7 +357,13 @@ echo "ok   - materializer progress releases WAL archive backpressure"
 # supervision contract.
 "$BIN/pg_ctl" -D "$REDO" -m fast -w stop >/dev/null 2>&1 ||
 	fail "could not stop materializer before stale-owner test"
-takeover_status=$($WP -c "SELECT pagestore_retention_set(0,2,1,2,6,'$materialized_lsn');")
+# The backlog restartpoint advanced generation 1's pin and may have reclaimed
+# the earlier materialized_lsn. Preserve its current restart-REDO boundary:
+# the flushed replay watermark can be later than the WAL needed to restart.
+takeover_lsn=$($WP -c "SELECT pagestore_retention_owner_lsn(0,2,1,1);") ||
+	fail "could not inspect the stopped materializer's retention pin"
+[ -n "$takeover_lsn" ] || fail "stopped materializer has no generation-1 pin"
+takeover_status=$($WP -c "SELECT pagestore_retention_set(0,2,1,2,6,'$takeover_lsn');")
 [ "$takeover_status" = "0" ] || fail "could not publish replacement owner generation"
 # Hot-standby startup can briefly make pg_ctl report success before recovery
 # reaches the pagestore owner check.  Observe the durable fencing result instead
@@ -383,6 +389,18 @@ if "$BIN/pg_ctl" -D "$REDO" status >/dev/null 2>&1; then
 	fail "stale materializer generation remained running after controller takeover"
 fi
 echo "ok   - replacement owner generation fences stale materializer startup"
+
+# Fencing the old worker is insufficient: its replacement must be able to
+# register at pg_control's restart REDO and serve the recovered relation.
+echo "pagestore.retention_owner_generation = '2'" >> "$REDO/postgresql.conf"
+"$BIN/pg_ctl" -D "$REDO" -l "$REDO/redo.log" -w start >/dev/null 2>&1 ||
+	fail "replacement materializer generation could not restart"
+wait_redo_value second || fail "replacement generation could not serve recovered pages"
+[ "$($RP -c "SELECT max(i) FROM materializer_backpressure_test;")" = "6" ] ||
+	fail "replacement generation lost the recovered archive backlog"
+echo "ok   - replacement owner generation restarts with its retained redo history"
+"$BIN/pg_ctl" -D "$REDO" -m fast -w stop >/dev/null 2>&1 ||
+	fail "could not stop replacement materializer before role-disabled restart"
 echo "pagestore.materializer = off" >> "$REDO/postgresql.conf"
 "$BIN/pg_ctl" -D "$REDO" -l "$REDO/redo.log" -w start >/dev/null 2>&1 ||
 	fail "redo worker role-disabled restart failed"
