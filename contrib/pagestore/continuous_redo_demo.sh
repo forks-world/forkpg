@@ -357,7 +357,12 @@ echo "ok   - materializer progress releases WAL archive backpressure"
 # supervision contract.
 "$BIN/pg_ctl" -D "$REDO" -m fast -w stop >/dev/null 2>&1 ||
 	fail "could not stop materializer before stale-owner test"
-takeover_status=$($WP -c "SELECT pagestore_retention_set(0,2,1,2,6,'$materialized_lsn');")
+# The backlog restartpoint advanced generation 1's pin and may have reclaimed
+# the earlier materialized_lsn. Sample its final durable boundary after stop,
+# while the worker can no longer move it, for the replacement generation.
+takeover_lsn=$($WP -c "SELECT materialized_wal_lsn FROM pagestore_materializer_status();") ||
+	fail "could not inspect the stopped materializer's durable boundary"
+takeover_status=$($WP -c "SELECT pagestore_retention_set(0,2,1,2,6,'$takeover_lsn');")
 [ "$takeover_status" = "0" ] || fail "could not publish replacement owner generation"
 # Hot-standby startup can briefly make pg_ctl report success before recovery
 # reaches the pagestore owner check.  Observe the durable fencing result instead
