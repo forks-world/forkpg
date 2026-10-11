@@ -226,6 +226,45 @@ listen_addresses = ''
 unix_socket_directories = '$MAIN_SOCK'
 port = $PORT
 EOF
+# A frontend without the complete P5 protocol (currently SPDK) must be
+# refused at startup, before a writer can leave checkpoint mirrors queued.
+CAPBOOT=$(mktemp -d "$SOCKROOT/p5-capability.XXXXXX")
+cc -I"$SCRIPT_DIR" -x c -o "$CAPBOOT/layout" - <<'C'
+#include <stddef.h>
+#include <stdio.h>
+#include "pagestore_ipc.h"
+int main(void) {
+    printf("%zu %u\n", offsetof(PsShmHeader, frontend_capabilities),
+           PS_FRONTEND_CAP_ATOMIC_PINS);
+    return 0;
+}
+C
+read -r p5_cap_offset p5_cap_bit < <("$CAPBOOT/layout")
+p5_cap_before=$(python3 - "$SHM_PATH" "$p5_cap_offset" "$p5_cap_bit" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    caps, = struct.unpack('=I', f.read(4))
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', caps & ~int(sys.argv[3])))
+    print(caps)
+PYTHON
+)
+p5BootRejected=yes
+if "$BIN/pg_ctl" -D "$DATA" -l "$DATA/p5-capability.log" -w start >/dev/null 2>&1; then
+    p5BootRejected=no
+    "$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1
+fi
+# Always restore the header before the normal compute starts.
+python3 - "$SHM_PATH" "$p5_cap_offset" "$p5_cap_before" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', int(sys.argv[3])))
+PYTHON
+assert "$p5BootRejected" "yes" "compute startup refuses a daemon without atomic P5 capability"
+assert "$(grep -c 'daemon lacks atomic pin capability' "$DATA/p5-capability.log" || true)" \
+    "1" "startup reports the missing P5 capability explicitly"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 
 # --- 1. localsvc round-trip: a routed table's I/O goes to the daemon --------

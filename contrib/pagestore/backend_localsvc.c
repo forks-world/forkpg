@@ -232,6 +232,7 @@ ls_attach(void)
 		uint32		got_version = 0;
 		uint32		got_page_size = 0;
 		bool		header_ok = false;
+		bool		atomic_pins = false;
 
 		for (;;)
 		{
@@ -248,6 +249,7 @@ ls_attach(void)
 			got_magic = hdr->magic;
 			got_version = hdr->version;
 			got_page_size = hdr->page_size;
+			atomic_pins = (hdr->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) != 0;
 			header_ok = (got_magic == PS_SHM_MAGIC && got_version == PS_SHM_VERSION &&
 						 __atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) == PS_SHM_READY &&
 						 got_page_size == BLCKSZ);
@@ -269,6 +271,17 @@ ls_attach(void)
 					(errmsg("pagestore localsvc shared memory \"%s\" has no running, initialized daemon",
 							localsvc_shm_name),
 					 errhint("Is the pagestore daemon running?")));
+		}
+		/* Every P5 compute publishes finite checkpoint/artifact views.  A
+		 * frontend lacking the complete protocol must fail before startup
+		 * identity probes or writes, rather than during CONTROL draining. */
+		if (!atomic_pins)
+		{
+			munmap(shm, PS_SHM_SIZE);
+			close(fd);
+			ereport(ERROR,
+					(errmsg("pagestore daemon lacks atomic pin capability"),
+					 errhint("Use a daemon frontend supporting the complete P5 protocol.")));
 		}
 	}
 	ls_shm = shm;

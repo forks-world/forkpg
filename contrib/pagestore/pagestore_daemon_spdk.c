@@ -987,6 +987,9 @@ main(int argc, char **argv)
 	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
+	/* Do not advertise ATOMIC_PINS: artifact BEGIN/COMMIT and token-aware
+	 * writes are not implemented by this frontend. P5 computes reject it
+	 * at attachment, before any checkpoint or artifact publication. */
 	ps_core_set_metrics_header(hdr);
 
 	memset(&sa, 0, sizeof(sa));

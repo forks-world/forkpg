@@ -1391,3 +1391,11 @@ cannot reconstruct a lost first-arrival identity after page compaction. This
 storage admission check does not grant PAGE_HISTORY authority. Regressions
 reproduce four failures without these guards and cover prior-checkpoint handoff,
 restart, late reserve refusal and valid WAL-only reserves without relation reads.
+
+P5 compute attachment requires ATOMIC_PINS before publishing startup identity
+or admitting any writes. SPDK intentionally leaves that capability clear:
+its frontend still bypasses token-aware artifact writes and does not implement
+artifact BEGIN/COMMIT. Advertising the bit merely for its checkpoint barrier
+would make the broader protocol unsafe. Integration simulates the missing bit,
+asserts startup refusal with the capability error, restores it and exercises
+the normal compute path; the startup assertions fail against the old client.
