@@ -531,10 +531,14 @@ wait_for_daemon_exit(pid_t pid, int expected_status)
 
 		if (result == pid)
 			return WIFEXITED(status) && WEXITSTATUS(status) == expected_status;
-		if (result < 0)
+		if (result < 0 && errno != EINTR)
 			return 0;
 		usleep(10000);
 	}
+	/* A missed fault must fail without leaving a daemon owning the store. */
+	kill(pid, SIGKILL);
+	while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+		;
 	return 0;
 }
 
@@ -656,13 +660,67 @@ claim_channel_at(uint32_t idx)
 	return NULL;
 }
 
+/* Crash-triggering requests may never receive a response. */
+static void
+submit_request(PsChannel *ch)
+{
+	ps_request_generation_next(ch);
+	ps_store_release(&ch->state, PS_STATE_REQUEST);
+}
+
+/* Exercise both response orderings without relying on scheduler timing. */
+static void
+check_crash_request_wait(void)
+{
+	PsChannel  *ch = mmap(NULL, sizeof(*ch), PROT_READ | PROT_WRITE,
+						MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+	check(ch != MAP_FAILED, "allocate a shared crash-test channel");
+	if (ch == MAP_FAILED)
+		return;
+	for (int scenario = 0; scenario < 4; scenario++)
+	{
+		pid_t		pid;
+		int			expected_crash;
+
+		memset(ch, 0, sizeof(*ch));
+		pid = fork();
+		check(pid >= 0, "start crash-test responder %d", scenario);
+		if (pid < 0)
+			break;
+		if (pid == 0)
+		{
+			while (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
+				usleep(1000);
+			if (scenario == 3)
+				for (;;)
+					pause();
+			if (scenario == 1)
+				ps_store_release(&ch->state, PS_STATE_DONE);
+			_exit(scenario == 2 ? 89 : 88);
+		}
+		submit_request(ch);
+		expected_crash = wait_for_daemon_exit(pid, 88);
+		check(expected_crash == (scenario < 2),
+			  "crash wait accepts only the expected exit status, scenario %d",
+			  scenario);
+		check(ps_load_acquire(&ch->state) ==
+			  (scenario == 1 ? PS_STATE_DONE : PS_STATE_REQUEST),
+			  "crash wait completes with or without a response, scenario %d",
+			  scenario);
+		check(waitpid(pid, NULL, WNOHANG) == -1 && errno == ECHILD,
+			  "crash wait reaps the responder, including timeout, scenario %d",
+			  scenario);
+	}
+	munmap(ch, sizeof(*ch));
+}
+
 static PsChannel *
 cl_exec(void)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
-	ps_request_generation_next(ch);
-	ps_store_release(&ch->state, PS_STATE_REQUEST);
+	submit_request(ch);
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		;					/* busy wait; single in-flight request */
 	return ch;
@@ -1192,8 +1250,8 @@ op_admission_barrier(uint64_t lsn, uint64_t *admission_seq_out)
 	return ch->req_seq == 0 ? PS_STATUS_ERROR : ch->status;
 }
 
-static int
-op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+static PsChannel *
+prepare_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 				 uint32_t generation, uint32_t resources, uint64_t lsn)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
@@ -1205,6 +1263,14 @@ op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 	ch->old_nblocks = generation;
 	ch->req_seq = owner_id;
 	ch->req_lsn = lsn;
+	return ch;
+}
+
+static int
+op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+				 uint32_t generation, uint32_t resources, uint64_t lsn)
+{
+	prepare_retention_set(timeline, owner_kind, owner_id, generation, resources, lsn);
 	return cl_exec()->status;
 }
 
@@ -3359,13 +3425,12 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 		if (fd >= 0)
 			close(fd);
 	}
-	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED,
-					   23000 + (uint64_t) case_no, 1,
-					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 3500) == PS_STATUS_OK,
-		  "crash case establishes a durable page cutoff");
-	client_detach();
+	submit_request(prepare_retention_set(0, PS_RETENTION_OWNER_CONFIGURED,
+									23000 + (uint64_t) case_no, 1,
+									PS_RETENTION_RESOURCE_PAGE_HISTORY, 3500));
 	check(wait_for_daemon_exit(pid, 88),
 		  "compaction crashes at deterministic phase %s", phase);
+	client_detach();
 	unlink(marker);
 	crashed_layer_count = local_layer_count(store);
 
@@ -3373,6 +3438,16 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
+	{
+		PsRetentionPin pin;
+
+		check(op_retention_lookup(0, PS_RETENTION_OWNER_CONFIGURED,
+								  23000 + (uint64_t) case_no, &pin) &&
+			  pin.generation == 1 && pin.lsn == 3500 &&
+			  pin.resources == PS_RETENTION_RESOURCE_PAGE_HISTORY &&
+			  pin.admission_seq != 0,
+			  "restart after %s recovers the durable page cutoff", phase);
+	}
 	op_read_one(rel, 0, 0, readback);
 	check(page_has_tag(readback, ps, 40),
 		  "restart after %s serves the published newest page", phase);
@@ -4697,7 +4772,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	 * into the successful "not found" response used for reclaimed history. */
 	for (int read_at = 0; read_at <= 1; read_at++)
 	{
-		PsChannel *ch = ps_channel(cl_shm, cl_chan);
+		PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 		cl_setkey(ch, REL_B, 1);
 		ch->timeline = 1;
@@ -5709,11 +5784,19 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
 		check(fd >= 0 && close(fd) == 0,
 			  "arm the WAL-index frontier publication crash");
-		check(op_walidx_progress(5, sizeof(wal), sizeof(wal) * 2, NULL) == 0,
-			  "commit a second WAL-index interval for crash recovery");
-		client_detach();
+		{
+			PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+			ch->timeline = 5;
+			ch->incarnation = 0;
+			ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+			ch->req_lsn = sizeof(wal);
+			ch->req_seq = sizeof(wal) * 2;
+			submit_request(ch);
+		}
 		check(wait_for_daemon_exit(dpid, 88),
 			  "WAL-index compaction crashes after durable frontier publication");
+		client_detach();
 		unlink(marker);
 	}
 	ps_shm_unlink(shm);
@@ -5766,6 +5849,13 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 				break;
 			}
 			usleep(10000);
+		}
+		{
+			uint64_t progress = 0;
+
+			check(op_walidx_progress(5, 0, 0, &progress) == 0 &&
+				  progress == sizeof(wal) * 2,
+				  "restart recovers the second committed WAL-index interval");
 		}
 		check(recovered && out[0].lsn == 530 && out[1].lsn == 550 &&
 			  op_walidx_get_status(5, REL_A, FORK0, 12, sizeof(wal), out,
@@ -6602,6 +6692,7 @@ main(int argc, char **argv)
 		fprintf(stderr, "%d checks, %d failed\n", tests_run, tests_failed);
 		return tests_failed ? 1 : 0;
 	}
+	check_crash_request_wait();
 	check_inspector_seqlock();
 	check_daemon_waits_for_shared_init_lock(daemon_path, tmpbase);
 
