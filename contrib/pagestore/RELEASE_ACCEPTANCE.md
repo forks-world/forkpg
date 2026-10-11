@@ -25,6 +25,30 @@ Neither is "the candidate passed acceptance": that claim needs an exact,
 reproducible commit and an unconditional requirement that the store and
 pgdata fixture checks find a fixture this build actually loads
 (`--require-build-match`, always on here, not gated by ref).
+The PGDATA checker receives `pagestore_control_restore --payload-identity`
+through `--postgres-payload-identity-tool`. Both the store and PGDATA sets
+include current PG18 and PG19 captures: foreign-major captures are skipped,
+and acceptance fails if none matches the candidate's build. Changes to the
+persisted format must refresh every current capture's format metadata and
+regenerate affected archives for both majors.
+The PG18/PG19 release captures' `fixture.json` records `capture_source`: the pagestore
+source SHA, PostgreSQL core SHA, major and assertion-build setting. For
+PG18 the core comes from the staged C1-C7 series while contrib comes from
+pagestore; this provenance describes a loader fixture, not a frozen release
+candidate.
+To capture or regenerate a fixture, pass `--capture-source source.json` to
+either capture command. The file must contain exactly these fields:
+
+```json
+{"pagestore_sha": "<40-hex build source SHA>",
+ "postgres_core_sha": "<40-hex core SHA>",
+ "postgres_major": 18, "cassert": true}
+```
+
+Use the source/core SHAs and assertion setting of the build that produced
+the payloads. Regenerating an existing provenance-bearing fixture without
+this input fails before replacing its archive; old SHAs are never silently
+reused. Both fixture checkers validate the recorded provenance fields.
 
 ## What it runs
 

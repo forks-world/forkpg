@@ -135,7 +135,7 @@ jobs:
         run: |
           python3 harness/pagestore_fixture_identities.py \
             --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
-                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/posix-timeline-delete-holes-horizon-v2 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 fixtures/pgdata-artifacts \
+                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/posix-timeline-delete-holes-horizon-v2 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 fixtures/pgdata-artifacts fixtures/pgdata-artifacts-pg18 \
             --format-tool ./pagestore_format_versions
 
       - name: Run standalone test suite
@@ -226,18 +226,22 @@ jobs:
         run: |
           python3 harness/pagestore_fixture.py \
             --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
-                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/posix-timeline-delete-holes-horizon-v2 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 \
+                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/posix-timeline-delete-holes-horizon-v2 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 \
             --daemon-binary ./pagestore_daemon \
             --client-binary ./pagestore_gc_crash_client \
             --inspect-binary ./pagestore_inspect \
             --format-tool ./pagestore_format_versions \
             | tee ../../standalone-store-fixture-check.log
 
+      - name: Check fixture capture provenance guards
+        working-directory: contrib/pagestore
+        run: python3 harness/tests/test_capture_source.py
+
       - name: Check data-directory artifact identities against the fixture
         working-directory: contrib/pagestore
         run: |
           python3 harness/pagestore_pgdata_fixture.py \
-            --check fixtures/pgdata-artifacts \
+            --check fixtures/pgdata-artifacts fixtures/pgdata-artifacts-pg18 \
             --format-tool ./pagestore_format_versions \
             | tee ../../standalone-pgdata-fixture-check.log
 
@@ -445,7 +449,7 @@ jobs:
                     contrib/pagestore/fixtures/posix-artifact-lifecycle \
                     contrib/pagestore/fixtures/posix-timeline-delete-holes \
                     contrib/pagestore/fixtures/posix-timeline-delete-holes-seqcap \
-                    contrib/pagestore/fixtures/posix-timeline-delete-holes-forkmeta-v4 contrib/pagestore/fixtures/posix-timeline-delete-holes-horizon-v2 contrib/pagestore/fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 \
+                    contrib/pagestore/fixtures/posix-timeline-delete-holes-forkmeta-v4 contrib/pagestore/fixtures/posix-timeline-delete-holes-horizon-v2 contrib/pagestore/fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 contrib/pagestore/fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 \
             --daemon-binary build/contrib/pagestore/pagestore_daemon \
             --client-binary build/contrib/pagestore/pagestore_gc_crash_client \
             --inspect-binary build/contrib/pagestore/pagestore_inspect \
@@ -454,17 +458,14 @@ jobs:
             --require-build-match \
             | tee in-engine-store-fixture-check.log
 
-      # See pagestore-test.yml's equivalent step: --require-build-match is
-      # inert here too until the pgdata-artifacts fixture is recaptured with
-      # pg_identity (RELEASE_VALIDATION.md gap 6) -- passed now so acceptance
-      # starts enforcing it the day that recapture lands, no workflow change
-      # needed.
+      # Candidate acceptance requires artifacts captured under this PG major.
       - name: Check data-directory artifact fixture against this PostgreSQL build
         run: |
           python3 contrib/pagestore/harness/pagestore_pgdata_fixture.py \
-            --check contrib/pagestore/fixtures/pgdata-artifacts \
+            --check contrib/pagestore/fixtures/pgdata-artifacts contrib/pagestore/fixtures/pgdata-artifacts-pg18 \
             --format-tool build/contrib/pagestore/pagestore_format_versions \
             --build build \
+            --postgres-payload-identity-tool build/contrib/pagestore/pagestore_control_restore \
             --require-build-match \
             | tee in-engine-pgdata-fixture-check.log
 

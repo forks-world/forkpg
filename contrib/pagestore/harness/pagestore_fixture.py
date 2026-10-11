@@ -28,6 +28,8 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pagestore_harness as harness  # noqa: E402
+from pagestore_capture_source import (CaptureSourceError, add_capture_source_argument,
+                                      capture_source, validate_capture_source)  # noqa: E402
 
 DAEMON_ARGS = [
     "--page-size", "8192", "--nshards", "1", "--storage", "posix",
@@ -742,6 +744,7 @@ def wait_for_forkmeta_cutover(store: Path, timeout: float) -> None:
 
 def capture(args: argparse.Namespace) -> int:
     fixture = args.capture
+    provenance = capture_source(args, fixture)
     # posix-timeline-delete-holes (and its per-PostgreSQL-release variants,
     # e.g. posix-timeline-delete-holes-pg18) seeds an extra deleted-branch
     # scenario in the extension phase (fixture_extend_holes() in
@@ -821,6 +824,7 @@ def capture(args: argparse.Namespace) -> int:
         "role": "current",
         "workload": "fixture",
         "checkpoint_fence": args.checkpoint_retention_tool is not None,
+        **({"capture_source": provenance} if provenance is not None else {}),
         "daemon_args": DAEMON_ARGS,
         "daemon_env": DAEMON_ENV,
         # the PostgreSQL identity of the payloads inside: a build with another
@@ -966,6 +970,8 @@ def fixture_metadata(fixture: Path) -> dict[str, Any]:
     parameters, and an older archive must still be read back under the ones it
     was captured with rather than under today's defaults."""
     metadata = json.loads((fixture / FIXTURE_JSON).read_text(encoding="utf-8"))
+    if "capture_source" in metadata:
+        validate_capture_source(metadata["capture_source"])
     if metadata.get("schema") != 1 or metadata.get("name") != fixture.name:
         raise FixtureError(f"{fixture / FIXTURE_JSON} does not describe {fixture.name}")
     daemon_args = metadata.get("daemon_args")
@@ -1034,7 +1040,7 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int | None:
                 continue
             try:
                 outcome = run_mutation(args, root, fixture, case, metadata)
-            except FixtureError as error:
+            except (FixtureError, CaptureSourceError) as error:
                 outcome = f"error: {error}"
             if outcome == case["expect"]:
                 print(f"ok   - {case['name']}: {outcome}")
@@ -1099,7 +1105,10 @@ def main(argv: list[str] | None = None) -> int:
                              "checkpoint fence during capture")
     parser.add_argument("--only", nargs="*", help="run only these mutation cases")
     parser.add_argument("--keep-failures", type=Path, help="copy failed mutation stores here")
+    add_capture_source_argument(parser)
     args = parser.parse_args(argv)
+    if args.capture_source is not None and args.capture is None:
+        parser.error("--capture-source requires --capture")
     for name in ("daemon_binary", "client_binary", "inspect_binary", "format_tool",
                  "postgres_payload_identity_tool", "postgres_payload_identity",
                  "checkpoint_retention_tool"):
@@ -1107,7 +1116,7 @@ def main(argv: list[str] | None = None) -> int:
             setattr(args, name, getattr(args, name).resolve())
     try:
         return capture(args) if args.capture else check(args)
-    except FixtureError as error:
+    except (FixtureError, CaptureSourceError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
