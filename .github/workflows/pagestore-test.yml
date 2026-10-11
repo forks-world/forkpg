@@ -1,0 +1,582 @@
+# Standalone CI for the contrib/pagestore module.
+#
+# The pagestore daemon and its test harness are freestanding C (they include
+# only pagestore_ipc.h and libc), so this runs WITHOUT building PostgreSQL --
+# it just compiles the two programs and runs the test, which exercises the
+# storage logic, COW versioning, segment rollover and crash recovery across
+# page sizes 4K/8K/16K.  Seconds, not minutes.
+name: pagestore
+
+on:
+  push:
+    branches:
+      - master
+      - pagestore
+      - 'branchdb_*'
+    paths:
+      - 'contrib/pagestore/**'
+      # core seams the pagestore module depends on: a core-only PR (e.g. the
+      # control-file write hook) must still run the in-engine tests
+      - 'src/backend/access/transam/xlog.c'
+      - 'src/backend/access/transam/xlogrecovery.c'
+      - 'src/include/access/xlogrecovery.h'
+      - 'src/backend/access/transam/slru.c'
+      - 'src/backend/access/transam/xlogutils.c'
+      - 'src/backend/access/heap/visibilitymap.c'
+      - 'src/backend/postmaster/walredo.c'
+      - 'src/backend/storage/smgr/**'
+      - 'src/backend/storage/ipc/procarray.c'
+      - 'src/backend/tcop/postgres.c'
+      - 'src/include/access/xlog.h'
+      - 'src/include/access/xlog_internal.h'
+      - 'src/include/catalog/pg_control.h'
+      - 'src/include/access/slru.h'
+      - 'src/include/postmaster/walredo.h'
+      - 'src/include/storage/smgr.h'
+      - 'src/include/storage/procarray.h'
+      - '.github/workflows/pagestore-test.yml'
+  pull_request:
+    paths:
+      - 'contrib/pagestore/**'
+      # core seams the pagestore module depends on: a core-only PR (e.g. the
+      # control-file write hook) must still run the in-engine tests
+      - 'src/backend/access/transam/xlog.c'
+      - 'src/backend/access/transam/xlogrecovery.c'
+      - 'src/include/access/xlogrecovery.h'
+      - 'src/backend/access/transam/slru.c'
+      - 'src/backend/access/transam/xlogutils.c'
+      - 'src/backend/access/heap/visibilitymap.c'
+      - 'src/backend/postmaster/walredo.c'
+      - 'src/backend/storage/smgr/**'
+      - 'src/backend/storage/ipc/procarray.c'
+      - 'src/backend/tcop/postgres.c'
+      - 'src/include/access/xlog.h'
+      - 'src/include/access/xlog_internal.h'
+      - 'src/include/catalog/pg_control.h'
+      - 'src/include/access/slru.h'
+      - 'src/include/postmaster/walredo.h'
+      - 'src/include/storage/smgr.h'
+      - 'src/include/storage/procarray.h'
+      - '.github/workflows/pagestore-test.yml'
+  workflow_dispatch:
+
+# A branch update fires both push and pull_request.  Keep only the newest run
+# for that branch so stacked-PR rebases do not consume the runner quota with
+# obsolete standalone/integration jobs.
+concurrency:
+  group: pagestore-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  standalone-test:
+    name: standalone daemon test (no PostgreSQL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile daemon and test harness
+        working-directory: contrib/pagestore
+        run: |
+          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_inspect pagestore_inspect.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_test   pagestore_test.c   -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_layer_test pagestore_layer_test.c pagestore_layer.c pagestore_layer_store.c pagestore_fault.c pagestore_store_owner.c -lrt -pthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_layer_store_test pagestore_layer_store_test.c pagestore_layer_store.c pagestore_layer.c pagestore_fault.c pagestore_store_owner.c -lrt -pthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_layer_crash_client pagestore_layer_crash_client.c -lrt -pthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_gc_crash_client pagestore_gc_crash_client.c -lrt -pthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_format_versions pagestore_format_versions.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c pagestore_spdk_super.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_tiering_test pagestore_tiering_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_cutover_test pagestore_forkmeta_cutover_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_crash_matrix_test pagestore_forkmeta_crash_matrix_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_pgcache_test pagestore_pgcache_test.c pagestore_pgcache.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_manifest_test pagestore_manifest_test.c pagestore_manifest.c pagestore_layer.c pagestore_layer_store.c pagestore_fault.c pagestore_store_owner.c -lrt -pthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_retention_test pagestore_retention_test.c pagestore_retention.c pagestore_fault.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_retention_crash_test pagestore_retention_crash_test.c pagestore_retention.c pagestore_fault.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_gc_test pagestore_gc_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_walidx_prune_test pagestore_walidx_prune_test.c pagestore_walidx_prune.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_prune_test pagestore_forkmeta_prune_test.c pagestore_forkmeta_prune.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_walidx_snapshot_test pagestore_walidx_snapshot_test.c pagestore_walidx_snapshot.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_snapshot_test pagestore_forkmeta_snapshot_test.c pagestore_forkmeta_snapshot.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o storage_posix_wal_test storage_posix_wal_test.c storage_posix.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_control_prune_test pagestore_control_prune_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_artifact_lifecycle_test pagestore_artifact_lifecycle_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_soak_test pagestore_soak_test.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_lifecycle_prune_test pagestore_lifecycle_prune_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_wal_reclaim_core_test pagestore_wal_reclaim_core_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o storage_posix_fork_owner_test storage_posix_fork_owner_test.c storage_posix.c pagestore_store_owner.c pagestore_manifest.c pagestore_layer.c pagestore_layer_store.c pagestore_fault.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_fault_test pagestore_fault_test.c pagestore_fault.c -pthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_spdk_super_test pagestore_spdk_super_test.c pagestore_spdk_super.c
+          cc -O2 -Wall -Wextra -Werror -o pagestore_fuzz_test pagestore_fuzz_test.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_fuzz_helpers_test pagestore_fuzz_helpers_test.c -lrt
+
+      - name: Check fixture format identities against one pagestore_format_versions snapshot
+        # Cheap, single-step guard: every current fixture's format.json must
+        # agree with the same compiled-identity snapshot.  PR #262 bumped two
+        # identities and regenerated posix-artifact-lifecycle/format.json but
+        # not pgdata-artifacts/format.json; both are checked in separate,
+        # much slower steps below, so the mismatch was only caught on the
+        # base branch after merge (PR #263).  This runs first, so it fails
+        # before either of those steps' daemon work starts.
+        working-directory: contrib/pagestore
+        run: |
+          python3 harness/pagestore_fixture_identities.py \
+            --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
+                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/posix-timeline-delete-holes-horizon-v2 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 fixtures/pgdata-artifacts fixtures/pgdata-artifacts-pg18 \
+            --format-tool ./pagestore_format_versions
+
+      - name: Run standalone test suite
+        working-directory: contrib/pagestore
+        run: ./pagestore_test ./pagestore_daemon ./pagestore_inspect
+
+      - name: Run store ownership and orphan recovery tests
+        working-directory: contrib/pagestore
+        run: |
+          ./storage_posix_fork_owner_test
+          python3 harness/tests/test_store_owner_recovery.py \
+            --daemon-binary ./pagestore_daemon \
+            --inspect-binary ./pagestore_inspect
+
+      - name: Run named fault registry unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_fault_test
+
+      - name: Run SPDK superblock format unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_spdk_super_test
+
+      - name: Run portable bootstrap install oracle unit tests
+        run: python3 -B contrib/pagestore/harness/tests/test_bootstrap_install_oracle.py
+
+      - name: Run named fault recovery harness
+        working-directory: contrib/pagestore
+        run: |
+          python3 harness/pagestore_harness.py \
+            --capabilities harness/capabilities.json \
+            --daemon-fault-recovery harness/scenarios/daemon_fault_recovery.jsonl \
+            --daemon-binary ./pagestore_daemon \
+            --inspect-binary ./pagestore_inspect
+
+      - name: Run image-layer H1 crash scenarios
+        working-directory: contrib/pagestore
+        run: |
+          for scenario in \
+            image_layer_after_create \
+            image_layer_after_write \
+            image_layer_after_seal \
+            image_layer_after_manifest_add; do
+            python3 harness/pagestore_harness.py \
+              --capabilities harness/capabilities.json \
+              --daemon-fault-recovery "harness/scenarios/${scenario}.jsonl" \
+              --daemon-binary ./pagestore_daemon \
+              --layer-client-binary ./pagestore_layer_crash_client \
+              --inspect-binary ./pagestore_inspect
+          done
+
+      - name: Run page-pruning, WAL-index, WAL-reclaim, deletion, manifest, and forkmeta H1 crash scenarios
+        working-directory: contrib/pagestore
+        run: |
+          for scenario in \
+            page_prune_after_frontier \
+            page_compaction_after_publish \
+            page_gc_after_mark_delete \
+            wal_index_after_frontier \
+            wal_reclaim_before_unlink \
+            wal_reclaim_after_unlink \
+            wal_reclaim_before_dir_fsync \
+            timeline_delete_after_deleting \
+            timeline_delete_after_wal_cleanup \
+            timeline_delete_mid_segment_tombstone \
+            timeline_delete_after_segment_tombstone \
+            timeline_delete_after_deleted \
+            timeline_delete_before_deleting \
+            manifest_compact_after_tmp_sync \
+            manifest_compact_after_rename \
+            forkmeta_after_prepare \
+            forkmeta_after_manifest_commit \
+            forkmeta_after_source_rewrite \
+            forkmeta_after_snapshot_gc; do
+            python3 harness/pagestore_harness.py \
+              --capabilities harness/capabilities.json \
+              --daemon-fault-recovery "harness/scenarios/${scenario}.jsonl" \
+              --daemon-binary ./pagestore_daemon \
+              --gc-client-binary ./pagestore_gc_crash_client \
+              --inspect-binary ./pagestore_inspect
+          done
+
+      - name: Check persisted-format fixtures
+        working-directory: contrib/pagestore
+        run: |
+          python3 harness/pagestore_fixture.py \
+            --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
+                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/posix-timeline-delete-holes-horizon-v2 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 \
+            --daemon-binary ./pagestore_daemon \
+            --client-binary ./pagestore_gc_crash_client \
+            --inspect-binary ./pagestore_inspect \
+            --format-tool ./pagestore_format_versions
+
+      - name: Check fixture capture provenance guards
+        working-directory: contrib/pagestore
+        run: python3 harness/tests/test_capture_source.py
+
+      - name: Check data-directory artifact identities against the fixture
+        working-directory: contrib/pagestore
+        run: |
+          python3 harness/pagestore_pgdata_fixture.py \
+            --check fixtures/pgdata-artifacts fixtures/pgdata-artifacts-pg18 \
+            --format-tool ./pagestore_format_versions
+
+      - name: Check the controller and supervisor JSON artifact fixture
+        working-directory: contrib/pagestore
+        run: python3 harness/pagestore_controller_fixture.py --check fixtures/controller-json
+
+      - name: Run image-layer unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_layer_test
+
+      - name: Run layer-store provider unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_layer_store_test
+
+      - name: Run tiering integration test
+        working-directory: contrib/pagestore
+        run: ./pagestore_tiering_test
+
+      - name: Run materialized-page cache unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_pgcache_test
+
+      - name: Run manifest replay unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_manifest_test
+
+      - name: Run retention registry unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_retention_test
+
+      - name: Run retention-log crash-safety unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_retention_crash_test
+
+      - name: Run GC crash-safety unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_gc_test
+
+      - name: Run WAL-index snapshot publication unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_walidx_snapshot_test
+
+      - name: Run forkmeta runtime cutover smoke
+        working-directory: contrib/pagestore
+        run: ./pagestore_forkmeta_cutover_test
+
+      - name: Run forkmeta POSIX process-crash matrix
+        working-directory: contrib/pagestore
+        run: ./pagestore_forkmeta_crash_matrix_test
+
+      - name: Run fork-metadata checkpoint snapshot unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_forkmeta_snapshot_test
+
+      - name: Run WAL-index prune planning unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_walidx_prune_test
+
+      - name: Run fork-metadata prune planning unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_forkmeta_prune_test
+
+      - name: Run flat-WAL prefix rewrite unit test
+        working-directory: contrib/pagestore
+        run: ./storage_posix_wal_test
+
+      - name: Run artifact publication and drop tests
+        working-directory: contrib/pagestore
+        run: |
+          ./pagestore_artifact_lifecycle_test
+          PAGESTORE_ARTIFACT_TEST_READER=1 ./pagestore_artifact_lifecycle_test
+
+      - name: Run control-object retention unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_control_prune_test
+
+      - name: Run bounded fork-lifecycle history test
+        working-directory: contrib/pagestore
+        run: ./pagestore_lifecycle_prune_test
+
+      - name: Run WAL reclaim retention policy test
+        # meson runs it too, but this lane is what a pull request gates on
+        working-directory: contrib/pagestore
+        run: ./pagestore_wal_reclaim_core_test
+
+      # Op-sequence fuzzer: coverage of opcode x status x interleaving
+      # combinations against one real daemon, fixed default seed, CI-sized op
+      # budget (matches the meson test's PAGESTORE_FUZZ_OPS; see
+      # contrib/pagestore/meson.build's pagestore_op_fuzz comment for the
+      # timing measurements behind that budget).  BUGB_WORKAROUND matches the
+      # meson test until P3b lands (see that test's TODO).
+      - name: Run op-sequence fuzzer
+        working-directory: contrib/pagestore
+        env:
+          PAGESTORE_FUZZ_BUGB_WORKAROUND: "1"
+          PAGESTORE_FUZZ_OPS: "2000"
+        run: |
+          ./pagestore_fuzz_helpers_test
+          ./pagestore_fuzz_test ./pagestore_daemon
+
+      # R6 bounded-space acceptance: a real daemon under the composed retention
+      # workload must keep every persisted category within its declared bound
+      # and reclaim after ingestion stops.  The report is the last stdout line.
+      - name: Run R6 bounded-space soak
+        working-directory: contrib/pagestore
+        run: ./pagestore_soak_test ./pagestore_daemon
+
+  # In-engine test: build PostgreSQL and exercise the real path (smgr hijack,
+  # localsvc backend over the daemon, COW read_at, WAL shipping).  Heavier --
+  # it compiles PostgreSQL -- so it is a separate job.
+  integration-test:
+    name: in-engine integration test (PostgreSQL + daemon)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Whether the store/pgdata fixture checks below must FAIL (rather than
+      # WARN) when this build carries no matching fixture.  `pagestore`
+      # always requires it; a `branchdb_<N>` release branch requires it only
+      # when release-branches.json does not mark major N unsupported (13 and
+      # 14 today -- they carry no release evidence and stay on the WARN
+      # path). This is a per-major decision, so it is read from the manifest
+      # via harness/pagestore_release_branches.py rather than hardcoded here
+      # a second time next to the existing branchdb_13/branchdb_14 skips
+      # below.
+      - name: Determine whether this ref's PostgreSQL major requires the build match
+        id: release-plan
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # `target` is the ref whose major decides the per-branch policy:
+          # the PR's base branch for a pull_request event (a PR into
+          # `pagestore` or into a `branchdb_*` branch must satisfy that
+          # base's rule), the triggering ref otherwise (push, workflow_dispatch).
+          target="$REF_NAME"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            target="$BASE_REF"
+          fi
+          python3 - "$target" <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+          import sys
+
+          sys.path.insert(0, "contrib/pagestore/harness")
+          from pagestore_release_branches import ReleaseBranchesError, unsupported_majors
+
+          target = sys.argv[1]
+          match = re.match(r"branchdb_(\d+)", target)
+          if match is None:
+              # Not a branchdb_<N> ref (e.g. `pagestore`, `master`, a PR head
+              # branch name): the workflow's own ref_name/base_ref checks
+              # below decide whether the build match applies at all, so this
+              # only needs to answer "false" for a branchdb_* ref the
+              # manifest excludes -- default true is harmless here.
+              supported = True
+          else:
+              try:
+                  unsupported = set(unsupported_majors())
+              except ReleaseBranchesError as error:
+                  print(f"::error::release-branches.json is invalid: {error}", file=sys.stderr)
+                  raise SystemExit(1)
+              supported = int(match.group(1)) not in unsupported
+          print("supported=" + ("true" if supported else "false"))
+          PY
+
+      - name: Install build dependencies
+        run: |
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name '*microsoft*' -o -name '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex meson ninja-build pkg-config perl python3
+
+      - name: Configure and build PostgreSQL (minimal)
+        run: |
+          meson setup build -Dcassert=true -Dauto_features=disabled
+          ninja -C build
+
+      - name: Prepare temporary install tree
+        run: meson test -C build --suite setup
+
+      - name: Run pagestore harness writer smoke
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --writer-smoke contrib/pagestore/harness/scenarios/writer_lifecycle.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
+
+      - name: Run H1 writer and pinned-reader restart combinations
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --writer-smoke contrib/pagestore/harness/scenarios/writer_reader_restart.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
+
+      - name: Run pagestore harness managed materializer smoke
+        if: github.ref_name != 'branchdb_13' && github.ref_name != 'branchdb_14'
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --materializer-smoke contrib/pagestore/harness/scenarios/materializer_lifecycle.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
+            --materializer-supervisor \
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+
+      - name: Run H1 materializer crash after relation sync
+        if: >
+          (github.event_name == 'pull_request' &&
+           github.base_ref != 'branchdb_13' &&
+           github.base_ref != 'branchdb_14') ||
+          (github.event_name != 'pull_request' &&
+           github.ref_name != 'branchdb_13' &&
+           github.ref_name != 'branchdb_14')
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --materializer-smoke \
+              contrib/pagestore/harness/scenarios/materializer_restartpoint_after_relation_sync_before_marker.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
+            --materializer-supervisor \
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+
+      - name: Run H1 materializer crash after marker sync
+        if: >
+          (github.event_name == 'pull_request' &&
+           github.base_ref != 'branchdb_13' &&
+           github.base_ref != 'branchdb_14') ||
+          (github.event_name != 'pull_request' &&
+           github.ref_name != 'branchdb_13' &&
+           github.ref_name != 'branchdb_14')
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --materializer-smoke \
+              contrib/pagestore/harness/scenarios/materializer_restartpoint_after_marker_sync.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
+            --materializer-supervisor \
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+
+      - name: Run H1 store, writer, and materializer restart combinations
+        if: >
+          (github.event_name == 'pull_request' &&
+           github.base_ref != 'branchdb_13' &&
+           github.base_ref != 'branchdb_14') ||
+          (github.event_name != 'pull_request' &&
+           github.ref_name != 'branchdb_13' &&
+           github.ref_name != 'branchdb_14')
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --materializer-smoke \
+              contrib/pagestore/harness/scenarios/materializer_restart_combinations.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
+            --materializer-supervisor \
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+
+      - name: Check persisted-format fixtures against this PostgreSQL build
+        # the standalone lane checks the envelopes; only a lane with a
+        # PostgreSQL build can ask whether the fixture's payload (its WAL page
+        # magic and long-header layout) is one this build loads.  On
+        # `pagestore`, and on a `branchdb_<N>` release branch whose major
+        # release-branches.json does not mark unsupported, a fixture for this
+        # build is required, so an upstream XLOG_PAGE_MAGIC bump (or a
+        # release branch that has not yet captured its own PG-major fixture)
+        # demands a recapture instead of passing or warning silently; an
+        # unsupported release branch (branchdb_13, branchdb_14 today) and
+        # anything else (master, a plain feature push, a PR into neither)
+        # keep the WARN behavior.
+        #
+        # --require-build-match truth table (`ref` = github.base_ref for a
+        # pull_request event, github.ref_name otherwise; `supported` =
+        # steps.release-plan.outputs.supported, computed above):
+        #   ref == 'pagestore'                                -> require
+        #   startsWith(ref, 'branchdb_') && supported == true  -> require
+        #   startsWith(ref, 'branchdb_') && supported == false -> warn
+        #   anything else                                      -> warn
+        run: |
+          python3 contrib/pagestore/harness/pagestore_fixture.py \
+            --check contrib/pagestore/fixtures/posix-mvp-baseline \
+                    contrib/pagestore/fixtures/posix-forkmeta-crc \
+                    contrib/pagestore/fixtures/posix-wal-payload-identity \
+                    contrib/pagestore/fixtures/posix-backend-objects \
+                    contrib/pagestore/fixtures/posix-artifact-lifecycle \
+                    contrib/pagestore/fixtures/posix-timeline-delete-holes \
+                    contrib/pagestore/fixtures/posix-timeline-delete-holes-seqcap \
+                    contrib/pagestore/fixtures/posix-timeline-delete-holes-forkmeta-v4 contrib/pagestore/fixtures/posix-timeline-delete-holes-horizon-v2 contrib/pagestore/fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 contrib/pagestore/fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 \
+            --daemon-binary build/contrib/pagestore/pagestore_daemon \
+            --client-binary build/contrib/pagestore/pagestore_gc_crash_client \
+            --inspect-binary build/contrib/pagestore/pagestore_inspect \
+            --format-tool build/contrib/pagestore/pagestore_format_versions \
+            --postgres-payload-identity-tool build/contrib/pagestore/pagestore_control_restore \
+            ${{ (github.ref_name == 'pagestore' || (startsWith(github.ref_name, 'branchdb_') && steps.release-plan.outputs.supported == 'true') || (github.event_name == 'pull_request' && (github.base_ref == 'pagestore' || (startsWith(github.base_ref, 'branchdb_') && steps.release-plan.outputs.supported == 'true')))) && '--require-build-match' || '' }}
+
+      - name: Check data-directory artifact fixture against this PostgreSQL build
+        # The backend's own loaders, in a scratch cluster of this build, must
+        # load every artifact an earlier build captured and refuse each
+        # declared mutation.
+        #
+        # Require a matching PG18/PG19 capture under the same release-ref
+        # rule as the store fixtures. Foreign-major captures are skipped.
+        run: |
+          python3 contrib/pagestore/harness/pagestore_pgdata_fixture.py \
+            --check contrib/pagestore/fixtures/pgdata-artifacts contrib/pagestore/fixtures/pgdata-artifacts-pg18 \
+            --format-tool build/contrib/pagestore/pagestore_format_versions \
+            --build build \
+            --postgres-payload-identity-tool build/contrib/pagestore/pagestore_control_restore \
+            ${{ (github.ref_name == 'pagestore' || (startsWith(github.ref_name, 'branchdb_') && steps.release-plan.outputs.supported == 'true') || (github.event_name == 'pull_request' && (github.base_ref == 'pagestore' || (startsWith(github.base_ref, 'branchdb_') && steps.release-plan.outputs.supported == 'true')))) && '--require-build-match' || '' }}
+
+      - name: Check G3 branch SQL entry gates
+        run: contrib/pagestore/branch_gate_test.sh "$(pwd)/build"
+
+      - name: Run pagestore integration test
+        run: contrib/pagestore/integration_test.sh "$(pwd)/build"
+
+      # On a FAIL, integration_test.sh has already stashed a tail of the
+      # daemon log and every cluster's server log it created under
+      # build/pagestore-integration-logs; upload them so the failing op can
+      # be identified without a local repro.
+      - name: Upload pagestore integration test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagestore-integration-logs
+          path: build/pagestore-integration-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Run WAL-redo worker demo
+        run: contrib/pagestore/redo_worker_demo.sh "$(pwd)/build"
+
+      - name: Run WAL-only (non-redundant) redo demo
+        run: contrib/pagestore/wal_only_redo_demo.sh "$(pwd)/build"
+
+      - name: Run continuous WAL redo materializer demo
+        run: contrib/pagestore/continuous_redo_demo.sh "$(pwd)/build"
+
+      - name: Run composed pagestore MVP golden scenario
+        run: contrib/pagestore/mvp_golden_test.sh "$(pwd)/build"
+
+      - name: Run H1 branch controller prepared-receipt crash slice
+        run: meson test -C build pagestore_branch_prepare --print-errorlogs
+
+      - name: Run end-to-end branch boot test
+        run: contrib/pagestore/branch_boot_test.sh "$(pwd)/build"
