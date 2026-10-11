@@ -336,6 +336,8 @@ static void publish_inspection_metrics(int force);
 static int branch_frontiers_allow(int parent, uint64_t branch_lsn);
 static int page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 								 uint32_t *nfences_out);
+static int page_storage_fences(uint32_t timeline, const PsHistoryFence *views,
+	uint32_t nviews, PsHistoryFence **fences_out, uint32_t *nfences_out);
 static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
 								   uint32_t *nfences_out);
 static int walidx_view_fences(uint32_t timeline, PsHistoryFence **fences_out,
@@ -3397,6 +3399,8 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	uint64_t B = timeline_inherited_below(timeline, &has_B);
 	PsHistoryFence *fences = NULL;
 	uint32_t	nfences = 0;
+	PsHistoryFence *relation_fences = NULL;
+	uint32_t nrelation_fences = 0;
 	PsHistoryFence *control_fences = NULL;
 	uint32_t	ncontrol_fences = 0;
 	uint64_t   *obj_generations = NULL;
@@ -3419,9 +3423,11 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return -1;
-	if (control_prune_fences(timeline, &control_fences, &ncontrol_fences) != 0)
+	if (page_storage_fences(timeline, fences, nfences, &relation_fences, &nrelation_fences) != 0 ||
+		control_prune_fences(timeline, &control_fences, &ncontrol_fences) != 0)
 	{
 		free(fences);
+		free(relation_fences);
 		return -1;
 	}
 
@@ -3434,11 +3440,11 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	/* one required generation per fence, plus the floor's */
 	obj_required = malloc(((size_t) nfences + 1) * sizeof(*obj_required));
 	closure_protect = malloc((size_t) *nrec);
-	if (nfences > 8)
-		vfences = malloc((size_t) nfences * sizeof(*vfences));
+	if (nrelation_fences > 8)
+		vfences = malloc((size_t) nrelation_fences * sizeof(*vfences));
 	if (!order || !versions || !keep || !selected || !dropped ||
 		!obj_generations || !obj_required || !closure_protect ||
-		(nfences > 8 && !vfences))
+		(nrelation_fences > 8 && !vfences))
 	{
 		free(order);
 		free(versions);
@@ -3451,12 +3457,13 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		if (vfences != vfences_local)
 			free(vfences);
 		free(fences);
+		free(relation_fences);
 		free(control_fences);
 		artifact_prune_cache_free(artifact_cache);
 		return -1;
 	}
-	for (uint32_t i = 0; i < nfences; i++)
-		vfences[i] = history_fence_view(fences[i]);
+	for (uint32_t i = 0; i < nrelation_fences; i++)
+		vfences[i] = history_fence_view(relation_fences[i]);
 	for (uint32_t i = 0; i < *nrec; i++)
 	{
 		order[i].key = recs[i].key;
@@ -3638,6 +3645,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				if (vfences != vfences_local)
 					free(vfences);
 				free(fences);
+				free(relation_fences);
 				free(control_fences);
 				artifact_prune_cache_free(artifact_cache);
 				return -1;
@@ -3673,7 +3681,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 
 			rc = ps_page_prune_plan_capped(versions, end - first,
 										   (PsPruneFence) {floor, UINT64_MAX},
-										   vfences, nfences, B, has_B, keep,
+										   vfences, nrelation_fences, B, has_B, keep,
 										   closure_protect);
 			if (rc < 0)
 			{
@@ -3686,6 +3694,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				if (vfences != vfences_local)
 					free(vfences);
 				free(fences);
+				free(relation_fences);
 				free(control_fences);
 				artifact_prune_cache_free(artifact_cache);
 				return -1;
@@ -3695,7 +3704,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 					!prune_version_needed(timeline, &order[first].key,
 										  order[first].block, versions,
 										  end - first, i - first, floor,
-										  fences, nfences))
+										  relation_fences, nrelation_fences))
 					keep[i - first] = 0;
 		}
 		out = compact_emit_grouped(order, first, end, keep, recs, selected,
@@ -3713,6 +3722,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	if (vfences != vfences_local)
 		free(vfences);
 	free(fences);
+	free(relation_fences);
 	free(control_fences);
 	artifact_prune_cache_free(artifact_cache);
 	*nrec = out;
@@ -20904,12 +20914,12 @@ artifact_fence_snapshot(uint32_t timeline, uint64_t **lsns_out,
  * fence pin mutations with admission-rd or the page-prune read fence. */
 static int
 page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
-				  uint32_t *nfences_out)
+				 uint32_t *nfences_out)
 {
 	PsRetentionPin *pins = NULL;
-	uint32_t npins = 0;
+	uint32_t	npins = 0;
 	PsHistoryFence *fences;
-	uint32_t nfences = 0;
+	uint32_t	nfences = 0;
 
 	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
 		return -1;
@@ -20922,17 +20932,20 @@ page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 	for (uint32_t i = 0; i < npins; i++)
 		if ((pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
 		{
-			ViewCap cap = viewcap_from_request(pins[i].lsn, pins[i].admission_seq);
+			ViewCap		cap = viewcap_from_request(pins[i].lsn, pins[i].admission_seq);
 
 			if (retention_project_cap(pins[i].timeline, timeline, &cap))
 			{
-				fences[nfences] = (PsHistoryFence) {cap.lsn, cap.strict_seq, cap.seq};
+				fences[nfences] = (PsHistoryFence)
+				{
+					cap.lsn, cap.strict_seq, cap.seq
+				};
 				nfences++;
 			}
 		}
 	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
 	{
-		ViewCap cap = viewcap_from_request(UINT64_MAX, 0);
+		ViewCap		cap = viewcap_from_request(UINT64_MAX, 0);
 		PsTimelineState state;
 
 		if (candidate != timeline && timelines[candidate].defined &&
@@ -20940,11 +20953,53 @@ page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 			state != PS_TIMELINE_DELETED &&
 			retention_project_cap(candidate, timeline, &cap))
 		{
-			fences[nfences] = (PsHistoryFence) {cap.lsn, cap.strict_seq, cap.seq};
+			fences[nfences] = (PsHistoryFence)
+			{
+				cap.lsn, cap.strict_seq, cap.seq
+			};
 			nfences++;
 		}
 	}
 	free(pins);
+	*fences_out = fences;
+	*nfences_out = nfences;
+	return 0;
+}
+
+/* WAL-index views do not authorize relation reads, but their original first
+ * arrivals must survive so compaction cannot manufacture a replacement base. */
+static int
+page_storage_fences(uint32_t timeline, const PsHistoryFence *views,
+					uint32_t nviews, PsHistoryFence **fences_out, uint32_t *nfences_out)
+{
+	PsHistoryFence *fences,
+			   *wal_fences = NULL;
+	uint32_t	nfences = nviews,
+				nwal = 0;
+
+	if (walidx_view_fences(timeline, &wal_fences, &nwal) != 0)
+		return -1;
+	fences = malloc((size_t) (nviews + nwal) * sizeof(*fences));
+	if (!fences)
+	{
+		free(wal_fences);
+		return -1;
+	}
+	memcpy(fences, views, (size_t) nviews * sizeof(*fences));
+	for (uint32_t i = 0; i < nwal; i++)
+	{
+		uint32_t	j;
+
+		if (wal_fences[i].seq == PS_SEQ_UNBOUNDED)
+			continue;
+		for (j = 0; j < nfences; j++)
+			if (fences[j].lsn == wal_fences[i].lsn && fences[j].seq == wal_fences[i].seq &&
+				fences[j].admission_seq == wal_fences[i].admission_seq)
+				break;
+		if (j == nfences)
+			fences[nfences++] = wal_fences[i];
+	}
+	free(wal_fences);
 	*fences_out = fences;
 	*nfences_out = nfences;
 	return 0;
@@ -21161,10 +21216,10 @@ ps_admission_barrier_register(uint32_t timeline, uint64_t lsn)
 	pthread_rwlock_wrlock(&walidx_prune_lock);
 	for (unsigned i = 0; i < 2; i++)
 	{
-		found[i] = ps_retention_lookup(timeline, PS_RETENTION_OWNER_CHECKPOINT_FENCE,
-									   i + 1, &slots[i]);
+		found[i] = ps_retention_checkpoint_lookup(timeline, i + 1, &slots[i]);
 		if (found[i] < 0)
 			goto out;
+		found[i] = slots[i].resources != 0;
 	}
 	slot = found[0] != 1 ? 0 : found[1] != 1 ? 1 :
 		slots[0].admission_seq < slots[1].admission_seq ? 0 : 1;
@@ -22591,13 +22646,36 @@ timeline_has_active_owner(uint32_t timeline)
 	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
 		return 1;
 	for (uint32_t i = 0; i < npins; i++)
-		if (pins[i].timeline == timeline)
+		if (pins[i].timeline == timeline &&
+			pins[i].owner_kind != PS_RETENTION_OWNER_CHECKPOINT_FENCE)
 		{
 			found = 1;
 			break;
 		}
 	free(pins);
 	return found;
+}
+
+/* Deleting is durable before these internal owners are retired. Recovery
+ * completes a retirement interrupted between the two log publications. */
+static int
+checkpoint_fences_retire(uint32_t timeline)
+{
+	int			changed = 0;
+
+	for (unsigned slot = 1; slot <= 2; slot++)
+	{
+		PsRetentionPin pin;
+		int			found = ps_retention_lookup(timeline, PS_RETENTION_OWNER_CHECKPOINT_FENCE, slot, &pin);
+
+		if (found < 0 || (found == 1 &&
+						  ps_retention_drop(timeline, pin.owner_kind, pin.owner_id, pin.generation) != 0))
+			return -1;
+		changed |= found == 1;
+	}
+	if (changed)
+		page_prune_mark_all_due_locked();
+	return 0;
 }
 
 /* On failure ch->result names the refusal (PsDeleteRefuseReason). */
@@ -22623,6 +22701,9 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 		return -1;
 	if (state == PS_TIMELINE_DELETING)
 	{
+		ch->result = PS_DELETE_REFUSE_STORAGE;
+		if (checkpoint_fences_retire(timeline) != 0)
+			return -1;
 		ch->result = state;
 		ch->req_seq = incarnation;
 		return 0;
@@ -22659,6 +22740,8 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 	__atomic_store_n(&timelines[timeline].state, PS_TIMELINE_DELETING,
 									 __ATOMIC_RELEASE);
 	inspection_timeline_cache_changed();
+	if (checkpoint_fences_retire(timeline) != 0)
+		return -1;
 	ch->result = PS_TIMELINE_DELETING;
 	ch->req_seq = incarnation;
 	return 0;
@@ -25312,6 +25395,10 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	errno = 0;
 	if (ps_retention_open(runtime_store_dir) != 0)
 		return OPEN_STEP("retention open");
+	for (uint32_t tl = 1; tl < MAX_TIMELINES; tl++)
+		if (timelines[tl].defined && timelines[tl].state != PS_TIMELINE_LIVE &&
+			checkpoint_fences_retire(tl) != 0)
+			return OPEN_STEP("retire deleting checkpoint owners");
 	errno = 0;
 	if (page_frontier_load(runtime_store_dir) != 0)
 	{

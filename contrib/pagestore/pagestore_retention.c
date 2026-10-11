@@ -2338,6 +2338,29 @@ ps_retention_lookup(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 	return rc;
 }
 
+int
+ps_retention_checkpoint_lookup(uint32_t timeline, uint64_t slot,
+							   PsRetentionPin *pin_out)
+{
+	int			rc = 0;
+
+	pthread_mutex_lock(&retention_lock);
+	if (retention_is_poisoned)
+		rc = -1;
+	else
+	{
+		int			idx = retention_find(timeline, PS_RETENTION_OWNER_CHECKPOINT_FENCE, slot);
+
+		if (idx >= 0)
+		{
+			*pin_out = retention_pins[idx];
+			rc = 1;
+		}
+	}
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
 /* Any active page-history pin on the timeline at exactly this LSN, whatever
  * its admission sequence. */
 int

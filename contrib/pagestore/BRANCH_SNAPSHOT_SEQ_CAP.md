@@ -1357,3 +1357,19 @@ Local validation (2026-10-11, cassert build):
   zero failures and no reported data races.
 - A P4 daemon refused a P5-activated store and left its timeline metadata
   unchanged. Legacy fixtures and high-word pin upgrade/restart passed.
+
+P5 review follow-up: legacy CONTROL requests keep both sequence bounds
+unbounded. Relation compaction retains original first arrivals for finite
+WAL-index-only owners and progress, without granting those views relation-read
+or replacement-base authority and without extending artifact retention.
+Timeline deletion ignores the internal checkpoint slots as a veto, retires them
+after durable DELETING, and completes interrupted retirement during recovery;
+slot generations survive tombstones and timeline reuse. SPDK routes WAL-index
+progress to shard 0 before the shared stable-horizon sampler.
+
+The writer-smoke harness hands off reader ownership before stopped capture.
+It also invokes checkpoint and retention helpers before R so their initial
+catalog hint FPIs do not enter the reader seed's post-R WAL. Expanded regressions
+reproduce 14 failures against the original P5 core and pass with these fixes,
+including WAL-only first-arrival pruning, legacy CONTROL retries, deletion veto,
+incarnation reuse and crash recovery between DELETING and checkpoint retirement.

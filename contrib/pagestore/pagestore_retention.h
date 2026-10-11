@@ -20,6 +20,9 @@ extern void ps_retention_close(void);
 #define PS_RETENTION_STALE	(-2)
 #define PS_RETENTION_NOT_REGISTERED (-3)
 extern int ps_retention_handoff(const PsRetentionPin *pin);
+/* Internal slots include tombstones, preserving generations across reuse. */
+extern int ps_retention_checkpoint_lookup(uint32_t timeline, uint64_t slot,
+	PsRetentionPin *pin_out);
 
 extern int ps_retention_set(const PsRetentionPin *pin);
 extern int ps_retention_reserve_and_set(const PsRetentionPin *pin);

@@ -520,7 +520,8 @@ request_shard(const PsChannel *ch)
 {
 	PsOpcode	op = (PsOpcode) ch->opcode;
 
-	if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ)
+	if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ ||
+		op == PS_OP_WAL_INDEX_PROGRESS)
 		return 0;
 	if (op == PS_OP_WAL_RETAIN_FLOOR || op == PS_OP_RETENTION_FLOOR)
 	{

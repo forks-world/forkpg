@@ -70,7 +70,8 @@ out:
 static void
 artifact_cap_drop_inflight(uint32_t tl, const PsKey *key)
 {
-	int removed = 0;
+	int			removed = 0;
+
 	pthread_mutex_lock(&artifact_caps_lock);
 	for (uint32_t i = 0; i < nartifact_caps;)
 		if (artifact_caps[i].timeline == tl && !artifact_caps[i].commit_seq &&
@@ -89,7 +90,7 @@ artifact_cap_drop_inflight(uint32_t tl, const PsKey *key)
 static void
 artifact_cap_forget_commit(uint32_t tl, const PsKey *meta, uint64_t commit_seq)
 {
-	int removed = 0;
+	int			removed = 0;
 	PsKey		key = *meta;
 
 	key.klass = key.forkNum;
@@ -200,6 +201,10 @@ static ViewCap
 artifact_control_cap(uint32_t tl, uint64_t lsn, uint64_t token)
 {
 	ViewCap		cap = viewcap_from_request(lsn, token);
+
+	/* Legacy CONTROL pins were LSN-only, including at their boundary. */
+	if (cap.legacy)
+		cap.strict_seq = PS_SEQ_UNBOUNDED;
 
 	pthread_mutex_lock(&artifact_caps_lock);
 	if (!artifact_caps_poisoned)

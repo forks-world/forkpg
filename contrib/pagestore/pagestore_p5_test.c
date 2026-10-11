@@ -5,12 +5,16 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include "pagestore_core.h"
 #include "pagestore_retention.h"
+#include "pagestore_fault.h"
+
+static const char *test_program;
 
 static int	failures,
 			checks;
@@ -91,6 +95,7 @@ test_legacy_upgrade(void)
 	PsRetentionPin pin = {0, PS_RETENTION_OWNER_READER, PS_RETENTION_RESOURCE_ALL,
 	1, 3001, 200, legacy_seq};
 	PsKey		relation = {.klass = PS_KLASS_RELATION, .relNumber = 66};
+	PsKey		control = {.klass = PS_KLASS_CONTROL};
 
 	check(mkdtemp(store) != NULL && ps_retention_open(store) == 0 &&
 		  ps_retention_set(&pin) == 0, "seed a pre-activation pin with a high sequence word");
@@ -98,6 +103,10 @@ test_legacy_upgrade(void)
 	check(ps_core_open(store) == 0, "upgrade legacy pin store");
 	write_value(&relation, 100, 0x51);
 	write_value(&relation, 100, 0x52);
+	write_value(&control, 200, 0x61);
+	write_value(&control, 200, 0x62);
+	check(read_value(&control, 200, legacy_seq, 0x62),
+		  "legacy CONTROL retry stays unbounded at exactly R");
 	check(read_value(&relation, 200, legacy_seq, 0x52),
 		  "pre-activation pin preserves LSN-only rewrites below its strict boundary");
 	check(set_pin(3002, 200, legacy_seq, PS_RETENTION_RESOURCE_PAGE_HISTORY) == PS_STATUS_OK,
@@ -111,7 +120,180 @@ test_legacy_upgrade(void)
 	check(ps_core_open(store) == 0 && stat(path, &after) == 0 &&
 		  before.st_size == after.st_size, "restart preserves epochs without appending new activation");
 	check(read_value(&relation, 200, legacy_seq, 0x52), "legacy interpretation survives restart");
+	for (unsigned i = 0; i < 32; i++)
+		ps_core_maintenance();
+	check(read_value(&control, 200, legacy_seq, 0x62),
+		  "legacy CONTROL remains readable after restart and compaction");
 	ps_core_close();
+	remove_store(store);
+}
+
+static void
+test_wal_first_arrival(void)
+{
+	for (unsigned progress = 0; progress < 2; progress++)
+	{
+		char		store[] = "/tmp/pagestore-p5-wal-first-XXXXXX";
+		PsKey		relation = {.klass = PS_KLASS_RELATION, .relNumber = 88};
+		PsChannel	ch = {.opcode = PS_OP_CREATE, .key = relation, .req_lsn = 50};
+		PsRetentionPin pin;
+		uint64_t	seq;
+
+		check(mkdtemp(store) && ps_core_open(store) == 0, "open first-arrival regression store");
+		ps_lock_shard_wr(ps_shard_of(&relation));
+		ps_handle_meta(&ch);
+		ps_unlock_shard(ps_shard_of(&relation));
+		check(ch.status == PS_STATUS_OK, "create first-arrival relation");
+		seq = ps_admission_barrier();
+		if (progress)
+		{
+			memset(&ch, 0, sizeof(ch));
+			ch.opcode = PS_OP_WAL_APPEND;
+			ch.datalen = 150;
+			ps_handle_meta(&ch);
+			check(ch.status == PS_STATUS_OK, "ship progress prefix");
+			memset(&ch, 0, sizeof(ch));
+			ch.opcode = PS_OP_WAL_INDEX_PROGRESS;
+			ch.req_seq = 150;
+			ps_lock_shard_wr(0);
+			ps_handle_meta(&ch);
+			ps_unlock_shard(0);
+			check(ch.status == PS_STATUS_OK, "publish finite WAL-index progress before first page arrival");
+		}
+		else
+		{
+			pin = (PsRetentionPin)
+			{
+				0, PS_RETENTION_OWNER_CONFIGURED,
+					PS_RETENTION_RESOURCE_WAL_INDEX, 1, 7001, 150, seq
+			};
+			check(ps_retention_set(&pin) == 0, "register WAL-index-only first-arrival horizon");
+		}
+		write_value(&relation, 100, 0x71);
+		write_value(&relation, 100, 0x72);
+		write_value(&relation, 200, 0x73);
+		pin = (PsRetentionPin)
+		{
+			0, PS_RETENTION_OWNER_READER,
+				PS_RETENTION_RESOURCE_PAGE_HISTORY, 1, 7002, 300, ps_admission_barrier()
+		};
+		check(ps_retention_set(&pin) == 0, "advance operational page floor past the WAL-only view");
+		for (unsigned i = 0; i < 32; i++)
+			ps_core_maintenance();
+		check(ps_test_page_version_count(0, &relation, 0) == 2,
+			  "page compaction retains the original first arrival for the WAL-index view");
+		check(read_value(&relation, 150, seq, -2), "WAL-index preservation does not grant relation read authority");
+
+		/*
+		 * Trusted test-only registration exposes the already-retained
+		 * identity.
+		 */
+		pin = (PsRetentionPin)
+		{
+			0, PS_RETENTION_OWNER_READER,
+				PS_RETENTION_RESOURCE_PAGE_HISTORY, 1, 7003, 150, seq
+		};
+		check(ps_retention_set(&pin) == 0 && read_value(&relation, 150, seq, 0x71),
+			  "compaction cannot promote a post-horizon rewrite into the original first arrival");
+		ps_core_close();
+		check(ps_core_open(store) == 0 && read_value(&relation, 150, seq, 0x71),
+			  "WAL-index first-arrival identity survives restart");
+		ps_core_close();
+		remove_store(store);
+	}
+}
+
+static int
+begin_delete(uint32_t timeline, uint64_t incarnation, uint32_t *reason)
+{
+	PsChannel	ch = {.opcode = PS_OP_BEGIN_DELETE, .timeline = timeline, .req_seq = incarnation};
+
+	ps_lifecycle_write_lock();
+	ps_admission_write_lock();
+	ps_lock_map_wr();
+	ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_admission_write_unlock();
+	ps_lifecycle_write_unlock();
+	if (reason)
+		*reason = ch.result;
+	return ch.status == PS_STATUS_OK;
+}
+
+static void
+test_checkpoint_delete(void)
+{
+	char		store[] = "/tmp/pagestore-p5-delete-XXXXXX";
+	PsChannel	ch = {.opcode = PS_OP_CREATE_BRANCH, .timeline = 1,
+	.parent_timeline = 0, .req_lsn = 100, .req_seq = 1};
+	PsRetentionPin pin;
+	uint64_t	seq;
+	uint32_t	reason;
+
+	check(mkdtemp(store) && ps_core_open(store) == 0, "open checkpoint deletion store");
+	ps_lock_map_wr();
+	ps_handle_meta(&ch);
+	ps_unlock_map();
+	check(ch.status == PS_STATUS_OK, "create checkpoint-bearing timeline");
+	seq = ps_admission_barrier_register(1, 200);
+	pin = (PsRetentionPin)
+	{
+		1, PS_RETENTION_OWNER_READER,
+			PS_RETENTION_RESOURCE_ALL, 1, 7004, 200, seq
+	};
+	check(seq && ps_retention_handoff(&pin) == 0, "retain checkpoint as an external reader");
+	check(!begin_delete(1, 1, &reason) && reason == PS_DELETE_REFUSE_OWNER,
+		  "external owner still vetoes timeline deletion");
+	check(ps_retention_drop(1, pin.owner_kind, pin.owner_id, 1) == 0 &&
+		  begin_delete(1, 1, NULL), "internal checkpoint owners do not veto deletion");
+	check(ps_retention_lookup(1, PS_RETENTION_OWNER_CHECKPOINT_FENCE, 1, &pin) == 0,
+		  "deletion retires daemon checkpoint slots");
+	for (unsigned i = 0; i < 32; i++)
+		ps_core_maintenance();
+	ps_core_close();
+	check(ps_core_open(store) == 0 &&
+		  ps_retention_lookup(1, PS_RETENTION_OWNER_CHECKPOINT_FENCE, 1, &pin) == 0,
+		  "deleted checkpoint slots stay retired after recovery");
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_CREATE_BRANCH;
+	ch.timeline = 1;
+	ch.parent_timeline = 0;
+	ch.req_lsn = 100;
+	ch.req_seq = 1;
+	ch.incarnation = 2;
+	ps_lock_map_wr();
+	ps_handle_meta(&ch);
+	ps_unlock_map();
+	check(ch.status == PS_STATUS_OK && ps_admission_barrier_register(1, 200) != 0,
+		  "reused timeline advances checkpoint generations beyond old tombstones");
+	ps_core_close();
+	{
+		char		fault_dir[] = "/tmp/pagestore-p5-delete-fault-XXXXXX";
+		char		arm[256];
+		FILE	   *file;
+		int			status = 0;
+		pid_t		child;
+
+		check(mkdtemp(fault_dir) != NULL, "create crash-control directory");
+		snprintf(arm, sizeof(arm), "%s/arm", fault_dir);
+		file = fopen(arm, "w");
+		check(file != NULL && fclose(file) == 0, "arm deletion crash");
+		child = fork();
+		if (child == 0)
+		{
+			execl(test_program, test_program, "--delete-crash", store, fault_dir, (char *) NULL);
+			_exit(127);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT,
+			  "crash after durable DELETING before checkpoint retirement");
+		check(ps_core_open(store) == 0 &&
+			  ps_retention_lookup(1, PS_RETENTION_OWNER_CHECKPOINT_FENCE, 1, &pin) == 0 &&
+			  begin_delete(1, 2, NULL),
+			  "recovery completes checkpoint retirement and accepts exact deletion retry");
+		ps_core_close();
+		remove_store(fault_dir);
+	}
 	remove_store(store);
 }
 
@@ -167,7 +349,7 @@ test_handoff_race(void)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
 	char		store[] = "/tmp/pagestore-p5-XXXXXX";
 	PsKey		relation = {.klass = PS_KLASS_RELATION, .relNumber = 55};
@@ -188,7 +370,21 @@ main(void)
 	ps_nshards = 3;
 	use_layers = 1;
 	ps_storage = &PsStoragePosix;
+	test_program = argv[0];
+	if (argc == 4 && strcmp(argv[1], "--delete-crash") == 0)
+	{
+		if (setenv("PAGESTORE_TEST_FAULT_NAME", "timeline_delete.after_deleting", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_DIR", argv[3], 1) != 0 ||
+			ps_core_open(argv[2]) != 0 || ps_fault_init(argv[2]) != 0)
+			return 127;
+		(void) begin_delete(1, 2, NULL);
+		return 126;
+	}
 	test_legacy_upgrade();
+	test_wal_first_arrival();
+	test_checkpoint_delete();
 	check(mkdtemp(store) && ps_core_open(store) == 0, "open P5 store");
 	{
 		PsChannel	ch = {.opcode = PS_OP_CREATE, .key = relation, .req_lsn = 50};
