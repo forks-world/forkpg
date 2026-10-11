@@ -1153,3 +1153,9 @@ opt-in. Old unbounded branches remain legacy data; completed receipts are
 checked for a finite edge and cannot recertify them. An activated store cannot
 be opened by the earlier format-only daemon. Independent reader-pin and
 WAL-index-horizon activation (P5) is not included in this branch-only fix.
+
+The P4 localsvc metadata path now separates WAL-less classification from its
+real-time lower bound: fallback metadata and ZEROEXTEND send unstamped requests
+with `req_floor_lsn`, while actual WAL record identities are preserved. This
+uses the already deployed P3a protocol and durable flags. P5 independent pin,
+WAL-index-horizon and artifact activation remains outstanding.
