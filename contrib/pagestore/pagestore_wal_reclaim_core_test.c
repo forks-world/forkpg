@@ -2911,7 +2911,7 @@ test_horizon_formats(void)
 	configure_core();
 	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, 16384) && wal_index_progress(0, 0, 8192),
-		  "write progress with unbounded horizon");
+		  "write progress with activated horizon");
 	close_store();
 	snprintf(path, sizeof(path), "%s/walidx_0_0", store);
 	file = fopen(path, "rb");
@@ -2925,17 +2925,18 @@ test_horizon_formats(void)
 	}
 	fclose(file);
 	memcpy(&cap, record + 1080, 8);
-	check(cap == UINT64_MAX, "progress v2 persists infinity before activation");
+	check(cap > 2 && cap < UINT64_MAX, "progress v2 persists a stable finite horizon");
 	for (int finite = 0; finite < 2; finite++)
 	{
-		cap = finite ? 7 : 0;
+		cap = finite ? 2 : 0;
 		memcpy(record + 1080, &cap, 8);
 		(void) horizon_test_crc(record, sizeof(record));
 		file = fopen(path, "wb");
 		check(file != NULL && fwrite(record, 1, sizeof(record), file) == sizeof(record),
 			  "write complete finite-cap record with valid CRC");
-		if (file) fclose(file);
-		check(ps_core_open(store) != 0, "finite progress cap fails closed");
+		if (file)
+			fclose(file);
+		check(ps_core_open(store) != 0, "zero or pre-activation progress cap fails closed");
 	}
 	/* Strip only the appended field and reseal the original legacy shape. */
 	bytes = 1080;
@@ -2957,9 +2958,11 @@ test_horizon_formats(void)
 		  "legacy snapshot v3 remains uncapped");
 	check(ps_test_walidx_snapshot_horizon_header(4, UINT64_MAX) == 0,
 		  "snapshot v4 accepts an unbounded horizon");
+	check(ps_test_walidx_snapshot_horizon_header(4, 7) == 0,
+		  "snapshot v4 accepts a post-activation horizon");
 	check(ps_test_walidx_snapshot_horizon_header(4, 0) != 0 &&
-		  ps_test_walidx_snapshot_horizon_header(4, 7) != 0,
-		  "snapshot v4 refuses finite horizon despite valid CRC");
+		  ps_test_walidx_snapshot_horizon_header(4, 2) != 0,
+		  "snapshot v4 refuses zero or pre-activation horizon despite valid CRC");
 }
 
 static void

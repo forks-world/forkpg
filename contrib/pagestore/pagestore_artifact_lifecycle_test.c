@@ -776,7 +776,7 @@ main(int argc, char **argv)
 			  "T4: an unversioned write to a key under protocol is refused as LEGACY_BYPASS");
 	}
 	token = begin(200);
-	check(metadata_matches(0, 0, 0, 1, 2) && metadata_matches(0, 200, token, 1, 2),
+	check(metadata_matches(0, 0, 0, 1, 2) && metadata_matches(0, 200, 0, 1, 2),
 		  "same-LSN retry retains completed metadata");
 	check(write_page(200, token, 1, 0x25) != 0 && read_value(0, 200, 1, 0x23), "same-LSN retry rejects changes to completed bytes");
 	{

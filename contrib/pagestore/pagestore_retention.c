@@ -2040,6 +2040,46 @@ ps_retention_set(const PsRetentionPin *pin)
 	return rc;
 }
 
+/*
+ * Source validation and publication share the registry mutex. The caller
+ * also excludes page/WAL-index pruning while establishing this hand-off.
+ */
+int
+ps_retention_handoff(const PsRetentionPin *pin)
+{
+	int			rc = PS_RETENTION_NOT_REGISTERED;
+
+	if (!retention_pin_valid(pin) || pin->admission_seq == 0)
+		return PS_RETENTION_ERROR;
+	pthread_mutex_lock(&retention_lock);
+	if (retention_is_poisoned)
+		rc = PS_RETENTION_ERROR;
+	else
+	{
+		int			idx = retention_find(pin->timeline, pin->owner_kind, pin->owner_id);
+
+		if (idx >= 0 && (pin->generation < retention_pins[idx].generation ||
+						 (pin->generation == retention_pins[idx].generation &&
+						  !retention_pin_active(&retention_pins[idx]))))
+			rc = PS_RETENTION_STALE;
+		else
+			for (uint32_t i = 0; i < retention_npins; i++)
+			{
+				const PsRetentionPin *source = &retention_pins[i];
+
+				if (retention_pin_active(source) && source->timeline == pin->timeline &&
+					source->lsn == pin->lsn && source->admission_seq == pin->admission_seq &&
+					(source->resources & pin->resources) == pin->resources)
+				{
+					rc = retention_set_locked(pin);
+					break;
+				}
+			}
+	}
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
 int
 ps_retention_reserve_and_set(const PsRetentionPin *pin)
 {

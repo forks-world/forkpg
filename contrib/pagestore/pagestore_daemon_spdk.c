@@ -595,7 +595,8 @@ run_request(uint32_t i, PsChannel *ch)
 		pthread_rwlock_wrlock(&core_rwlock);
 		ch->status = PS_STATUS_OK;
 		ch->result = 0;
-		ch->req_seq = ps_admission_barrier();
+		ch->req_seq = ch->is_redo == PS_BARRIER_REGISTER ?
+			ps_admission_barrier_register(ch->timeline, ch->req_lsn) : 0;
 		if (ch->req_seq == 0)
 			ch->status = PS_STATUS_ERROR;
 		ps_store_release(&ch->state, PS_STATE_DONE);

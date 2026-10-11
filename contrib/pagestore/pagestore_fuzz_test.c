@@ -1976,6 +1976,7 @@ act_unknown_opcode(void)
  * allocator backward.
  */
 static uint64_t g_last_admission_seq;
+static PsRetentionPin g_checkpoint_pins[2];
 
 /*
  * Every caller that issues a real ADMISSION_BARRIER -- not just the
@@ -1994,7 +1995,7 @@ static int
 observe_admission_barrier(const char *phase, uint64_t *seq_out)
 {
 	uint64_t	seq = 0;
-	int			status = psc_op_admission_barrier(&seq);
+	int			status = psc_op_admission_barrier(0, g_tl[0].wal_end, &seq);
 
 	ck(status == PS_STATUS_OK && seq != 0, "%s: ADMISSION_BARRIER (status %d "
 	   "seq=%llu)", phase, status, (unsigned long long) seq);
@@ -2011,6 +2012,20 @@ observe_admission_barrier(const char *phase, uint64_t *seq_out)
 		   (unsigned long long) seq, (unsigned long long) g_max_mutation_seq);
 		if (seq > g_last_admission_seq)
 			g_last_admission_seq = seq;
+		{
+			unsigned	slot = g_checkpoint_pins[0].admission_seq == 0 ? 0 :
+				g_checkpoint_pins[1].admission_seq == 0 ? 1 :
+				g_checkpoint_pins[0].admission_seq < g_checkpoint_pins[1].admission_seq ? 0 : 1;
+			PsRetentionPin *pin = &g_checkpoint_pins[slot];
+
+			pin->timeline = 0;
+			pin->owner_kind = PS_RETENTION_OWNER_CHECKPOINT_FENCE;
+			pin->owner_id = slot + 1;
+			pin->resources = PS_RETENTION_RESOURCE_ALL;
+			pin->generation++;
+			pin->lsn = g_tl[0].wal_end;
+			pin->admission_seq = seq;
+		}
 	}
 	if (seq_out)
 		*seq_out = seq;
@@ -2859,12 +2874,13 @@ static void
 act_retention_get(void)
 {
 	uint64_t	epoch = 0;
-	PsRetentionPin pin, expected[FZ_NREADERS + 1];
+	PsRetentionPin pin,
+				expected[FZ_NREADERS + 3];
 	uint32_t	count = 0;
 	int			nexpected = 0;
 	int			status;
 	int			rc;
-	int			seen[FZ_NREADERS + 1] = {0};
+	int			seen[FZ_NREADERS + 3] = {0};
 
 	for (uint32_t i = 0; i < FZ_NREADERS; i++)
 		if (g_reader[i].held)
@@ -2895,9 +2911,13 @@ act_retention_get(void)
 		p->admission_seq = g_tl[0].mat_seq;
 	}
 
+	for (unsigned i = 0; i < 2; i++)
+		if (g_checkpoint_pins[i].admission_seq)
+			expected[nexpected++] = g_checkpoint_pins[i];
+
 	for (uint32_t index = 0; index <= (uint32_t) nexpected; index++)
 	{
-		int idx;
+		int			idx;
 
 		rc = psc_op_retention_get(index, &epoch, &pin, &count);
 		status = psc_chan_ptr()->status;
@@ -6068,6 +6088,10 @@ verify_after_restart(const char *phase)
 		int			rc = psc_op_retention_get(0, &epoch, &pin, &count);
 		int			gstatus = psc_chan_ptr()->status;
 		uint32_t	expected_count = g_tl[0].mat_registered ? 1 : 0;
+
+		for (unsigned i = 0; i < 2; i++)
+			if (g_checkpoint_pins[i].admission_seq)
+				expected_count++;
 
 		for (uint32_t i = 0; i < FZ_NREADERS; i++)
 			if (g_reader[i].held)

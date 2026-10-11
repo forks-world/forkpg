@@ -2035,6 +2035,10 @@ read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerO
 	FROM pg_control_checkpoint();")"
 assert "$($P -c "SELECT pg_wal_lsn_diff('$readerR', '$readerPinStart') > 0;")" "t" \
 	"prepared reader checkpoint R is strictly newer than its initial pin"
+# Hand off before shutdown and restart can evict this checkpoint from the
+# daemon's newest-two automatic registrations. Its original S remains retained.
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0" \
+    "controller hands off the prepared reader checkpoint before stopping the writer"
 # This test has no concurrent catalog-changing workload across the checkpoint,
 # so its stopped copy is the control-plane catalog artifact for R.  The
 # prepared reader bundle replaces its SLRUs; pg_control is restored
@@ -2046,7 +2050,7 @@ cp -a "$DATA" "$READERDATA"
 # The stop drained/terminated the old publication workers.  No queued
 # pre-R snapshot can now race this retention advance on the fresh writer.
 assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0" \
-	"controller advances the prepared reader owner to exact checkpoint R"
+	"controller retries its exact checkpoint hand-off after writer restart"
 $P -c "COMMIT PREPARED 'reader_running_at_r';" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT count(*) FROM reader_running;")" "1" \

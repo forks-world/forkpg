@@ -18,6 +18,8 @@ extern void ps_retention_close(void);
 #define PS_RETENTION_OK		0
 #define PS_RETENTION_ERROR	(-1)
 #define PS_RETENTION_STALE	(-2)
+#define PS_RETENTION_NOT_REGISTERED (-3)
+extern int ps_retention_handoff(const PsRetentionPin *pin);
 
 extern int ps_retention_set(const PsRetentionPin *pin);
 extern int ps_retention_reserve_and_set(const PsRetentionPin *pin);

@@ -1274,14 +1274,18 @@ pagestore_localsvc_admission_fence_active(uint64 token)
 }
 
 uint64
-pagestore_localsvc_admission_barrier_timeout(int timeout_ms)
+pagestore_localsvc_admission_barrier_timeout(uint64 lsn, int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	PsChannel  *ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL,
-													(uint32) localsvc_timeline);
+												   (uint32) localsvc_timeline);
 
 	ch->key.klass = PS_KLASS_CONTROL;
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		ereport(ERROR, (errmsg("pagestore daemon lacks atomic pin capability")));
 	ch->opcode = PS_OP_ADMISSION_BARRIER;
+	ch->req_lsn = lsn;
+	ch->is_redo = PS_BARRIER_REGISTER;
 	ls_exec_timeout(ch, timeout_ms);
 	return ch->req_seq;
 }
@@ -1354,6 +1358,8 @@ pagestore_localsvc_retention_set_timeout(uint32 timeline, uint32 owner_kind,
 		return PS_STATUS_ERROR;
 	ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL, timeline);
 	ch->key.klass = PS_KLASS_CONTROL;
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		return PS_STATUS_ERROR;
 	ch->opcode = PS_OP_RETENTION_PIN_SET;
 	ch->timeline = timeline;
 	ch->blocknum = owner_kind;
@@ -1382,6 +1388,8 @@ pagestore_localsvc_retention_reserve_timeout(uint32 timeline,
 		return PS_STATUS_ERROR;
 	ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL, timeline);
 	ch->key.klass = PS_KLASS_CONTROL;
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		return PS_STATUS_ERROR;
 	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
 	ch->timeline = timeline;
 	ch->blocknum = owner_kind;
@@ -2197,12 +2205,25 @@ pagestore_localsvc_artifact_supersedable(bool on)
 
 uint64
 pagestore_localsvc_artifact_begin(uint32 klass, const PageStoreRelKey *key,
-	uint64 version, int timeout_ms)
+								  uint64 version, int timeout_ms)
 {
-	PsChannel *ch = ls_artifact_channel(klass, key, version);
+	PsChannel  *ch = ls_artifact_channel(klass, key, version);
+
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		ereport(ERROR, (errmsg("pagestore daemon lacks capped artifact capability")));
 	ch->opcode = PS_OP_ARTIFACT_BEGIN;
+	ch->is_redo = PS_ARTIFACT_BEGIN_CAPPED_READ;
 	ls_exec_timeout(ch, timeout_ms);
-	return ch->req_seq;
+	{
+		uint64		token = ch->req_seq;
+		PageStoreRelKey control_key = {0};
+		char		control_page[BLCKSZ];
+
+		if (!pagestore_localsvc_obj_read_capped_timeout(PS_KLASS_CONTROL, &control_key,
+														PS_CONTROL_IMAGE_BLOCK, version, token, control_page, NULL, timeout_ms))
+			ereport(ERROR, (errmsg("pagestore artifact has no retained control era at its publication cap")));
+		return token;
+	}
 }
 
 void
@@ -2327,14 +2348,24 @@ pagestore_localsvc_obj_read_at_timeout(uint32 klass, const PageStoreRelKey *key,
 									   void *page, uint64 *resolved,
 									   int timeout_ms)
 {
-	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass,
-													(uint32) localsvc_timeline);
+	return pagestore_localsvc_obj_read_capped_timeout(klass, key, block, version,
+													  klass == PS_KLASS_CONTROL && version == localsvc_read_lsn ? ls_pinned_read_seq() : 0,
+													  page, resolved, timeout_ms);
+}
+
+bool
+pagestore_localsvc_obj_read_capped_timeout(uint32 klass, const PageStoreRelKey *key,
+										   BlockNumber block, uint64 version, uint64 seq, void *page, uint64 *resolved,
+										   int timeout_ms)
+{
+	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass, (uint32) localsvc_timeline);
 	bool		found;
 
 	ch->key.klass = klass;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = version;
+	ch->req_seq = seq;
 	ls_exec_timeout(ch, timeout_ms);
 	memcpy(page, ch->data, BLCKSZ);
 	found = ch->result != 0;

@@ -1406,10 +1406,12 @@ static void
 fixture_artifact_request(PsKey key, uint32_t op, uint64_t lsn, uint64_t token,
 	uint32_t block, uint32_t count, int value, uint64_t *out)
 {
-	PsChannel *ch = ps_channel(shm_base, channel);
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
 	set_relation(ch);
 	ch->key = key;
 	ch->opcode = op;
+	ch->is_redo = op == PS_OP_ARTIFACT_BEGIN ? PS_ARTIFACT_BEGIN_CAPPED_READ : 0;
 	ch->req_lsn = lsn;
 	ch->req_seq = token;
 	ch->blocknum = block;

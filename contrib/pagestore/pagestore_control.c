@@ -236,11 +236,6 @@ ps_control_drain(void)
 				continue;
 			}
 
-			if (p->fence_token != 0 &&
-				pagestore_localsvc_admission_fence_active(p->fence_token))
-				fence_seq = pagestore_localsvc_admission_barrier_timeout(
-					PS_CONTROL_SHIP_TIMEOUT_MS);
-
 			elog(DEBUG1, "pagestore: shipping pg_control mirror image, update_lsn=%X/%08X state=%d",
 				 LSN_FORMAT_ARGS(p->update_lsn), (int) p->image.state);
 
@@ -336,12 +331,20 @@ ps_control_drain(void)
 															  &key,
 															  PS_CONTROL_SHIP_TIMEOUT_MS);
 			(void) pagestore_localsvc_obj_write_post_timeout(
-				PS_KLASS_CONTROL, &key, PS_CONTROL_IMAGE_BLOCK, page,
-				(uint64) p->update_lsn, nb, PS_CONTROL_SHIP_TIMEOUT_MS);
+															 PS_KLASS_CONTROL, &key, PS_CONTROL_IMAGE_BLOCK, page,
+															 (uint64) p->update_lsn, nb, PS_CONTROL_SHIP_TIMEOUT_MS);
 
-			/* Publish only when the hook established a gate at this checkpoint
-			 * boundary.  The barrier sequence follows every mutation admitted
-			 * before the gate, while the gate defers later relation writes <= R. */
+			if (p->fence_token != 0 &&
+				pagestore_localsvc_admission_fence_active(p->fence_token))
+				fence_seq = pagestore_localsvc_admission_barrier_timeout(
+								p->image.checkPointCopy.redo, PS_CONTROL_SHIP_TIMEOUT_MS);
+
+			/*
+			 * Publish only when the hook established a gate at this
+			 * checkpoint boundary.  The barrier sequence follows every
+			 * mutation admitted before the gate, while the gate defers later
+			 * relation writes <= R.
+			 */
 			if (fence_seq != 0)
 			{
 				PsAdmissionFence fence;

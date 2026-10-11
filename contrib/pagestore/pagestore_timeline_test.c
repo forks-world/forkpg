@@ -4422,7 +4422,7 @@ test_timeline_seqcap_format(void)
 	check(create_branch(2, 1, 110), "append cap-format child to legacy log");
 	close_store();
 	fd = open(path, O_RDONLY);
-	check(fd >= 0 && pread(fd, &current, sizeof(current), sizeof(old)) ==
+	check(fd >= 0 && pread(fd, &current, sizeof(current), sizeof(old) + 3 * sizeof(current)) ==
 		  (ssize_t) sizeof(current), "read 64-byte cap-format create");
 	if (fd >= 0)
 		(void) close(fd);
@@ -4473,7 +4473,7 @@ test_timeline_seqcap_format(void)
 			  append_bytes(path, &current, len) == 0 && ps_core_open(store) == 0,
 			  "every incomplete cap-format tail preserves the legacy prefix");
 		close_store();
-		check(stat(path, &st) == 0 && st.st_size == (off_t) sizeof(old),
+		check(stat(path, &st) == 0 && st.st_size == (off_t) (sizeof(old) + 3 * sizeof(current)),
 			  "incomplete cap-format tail is truncated at its record boundary");
 	}
 	/* Old complete records must be checked before conversion to V3. */

@@ -1178,11 +1178,14 @@ op_retention_set_seq(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 }
 
 static int
-op_admission_barrier(uint64_t *admission_seq_out)
+op_admission_barrier(uint64_t lsn, uint64_t *admission_seq_out)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	ch->opcode = PS_OP_ADMISSION_BARRIER;
+ ch->is_redo = PS_BARRIER_REGISTER;
+ ch->timeline = 0;
+ ch->req_lsn = lsn;
 	cl_exec();
 	if (admission_seq_out != NULL)
 		*admission_seq_out = ch->req_seq;
@@ -2794,10 +2797,14 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_create_at(rel, 0, 1000);
 	fill_page(page, ps, 5000, 80);
 	fence_seq = op_write_one_seq(rel, 0, 0, page);
-	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_READER, 29200,
-								  1, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-								  5000, fence_seq) == PS_STATUS_OK,
-		  "reader refines its provisional pin to the exact admission fence");
+	{
+	PsRetentionPin pin;
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29200,
+		  1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) == PS_STATUS_OK &&
+		  op_retention_lookup(0, PS_RETENTION_OWNER_READER, 29200, &pin),
+		  "reader atomically reserves its admission fence after the page");
+	fence_seq = pin.admission_seq;
+	}
 	/* The sequence fence disambiguates mutations only at the boundary LSN.
 	 * An older-LSN page admitted later remains part of that as-of view, first
 	 * in the memtable and later in its image layer. */
@@ -2839,6 +2846,14 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_create_at(rel + 1, 0, 9000);
 	fill_page(page, ps, 9000, 100);
 	fork_fence_seq = op_write_one_seq(rel + 1, 0, 0, page);
+	{
+	PsRetentionPin pin;
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29205, 1,
+		  PS_RETENTION_RESOURCE_PAGE_HISTORY, 9000) == PS_STATUS_OK &&
+		  op_retention_lookup(0, PS_RETENTION_OWNER_READER, 29205, &pin),
+		  "fork metadata fence is sampled and registered atomically");
+	fork_fence_seq = pin.admission_seq;
+	}
 	op_truncate_at(rel + 1, 0, 0, 9000);
 	check(op_nblocks_asof(rel + 1, 0, 9000) == 0,
 		  "uncapped same-LSN fork metadata serves the later truncate");
@@ -2889,8 +2904,15 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		{
 			memset((void *) &barrier_ch->key, 0, sizeof(barrier_ch->key));
 			barrier_ch->opcode = PS_OP_ADMISSION_BARRIER;
-			barrier_ch->req_lsn = 0;
+ barrier_ch->is_redo = PS_BARRIER_REGISTER;
+ barrier_ch->timeline = 0;
+			barrier_ch->req_lsn = 12000;
 			barrier_ch->req_seq = 0;
+		barrier_ch->is_redo = 0;
+		exec_channel(barrier_ch);
+		check(barrier_ch->status == PS_STATUS_ERROR && barrier_ch->req_seq == 0,
+		  "post-activation barrier refuses a missing registration promise");
+		barrier_ch->is_redo = PS_BARRIER_REGISTER;
 			exec_channel(barrier_ch);
 			durable_barrier_seq = barrier_ch->req_seq;
 			check(durable_barrier_seq != 0,
@@ -2954,7 +2976,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	{
 		uint64_t	restarted_barrier_seq = 0;
 
-		check(op_admission_barrier(&restarted_barrier_seq) == PS_STATUS_OK &&
+		check(op_admission_barrier(13000, &restarted_barrier_seq) == PS_STATUS_OK &&
 			  restarted_barrier_seq > durable_barrier_seq,
 			  "restart allocates above an unclaimed durable admission barrier");
 	}
@@ -2962,7 +2984,8 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 12000) == PS_STATUS_OK,
 		  "a durable replacement cutoff protects current page history");
 	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 29200, 1) ==
-		  PS_STATUS_OK,
+		  PS_STATUS_OK && op_retention_drop(0, PS_RETENTION_OWNER_READER, 29205, 1) ==
+	PS_STATUS_OK,
 		  "dropping the reader releases admission-fenced page history");
 	{
 		PsChannel  *ch = ps_channel(cl_shm, cl_chan);
@@ -4405,10 +4428,9 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
 						   1, PS_RETENTION_RESOURCE_ALL, 5000) == PS_STATUS_OK,
 		  "reader pin is durably registered");
-	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_MATERIALIZER, 202,
-						   1,
-						   PS_RETENTION_RESOURCE_WAL |
-						   PS_RETENTION_RESOURCE_WAL_INDEX, 3000, 0x100000002ULL) ==
+	check(op_retention_set(0, PS_RETENTION_OWNER_MATERIALIZER, 202,
+			   1, PS_RETENTION_RESOURCE_WAL |
+			   PS_RETENTION_RESOURCE_WAL_INDEX, 3000) ==
 		  PS_STATUS_OK,
 		  "materializer pin can retain WAL without page history");
 	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 303,
@@ -4436,7 +4458,7 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  "registry enumeration returns every owner kind");
 	check(op_retention_lookup(0, PS_RETENTION_OWNER_MATERIALIZER, 202, &pin) &&
 		  pin.generation == 1 && pin.lsn == 3000 &&
-		  pin.admission_seq == 0x100000002ULL,
+		  pin.admission_seq != 0,
 		  "registry atomically looks up one owner by stable key");
 	check(!op_retention_lookup(0, PS_RETENTION_OWNER_READER, 9999, &pin),
 		  "keyed owner lookup reports an absent owner atomically");

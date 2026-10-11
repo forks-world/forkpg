@@ -1302,3 +1302,58 @@ WAL-index/artifact activation remain separate.
 The in-engine regression checks both the pre-create historical horizon and the
 actual FKM4 ZEROEXTEND record: UNSTAMPED, nonzero admission sequence, and an LSN
 strictly above the previously sampled insert position.
+
+## P5 implementation: finite pins, WAL horizons and artifact eras
+
+P5 activates PIN, WALIDX_HORIZON and ARTIFACT independently, after recovery
+observes every durable sequence and before serving requests. The three epochs
+use V3 CAP_ACTIVATION records; recovered pre-activation views retain their
+legacy semantics. IPC version 49 and `PS_FRONTEND_CAP_ATOMIC_PINS` require
+matching compute and daemon binaries. A P4 binary refuses the activated store.
+The POSIX frontend advertises the capability; SPDK does not yet advertise it.
+
+The registering barrier validates page, WAL and WAL-index ancestry frontiers
+under the admission and prune write locks. Two daemon-owned checkpoint slots
+retain the newest samples without accumulating owner tombstones. Explicit SET
+can only hand off a live identical `(timeline,R,S)` with a resource superset;
+source validation and target publication share the retention mutex. Readers
+resolve the checkpoint's original S and hand off directly, without a provisional
+RESERVE. A controller must acquire its owner before that checkpoint is evicted.
+
+Checkpoint publication writes the CONTROL image and redo note, including their
+exact-redo twins, before sampling S. The later admission-fence record publishes
+that sample. Reader startup, advancing adoption and CONTROL reads carry the
+original S. WAL-only owners also authorize their retained CONTROL views.
+Ordered operational writes move above a positional boundary only when their
+sequence is visible at that boundary; a strict finite S alone does not justify
+moving a write to R+1.
+
+WAL-index commits sample S_H while holding all shard locks in ascending order.
+WIPG v2 and WISD v4 persist finite horizons, including a consistent sample across
+snapshot shards. Replacement bases, death folds and forkmeta cutovers use full
+projected caps. Page closure preserves the selected visible identity at each
+retained position, while allowing fully invalidated positions to retire.
+
+Artifact BEGIN registers an in-flight `(C,token)` control cap, and the producer
+reads CONTROL with that cap before publishing data. COMMIT retains the cap,
+including empty generations, until its physical completion record is retired.
+Superseding BEGIN, DROP and restart remove unfinished attempts; recovery rebuilds
+committed generations only. Cap release schedules another control-pruning pass.
+Lifecycle-less seeds retain their legacy unbounded control eras.
+
+Focused coverage includes below-R rewrites, unregistered refusals, resource
+superset checks, concurrent source release versus hand-off, bounded checkpoint
+slots, high-word legacy sequences, durable activation, artifact supersession,
+empty COMMIT, restart and compaction. Validation results are recorded with the
+implementation change; local runs do not constitute release qualification.
+
+Local validation (2026-10-11, cassert build):
+
+- Meson `setup` + `pagestore` suites: 110/110 passed, including the bounded
+  soak, operation fuzzing, format replay and gate sweep.
+- PostgreSQL `integration_test.sh`: passed with finite reader hand-offs,
+  advancing adoption and the CONTROL/redo pair assertion enabled.
+- The new three-shard P5 regression under Clang ThreadSanitizer: 111 checks,
+  zero failures and no reported data races.
+- A P4 daemon refused a P5-activated store and left its timeline metadata
+  unchanged. Legacy fixtures and high-word pin upgrade/restart passed.

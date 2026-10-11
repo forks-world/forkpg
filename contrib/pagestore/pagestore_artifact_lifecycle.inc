@@ -593,9 +593,9 @@ ps_artifact_diag(uint32_t tl, const PsKey *key, uint64_t *last_page_lsn,
 	*last_commit_lsn = v ? v->lsn : 0;
 }
 
-int
-ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token,
-				  PsArtifactRefuseReason *reason)
+static int
+artifact_begin_locked(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token,
+					  PsArtifactRefuseReason *reason)
 {
 	PsKey		meta;
 	PageEnt    *e;
@@ -678,8 +678,22 @@ ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token,
 		fork->artifact_attempt_seq = *token;
 		fork->artifact_page_count = 0;
 		fork->artifact_nblocks = 0;
+		if (artifact_cap_note(tl, key, lsn, *token, 0) != 0)
+			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_POISONED);
 	}
 	return 0;
+}
+
+int
+ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn, uint64_t *token,
+				  PsArtifactRefuseReason *reason)
+{
+	int			rc;
+
+	pthread_rwlock_wrlock(&page_prune_lock);
+	rc = artifact_begin_locked(tl, key, lsn, token, reason);
+	pthread_rwlock_unlock(&page_prune_lock);
+	return rc;
 }
 
 static int
@@ -883,10 +897,13 @@ ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
 	record.nblocks = fork->artifact_nblocks;
 	{
 		PsAppendOutcome outcome;
+		uint64_t	commit_seq;
 
 		if (artifact_store_record(tl, key, PS_ARTIFACT_COMMIT_BLOCK, lsn, &record,
-								  NULL, &outcome) != 0)
+								  &commit_seq, &outcome) != 0)
 			return artifact_refuse(reason, artifact_reason_for_outcome(outcome));
+		if (artifact_cap_note(tl, key, lsn, token, commit_seq) != 0)
+			return artifact_refuse(reason, PS_ARTIFACT_REFUSE_POISONED);
 	}
 	return 0;
 }
@@ -939,6 +956,7 @@ ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn,
 								  NULL, &outcome) != 0)
 			return artifact_refuse(reason, artifact_reason_for_outcome(outcome));
 	}
+	artifact_cap_drop_inflight(tl, key);
 	return 0;
 }
 
