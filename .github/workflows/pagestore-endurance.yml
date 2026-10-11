@@ -113,7 +113,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pagestore-endurance-${{ inputs.seed || '1' }}
+          name: pagestore-endurance-${{ inputs.seed || '1' }}-attempt-${{ github.run_attempt }}
           path: build/pagestore-endurance-evidence
           if-no-files-found: warn
           retention-days: 30

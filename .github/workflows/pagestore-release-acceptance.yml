@@ -124,6 +124,8 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_control_prune_test pagestore_control_prune_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_artifact_lifecycle_test pagestore_artifact_lifecycle_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_soak_test pagestore_soak_test.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_fuzz_test pagestore_fuzz_test.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_fuzz_helpers_test pagestore_fuzz_helpers_test.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_lifecycle_prune_test pagestore_lifecycle_prune_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_wal_reclaim_core_test pagestore_wal_reclaim_core_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c pagestore_store_owner.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o storage_posix_fork_owner_test storage_posix_fork_owner_test.c storage_posix.c pagestore_store_owner.c pagestore_manifest.c pagestore_layer.c pagestore_layer_store.c pagestore_fault.c -lrt -lpthread
@@ -233,6 +235,9 @@ jobs:
             --format-tool ./pagestore_format_versions \
             | tee ../../standalone-store-fixture-check.log
 
+      - name: Check release-branch sync rewrite guards
+        run: python3 .github/scripts/test_branchdb_sync.py
+
       - name: Check fixture capture provenance guards
         working-directory: contrib/pagestore
         run: python3 harness/tests/test_capture_source.py
@@ -326,6 +331,16 @@ jobs:
       - name: Run WAL reclaim retention policy test
         working-directory: contrib/pagestore
         run: ./pagestore_wal_reclaim_core_test
+
+      # Match the regular standalone lane, including its existing Bug-B mode.
+      - name: Run op-sequence fuzz helpers and regression gate
+        working-directory: contrib/pagestore
+        env:
+          PAGESTORE_FUZZ_BUGB_WORKAROUND: "1"
+          PAGESTORE_FUZZ_OPS: "2000"
+        run: |
+          ./pagestore_fuzz_helpers_test
+          ./pagestore_fuzz_test ./pagestore_daemon
 
       - name: Run R6 bounded-space soak (CI-sized)
         working-directory: contrib/pagestore
@@ -468,6 +483,9 @@ jobs:
             --postgres-payload-identity-tool build/contrib/pagestore/pagestore_control_restore \
             --require-build-match \
             | tee in-engine-pgdata-fixture-check.log
+
+      - name: Check G3 branch SQL entry gates
+        run: contrib/pagestore/branch_gate_test.sh "$(pwd)/build"
 
       - name: Run pagestore integration test
         env:

@@ -214,6 +214,9 @@ jobs:
             --inspect-binary ./pagestore_inspect \
             --format-tool ./pagestore_format_versions
 
+      - name: Check release-branch sync rewrite guards
+        run: python3 .github/scripts/test_branchdb_sync.py
+
       - name: Check fixture capture provenance guards
         working-directory: contrib/pagestore
         run: python3 harness/tests/test_capture_source.py
@@ -424,7 +427,13 @@ jobs:
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
 
       - name: Run pagestore harness managed materializer smoke
-        if: github.ref_name != 'branchdb_13' && github.ref_name != 'branchdb_14'
+        if: >
+          (github.event_name == 'pull_request' &&
+           github.base_ref != 'branchdb_13' &&
+           github.base_ref != 'branchdb_14') ||
+          (github.event_name != 'pull_request' &&
+           github.ref_name != 'branchdb_13' &&
+           github.ref_name != 'branchdb_14')
         run: |
           python3 contrib/pagestore/harness/pagestore_harness.py \
             --capabilities contrib/pagestore/harness/capabilities.json \

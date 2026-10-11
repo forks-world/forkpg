@@ -151,6 +151,13 @@ newest_release_tag() {
   git tag -l "REL_${v}_*" | { grep -vE 'BETA|RC' || true; } | sort -V | tail -1
 }
 
+# Refuse foreign-major names and branch/SHA aliases before any rewrite.
+require_release_tag() {
+  local tag=$1 major=$2
+  [[ "$tag" == REL_${major}_* ]] || die "tag '$tag' is not an upstream REL_${major}_* release tag"
+  git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" >/dev/null || die "unknown release tag '$tag' (run '$SELF fetch'?)"
+}
+
 # ---- fetch -----------------------------------------------------------------
 
 cmd_fetch() {
@@ -225,7 +232,7 @@ cmd_minor() {
     tag=$(newest_release_tag "$v")
     [[ -n "$tag" ]] || die "no non-prerelease REL_${v}_* tag exists yet; pass TAG explicitly"
   fi
-  git rev-parse --verify --quiet "$tag" >/dev/null || die "unknown ref '$tag' (run '$SELF fetch'?)"
+  require_release_tag "$tag" "$v"
   local upref
   upref=$(upstream_ref "$v") || die "no upstream ref for PG $v"
   local oldbase
@@ -287,7 +294,7 @@ cmd_forward() {
     tag=$(newest_release_tag "$to_major")
     [[ -n "$tag" ]] || die "no non-prerelease REL_${to_major}_* tag exists yet; pass TAG explicitly"
   fi
-  git rev-parse --verify --quiet "$tag" >/dev/null || die "unknown ref '$tag' (run '$SELF fetch'?)"
+  require_release_tag "$tag" "$to_major"
 
   # Select only commits with a well-formed series trailer (exactly
   # "Branchdb-Series: C1".."C7"), the same pattern `verify` holds commits
@@ -320,6 +327,11 @@ EOF
   done
 
   if git rev-parse --verify --quiet "$rc_branch" >/dev/null; then
+    local target_upref staging_base requested_base
+    target_upref=$(upstream_ref "$to_major") || die "no upstream ref for PG $to_major"
+    staging_base=$(git merge-base "$rc_branch" "$target_upref")
+    requested_base=$(git rev-parse "refs/tags/${tag}^{commit}")
+    [[ "$staging_base" == "$requested_base" ]] || die "$rc_branch base $staging_base differs from requested tag $tag; rebase or recreate staging deliberately before retrying"
     # Resume onto the existing staging branch instead of force-resetting it
     # back to $tag, which would silently discard any conflict resolutions
     # already made on it. Skip commits already applied there (identified by
