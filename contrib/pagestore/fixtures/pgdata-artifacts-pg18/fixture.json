@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "name": "pgdata-artifacts-pg18",
+  "role": "current",
+  "captured": "2026-10-12",
+  "description": "data-directory artifacts a real backend prepared: a branch (manifest and bootstrap), a reader (manifest, snapshot and catalog provenance) and the two raw-value markers with their identity trailers",
+  "identity": {
+    "branch": {
+      "new_timeline": 3,
+      "parent_timeline": 0,
+      "checkpoint_redo": "0/12000028",
+      "recovery_lsn": "0/120000A0",
+      "fork_lsn": "0/13000000"
+    },
+    "reader": {
+      "timeline": 0,
+      "read_lsn": "0/18199490",
+      "system_identifier": "7695469056314921516"
+    },
+    "markers": {
+      "reader_map_pending_horizon": "0/18199490",
+      "slru_primed_stamp": "0/B05DA40"
+    }
+  },
+  "artifacts": {
+    "branch_manifest": "branch/pagestore_branch.manifest",
+    "branch_bootstrap": "branch/pagestore_branch.bootstrap",
+    "reader_manifest": "reader/pagestore_reader.manifest",
+    "reader_snapshot": "reader/pagestore_reader.snapshot",
+    "reader_catalog": "reader/pagestore_reader.catalog",
+    "reader_map_pending": "markers/.pagestore-reader-map-pending",
+    "slru_primed": "markers/pagestore.slru_mirror_primed"
+  },
+  "files": [
+    "branch",
+    "branch/pagestore_branch.bootstrap",
+    "branch/pagestore_branch.manifest",
+    "markers",
+    "markers/.pagestore-reader-map-pending",
+    "markers/pagestore.slru_mirror_primed",
+    "reader",
+    "reader/pagestore_reader.catalog",
+    "reader/pagestore_reader.manifest",
+    "reader/pagestore_reader.snapshot"
+  ],
+  "pg_identity": {
+    "pg_control_version": 1800,
+    "xlog_page_magic": 53528,
+    "catalog_version_no": 202506291
+  },
+  "capture_source": {
+    "pagestore_sha": "fb4f2b3cd2e4c74ddec8b27076762d41bb99744f",
+    "postgres_core_sha": "396c50337686342dcb9493306f95d3c17f09a653",
+    "postgres_major": 18,
+    "cassert": true
+  }
+}

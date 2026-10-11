@@ -128,18 +128,20 @@ this revision before the final MVP status update.
    EOL and 14 reaches EOL 2026-11-12, both need a materially different core
    patch series (pre-17 SLRU, no `xlogrecovery.c` split before 15, no meson
    before 16) — and carry **no release evidence**; do not advertise them as
-   supported. `contrib/pagestore` itself is not yet portable to 18 either:
-   `PG_MAJOR_PORTABILITY.md` tracks the compile-verified list of
-   version-specific API usage a "PG 18 compatibility guards" PR (built from
-   P2's core-patch work) must close before `branchdb_18-rc`'s
-   `sync-contrib` copies a tree that actually builds.
-   `harness/pagestore_pgdata_fixture.py`'s existing `pgdata-artifacts`
-   fixture predates its `pg_identity` field (added alongside the store
-   fixture's `--require-build-match`, P1): it must be **recaptured** with
-   `--postgres-payload-identity[-tool]` on `pagestore` before any workflow
-   turns `--require-build-match` on for it — the checker now fails a current
-   fixture with no `pg_identity` under that flag (rather than passing
-   vacuously), so the recapture is a precondition, not an afterthought.
+   supported. The PG18 compatibility guards and SLRU build/startup fixes
+   now pass a full local PG18 build and integration run against its core
+   series. `PG_MAJOR_PORTABILITY.md` records the remaining fail-closed
+   limitations; release-branch synchronization is still required to freeze
+   that verified contrib tree on the release core.
+   The release-fixture follow-up recaptures `pgdata-artifacts` under PG19
+   and adds `pgdata-artifacts-pg18`, both recording `pg_identity` from the
+   actual capturing build. A matching PG18 store fixture is also checked in
+   as `posix-timeline-delete-holes-checkpoint-fence-v3-pg18`. Ordinary and
+   candidate-acceptance workflows supply the compiled payload identity to
+   the PGDATA checker, so their `--require-build-match` gate now rejects a
+   fixture set with no current capture for the checking major. These
+   fixtures establish loader coverage; they do not freeze a candidate or
+   replace its endurance evidence.
 
 The two artifact lifecycle gaps identified in the reviewed baseline are
 addressed by the follow-up described in [`ARTIFACT_LIFECYCLE.md`](ARTIFACT_LIFECYCLE.md):
@@ -233,10 +235,9 @@ request, its base) is `pagestore`, or is a `branchdb_<N>` branch whose major
 step (`Determine whether this ref's PostgreSQL major requires the build
 match`) reads the manifest via `harness/pagestore_release_branches.py` so
 that per-major decision is data, not a second hardcoded branch list next to
-the existing `branchdb_13`/`branchdb_14` scenario skips. (The pgdata step's
-flag is currently inert: `pagestore_pgdata_fixture.py` only enforces it once
-also given `--postgres-payload-identity[-tool]`, which is deliberately not
-wired in yet — see gap 6 below.) `pagestore-nightly.yml` gained a `ref`
+the existing `branchdb_13`/`branchdb_14` scenario skips. The pgdata step also
+supplies `--postgres-payload-identity-tool`, enabling the same matching-build gate
+as the store check. `pagestore-nightly.yml` gained a `ref`
 dispatch input (branch, tag or SHA) so an exact commit can be soaked on
 demand, and a weekly schedule that fans the same soak out over every branch
 `release-branches.json` currently marks `candidate` or `released` (empty
