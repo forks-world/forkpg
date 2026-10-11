@@ -1406,10 +1406,12 @@ static void
 fixture_artifact_request(PsKey key, uint32_t op, uint64_t lsn, uint64_t token,
 	uint32_t block, uint32_t count, int value, uint64_t *out)
 {
-	PsChannel *ch = ps_channel(shm_base, channel);
+	PsChannel  *ch = ps_channel(shm_base, channel);
+
 	set_relation(ch);
 	ch->key = key;
 	ch->opcode = op;
+	ch->is_redo = op == PS_OP_ARTIFACT_BEGIN ? PS_ARTIFACT_BEGIN_CAPPED_READ : 0;
 	ch->req_lsn = lsn;
 	ch->req_seq = token;
 	ch->blocknum = block;
@@ -1782,6 +1784,15 @@ fixture_verify(void)
 					   PS_RETENTION_RESOURCE_PAGE_HISTORY, TEST_CUTOFF,
 					   "fixture lost the archived page-history owner's pin",
 					   "fixture changed the archived page-history owner's identity");
+	{
+		const char *checkpoint = getenv("PAGESTORE_FIXTURE_CHECKPOINT_FENCE");
+
+		if (checkpoint != NULL && strcmp(checkpoint, "1") == 0)
+			check_pin_identity(0, PS_RETENTION_OWNER_CHECKPOINT_FENCE, 9001,
+				PS_RETENTION_RESOURCE_ALL, FIXTURE_WAL_REDO + WALIDX_READER_LSN,
+				"fixture lost the archived checkpoint fence",
+				"fixture changed the archived checkpoint owner identity");
+	}
 	set_relation(ch);
 	ch->opcode = PS_OP_WAL_SIZE;
 	if (execute()->status != PS_STATUS_OK || ch->req_lsn != FIXTURE_WAL_END)

@@ -74,6 +74,58 @@ rm_rf(const char *path)
 	}
 }
 
+/*
+ * Read from a pipe until EOF (the write end closes when the child exits) or
+ * the buffer fills, retrying across EINTR.
+ *
+ * A single read() is not enough here even though the child logically makes
+ * one diagnostic call (e.g. usage()'s one fprintf(stderr, ...)): under CPU
+ * pressure that call's output can reach the kernel as more than one write(),
+ * and read() is allowed to return as soon as the first of those lands,
+ * handing the caller a truncated buffer.  Worse, if the caller then closes
+ * the read end and calls waitpid() (as this file used to), the child's next
+ * write() to the now-reader-less pipe raises SIGPIPE and kills it before it
+ * reaches its own exit(), corrupting the exit status the test asserts on.
+ * Looping to EOF avoids both problems.
+ */
+static ssize_t
+read_all(int fd, char *buf, size_t bufsize)
+{
+	size_t		total = 0;
+
+	while (total < bufsize)
+	{
+		ssize_t		n = read(fd, buf + total, bufsize - total);
+
+		if (n < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			return total > 0 ? (ssize_t) total : -1;
+		}
+		if (n == 0)
+			break;
+		total += (size_t) n;
+	}
+	return (ssize_t) total;
+}
+
+/*
+ * waitpid() wrapper that retries across EINTR instead of leaving *status
+ * unset/stale for the caller's WIFEXITED()/WEXITSTATUS() to misread.
+ */
+static pid_t
+waitpid_retry(pid_t pid, int *status)
+{
+	pid_t		r;
+
+	do
+	{
+		r = waitpid(pid, status, 0);
+	} while (r < 0 && errno == EINTR);
+	return r;
+}
+
 /* The inspector must observe a live daemon without claiming an I/O channel. */
 static int
 run_inspector(const char *shm, const char *operation, char *output, size_t output_size)
@@ -103,7 +155,7 @@ run_inspector(const char *shm, const char *operation, char *output, size_t outpu
 		_exit(127);
 	}
 	close(pipefd[1]);
-	nread = read(pipefd[0], output, output_size - 1);
+	nread = read_all(pipefd[0], output, output_size - 1);
 	close(pipefd[0]);
 	if (nread < 0)
 	{
@@ -111,7 +163,8 @@ run_inspector(const char *shm, const char *operation, char *output, size_t outpu
 		exit(2);
 	}
 	output[nread] = '\0';
-	waitpid(pid, &status, 0);
+	if (waitpid_retry(pid, &status) < 0)
+		return 0;
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
@@ -145,12 +198,13 @@ run_inspector_timeline(const char *shm, uint32_t timeline,
 		_exit(127);
 	}
 	close(pipefd[1]);
-	nread = read(pipefd[0], output, output_size - 1);
+	nread = read_all(pipefd[0], output, output_size - 1);
 	close(pipefd[0]);
 	if (nread < 0)
 		nread = 0;
 	output[nread] = '\0';
-	waitpid(pid, &status, 0);
+	if (waitpid_retry(pid, &status) < 0)
+		return 0;
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
@@ -195,12 +249,13 @@ run_inspector_relation(const char *shm, uint32_t timeline,
 		_exit(127);
 	}
 	close(pipefd[1]);
-	nread = read(pipefd[0], output, output_size - 1);
+	nread = read_all(pipefd[0], output, output_size - 1);
 	close(pipefd[0]);
 	if (nread < 0)
 		nread = 0;
 	output[nread] = '\0';
-	waitpid(pid, &status, 0);
+	if (waitpid_retry(pid, &status) < 0)
+		return 0;
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
@@ -234,12 +289,13 @@ run_inspector_timeline_error(const char *shm, uint32_t timeline,
 		_exit(127);
 	}
 	close(pipefd[1]);
-	nread = read(pipefd[0], output, output_size - 1);
+	nread = read_all(pipefd[0], output, output_size - 1);
 	close(pipefd[0]);
 	if (nread < 0)
 		nread = 0;
 	output[nread] = '\0';
-	waitpid(pid, &status, 0);
+	if (waitpid_retry(pid, &status) < 0)
+		return 0;
 	return WIFEXITED(status) && WEXITSTATUS(status) != 0;
 }
 
@@ -271,12 +327,13 @@ run_inspector_timeline_missing(const char *shm, char *output,
 		_exit(127);
 	}
 	close(pipefd[1]);
-	nread = read(pipefd[0], output, output_size - 1);
+	nread = read_all(pipefd[0], output, output_size - 1);
 	close(pipefd[0]);
 	if (nread < 0)
 		nread = 0;
 	output[nread] = '\0';
-	waitpid(pid, &status, 0);
+	if (waitpid_retry(pid, &status) < 0)
+		return 0;
 	return WIFEXITED(status) && WEXITSTATUS(status) == 2;
 }
 
@@ -384,9 +441,25 @@ check_inspector_seqlock(void)
 	if (fd < 0)
 		return;
 	base = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	close(fd);
 	if (base == MAP_FAILED)
+	{
+		close(fd);
 		return;
+	}
+	/* Stand in for a live, initialized daemon: the inspector refuses a READY
+	 * header whose daemon lease (byte one) has no holder.  Closing fd at the
+	 * end releases it. */
+	{
+		struct flock lease;
+
+		memset(&lease, 0, sizeof(lease));
+		lease.l_type = F_WRLCK;
+		lease.l_whence = SEEK_SET;
+		lease.l_start = PS_INSPECTION_DAEMON_LOCK_BYTE;
+		lease.l_len = 1;
+		check(fcntl(fd, F_SETLK, &lease) == 0,
+			  "synthetic inspection shared memory holds a daemon lease");
+	}
 	memset(base, 0, PS_SHM_SIZE);
 	hdr = base;
 	hdr->magic = PS_SHM_MAGIC;
@@ -444,6 +517,7 @@ check_inspector_seqlock(void)
 		  strcmp(output, "pagestore_inspect: timeline 7 does not exist\n") == 0,
 		  "a clean timeline snapshot reports a genuinely absent timeline");
 	munmap(base, PS_SHM_SIZE);
+	close(fd);
 	ps_shm_unlink(name);
 }
 
@@ -457,10 +531,14 @@ wait_for_daemon_exit(pid_t pid, int expected_status)
 
 		if (result == pid)
 			return WIFEXITED(status) && WEXITSTATUS(status) == expected_status;
-		if (result < 0)
+		if (result < 0 && errno != EINTR)
 			return 0;
 		usleep(10000);
 	}
+	/* A missed fault must fail without leaving a daemon owning the store. */
+	kill(pid, SIGKILL);
+	while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+		;
 	return 0;
 }
 
@@ -560,13 +638,89 @@ claim_extra_channel(void)
 	return NULL;
 }
 
+/*
+ * Claim the one channel at index 'idx', or NULL if it is already claimed or
+ * out of range.  Unlike claim_extra_channel(), the caller picks the index --
+ * ps_channel() lays channels out contiguously (base + idx * PS_CHANNEL_STRIDE),
+ * so claim_channel_at(cl_chan + 1) is the channel physically adjacent to
+ * cl_chan's own PsChannel struct: an out-of-bounds write past cl_chan's
+ * data[PS_IO_UNIT] lands there first.
+ */
+static PsChannel *
+claim_channel_at(uint32_t idx)
+{
+	PsShmHeader *hdr = (PsShmHeader *) cl_shm;
+	PsChannel  *ch;
+
+	if (idx >= hdr->nchannels)
+		return NULL;
+	ch = ps_channel(cl_shm, idx);
+	if (ps_cas(&ch->claimed, 0, 1))
+		return ch;
+	return NULL;
+}
+
+/* Crash-triggering requests may never receive a response. */
+static void
+submit_request(PsChannel *ch)
+{
+	ps_request_generation_next(ch);
+	ps_store_release(&ch->state, PS_STATE_REQUEST);
+}
+
+/* Exercise both response orderings without relying on scheduler timing. */
+static void
+check_crash_request_wait(void)
+{
+	PsChannel  *ch = mmap(NULL, sizeof(*ch), PROT_READ | PROT_WRITE,
+						MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+	check(ch != MAP_FAILED, "allocate a shared crash-test channel");
+	if (ch == MAP_FAILED)
+		return;
+	for (int scenario = 0; scenario < 4; scenario++)
+	{
+		pid_t		pid;
+		int			expected_crash;
+
+		memset(ch, 0, sizeof(*ch));
+		pid = fork();
+		check(pid >= 0, "start crash-test responder %d", scenario);
+		if (pid < 0)
+			break;
+		if (pid == 0)
+		{
+			while (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
+				usleep(1000);
+			if (scenario == 3)
+				for (;;)
+					pause();
+			if (scenario == 1)
+				ps_store_release(&ch->state, PS_STATE_DONE);
+			_exit(scenario == 2 ? 89 : 88);
+		}
+		submit_request(ch);
+		expected_crash = wait_for_daemon_exit(pid, 88);
+		check(expected_crash == (scenario < 2),
+			  "crash wait accepts only the expected exit status, scenario %d",
+			  scenario);
+		check(ps_load_acquire(&ch->state) ==
+			  (scenario == 1 ? PS_STATE_DONE : PS_STATE_REQUEST),
+			  "crash wait completes with or without a response, scenario %d",
+			  scenario);
+		check(waitpid(pid, NULL, WNOHANG) == -1 && errno == ECHILD,
+			  "crash wait reaps the responder, including timeout, scenario %d",
+			  scenario);
+	}
+	munmap(ch, sizeof(*ch));
+}
+
 static PsChannel *
 cl_exec(void)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
-	ps_request_generation_next(ch);
-	ps_store_release(&ch->state, PS_STATE_REQUEST);
+	submit_request(ch);
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		;					/* busy wait; single in-flight request */
 	return ch;
@@ -1082,19 +1236,22 @@ op_retention_set_seq(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 }
 
 static int
-op_admission_barrier(uint64_t *admission_seq_out)
+op_admission_barrier(uint64_t lsn, uint64_t *admission_seq_out)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	ch->opcode = PS_OP_ADMISSION_BARRIER;
+ ch->is_redo = PS_BARRIER_REGISTER;
+ ch->timeline = 0;
+ ch->req_lsn = lsn;
 	cl_exec();
 	if (admission_seq_out != NULL)
 		*admission_seq_out = ch->req_seq;
 	return ch->req_seq == 0 ? PS_STATUS_ERROR : ch->status;
 }
 
-static int
-op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+static PsChannel *
+prepare_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 				 uint32_t generation, uint32_t resources, uint64_t lsn)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
@@ -1106,6 +1263,14 @@ op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 	ch->old_nblocks = generation;
 	ch->req_seq = owner_id;
 	ch->req_lsn = lsn;
+	return ch;
+}
+
+static int
+op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+				 uint32_t generation, uint32_t resources, uint64_t lsn)
+{
+	prepare_retention_set(timeline, owner_kind, owner_id, generation, resources, lsn);
 	return cl_exec()->status;
 }
 
@@ -1245,6 +1410,7 @@ op_create_branch(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 	uint64_t	parent_incarnation = op_timeline_incarnation(parent_tl);
 
+	ch->is_redo = 0;
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
@@ -1261,6 +1427,7 @@ op_create_branch_status(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 	uint64_t	parent_incarnation = op_timeline_incarnation(parent_tl);
 
+	ch->is_redo = 0;
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
@@ -1715,6 +1882,17 @@ page_all_zero(const unsigned char *buf, uint32_t ps)
 	return 1;
 }
 
+/* True if every one of the first 'n' bytes at buf equals 'byte' (a sentinel
+ * check: proves a neighboring channel's data[] was not touched). */
+static int
+memcmp_all(const unsigned char *buf, unsigned char byte, size_t n)
+{
+	for (size_t i = 0; i < n; i++)
+		if (buf[i] != byte)
+			return 0;
+	return 1;
+}
+
 /* ===================== daemon lifecycle ================================ */
 
 static pid_t
@@ -2006,6 +2184,83 @@ stop_daemon(pid_t pid)
 	waitpid(pid, NULL, 0);
 }
 
+/*
+ * E-8: clients now briefly take a *shared* lock on byte zero
+ * (ps_shm_hold_init_shared(), see pagestore_shm.h) while checking whether
+ * the segment is ready -- an orchestrator polling health across a daemon
+ * restart can legitimately hold it for the length of one health probe.
+ * Before this fix the daemon failed immediately ("shm initialization is
+ * busy") on any byte-zero contention; it must now retry for up to ~10s
+ * instead.  This drives the *real* daemon binary against a pre-created,
+ * pre-sized shm segment whose byte zero this test process holds shared
+ * (exactly like a health check in progress), and checks that the daemon is
+ * still running well short of the retry bound -- then releases the lock
+ * and checks the daemon goes on to become ready normally.
+ */
+static void
+check_daemon_waits_for_shared_init_lock(const char *daemon_path,
+										const char *tmpbase)
+{
+	char		name[64];
+	char		store[256];
+	int			fd;
+	pid_t		dpid;
+	int			held;
+	int			status = 0;
+	int			i;
+	int			exited_early;
+
+	snprintf(name, sizeof(name), "/pstest_%d_initlock_wait", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_initlock_wait", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(name);
+
+	fd = ps_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+	check(fd >= 0 && ftruncate(fd, PS_SHM_SIZE) == 0,
+		  "create pre-sized shm for the init-lock-wait test");
+	if (fd < 0)
+		return;
+
+	held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	check(held == 1, "test process holds the shared init lock");
+	if (held != 1)
+	{
+		close(fd);
+		ps_shm_unlink(name);
+		return;
+	}
+
+	dpid = spawn_daemon(daemon_path, name, store, 8192, test_nshards);
+
+	exited_early = 0;
+	for (i = 0; i < 200; i++)	/* ~2s, well inside the ~10s retry bound */
+	{
+		if (waitpid(dpid, &status, WNOHANG) == dpid)
+		{
+			exited_early = 1;
+			break;
+		}
+		usleep(10000);
+	}
+	check(!exited_early,
+		  "daemon retries byte zero instead of failing immediately while a client holds it shared");
+
+	ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	close(fd);
+
+	if (exited_early)
+	{
+		ps_shm_unlink(name);
+		rm_rf(store);
+		return;
+	}
+
+	wait_ready(name, 8192);
+	stop_daemon(dpid);
+	ps_shm_unlink(name);
+	rm_rf(store);
+}
+
 /* On-disk fork-meta record mirror, used only to synthesize a pre-marker store. */
 typedef struct TestForkMetaRec
 {
@@ -2073,7 +2328,7 @@ strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
 
 		if (pread(fd, &first, sizeof(first), in) != (ssize_t) sizeof(first))
 			break;
-		if (first == TEST_FORK_META_V2_MAGIC || first == TEST_FORK_META_V3_MAGIC)
+		if (first == TEST_FORK_META_V2_MAGIC || (first == TEST_FORK_META_V3_MAGIC || first == 0x344d4b46U))
 		{
 			if (pread(fd, &rec2, sizeof(rec2), in) != (ssize_t) sizeof(rec2))
 				break;
@@ -2128,7 +2383,7 @@ strip_bound_forkmeta_markers(const char *store)
 
 		if (pread(fd, &first, sizeof(first), in) != (ssize_t) sizeof(first))
 			break;
-		if (first == TEST_FORK_META_V2_MAGIC || first == TEST_FORK_META_V3_MAGIC)
+		if (first == TEST_FORK_META_V2_MAGIC || (first == TEST_FORK_META_V3_MAGIC || first == 0x344d4b46U))
 		{
 			if (pread(fd, &rec2, sizeof(rec2), in) != (ssize_t) sizeof(rec2))
 				break;
@@ -2263,7 +2518,7 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 		check(fd >= 0 && pread(fd, &rec2, sizeof(rec2), 0) ==
 			  (ssize_t) sizeof(rec2) &&
 			  (rec2.magic == TEST_FORK_META_V2_MAGIC ||
-			   rec2.magic == TEST_FORK_META_V3_MAGIC) &&
+			   (rec2.magic == TEST_FORK_META_V3_MAGIC || rec2.magic == 0x344d4b46U)) &&
 			  rec2.kind == 4,
 			  "migration marker replaces the torn forkmeta prefix");
 		check(fd >= 0 && fstat(fd, &st) == 0 &&
@@ -2608,10 +2863,14 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_create_at(rel, 0, 1000);
 	fill_page(page, ps, 5000, 80);
 	fence_seq = op_write_one_seq(rel, 0, 0, page);
-	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_READER, 29200,
-								  1, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-								  5000, fence_seq) == PS_STATUS_OK,
-		  "reader refines its provisional pin to the exact admission fence");
+	{
+	PsRetentionPin pin;
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29200,
+		  1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) == PS_STATUS_OK &&
+		  op_retention_lookup(0, PS_RETENTION_OWNER_READER, 29200, &pin),
+		  "reader atomically reserves its admission fence after the page");
+	fence_seq = pin.admission_seq;
+	}
 	/* The sequence fence disambiguates mutations only at the boundary LSN.
 	 * An older-LSN page admitted later remains part of that as-of view, first
 	 * in the memtable and later in its image layer. */
@@ -2653,6 +2912,14 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_create_at(rel + 1, 0, 9000);
 	fill_page(page, ps, 9000, 100);
 	fork_fence_seq = op_write_one_seq(rel + 1, 0, 0, page);
+	{
+	PsRetentionPin pin;
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29205, 1,
+		  PS_RETENTION_RESOURCE_PAGE_HISTORY, 9000) == PS_STATUS_OK &&
+		  op_retention_lookup(0, PS_RETENTION_OWNER_READER, 29205, &pin),
+		  "fork metadata fence is sampled and registered atomically");
+	fork_fence_seq = pin.admission_seq;
+	}
 	op_truncate_at(rel + 1, 0, 0, 9000);
 	check(op_nblocks_asof(rel + 1, 0, 9000) == 0,
 		  "uncapped same-LSN fork metadata serves the later truncate");
@@ -2703,8 +2970,15 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		{
 			memset((void *) &barrier_ch->key, 0, sizeof(barrier_ch->key));
 			barrier_ch->opcode = PS_OP_ADMISSION_BARRIER;
-			barrier_ch->req_lsn = 0;
+ barrier_ch->is_redo = PS_BARRIER_REGISTER;
+ barrier_ch->timeline = 0;
+			barrier_ch->req_lsn = 12000;
 			barrier_ch->req_seq = 0;
+		barrier_ch->is_redo = 0;
+		exec_channel(barrier_ch);
+		check(barrier_ch->status == PS_STATUS_ERROR && barrier_ch->req_seq == 0,
+		  "post-activation barrier refuses a missing registration promise");
+		barrier_ch->is_redo = PS_BARRIER_REGISTER;
 			exec_channel(barrier_ch);
 			durable_barrier_seq = barrier_ch->req_seq;
 			check(durable_barrier_seq != 0,
@@ -2768,7 +3042,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	{
 		uint64_t	restarted_barrier_seq = 0;
 
-		check(op_admission_barrier(&restarted_barrier_seq) == PS_STATUS_OK &&
+		check(op_admission_barrier(13000, &restarted_barrier_seq) == PS_STATUS_OK &&
 			  restarted_barrier_seq > durable_barrier_seq,
 			  "restart allocates above an unclaimed durable admission barrier");
 	}
@@ -2776,7 +3050,8 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 12000) == PS_STATUS_OK,
 		  "a durable replacement cutoff protects current page history");
 	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 29200, 1) ==
-		  PS_STATUS_OK,
+		  PS_STATUS_OK && op_retention_drop(0, PS_RETENTION_OWNER_READER, 29205, 1) ==
+	PS_STATUS_OK,
 		  "dropping the reader releases admission-fenced page history");
 	{
 		PsChannel  *ch = ps_channel(cl_shm, cl_chan);
@@ -3150,13 +3425,12 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 		if (fd >= 0)
 			close(fd);
 	}
-	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED,
-					   23000 + (uint64_t) case_no, 1,
-					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 3500) == PS_STATUS_OK,
-		  "crash case establishes a durable page cutoff");
-	client_detach();
+	submit_request(prepare_retention_set(0, PS_RETENTION_OWNER_CONFIGURED,
+									23000 + (uint64_t) case_no, 1,
+									PS_RETENTION_RESOURCE_PAGE_HISTORY, 3500));
 	check(wait_for_daemon_exit(pid, 88),
 		  "compaction crashes at deterministic phase %s", phase);
+	client_detach();
 	unlink(marker);
 	crashed_layer_count = local_layer_count(store);
 
@@ -3164,6 +3438,16 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
+	{
+		PsRetentionPin pin;
+
+		check(op_retention_lookup(0, PS_RETENTION_OWNER_CONFIGURED,
+								  23000 + (uint64_t) case_no, &pin) &&
+			  pin.generation == 1 && pin.lsn == 3500 &&
+			  pin.resources == PS_RETENTION_RESOURCE_PAGE_HISTORY &&
+			  pin.admission_seq != 0,
+			  "restart after %s recovers the durable page cutoff", phase);
+	}
 	op_read_one(rel, 0, 0, readback);
 	check(page_has_tag(readback, ps, 40),
 		  "restart after %s serves the published newest page", phase);
@@ -4219,10 +4503,9 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
 						   1, PS_RETENTION_RESOURCE_ALL, 5000) == PS_STATUS_OK,
 		  "reader pin is durably registered");
-	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_MATERIALIZER, 202,
-						   1,
-						   PS_RETENTION_RESOURCE_WAL |
-						   PS_RETENTION_RESOURCE_WAL_INDEX, 3000, 0x100000002ULL) ==
+	check(op_retention_set(0, PS_RETENTION_OWNER_MATERIALIZER, 202,
+			   1, PS_RETENTION_RESOURCE_WAL |
+			   PS_RETENTION_RESOURCE_WAL_INDEX, 3000) ==
 		  PS_STATUS_OK,
 		  "materializer pin can retain WAL without page history");
 	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 303,
@@ -4250,7 +4533,7 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  "registry enumeration returns every owner kind");
 	check(op_retention_lookup(0, PS_RETENTION_OWNER_MATERIALIZER, 202, &pin) &&
 		  pin.generation == 1 && pin.lsn == 3000 &&
-		  pin.admission_seq == 0x100000002ULL,
+		  pin.admission_seq != 0,
 		  "registry atomically looks up one owner by stable key");
 	check(!op_retention_lookup(0, PS_RETENTION_OWNER_READER, 9999, &pin),
 		  "keyed owner lookup reports an absent owner atomically");
@@ -4467,6 +4750,9 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	fill_page(p, ps, 1000, 11);
 	op_write_tl(0, REL_B, FORK0, 0, p);
 
+	fill_page(p, ps, 0, 61);
+	op_write_tl(0, REL_B, 1, 0, p);
+
 	/* branch T1 off main at LSN 1500 -- instant, no data copied */
 	op_create_branch(1, 0, 1500);
 	{
@@ -4481,6 +4767,23 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	}
 	op_read_tl(1, REL_B, FORK0, 0, rb);
 	check(page_has_tag(rb, ps, 11), "branch sees parent page via read-through (no copy)");
+
+	/* A diagnostic READ_AT must not turn unavailable WAL-less ancestry
+	 * into the successful "not found" response used for reclaimed history. */
+	for (int read_at = 0; read_at <= 1; read_at++)
+	{
+		PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+		cl_setkey(ch, REL_B, 1);
+		ch->timeline = 1;
+		ch->opcode = read_at ? PS_OP_READ_AT : PS_OP_READV;
+		ch->blocknum = 0;
+		ch->nblocks = 1;
+		ch->req_lsn = read_at ? 1500 : 0;
+		check(cl_exec()->status == PS_STATUS_ERROR,
+			  "child %s rejects unavailable WAL-less ancestor bytes",
+			  read_at ? "READ_AT" : "READV");
+	}
 
 	/* writing on T1 diverges it (copy-on-write) */
 	fill_page(p, ps, 2000, 22);
@@ -5481,11 +5784,19 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
 		check(fd >= 0 && close(fd) == 0,
 			  "arm the WAL-index frontier publication crash");
-		check(op_walidx_progress(5, sizeof(wal), sizeof(wal) * 2, NULL) == 0,
-			  "commit a second WAL-index interval for crash recovery");
-		client_detach();
+		{
+			PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+			ch->timeline = 5;
+			ch->incarnation = 0;
+			ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+			ch->req_lsn = sizeof(wal);
+			ch->req_seq = sizeof(wal) * 2;
+			submit_request(ch);
+		}
 		check(wait_for_daemon_exit(dpid, 88),
 			  "WAL-index compaction crashes after durable frontier publication");
+		client_detach();
 		unlink(marker);
 	}
 	ps_shm_unlink(shm);
@@ -5538,6 +5849,13 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 				break;
 			}
 			usleep(10000);
+		}
+		{
+			uint64_t progress = 0;
+
+			check(op_walidx_progress(5, 0, 0, &progress) == 0 &&
+				  progress == sizeof(wal) * 2,
+				  "restart recovers the second committed WAL-index interval");
 		}
 		check(recovered && out[0].lsn == 530 && out[1].lsn == 550 &&
 			  op_walidx_get_status(5, REL_A, FORK0, 12, sizeof(wal), out,
@@ -5682,6 +6000,182 @@ run_vectored_suite(const char *daemon_path, const char *tmpbase)
 	check(page_has_tag(rbuf, ps, (unsigned char) (nb / 2 + 1)),
 		  "single-block read of a vector-written block");
 
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	free(wbuf);
+	free(rbuf);
+}
+
+/*
+ * IPC request-bounds hardening (Bug A, found by the op fuzzer): handle_request()'s
+ * WRITEV/READV loops used to index ch->data by the client-supplied ch->nblocks
+ * with no check that nblocks * page_size <= PS_IO_UNIT, and ps_handle_meta()'s
+ * WAL_APPEND/WAL_READ used ch->datalen the same way.  A too-large count/length
+ * walks past this channel's fixed data[] buffer into the physically adjacent
+ * channel's shared memory (ps_channel() lays channels out contiguously) -- or,
+ * for nblocks near UINT32_MAX, far beyond it.  ps_request_payload_fits() now
+ * refuses any request whose declared payload does not fit, before ch->data is
+ * touched.  Exercise: nblocks == capacity (OK), capacity+1 (refused),
+ * UINT32_MAX (refused, no 32-bit multiplication wraparound), and an
+ * out-of-range WAL_APPEND/WAL_READ datalen (refused) -- each checked against a
+ * sentinel planted in the adjacent channel, which must survive every refusal.
+ */
+static void
+run_ipc_bounds_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	uint32_t	capacity = PS_IO_UNIT / ps;	/* 32 at the default page size */
+	unsigned char *wbuf;
+	unsigned char *rbuf;
+	PsChannel  *ch;
+	PsChannel  *neighbor;
+
+	fprintf(stderr, "== IPC request-bounds hardening (Bug A) ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_ipcbounds", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_ipcbounds", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	wbuf = malloc((size_t) capacity * ps);
+	rbuf = malloc((size_t) capacity * ps);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	neighbor = claim_channel_at((uint32_t) cl_chan + 1);
+	check(neighbor != NULL,
+		  "IPC bounds test claims the channel physically adjacent to cl_chan");
+	if (neighbor == NULL)
+		goto done;
+
+	/* A recognizable pattern nothing else in this suite ever writes. */
+	memset(neighbor->data, 0xa5, PS_IO_UNIT);
+
+	/* 1. nblocks == capacity: fits exactly.  A plain OK path (not the bug),
+	 * proving the fix does not also reject the legitimate boundary case. */
+	for (uint32_t i = 0; i < capacity; i++)
+		fill_page(wbuf + (size_t) i * ps, ps, 3000 + i, (unsigned char) (i + 1));
+	op_writev(REL_A, FORK0, 0, wbuf, capacity);
+	check(ps_channel(cl_shm, cl_chan)->status == PS_STATUS_OK,
+		  "WRITEV nblocks=capacity (%u) succeeds", capacity);
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "WRITEV nblocks=capacity leaves the adjacent channel untouched");
+
+	op_readv(REL_A, FORK0, 0, rbuf, capacity);
+	{
+		int			ok = 1;
+
+		for (uint32_t i = 0; i < capacity; i++)
+			if (!page_has_tag(rbuf + (size_t) i * ps, ps, (unsigned char) (i + 1)))
+				ok = 0;
+		check(ok, "READV nblocks=capacity (%u) succeeds and returns every page",
+			  capacity);
+	}
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "READV nblocks=capacity leaves the adjacent channel untouched");
+
+	/* 2. nblocks == capacity+1: the minimal repro (33 at the default page
+	 * size).  Set the field directly -- do not memcpy capacity+1 pages of
+	 * client-side data first, or the *test* would spill into the neighbor's
+	 * memory before the request is even sent. */
+	ch = ps_channel(cl_shm, cl_chan);
+	cl_setkey(ch, REL_A, FORK0);
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = 0;
+	ch->nblocks = capacity + 1;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR,
+		  "WRITEV nblocks=capacity+1 (%u) is refused", capacity + 1);
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused WRITEV nblocks=capacity+1 leaves the adjacent channel untouched");
+
+	ch = ps_channel(cl_shm, cl_chan);
+	cl_setkey(ch, REL_A, FORK0);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = capacity + 1;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR,
+		  "READV nblocks=capacity+1 (%u) is refused", capacity + 1);
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused READV nblocks=capacity+1 leaves the adjacent channel untouched");
+
+	/* 3. nblocks == UINT32_MAX: must be refused outright, with no 32-bit
+	 * multiplication wraparound turning it into something that looks small. */
+	ch = ps_channel(cl_shm, cl_chan);
+	cl_setkey(ch, REL_A, FORK0);
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = 0;
+	ch->nblocks = UINT32_MAX;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR, "WRITEV nblocks=UINT32_MAX is refused");
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused WRITEV nblocks=UINT32_MAX leaves the adjacent channel untouched");
+
+	ch = ps_channel(cl_shm, cl_chan);
+	cl_setkey(ch, REL_A, FORK0);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = UINT32_MAX;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR, "READV nblocks=UINT32_MAX is refused");
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused READV nblocks=UINT32_MAX leaves the adjacent channel untouched");
+
+	/* Daemon must still be alive and serving after the UINT32_MAX requests
+	 * (an unbounded loop indexing ch->data by nblocks would have crashed it). */
+	check(op_nblocks(REL_A, FORK0) == capacity,
+		  "daemon still serves ordinary requests after the UINT32_MAX probes");
+
+	/* 4. datalen out of range: WAL_APPEND/WAL_READ must be refused for a
+	 * datalen beyond PS_IO_UNIT, without reading/writing ch->data by it.
+	 * Set the field directly rather than through op_wal_append()'s memcpy
+	 * (which would need datalen valid bytes to copy). */
+	ch = ps_channel(cl_shm, cl_chan);
+	ch->timeline = 0;
+	ch->incarnation = 0;
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = 0;
+	ch->datalen = PS_IO_UNIT + 1;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR,
+		  "WAL_APPEND datalen=PS_IO_UNIT+1 is refused");
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused WAL_APPEND datalen=PS_IO_UNIT+1 leaves the adjacent channel untouched");
+
+	ch = ps_channel(cl_shm, cl_chan);
+	ch->timeline = 0;
+	ch->incarnation = 0;
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = 0;
+	ch->datalen = UINT32_MAX;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR,
+		  "WAL_APPEND datalen=UINT32_MAX is refused");
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused WAL_APPEND datalen=UINT32_MAX leaves the adjacent channel untouched");
+
+	ch = ps_channel(cl_shm, cl_chan);
+	ch->timeline = 0;
+	ch->incarnation = 0;
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = 0;
+	ch->datalen = PS_IO_UNIT + 1;
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR,
+		  "WAL_READ datalen=PS_IO_UNIT+1 is refused");
+	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
+		  "refused WAL_READ datalen=PS_IO_UNIT+1 leaves the adjacent channel untouched");
+
+	ps_store_release(&neighbor->claimed, 0);
+
+done:
 	client_detach();
 	stop_daemon(dpid);
 	rm_rf(store);
@@ -5894,6 +6388,274 @@ run_stress_suite(const char *daemon_path, const char *tmpbase)
 #undef NREADERS
 }
 
+static uint32_t
+op_create_branch_proven(uint32_t child, uint32_t parent, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	uint64_t	incarnation = op_timeline_incarnation(parent);
+	uint32_t	result;
+
+	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->timeline = child;
+	ch->parent_timeline = parent;
+	ch->req_lsn = lsn;
+	ch->req_seq = incarnation;
+	ch->incarnation = 0;
+	ch->is_redo = PS_BRANCH_R2_PROVEN;
+	cl_exec();
+	result = ch->result;
+	check(ch->status == PS_STATUS_OK && (result & PS_BRANCH_RESULT_FINITE),
+		  "checked branch creation returns a finite edge");
+	ch->is_redo = 0;
+	return result;
+}
+
+static void
+check_bugb_control_image(uint32_t timeline, const char *label)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->timeline = timeline;
+	ch->incarnation = 0;
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = 0;
+	ch->req_lsn = 1500;
+	/* Explicitly reset every other request field: the channel is reused
+	 * across ops, and PS_OP_READ_AT echoes its *own* resolved admission_seq
+	 * back into ch->req_seq on success (pagestore_daemon.c, PS_OP_READ_AT
+	 * case).  A prior relation READ_AT on this same channel therefore
+	 * leaves ch->req_seq holding that read's resolved admission_seq, which
+	 * page_visible()/read_resolve_version() treat as an input seq_cap for
+	 * the *next* request at the same LSN -- silently hiding this control
+	 * image's own (newer) admission_seq if the leftover value is smaller. */
+	ch->req_seq = 0;
+	ch->is_redo = 0;
+	ch->skip_fsync = 0;
+	ch->nblocks = 0;
+	ch->old_nblocks = 0;
+	ch->parent_timeline = 0;
+	ch->datalen = 0;
+	ch->pad1 = 0;
+	cl_exec();
+	check(ch->status == PS_STATUS_OK && ch->result != 0 && ch->data[0] == 0,
+		  "control image: %s does not see the post-fork same-version rewrite",
+		  label);
+}
+
+static void
+check_bugb_state(uint32_t ps, unsigned char *rb)
+{
+	ps_channel(cl_shm, cl_chan)->is_redo = 0;
+	op_read_tl(4, 108, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x51), "nested branch hides its parent's local same-position rewrite");
+	op_read_tl(1, 108, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x52), "nested parent keeps newest local bytes");
+	/* A first WAL page arriving after the cut still belongs to the
+	 * inclusive fork LSN; a rewrite at an occupied position does not. */
+	check(op_nblocks_tl(1, 100, 0) == 2,
+		  "rel100: a genuine first admission exactly at L is visible to the branch (got %u)",
+		  op_nblocks_tl(1, 100, 0));
+	op_read_at_tl(1, 100, 0, 1, 1500, rb);
+	check(page_has_tag(rb, ps, 0x20),
+		  "rel100: branch sees the new block's real bytes, admitted exactly at L");
+
+	for (uint32_t rel = 101; rel < 107; rel++)
+		check(op_nblocks_tl(1, rel, 0) == 1,
+			  "rel%u: branch stays frozen at its pre-fork size (got %u)",
+			  rel, op_nblocks_tl(1, rel, 0));
+	op_read_at_tl(1, 100, 0, 0, 1500, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel100: branch's pre-existing block0 unaffected by the post-fork EXTEND at L");
+	op_read_at_tl(1, 103, 0, 0, 1500, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel103: branch does not see the post-fork same-lsn rewrite (hint-bit case)");
+	op_read_at_tl(1, 104, 0, 0, 1500, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel104: WAL-less rewrite was already safe, branch still unaffected");
+
+	/* grandchild (timeline 2, child of branch 1 at 1800): its projected cap
+	 * onto the root is the same 1500 fork point branch 1 has (branch 1's
+	 * own branch_lsn is the tighter bound), so it sees the same genuine
+	 * first admission and stays frozen against the same rewrites. */
+	check(op_nblocks_tl(2, 100, 0) == 2,
+		  "rel100: grandchild also sees the genuine first admission at L (got %u)",
+		  op_nblocks_tl(2, 100, 0));
+	for (uint32_t rel = 101; rel < 107; rel++)
+		check(op_nblocks_tl(2, rel, 0) == 1,
+			  "rel%u: grandchild branch also stays frozen at pre-fork size", rel);
+	op_read_tl(2, 103, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x10),
+		  "rel103: grandchild does not see the post-fork same-lsn rewrite either");
+	/* Checked last, matching the order the post-fork mutations were applied
+	 * in (run_bugb_suite() writes the control image rewrite after all the
+	 * other leak shapes): reuses the client channel after a run of relation
+	 * NBLOCKS/READ_AT calls, so it also exercises that check_bugb_control_image()
+	 * resets every request field of its own rather than relying on a fresh
+	 * channel. */
+	check_bugb_control_image(1, "branch");
+}
+
+
+static void
+run_bugb_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	uint64_t compactions = 0, before_compactions = 0;
+	uint64_t scanned = 0, kept = 0, deleted = 0;
+	unsigned char *p,
+			   *rb;
+
+	fprintf(stderr, "== Bug B: post-fork same-position snapshot caps ==\n");
+
+	snprintf(shm, sizeof(shm), "/pstest_%d_bugb", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_bugb", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+
+	p = malloc(ps);
+	rb = malloc(ps);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	/* seven pre-fork relations on the root, block0 written at P=1000 */
+	for (uint32_t rel = 100; rel < 107; rel++)
+	{
+		op_create_at(rel, 0, 1000);
+		fill_page(p, ps, 1000, 0x10);
+		op_write_tl(0, rel, 0, 0, p);
+	}
+
+	/* the control image legitimately established at exactly L, as part of
+	 * branch preparation (same shape as a materializer's env_materialize) --
+	 * must happen BEFORE the branch so the branch's frozen view has
+	 * something real at that version to protect. */
+	memset(p, 0, ps);
+	op_write_control(0, p, 1500);
+
+	/* branch 1 off root at L=1500; grandchild 2 off branch 1 at 1800 --
+	 * both must freeze the SAME root-level relations at the SAME size. */
+	op_create_branch_proven(1, 0, 1500);
+	op_create_branch_proven(2, 1, 1800);
+	check((op_create_branch_proven(1, 0, 1500) & PS_BRANCH_RESULT_NEW) == 0,
+		  "finite exact retry preserves the original edge");
+	check(op_create_branch_status(1, 0, 1500) == PS_STATUS_ERROR,
+		  "legacy caller cannot retry a finite branch");
+	check(op_create_branch_proven(3, 0, 1500) & PS_BRANCH_RESULT_NEW,
+		  "same-LSN independent branch has its own finite cut");
+	check(op_retention_set(1, PS_RETENTION_OWNER_READER, 88100, 1,
+						  PS_RETENTION_RESOURCE_PAGE_HISTORY, 1200) == PS_STATUS_OK,
+		  "new descendant pin registers a narrower view before reclamation");
+	check(op_retention_drop(1, PS_RETENTION_OWNER_READER, 88100, 1) == PS_STATUS_OK,
+		  "release the narrow descendant test pin");
+	for (uint32_t rel = 100; rel < 107; rel++)
+	{
+		check(op_nblocks_tl(1, rel, 0) == 1,
+			  "rel%u: branch starts at the pre-fork size", rel);
+		check(op_nblocks_tl(2, rel, 0) == 1,
+			  "rel%u: grandchild starts at the pre-fork size", rel);
+	}
+
+	fill_page(p, ps, 2500, 0x51);
+	op_write_tl(1, 108, 0, 0, p);
+	op_create_branch_proven(4, 1, 2600);
+	fill_page(p, ps, 2500, 0x52);
+	op_write_tl(1, 108, 0, 0, p);
+	/* --- post-fork parent mutations: the eight bugb_repro.c leak shapes --- */
+	fill_page(p, ps, 1500, 0x20);
+	check(op_write_tl_status(0, 100, 0, 1, p) == PS_STATUS_OK,
+		  "rel100: EXTEND a new block at exactly the branch cap L");
+	op_zeroextend_at(101, 0, 1, 3, 1000);	/* stale req_lsn==P, collides with rel101's own CREATE */
+	op_zeroextend(102, 0, 1, 3);			/* unstamped req_lsn==0 */
+	fill_page(p, ps, 1000, 0x30);
+	check(op_write_tl_status(0, 103, 0, 0, p) == PS_STATUS_OK,
+		  "rel103: WRITEV rewrites block0 keeping its old pd_lsn (hint-bit case)");
+	fill_page(p, ps, 0, 0x40);
+	check(op_write_tl_status(0, 104, 0, 0, p) == PS_STATUS_OK,
+		  "rel104: WAL-less WRITEV rewrite (already-safe negative control)");
+	op_truncate_at(105, 0, 0, 1000);		/* stale req_lsn==P, collides with rel105's own CREATE */
+	memset(p, 0, ps);
+	check(op_write_tl_status(0, 106, 0, 1, p) == PS_STATUS_OK,
+		  "rel106: all-zero-page EXTEND (already-safe negative control)");
+	memset(p, 0x77, ps);
+	op_write_control(0, p, 1500);			/* post-fork rewrite at the SAME version -- must not leak */
+
+	op_read_tl(0, 103, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x30), "parent newest retains the rewrite bytes and ordering");
+	check_bugb_state(ps, rb);
+
+	/* clean restart */
+	client_detach();
+	stop_daemon(dpid);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_tl(0, 103, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x30), "parent newest retains the rewrite bytes and ordering");
+	check_bugb_state(ps, rb);
+	fprintf(stderr, "  (reverified after clean restart)\n");
+
+	/* crash restart */
+	client_detach();
+	kill(dpid, SIGKILL);
+	{
+		int status;
+
+		waitpid(dpid, &status, 0);
+	}
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_tl(0, 103, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x30), "parent newest retains the rewrite bytes and ordering");
+	check_bugb_state(ps, rb);
+	fprintf(stderr, "  (reverified after crash restart)\n");
+
+	/* Compaction is per timeline/shard: the store-wide file count includes
+	 * child layers and cannot prove a root pass completed. Require a new
+	 * accounted pass that actually discards obsolete versions instead. */
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 88101, 1,
+		  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) == PS_STATUS_OK,
+		  "Bug B suite: advance page floor above the finite branch snapshots");
+	check(read_pruning_metrics(shm, &before_compactions, &scanned, &kept, &deleted),
+		  "Bug B suite: sample compaction counter before forced reclamation");
+	for (uint32_t block = 1; block <= 48; block++)
+	{
+		fill_page(p, ps, 5000 + block, (unsigned char) block);
+		op_write_tl(0, 107, 0, block, p);
+	}
+	check(wait_for_accounted_pruning_metrics(shm, before_compactions + 1,
+		  &compactions, &scanned, &kept, &deleted),
+		  "Bug B suite: forced compaction completes an accounted reclamation pass");
+	client_detach();
+	stop_daemon(dpid);
+	ps_shm_unlink(shm);
+	dpid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_tl(0, 103, 0, 0, rb);
+	check(page_has_tag(rb, ps, 0x30), "parent newest retains the rewrite bytes and ordering");
+	check_bugb_state(ps, rb);
+	fprintf(stderr, "  (reverified after forced page compaction)\n");
+
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	free(p);
+	free(rb);
+}
+
+
 int
 main(int argc, char **argv)
 {
@@ -5923,7 +6685,16 @@ main(int argc, char **argv)
 		perror("mkdtemp");
 		return 2;
 	}
+	if (getenv("PAGESTORE_TEST_BUGB_ONLY"))
+	{
+		run_bugb_suite(daemon_path, tmpbase);
+		rm_rf(tmpbase);
+		fprintf(stderr, "%d checks, %d failed\n", tests_run, tests_failed);
+		return tests_failed ? 1 : 0;
+	}
+	check_crash_request_wait();
 	check_inspector_seqlock();
+	check_daemon_waits_for_shared_init_lock(daemon_path, tmpbase);
 
 	/* Legacy migration must seal before the daemon publishes readiness. */
 	run_migration_failure_suite(daemon_path, tmpbase);
@@ -5960,6 +6731,7 @@ main(int argc, char **argv)
 
 	/* branch / snapshot isolation (page-size independent, run once) */
 	run_branch_suite(daemon_path, tmpbase);
+	run_bugb_suite(daemon_path, tmpbase);
 
 	/* shipped-WAL durability */
 	run_wal_suite(daemon_path, tmpbase);
@@ -5970,6 +6742,9 @@ main(int argc, char **argv)
 
 	/* vectored multi-page I/O */
 	run_vectored_suite(daemon_path, tmpbase);
+
+	/* IPC request-bounds hardening (Bug A): nblocks/datalen vs PS_IO_UNIT */
+	run_ipc_bounds_suite(daemon_path, tmpbase);
 
 	/* many concurrent clients */
 	run_concurrency_suite(daemon_path, tmpbase);

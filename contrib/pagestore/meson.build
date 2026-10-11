@@ -36,6 +36,14 @@ install_data(
   'pagestore--1.1.sql',
   'pagestore--1.1--1.2.sql',
   'pagestore--1.2.sql',
+  'pagestore--1.2--1.3.sql',
+  'pagestore--1.3.sql',
+  'pagestore--1.3--1.4.sql',
+  'pagestore--1.4.sql',
+  'pagestore--1.4--1.5.sql',
+  'pagestore--1.5.sql',
+  'pagestore--1.5--1.6.sql',
+  'pagestore--1.6.sql',
   kwargs: contrib_data_args,
 )
 
@@ -348,6 +356,30 @@ test('pagestore_timeline',
   timeout: 60,
 )
 
+# Focused POSIX-only unit test for the Bug B read-side seq-cap machinery
+# (BRANCH_SNAPSHOT_SEQ_CAP.md), phase P1: ViewCap/page_select/fork_asof_hop
+# differential tests against frozen pre-P1 references and an independent
+# literal-rule brute force.  Links the shared core directly; no daemon.
+pagestore_viewcap_test = executable('pagestore_viewcap_test',
+  files('pagestore_viewcap_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: ['-DPAGESTORE_RETENTION_TEST', '-DPAGESTORE_RELATION_INSPECTION_TEST']
+          + pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_viewcap',
+  pagestore_viewcap_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Focused shared-core tests for the conservative POSIX WAL reclaim policy.
 pagestore_wal_reclaim_core_test = executable('pagestore_wal_reclaim_core_test',
   files('pagestore_wal_reclaim_core_test.c', 'pagestore_core.c',
@@ -453,6 +485,59 @@ test('pagestore_soak',
   timeout: 600,
 )
 
+# Op-sequence fuzzer: coverage of opcode x status x interleaving
+# combinations against one real daemon in a short, fixed-seed CI run (see
+# pagestore_fuzz_test.c's header for the full design).  PAGESTORE_FUZZ_SEED /
+# PAGESTORE_FUZZ_OPS raise the seed count / op budget for exploration runs
+# outside CI; direct invocation without PAGESTORE_FUZZ_OPS uses the
+# binary's own FZ_DEFAULT_OPS (4000).  CI overrides it down to 2000 below
+# (env, not FZ_DEFAULT_OPS) to keep this test's own wall time bounded; 2000
+# ops still reaches 0 missing coverage cells for the fixed default seed.
+#
+# Timing measured 2026-09-28, default seed, PAGESTORE_FUZZ_BUGB_WORKAROUND=1,
+# unloaded box, both the cassert meson build and a standalone `cc -O2 -Wall
+# -Wextra -Werror` build (matching the CI workflow's compile flags):
+#   4000 ops (FZ_DEFAULT_OPS): ~16-18s in both builds.  This is the config
+#     PR #302's Codex P2 finding measured as *not finishing* inside an
+#     external 100s timeout on an -O2 build -- CI hardware is evidently
+#     substantially slower than this measurement box for this IPC-heavy
+#     workload (high syscall/context-switch volume: ~130k voluntary context
+#     switches per run), so the ratio below is not just this box's 3x.
+#   2000 ops: ~9-10s in both builds.
+# timeout is set for >=3x headroom over a conservative estimate of the CI
+# worst case (assuming CI is up to ~8x slower than this box for this
+# workload, consistent with the 4000-op discrepancy above): 10s * 8 = 80s;
+# 3x that is 240s; rounded up to 300s.
+pagestore_fuzz_test = executable('pagestore_fuzz_test',
+  files('pagestore_fuzz_test.c'),
+  install: false,
+)
+test('pagestore_op_fuzz',
+  pagestore_fuzz_test,
+  args: [pagestore_daemon],
+  depends: [pagestore_daemon],
+  suite: ['pagestore'],
+  timeout: 300,
+  # TODO(remove with seq-cap P3b): "Bug B" (a parent admission after a
+  # branch's fork point leaks through the child's read-through) is fixed by
+  # the read-side seq cap (BRANCH_SNAPSHOT_SEQ_CAP.md), which only takes
+  # effect at P3b activation.  Stage 2's verify_branch_frozen() oracle
+  # catches Bug B deterministically once PAGESTORE_FUZZ_BUGB_WORKAROUND is
+  # unset, but CI must stay green against the not-yet-fixed daemon, so force
+  # the avoidance workaround on here; once P3b lands, drop this env entry so
+  # CI exercises the real race by default.
+  env: ['PAGESTORE_FUZZ_BUGB_WORKAROUND=1', 'PAGESTORE_FUZZ_OPS=2000'],
+)
+
+pagestore_fuzz_helpers_test = executable('pagestore_fuzz_helpers_test',
+  files('pagestore_fuzz_helpers_test.c'),
+  install: false,
+)
+test('pagestore_fuzz_helpers', pagestore_fuzz_helpers_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Deterministic page/WAL lag-controller and admission-wait coverage.
 pagestore_backpressure_test = executable('pagestore_backpressure_test',
   files('pagestore_backpressure_test.c', 'pagestore_core.c',
@@ -503,12 +588,30 @@ test('pagestore_manifest',
 
 # Unit test for durable retention pins, replay and churn compaction.
 pagestore_retention_test = executable('pagestore_retention_test',
-  files('pagestore_retention_test.c', 'pagestore_retention.c'),
+  files('pagestore_retention_test.c', 'pagestore_retention.c',
+        'pagestore_fault.c'),
   dependencies: [dependency('threads')],
   install: false,
 )
 test('pagestore_retention',
   pagestore_retention_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Deterministic process-abort regression for Bug C: a crash during retention
+# log compaction (or a plain in-place append) must not leave the store
+# unable to open.  Forks directly against pagestore_retention.c/pagestore_fault.c;
+# no daemon, no pagestore_core.c.
+pagestore_retention_crash_test = executable('pagestore_retention_crash_test',
+  files('pagestore_retention_crash_test.c', 'pagestore_retention.c',
+        'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_retention_crash',
+  pagestore_retention_crash_test,
   suite: ['pagestore'],
   timeout: 60,
 )
@@ -537,6 +640,19 @@ test('pagestore_prune',
   timeout: 30,
 )
 
+# P2: ps_page_prune_plan_capped() property tests (design doc S3.5/S8.2,
+# merge blockers) -- differential against a frozen pre-P2 reference, and
+# read/prune consistency over random histories/views/rounds.
+pagestore_prune_capped_test = executable('pagestore_prune_capped_test',
+  files('pagestore_prune_capped_test.c', 'pagestore_prune.c'),
+  install: false,
+)
+test('pagestore_prune_capped',
+  pagestore_prune_capped_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Pure replacement-base chain selection for WAL-index compaction.
 pagestore_walidx_prune_test = executable('pagestore_walidx_prune_test',
   files('pagestore_walidx_prune_test.c', 'pagestore_walidx_prune.c'),
@@ -557,6 +673,18 @@ test('pagestore_forkmeta_prune',
   pagestore_forkmeta_prune_test,
   suite: ['pagestore'],
   timeout: 30,
+)
+
+# P2: ps_forkmeta_prune_plan_capped() property tests (design doc S3.7/S8.2,
+# merge blockers).
+pagestore_forkmeta_prune_capped_test = executable('pagestore_forkmeta_prune_capped_test',
+  files('pagestore_forkmeta_prune_capped_test.c', 'pagestore_forkmeta_prune.c'),
+  install: false,
+)
+test('pagestore_forkmeta_prune_capped',
+  pagestore_forkmeta_prune_capped_test,
+  suite: ['pagestore'],
+  timeout: 60,
 )
 
 # Persisted immutable shipped-WAL segment header and checksum contract.
@@ -661,16 +789,27 @@ test('pagestore_harness_plan',
   suite: ['pagestore'],
   timeout: 30,
 )
+# Self-validates contrib/pagestore/release-branches.json, the supported-major
+# manifest scripts/branchdb-sync.sh's `status` and the release workflows (V4
+# plan, P4) read; no build or fixture inputs needed.
+test('pagestore_release_branches',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_release_branches.py')],
+  suite: ['pagestore'],
+  timeout: 30,
+)
 if host_system != 'windows'
   test('pagestore_materializer_supervisor',
     pagestore_harness_python,
     args: [files('harness/tests/test_materializer_supervisor.py')],
+    env: ['PG_MAJORVERSION=' + pg_version_major.to_string()],
     suite: ['pagestore'],
     timeout: 30,
   )
   test('pagestore_branch_prepare',
     pagestore_harness_python,
     args: [files('harness/tests/test_branch_prepare.py')],
+    env: ['PG_MAJORVERSION=' + pg_version_major.to_string()],
     suite: ['pagestore'],
     timeout: 30,
   )
@@ -799,6 +938,12 @@ if host_machine.endian() == 'little'
 # after a persisted-format bump; each of those tests only compares its own
 # fixture against the compiled identities, so the two drifting apart was
 # only caught on the base branch after merge (PR #263).
+test('pagestore_capture_source',
+  pagestore_harness_python,
+  args: files('harness/tests/test_capture_source.py'),
+  suite: ['pagestore'],
+  timeout: 30,
+)
 test('pagestore_fixture_identities',
   pagestore_harness_python,
   args: [files('harness/pagestore_fixture_identities.py'),
@@ -808,7 +953,13 @@ test('pagestore_fixture_identities',
          meson.current_source_dir() / 'fixtures' / 'posix-backend-objects',
          meson.current_source_dir() / 'fixtures' / 'posix-artifact-lifecycle',
          meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes-seqcap',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes-forkmeta-v4',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes-horizon-v2',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes-checkpoint-fence-v3',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes-checkpoint-fence-v3-pg18',
          meson.current_source_dir() / 'fixtures' / 'pgdata-artifacts',
+         meson.current_source_dir() / 'fixtures' / 'pgdata-artifacts-pg18',
          '--format-tool', pagestore_format_versions],
   depends: [pagestore_format_versions],
   suite: ['pagestore'],
@@ -823,6 +974,11 @@ test('pagestore_persisted_format_fixture',
          meson.current_source_dir() / 'fixtures' / 'posix-backend-objects',
          meson.current_source_dir() / 'fixtures' / 'posix-artifact-lifecycle',
          meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes-seqcap',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes-forkmeta-v4',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes-horizon-v2',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes-checkpoint-fence-v3',
+         meson.current_source_dir() / 'fixtures' / 'posix-timeline-delete-holes-checkpoint-fence-v3-pg18',
          '--daemon-binary', pagestore_daemon,
          '--client-binary', pagestore_gc_crash_client,
          '--inspect-binary', pagestore_inspect,
@@ -846,9 +1002,112 @@ test('pagestore_pgdata_format_fixture',
   pagestore_harness_python,
   args: [files('harness/pagestore_pgdata_fixture.py'),
          '--check', meson.current_source_dir() / 'fixtures' / 'pgdata-artifacts',
+         meson.current_source_dir() / 'fixtures' / 'pgdata-artifacts-pg18',
          '--format-tool', pagestore_format_versions],
   depends: [pagestore_format_versions],
   suite: ['pagestore'],
+  timeout: 60,
+)
+endif
+# Layer 2 persisted-format fuzzing (contrib/pagestore/fuzz/): byte-level
+# fuzzing of every file kind a store directory persists (layers.manifest,
+# forkmeta and its snapshots, image layers, seg_* page segments, the WAL and
+# WAL-index catalogs and their snapshots, retention/timeline/frontier
+# records, the shard-count file), asserting a corrupt or truncated file
+# either fails ps_core_open() cleanly or opens and serves reads without an
+# ASan/UBSan error, a hang, or unbounded memory growth.  The instrumented
+# libFuzzer+ASan+UBSan binary is built out-of-band by fuzz/build.sh (a clang
+# with libFuzzer support, not part of this build); what runs here is the
+# non-instrumented replay driver (fuzz_standalone_driver.c) over the
+# checked-in corpus, a plain-compiler regression check that known-good
+# inputs still don't crash, so a clang+libFuzzer toolchain is not required
+# to exercise this in CI.  Confirmed findings live under
+# fuzz/known-crashes/<target>/ and are deliberately not replayed here --
+# see fuzz/run_fuzz.sh's header for how to reproduce and triage those.
+pagestore_format_fuzz_replay = executable('pagestore_format_fuzz_replay',
+  files('pagestore_core.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c', 'pagestore_wal_segment.c',
+        'pagestore_walidx_prune.c', 'pagestore_walidx_snapshot.c',
+        'pagestore_forkmeta_prune.c', 'pagestore_forkmeta_snapshot.c',
+        'pagestore_fault.c', 'fuzz/fuzz_common.c', 'fuzz/fuzz_crc_fixup.c',
+        'fuzz/fuzz_standalone_driver.c'),
+  include_directories: include_directories('.'),
+  c_args: ['-DPS_FUZZ_FIXTURE_TGZ="' +
+           (meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline' / 'store.tar.gz') +
+           '"'] + pagestore_cassert_c_args,
+  dependencies: [dependency('threads')],
+  install: false,
+)
+foreach fuzz_target : [
+  'manifest', 'forkmeta', 'forkmeta_snapshot_manifest',
+  'forkmeta_snapshot_checkpoint', 'forkmeta_snapshot_tail', 'image_layer',
+  'page_frontier', 'page_segment', 'retention_meta', 'retention_state',
+  'store_config', 'timelines', 'wal_log', 'wal_store_identity', 'wal_segment',
+  'walidx_frontier', 'walidx_log_epoch', 'walidx_log_legacy',
+  'walidx_watermark', 'walidx_snapshot_manifest', 'walidx_snapshot_shard',
+]
+  test('pagestore_format_fuzz_replay_' + fuzz_target,
+    pagestore_format_fuzz_replay,
+    args: [fuzz_target, meson.current_source_dir() / 'fuzz' / 'corpus' / fuzz_target],
+    suite: ['pagestore', 'pagestore-fuzz'],
+    timeout: 60,
+  )
+endforeach
+test('pagestore_fuzz_runner_regressions',
+  find_program(meson.current_source_dir() / 'fuzz' / 'tests' /
+               'check_runner_regression.sh'),
+  suite: ['pagestore', 'pagestore-fuzz'],
+  timeout: 30,
+)
+# PR #303 round 7: three straight rounds of manually reading each target's
+# product loader against its fuzz_crc_fixup.c handling (fuzz/FIXUP_GATES.md)
+# still missed real gates Codex's review found. gate_sweep.c (fuzz/tests/)
+# replaces that manual reading with brute force wherever brute force is
+# cheap enough to run in a regression test: for every target, it flips
+# every byte in the first 256 bytes of the pristine fixture file two ways,
+# runs the real ps_fuzz_crc_fixup() and ps_core_open(), and fails if any
+# offset newly rejects a fixed-up file the pristine one opens and is not on
+# the reviewed (b)/(c) allowlist (gate_sweep_allowlist.txt's own header
+# comment explains that format and the classification scheme). See
+# FIXUP_GATES.md for how to add a fixup-side fix (class (a)) versus
+# document a new allowlist entry (class (b)/(c)) when this fails.
+pagestore_gate_sweep = executable('pagestore_gate_sweep',
+  files('pagestore_core.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c', 'pagestore_wal_segment.c',
+        'pagestore_walidx_prune.c', 'pagestore_walidx_snapshot.c',
+        'pagestore_forkmeta_prune.c', 'pagestore_forkmeta_snapshot.c',
+        'pagestore_fault.c', 'fuzz/fuzz_common.c', 'fuzz/fuzz_crc_fixup.c',
+        'fuzz/tests/gate_sweep.c'),
+  include_directories: include_directories('.', 'fuzz'),
+  c_args: ['-DPS_FUZZ_FIXTURE_TGZ="' +
+           (meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline' / 'store.tar.gz') +
+           '"'] + pagestore_cassert_c_args,
+  dependencies: [dependency('threads')],
+  install: false,
+)
+# Neither this binary nor pagestore_format_fuzz_replay above wraps
+# fsync() (only fuzz/build.sh's instrumented libFuzzer binary does, via
+# fuzz_nosync.c) -- each of this tool's ps_core_open()/close() cycles pays
+# a real fsync(), fine at the handful of corpus files each replay test
+# above runs but not at the ~3800 (offset, mask) pairs a *full* 256-byte/
+# 2-mask sweep tries per run. Args 3/4 below cap the wired regression run
+# to one mask over the first 64 bytes of each target (still every fixed
+# header this file's fixups know about, just not several records deep of
+# every record-structured format) so it finishes in seconds even under
+# meson's own parallel test load; rerun with no such cap (see
+# FIXUP_GATES.md) for the full audit by hand.
+# The fixture stores native little-endian structures.
+if host_machine.endian() == 'little'
+test('pagestore_gate_sweep',
+  pagestore_gate_sweep,
+  args: ['check',
+         meson.current_source_dir() / 'fuzz' / 'tests' / 'gate_sweep_allowlist.txt',
+         meson.current_source_dir(), '64', '1'],
+  suite: ['pagestore', 'pagestore-fuzz'],
   timeout: 60,
 )
 endif
@@ -899,3 +1158,21 @@ foreach prune_fault_scenario : [
     timeout: 90,
   )
 endforeach
+pagestore_p5_test = executable('pagestore_p5_test',
+  files('pagestore_p5_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  c_args: pagestore_cassert_c_args,
+  install: false,
+)
+test('pagestore_p5',
+  pagestore_p5_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)

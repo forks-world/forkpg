@@ -38,6 +38,12 @@
   {
     "family": "forkmeta",
     "artifact": "forkmeta record",
+    "magic": "0x344d4b46",
+    "version": 4
+  },
+  {
+    "family": "forkmeta",
+    "artifact": "forkmeta record (accepted legacy)",
     "magic": "0x334d4b46",
     "version": 3
   },
@@ -51,7 +57,7 @@
     "family": "forkmeta_snapshot",
     "artifact": "forkmeta checkpoint/tail payload",
     "magic": "0x31534d46",
-    "version": 1
+    "version": 2
   },
   {
     "family": "forkmeta_snapshot",
@@ -195,13 +201,13 @@
     "family": "retention",
     "artifact": "retention.meta record",
     "magic": "0x4e544552",
-    "version": 2
+    "version": 3
   },
   {
     "family": "retention",
     "artifact": "retention.state",
     "magic": "0x53544552",
-    "version": 2
+    "version": 3
   },
   {
     "family": "slru_mirror",
@@ -249,7 +255,7 @@
     "family": "timelines",
     "artifact": "timelines record",
     "magic": "0x324d4c54",
-    "version": 2
+    "version": 3
   },
   {
     "family": "wal_log",
@@ -285,7 +291,7 @@
     "family": "walidx_log",
     "artifact": "walidx_<tl>_<shard> progress record",
     "magic": "0x57495047",
-    "version": 0
+    "version": 2
   },
   {
     "family": "walidx_log",
@@ -297,7 +303,7 @@
     "family": "walidx_snapshot",
     "artifact": "walidx snapshot shard payload",
     "magic": "0x44534957",
-    "version": 3
+    "version": 4
   },
   {
     "family": "walidx_snapshot",

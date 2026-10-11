@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "posix-timeline-delete-holes",
-  "role": "current",
+  "role": "legacy",
   "workload": "fixture",
   "daemon_args": [
     "--page-size",

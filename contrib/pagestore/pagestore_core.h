@@ -11,7 +11,7 @@
  * through the PsStorage interface.
  *
  * Seam: ps_handle_meta() handles every request that is not page byte I/O; the
- * four byte-I/O ops are done by each frontend using read_through()/read_version()
+ * four byte-I/O ops are done by each frontend using read_through_checked()/read_version()
  * (reads) and append_page()/fork_grow() (writes).
  *
  *-------------------------------------------------------------------------
@@ -159,6 +159,7 @@ extern void ps_backpressure_record_wait4(uint64_t page_wait_ns,
 extern int ps_admission_write_lock(void);
 extern void ps_admission_write_unlock(void);
 extern uint64_t ps_admission_barrier(void);
+extern uint64_t ps_admission_barrier_register(uint32_t timeline, uint64_t lsn);
 extern int ps_backpressure_configure(uint64_t page_high_water,
 									 uint64_t page_catchup,
 										 uint64_t wal_high_water,
@@ -195,6 +196,27 @@ extern int ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 /* Test-only: total scan/bisection steps taken by the fork-event index and
  * its fallback loops on this thread since the process started. */
 extern uint64_t ps_test_fork_event_scan_steps(void);
+/* Phase P1 (BRANCH_SNAPSHOT_SEQ_CAP.md S9.3) differential test: random page
+ * versions and fork-event histories, checked against frozen pre-P1
+ * references at PS_SEQ_UNBOUNDED (must be bit-identical) and against an
+ * independent literal-S1.3/S3.2-rule brute force with finite caps.  Returns
+ * 0 on success or the 1-based number of the first failed check. */
+extern int ps_test_viewcap_differential(uint64_t seed, uint32_t niter);
+/* Phase P1 differential-test extension for artifact reads (Codex finding
+ * 4104937134): checks artifact_visible() against brute_page_select() at
+ * PS_SEQ_UNBOUNDED and at finite caps, over a real pre-first-BEGIN
+ * ("legacy fallback") artifact history the caller has already written on
+ * an open store (see the function body in pagestore_core.c for the exact
+ * arrangement it requires).  Returns 0 on success or the 1-based number of
+ * the first failed check. */
+extern int ps_test_artifact_viewcap_property(uint32_t tl, const PsKey *key,
+											 uint32_t block,
+											 uint64_t lsn_rewrite,
+											 uint64_t lsn_first);
+/* Test-only: PS_ADM_F_META/UNSTAMPED classification for an exact event,
+ * or -1 when it is absent. */
+extern int ps_test_fork_event_flags(uint32_t timeline, const PsKey *key,
+								  uint64_t admission_seq);
 /* Test-only: event counts for one fork (0 if not found).  nmarkers counts
  * marker_kind != 0, ninert counts kind > FEV_DEAD (never activated). */
 extern int ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
@@ -204,6 +226,22 @@ extern int ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
  * returns 1 if a frontier has been published for this timeline's current
  * incarnation, 0 if not (both out values are 0 in that case). */
 extern int ps_test_page_frontier(uint32_t timeline, uint64_t *lsn, uint64_t *seq);
+/* Test-only: P2 plan-epoch (design doc S3.7(7)).  ps_test_plan_epoch()
+ * samples the current fork_event_admit_seq epoch for a timeline, exactly as
+ * a real planner would before doing its analysis.  ps_test_plan_epoch_bump()
+ * forces the epoch forward without a real fork-event admission, so a test
+ * can deterministically inject "an admission raced the plan" between a
+ * capture and a later validation. */
+extern uint64_t ps_test_plan_epoch(uint32_t timeline);
+extern void ps_test_plan_epoch_bump(uint32_t timeline, uint64_t seq);
+extern int ps_test_plan_epoch_validate(uint32_t timeline, uint64_t captured);
+/* Test-only: design doc S3.7(7) rev 3.  This is now a pure soak-report
+ * statistic (no gate): the count of walidx_snapshot_publish_one() attempts
+ * that observed at least one fork-event/PAGE-GROW admission on the
+ * candidate timeline between sampling the plan epoch and the generation
+ * switch.  Late admissions of this kind are routine and never block or
+ * invalidate publication -- see the S1-S4 monotonicity argument. */
+extern uint64_t ps_test_walidx_plan_epoch_aborts(void);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_reclaim_due(uint32_t timeline);
 extern uint32_t ps_test_wal_reclaim_watch_count(uint32_t timeline);
@@ -330,6 +368,18 @@ extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);
 extern int	ps_handle_meta(PsChannel *ch);
 
 /*
+ * True if this request's client-supplied nblocks/datalen fits within one
+ * channel's fixed PS_IO_UNIT data[] buffer, so the caller may safely index
+ * ch->data by it.  Both frontends (POSIX and SPDK) and this file's own
+ * WAL_APPEND/WAL_READ handling in ps_handle_meta() route their bounds check
+ * through this single helper -- see its definition in pagestore_core.c for
+ * which opcodes it covers and why the others need no check.  A request that
+ * does not fit must be refused (PS_STATUS_ERROR) without touching ch->data,
+ * never clamped and served short.
+ */
+extern int	ps_request_payload_fits(const PsChannel *ch);
+
+/*
  * Page byte-I/O helpers used by the frontends' byte-op handlers.  'version' is the
  * caller-supplied version LSN for an SLRU-class write (the dirtying/cutoff WAL LSN,
  * stored verbatim so it stays comparable to a branch cutoff); it is ignored for
@@ -339,6 +389,10 @@ extern int	ps_handle_meta(PsChannel *ch);
 extern int	append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 						const unsigned char *page, uint64_t version,
 						uint64_t *out_admission_seq);
+/* Checked index lookup: 1 found, 0 absent, -1 error (including WAL-less ancestry).
+ * Byte-serving frontends must use this form rather than zero-fill on NULL. */
+extern int read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
+							   uint64_t read_lsn, uint64_t read_seq, PageVer **out);
 extern PageVer *read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 							 uint64_t read_lsn, uint64_t read_seq);
 extern int	read_version(const PageVer *v, unsigned char *out);
@@ -348,7 +402,8 @@ extern int	wal_retain_floor(uint32_t timeline, uint64_t *floor_out);
  * Resolve a read into out (page_size bytes), serving from memtable / image
  * layers with a segment fallback.  Returns 1 if found (out filled), 0 if the
  * page is unwritten, -1 if an authoritative stored version cannot be read, and
- * -2 when the requested capped horizon has been reclaimed.
+ * -2 when the requested capped horizon has been reclaimed.  WAL-less ancestry
+ * is an error (-1), not a reclaimed-history miss.
  */
 extern int	read_resolve_version(uint32_t timeline, const PsKey *key,
 								 uint32_t block, uint64_t read_lsn,
@@ -385,5 +440,10 @@ extern int ps_timeline_request_allowed(uint32_t timeline,
 /* Shard index that will be touched for 'key' (klass-aware); the frontend takes
  * the per-shard lock from the final request key, not a client-supplied shard. */
 extern uint32_t ps_shard_of(const PsKey *key);
+
+
+/* Exercise recovery sentinel handling without forging durable page records. */
+extern void ps_test_admission_seq_observe(uint64_t seq);
+extern int ps_test_walidx_snapshot_horizon_header(uint32_t version, uint64_t seq);
 
 #endif							/* PAGESTORE_CORE_H */

@@ -119,6 +119,29 @@ this revision before the final MVP status update.
    fixtures. The existing workflow requires a matching store fixture on
    `pagestore`, but permits a missing build match on release branches; a release
    acceptance run must require that match rather than accept the warning.
+   The supported set is PG **15–19** (`contrib/pagestore/release-branches.json`
+   is the source of truth for each major's status and sync state); PG 18 is
+   the first candidate target (its manifest `status` stays `"planned"` until
+   the freeze in P6 actually promotes it), frozen on its own tagged upstream
+   release rather than a moving stable-branch head. `branchdb_13` and
+   `branchdb_14` are kept for reference only — 13 is already past upstream
+   EOL and 14 reaches EOL 2026-11-12, both need a materially different core
+   patch series (pre-17 SLRU, no `xlogrecovery.c` split before 15, no meson
+   before 16) — and carry **no release evidence**; do not advertise them as
+   supported. The PG18 compatibility guards and SLRU build/startup fixes
+   now pass a full local PG18 build and integration run against its core
+   series. `PG_MAJOR_PORTABILITY.md` records the remaining fail-closed
+   limitations; release-branch synchronization is still required to freeze
+   that verified contrib tree on the release core.
+   The release-fixture follow-up recaptures `pgdata-artifacts` under PG19
+   and adds `pgdata-artifacts-pg18`, both recording `pg_identity` from the
+   actual capturing build. A matching PG18 store fixture is also checked in
+   as `posix-timeline-delete-holes-checkpoint-fence-v3-pg18`. Ordinary and
+   candidate-acceptance workflows supply the compiled payload identity to
+   the PGDATA checker, so their `--require-build-match` gate now rejects a
+   fixture set with no current capture for the checking major. These
+   fixtures establish loader coverage; they do not freeze a candidate or
+   replace its endurance evidence.
 
 The two artifact lifecycle gaps identified in the reviewed baseline are
 addressed by the follow-up described in [`ARTIFACT_LIFECYCLE.md`](ARTIFACT_LIFECYCLE.md):
@@ -194,6 +217,43 @@ the complete relevant CI suites, golden/branch boot scenarios, multi-seed soak
 and V1–V3 against that candidate. Capture matching PostgreSQL payload fixtures
 and require `--require-build-match` for the store fixture check. Validate
 supported older formats and refusal of unsupported ones.
+
+The supported majors are **15–19**, tracked in
+`contrib/pagestore/release-branches.json`; PG **18** (`REL_18_6` plus the
+curated core patch series and a byte-identical `contrib/pagestore`, built and
+synced with `scripts/branchdb-sync.sh`) is the first candidate — its on-disk
+identity is frozen for the life of the branch, unlike PG 19, which has no
+GA/RC tag yet and would produce disposable fixtures. `branchdb_13` and
+`branchdb_14` are excluded from the supported set and carry no release
+evidence; do not run or advertise V1–V4 against them.
+
+Release branches now get the same CI lanes `pagestore` gets, not a warned
+subset of them. `pagestore-test.yml`'s in-engine store- and pgdata-fixture
+checks pass `--require-build-match` whenever the ref (or, for a pull
+request, its base) is `pagestore`, or is a `branchdb_<N>` branch whose major
+`release-branches.json` does not list as unsupported — a small preparatory
+step (`Determine whether this ref's PostgreSQL major requires the build
+match`) reads the manifest via `harness/pagestore_release_branches.py` so
+that per-major decision is data, not a second hardcoded branch list next to
+the existing `branchdb_13`/`branchdb_14` scenario skips. The pgdata step also
+supplies `--postgres-payload-identity-tool`, enabling the same matching-build gate
+as the store check. `pagestore-nightly.yml` gained a `ref`
+dispatch input (branch, tag or SHA) so an exact commit can be soaked on
+demand, and a weekly schedule that fans the same soak out over every branch
+`release-branches.json` currently marks `candidate` or `released` (empty
+today: no major has been promoted past `planned` yet).
+
+The new `pagestore-release-acceptance.yml` (`contrib/pagestore/RELEASE_ACCEPTANCE.md`)
+is what actually executes this gate: triggered by a `pagestore-candidate-*`
+tag, it runs both CI lanes against that exact commit with
+`--require-build-match` unconditional, the golden and branch-boot scenarios,
+a 3-seed x 8000-round soak, and bundles all of it — JSON reports, integration
+logs, fixture-check output, `pagestore_control_restore --payload-identity`,
+`pagestore_format_versions`, and `git describe` — into one
+`evidence-<tag>.tar.gz` retained 90 days. These workflow changes are staged
+to be cherry-picked onto `branchdb_18-rc` alongside the rest of its sync, so
+the release branch itself carries working CI rather than relying on
+`pagestore`'s copy.
 
 On a clean deployment, follow the published installation and branch-creation
 instructions. For production qualification, also rehearse the documented
@@ -605,6 +665,53 @@ and are now resolved.
   admission gate -- specifically to exercise the theoretical gap) in
   `pagestore_forkmeta_cutover_test.c`.
 
+## Resolved: a superseded automatic reader snapshot tripped the R5-2 refusal check
+
+`integration_test.sh` failed intermittently (four CI occurrences, one local)
+on its final R5-2 assertion with one daemon line of the form `artifact BEGIN
+refused: reason=generation LSN below the page-reclaimed frontier and unfenced
+timeline=0 key=(klass=6,spc=0,db=0,rel=1,...)`: the DATA object of the
+*automatic* checkpoint reader snapshot, at a checkpoint's redo.
+
+Mechanism: the control ship enqueues the automatic job for checkpoint B after
+B's note is durable and B's admission fence has ended; the reader snapshot
+worker builds it asynchronously (XID scan, WAL scan to `scan_end`) and only
+then BEGINs.  If checkpoint C's note becomes durable meanwhile, the
+direct-write compute's page-history cutoff (`control_checkpoint_cutoff()`)
+moves to C's redo, maintenance publishes a page-reclaimed frontier past B's
+redo, and B's BEGIN is -- correctly -- refused as unfenced: nothing pins B,
+so no reader could ever pin that generation either.  Section 28 (two
+back-to-back `CHECKPOINT`s with no page-history pin) hit the window by
+timing.
+
+Fix: the refusal is right; reporting it as a refused operation was not.  The
+worker publishes in an automatic-generation mode
+(`pagestore_localsvc_artifact_supersedable()`): its artifact requests carry
+`PS_ARTIFACT_REQ_SUPERSEDABLE` in `parent_timeline`, the daemon logs an
+unfenced refusal of such a request as `artifact ... superseded` instead of
+`refused`, and the worker skips the job with a LOG line rather than a
+WARNING.  Every other refusal, and every refusal of an unmarked (for example
+controller-published exact-R) request, is reported exactly as before; no
+persisted format changes and no `PS_SHM_VERSION` bump (the field is unused
+for artifact operations, and an unmarked request keeps the old behaviour).
+Liveness: the newest job's redo is the newest durable note's redo, which is
+the cutoff, so the newest job is never unfenced; a superseded job is always
+followed by the newer job that superseded it.  Only a sustained checkpoint
+rate faster than one build can keep every job superseded -- and a generation
+built in that regime could not be pinned by any reader anyway.  Fencing each
+queued job until it commits was considered and rejected for that reason: it
+would add a leak-prone in-memory hold (crashed worker, restarted daemon,
+overwritten pending job) only to publish generations whose page history is
+reclaimed the moment the hold is released.  Consumers that need the history
+pin it first, as section 31 does.
+
+Test: section 28c holds the worker before its first BEGIN
+(`PAGESTORE_TEST_READER_SNAPSHOT_HOLD`), checkpoints until the store's durable
+timeline-0 page frontier (`page-prune.frontiers`) passes the held redo, then
+releases it and requires the `superseded` outcome, no new refusal line, and
+publication of the newest checkpoint's snapshot.  Before the fix it fails
+deterministically (`got 'failed'` and one new refusal line).
+
 ## Resolved: pruned ordered marker rescanned after a timeline-delete rewrite (F3)
 
 **Root cause.** The deletion rewrite moved bytes and retreated (rebased) the
@@ -691,7 +798,45 @@ data loss
 irreversible: the records after an unmatched ordered record are acknowledged
 data a root fix is meant to recover, and today they are only *logically*
 discarded (unreachable through the index, but the bytes are still there for
-that fix to find); truncating them would foreclose that.
+that fix to find); truncating them would foreclose that. Timeline deletion
+itself, however, no longer needs that durable boundary at all (L6 below):
+`page_cleanup_tombstone_segment()`'s pass 1 re-derives the same
+reachable-region boundary `recover()` would on any later open, in memory, on
+every run, exactly the way `recover()` itself re-derives retirement on every
+open described in this paragraph -- adding no new durability requirement and
+no new assumption beyond the end-of-log parse rule recovery already trusts.
+
+**Invariant I4 -- the reachable region** (added by L6 below, stated here
+because it is the same "retirement is logical, not physical" fact this
+paragraph documents, applied to timeline-delete's own segment scan): for any
+segment, the reachable region is the prefix `[0, R)` where `R` is the first
+offset *at or after* `W` at which `recover()`'s end-of-log rule stops --
+zero magic, a torn (non-`page_size`) record, or a body/trailer field that
+runs past the available bytes -- further bounded for the *current* segment
+by the append cursor (`R <= cur_off` when `cur_off < segment_size`; a sealed
+or retired segment has no such bound, exactly as this paragraph already
+describes for `recover()`'s own rescans). `W` is `recover()`'s own starting
+offset for this segment: `flush_watermark.seg_off` when this segment is the
+one the durable flush watermark names, `0` for every other segment.
+
+The qualifier matters because `recover()` does not start every segment's
+scan at `0` -- it starts the watermark segment's scan at `W`, since segments
+are not synced before `ps_manifest_set_flush_watermark()` durably records
+that cursor, so a lost header sector *below* `W` (garbage that predates the
+watermark, e.g. a sector a crash tore before the watermark itself made it to
+disk) says nothing about what `recover()` would find at or after `W` --
+`recover()` never even looks below `W` on this segment. An end-of-log shape
+below `W` is therefore not a real end of the reachable region: pass 1 must
+resume its scan at `W` (always a record boundary -- it is a previously
+recorded flush cursor) rather than stopping there, or it would leave live,
+`recover()`-replayable target records at/after `W` untouched while reporting
+the deletion complete. See the "Power-loss reordering caveat" below for what
+*is* still true about bytes below `W`. Every record the next open's
+`recover()` replays *directly from this segment* lies inside `[W, R)`
+(an earlier open, before `W` last advanced, could have replayed records now
+below `W` from this same segment -- that history is exactly what the
+caveat below covers); bytes at or beyond `R` are unreachable through any
+index and are exactly the bytes a later append is free to overwrite.
 
 **Evidence before the fix** (regression tests, `pagestore_forkmeta_cutover_test.c`,
 against the unmodified `page_cleanup_rewrite_segment()`): `test_deletion_filtered_forkmeta`
@@ -746,18 +891,24 @@ exist in a store written before this fix, and a rebased watermark left by a
 pre-fix deletion is simply a valid (low, never retreating further) watermark
 to the new daemon.
 
-**SPDK is unaffected and remains unable to complete a timeline deletion,
-unchanged by this PR.** `timeline_delete_page_cleanup_one()` and
+**SPDK is unaffected by this PR; the L6 fix below changes *why* it stays out
+of scope.** `timeline_delete_page_cleanup_one()` and
 `timeline_delete_publish_ready()` gate on `ps_storage->seg_write`, which SPDK
 does implement, so this PR removes the previous (already stale, since
 tombstoning never called `seg_rewrite`) blanket refusal on that backend.
-Tombstoning's pass 1 still cannot get past its very first segment there:
 `spdk_seg_size()` reports the backend's fixed `g_segsize` for every segment
-regardless of how much of it actually holds records, so the validation scan
-runs straight into the unwritten tail as if it were a torn record and fails
-closed as malformed, forever retryable and never destructive. This is a
-pre-existing SPDK gap, not introduced or widened by this PR, and SPDK is out
-of the MVP deployment boundary per D6 in `MVP_COMPLETION_PLAN.md`.
+regardless of how much of it actually holds records, so tombstoning's pass 1
+used to run straight into the unwritten tail as if it were a torn record and
+fail closed as malformed, forever retryable and never destructive -- a
+structural blocker to completing SPDK deletion at all. As of L6 below, pass 1
+treats a zero-padded tail as end of log exactly where `recover()` already
+does (invariant I4), so that structural blocker is gone; SPDK deletion is
+merely **unvalidated**, not still-broken, and stays out of the MVP deployment
+boundary per D6 in `MVP_COMPLETION_PLAN.md` for a different reason: there is
+no SPDK lane exercising this path, and SPDK's `seg_write` goes through the
+buffered `curbuf`/`iobuf` path (`storage_spdk.c`) with unverified `sync`
+semantics for an in-place hole write. A follow-up SPDK test is the first step
+toward lifting D6, not a further core-code change.
 
 **What is not yet fixed (follow-up, not blocking), and how little evidence
 of it survives.** A store that already underwent a timeline deletion before
@@ -791,14 +942,189 @@ for pre-fix stores in `fork_event_adopt_orphaned_seg()`/`_commit_seg()`'s
 header comments); do not remove that adoption code before a release that no
 longer supports opening a store written by a pre-fix daemon.
 
-## Resolved: linear event scans over inert commit markers (F5)
+## Resolved: torn-tail garbage stalled a timeline deletion (L6)
+
+**Mechanism.** `page_cleanup_tombstone_segment()`'s pass 1 validated the
+*whole* segment file `[0, bytes)` and failed the entire pass closed -- zero
+writes, but also zero progress, forever -- on any record it could not fully
+parse: a short header, an unknown magic (including plain zero), a `len` not
+equal to `page_size`, a body running past the end of the file, or a
+bound/admission trailer field it could not read. `recover()` parses the same
+bytes with a different rule: it treats exactly those shapes as *end of log*
+(`break`, not a failure) and sets the shard's append cursor from wherever it
+stopped -- `cur_off = segment_size` for a retired segment, `cur_off = off`
+otherwise. Nothing about retirement is physical (see the "Retirement is
+logical, not physical" paragraph above): recovery never truncates a segment
+file, so any bytes written after a torn append, a sealed segment's rollover
+point, or (on SPDK) the unwritten zero-padded tail past the last real record
+stay on disk forever, past the point recovery ever reads again. Pass 1 met
+those same bytes and, instead of also treating them as end of log, failed
+closed on them every maintenance turn -- indefinitely, since nothing ever
+truncates or overwrites them either. The failure was silent:
+`timeline_delete_page_cleanup_one()` dropped a `-1` return from the scan on
+the floor with only a code comment ("must not prevent another deleting
+timeline from being attempted"), so a stalled deletion sat in `DELETING`
+with no diagnostic at all before L2 below.
+
+**Fail-before evidence** (`test_deleting_timeline_page_cleanup_torn_tail`,
+folding in the standalone `torn_test.c` reproduction): target block 0,
+sibling block 1, target block 2, each flushed; clean close; a
+complete-looking `SEG_ADMISSION` header for the sibling timeline plus 100
+body bytes (of a claimed `page_size`) appended directly to the segment file;
+reopen (`recover()` calls this end of log, `cur_off` stops at the valid
+boundary); `BEGIN_DELETE` the target; 48 maintenance turns later the
+timeline is still `DELETING`, `count_segment_holes() == 0`, and the target
+block is still served -- the deletion never completes and nothing is
+damaged. The sealed-segment (`_sealed_torn_tail`), retired-sentinel
+(`_retired_torn_tail`), zero-padded-tail (`_zero_tail`), and real-crash
+(`test_timeline_delete_torn_tail_crash_matrix`,
+`pagestore_forkmeta_cutover_test.c`) variants all reproduce the same stall
+before this fix.
+
+**Invariant I4 -- the reachable region** is stated in full where it is
+proven, next to the "Retirement is logical, not physical" paragraph above
+(the same fact -- retirement is derived on every open, not made durable --
+applied to timeline-delete's own scan). In short: pass 1 now validates only
+`[0, R)`, where `R` is where `recover()`'s own end-of-log rule would stop *at
+or after `W`* (the watermark-segment resume rule, spelled out where I4 is
+stated), further bounded by the append cursor for the segment currently
+being appended to. The rule table, side by side with `recover()`'s
+equivalent check (`pagestore_core.c`, `recover()`, line references are for
+this PR's tree). Every "unreadable" row below means the `seg_read()` call
+for that specific field *succeeded* but the field itself was short/zero;
+an outright `seg_read()` failure is its own row, listed once at the end,
+because it is never a parse decision on either side:
+
+| Shape encountered inside pass 1's scan window | pass 1 (after this PR) | `recover()` |
+| --- | --- | --- |
+| Fewer than `sizeof(SegRecHdr)` bytes left | end of log (`break`, or resume at `W` -- see below) | end of log (short read) |
+| Magic word `0` | end of log (`break`, or resume at `W`) | end of log (`break`, magic 0 check) |
+| Nonzero, unrecognized magic | **fail closed** (`goto fail_malformed`) | **fail closed** (`goto fail`, "incompatible record magic") |
+| Hole magic with `len != page_size` | **fail closed** (`goto fail_malformed`) | **fail closed** (`goto fail`, hole len check) |
+| Non-hole record with `len != page_size` | end of log (`break`, or resume at `W`) | end of log (`break`) |
+| Record body runs past the scan window / file | end of log (`break`, or resume at `W`) | end of log (`break`) |
+| Bound trailer read succeeds but `order_id == 0` | end of log (`break`, or resume at `W`) | end of log (`break`) |
+| Admission trailer read succeeds but `admission_seq == 0` | end of log (`break`, or resume at `W`) | end of log (`break`) |
+| Complete record naming `timeline >= MAX_TIMELINES` | **fail closed** (`goto fail_malformed`) | (not reachable: `recover()` has no such record to name a target) |
+| `ps_storage->seg_read()` itself fails (header, bound trailer, or admission trailer) | **fail closed**, plain `goto fail` -- no "malformed record" diagnostic (L3/M2: it is an I/O failure, not a parse decision) | end of log (`break` -- `recover()` optimistically treats an unreadable header as end of log; pass 1 does not, since misreading a real I/O error as "nothing more was ever here" for a *delete* is the wrong direction to fail) |
+
+Every "end of log" row above is qualified "or resume at `W`": an
+end-of-log-shaped stumble *below* the watermark `W` does not end pass 1's
+scan -- it resumes at `W` and keeps going, per the watermark-segment rule in
+invariant I4 above. Only an end-of-log shape found at or after `W` is a real
+end of the reachable region. (This distinction does not apply to the two
+"fail closed" outcomes: corruption inside the reachable region fails the
+pass regardless of where it sits relative to `W`, because `[W, R)` -- the
+part `recover()` actually replays from this segment -- is always scanned in
+full before pass 1 can succeed.)
+
+Everything pass 1 still fails closed on is corruption of bytes *inside* the
+reachable region -- the same bytes `recover()` already trusted enough to
+replay or would trust on this segment's own terms. Everything it now treats
+as end of log is a shape `recover()` already agreed was never indexed by
+anyone (from `W` onward; see the caveat below for bytes below `W`).
+`page_cleanup_tombstone_segment()`'s two-pass, all-or-nothing contract is
+unchanged: a `goto fail`/`goto fail_malformed` anywhere still happens before
+pass 2 ever writes a byte, so a segment that is genuinely malformed inside
+`[0, R)` still fails the whole pass closed and stays retryable, writing
+nothing.
+
+**No hole write ever lands at or beyond the cursor.** Pass 2 carries a
+cassert-only assertion, `seg != s->cur_seg || s->cur_off == segment_size ||
+holes[i].off + holes[i].header_size + holes[i].len <= s->cur_off`, immediately
+before each hole write: for the segment currently being appended to, every
+hole pass 1 collected must lie entirely below the cursor. This is provable
+from pass 1's own scan bound (`limit`), not merely hoped for; the assertion
+exists to catch a future change to pass 1 that widens its scan window
+without updating this proof.
+
+**Power-loss reordering caveat.** Segments are not fsynced before
+`ps_manifest_set_flush_watermark()` durably records the flush cursor `W`
+(`ps_storage->sync()` runs only at shutdown and on an explicit sync
+request), so a crash can leave a record's header sector lost *below* `W`
+while the pages and the watermark that make `W` durable both survived. Two
+distinct offsets matter here, and they resolve differently:
+
+- **Below `W`.** Any record here -- whether it parses cleanly or looks like
+  an end-of-log shape -- is not what `recover()` replays from this segment
+  on the next open: `recover()` never scans below `W` on the watermark
+  segment at all. If a target record happens to sit below `W`, it was
+  already replayed during an *earlier* open (before the watermark advanced
+  past it) and is served today from the layer that earlier flush produced,
+  not from a fresh segment scan. Pass 1 still walks through this range from
+  `off = 0` and still tombstones a parseable target record it finds there
+  (there is no reason not to -- the write is safe and only helps segment
+  GC), but an end-of-log shape found below `W` is exactly the case M1 fixed:
+  it must not be mistaken for the true end of the reachable region, or a
+  live record at/after `W` would go untombstoned while pass 1 reports
+  success. Bytes below `W` that pass 1's scan cannot get past (an
+  end-of-log shape it resumes past at `W`, or, in the very rare case a
+  torn-below-`W` region also contains genuine corruption pass 1 does not
+  visit because it jumped ahead) are "logically unreachable, physically
+  retained" -- exactly the class the "Retirement is logical, not physical"
+  paragraph above already accepts for retired segment tails; they wait for
+  segment GC, same as before this PR.
+- **At or after `W`.** This is the region `recover()` actually replays
+  directly from the segment on every open, and pass 1's reachable region
+  `[W, R)` covers it completely: any target record here is found and
+  tombstoned, and any corruption here fails pass 1 closed exactly as it
+  fails `recover()`'s own open. This is the region invariant I4 is about,
+  and M1 exists to guarantee pass 1 never reports success without having
+  scanned all of it.
+
+This is not a new gap L6 introduces -- it is the same "retirement is
+logical, not physical" fact this document already documents, restated for
+timeline-delete's own scan.
+
+**Diagnostic (L2).** A stalled deletion is no longer silent.
+`timeline_delete_page_cleanup_one()` now logs, once per distinct `(timeline,
+shard, seg, off, magic, len)` tuple (not once per maintenance turn):
+`pagestore_daemon: timeline %u deletion blocked: shard %u segment %d
+malformed record at offset %llu (magic %#x len %u) inside the reachable
+region; retrying each maintenance turn`. The tuple is filled by
+`page_cleanup_tombstone_segment()` only at an actual parse failure -- the
+`goto fail_malformed` sites in the rule table above (nonzero unknown magic,
+a hole with the wrong `len`, or a complete record naming an impossible
+timeline) -- never for a `seg_read()` I/O failure (L3/M2: those are a plain
+`goto fail`, skipping the tuple entirely) and never for an allocation or
+storage I/O failure during pass 2, none of which are a data problem and none
+of which get "malformed record" wording.
+
+**Contract guard, not a fail-before.** A malformed record genuinely *inside*
+the reachable region -- for example the target's sibling record's own magic
+word corrupted in place, below the append cursor -- must still fail pass 1
+closed exactly as before this PR;
+`test_deleting_timeline_page_cleanup_fail_closed` covers this (reworked to
+corrupt in place instead of appending past the cursor, since the latter is
+now the very case this PR fixes) and additionally asserts the L2 diagnostic
+above logs exactly once across 16 retried maintenance turns.
+`test_deleting_timeline_page_cleanup_garbage_beyond_cursor_is_ignored`
+carries the flipped case forward under an explicit name: the same 4 bytes of
+unknown-magic garbage installed exactly *at* the cursor (this repository's
+`test_deleting_timeline_page_cleanup_fail_closed` used to assert this stayed
+`DELETING` forever) now completes to `DELETED`, untouched.
+
+**Format/migration impact (D5): none.** No persisted record, magic, or field
+changed; the reachable-region rule is purely an in-memory scan bound derived
+from `cur_off` and the same end-of-log parser `recover()` already applies.
+Fixtures are unchanged and `pagestore_format_versions` is unchanged. An older
+daemon opening a store deleted by a daemon with this fix sees the same hole
+records as before (the #273/F3 D5 note above stands).
+
+**SPDK.** See the reworded SPDK paragraph in the F3 section above: the
+structural blocker (pass 1 running into SPDK's zero-padded tail and failing
+closed) is gone, but SPDK timeline deletion remains unvalidated, not
+newly supported, per D6.
+
+
+## Resolved: linear event scans over inert commit markers, and their per-lifetime memory bound (F5)
 
 Found during an earlier review. Every commit-class rewrite of a fork leaves
-one inert `FEV_SEG_GROW_BOUND`/`FEV_SEG_COMMIT_BOUND`-derived event in memory
-(still true after this fix: markers are loaded from the log/snapshot and, in
-this PR, still never compacted within a lifetime -- see the follow-up below);
+one inert `FEV_SEG_GROW_BOUND`/`FEV_SEG_COMMIT_BOUND`-derived event in memory;
 the snapshot builder drops a commit marker once its version is pruned, so the
-*durable* count is bounded by live versions. The cost was not memory (40
+*durable* count is bounded by live versions, and (design B, below) the
+*in-memory* count is now kept equal to it, once per cutover, instead of only
+at the next restart. The cost was not memory (40
 bytes/event) but algorithmic: `fork_event_activate_seg()`, both
 `fork_event_adopt_orphaned_*()` rules, and
 `fork_meta_snapshot_marker_present()` scanned a fork's event array linearly,
@@ -850,13 +1176,69 @@ fork) and 1641 events on the busiest fork (a growing table, already
 O(log N) reads even before this fix); `mvp_golden_test.sh` peaks at 2
 markers on one fork.
 
-No persisted-format change; the array's *contents* and order are unchanged,
-only how they are searched. Remaining follow-ups, deliberately out of this
-PR: (1) bound the in-memory array itself by compacting the inert markers a
-successful cutover just dropped from the durable snapshot (design B, next
-PR) -- until then the array is still never compacted within a lifetime; (2)
+No persisted-format change from the index (design A); the array's *contents*
+and order are unchanged, only how they are searched.
+
+### Design B: bounding the array per daemon lifetime
+
+The index above made every *lookup* O(log N), but the array itself still grew
+without bound within one daemon lifetime: a successful cutover already
+computes, per event, whether it survives into the new checkpoint/tail (the
+snapshot builder's per-entry loop), but the in-memory copy kept every event
+regardless -- "keep the in-memory chain conservative until the next restart"
+was the comment at the call site. Design B removes that gap: the builder's
+per-entry loop now also stamps a spare `ForkEvent.snapshot_dropped` byte (0 on
+every branch that emits the event into the checkpoint or tail, 1 on the
+`else continue;` branch that drops it), and
+`fork_event_compact_dropped_markers()`, called once right after a successful
+publish (under the same admission/shard/prune/map lock set that serialized
+the build), removes every event with `snapshot_dropped && kind > FEV_DEAD`
+(an inert marker that was never activated to a size event) from each fork's
+array in place, decrementing `nlegacy_seq` and rebuilding `def_idx` as it
+goes. Deleting forks (excluded from the build wholesale) and
+`preserve_survivors` generations (every record re-emitted, nothing flagged)
+are untouched by construction: neither ever gets the flag set to 1, so
+compaction is a no-op for them. Recovery-equivalent by construction: the
+events dropped from memory are exactly the events the durable checkpoint no
+longer carries, so the in-memory array after a live cutover equals what the
+next boot rebuilds from that checkpoint -- the merged invariant that a live
+operation's in-memory state must match recovery's (see `MVP_STATUS.md`).
+
+No persisted-format change. Tests (`pagestore_forkmeta_cutover_test.c`):
+`test_inert_markers_compacted_after_cutover` (12 live writes leave 11 inert
+markers in memory; after a reclaiming cutover the in-memory count drops to
+match the durable snapshot's, and a reopen's in-memory event/inert counts
+match the post-compaction in-memory counts exactly -- the recovery
+equivalence check; marker count is deliberately excluded from that
+comparison, see the test's own comment: an activated growth marker's
+`marker_kind` stays set in memory for the rest of the daemon lifetime by
+design, but the durable checkpoint record for it is an ordinary plain-GROW
+record with no marker identity, a pre-existing asymmetry design B does not
+touch; fails before this PR, since the in-memory count stayed at 11 forever
+in that process), `test_inert_markers_kept_when_retained` (no
+version reclaimed -> compaction is a no-op), `test_inert_markers_kept_on_preserve_survivors`
+(a deletion-forced generation with no provable operational cutoff -> every
+record re-emitted, compaction is a no-op), a `compact` phase added to the
+randomized index self-test (flags a random subset of a private fork's inert
+markers, runs the compaction routine, and cross-checks array order,
+`nlegacy_seq`, `def_idx`, and every surviving event's own fields including
+its `cached_*` triple against a pre-compaction copy), and
+`test_fork_event_index_periodic_cutover_bounded` (6 rounds of 30 WAL-less
+rewrites each to one fork's block 0, 180 writes total, each round ending in
+its own reclaiming cutover: the in-memory event count stays flat at 3 after
+every round with this PR; reverted, it grows round-by-round (31, 61, 91,
+121, 151, 181), tracking round * 30 + 1, unbounded in the number of rounds).
+`fev_bench K periodic` (same fixture and mechanism, K = 50,000 split into 10
+rounds instead) confirms the pattern at scale: max in-memory `nevents`
+across every round is 11 with this PR versus 50,001 (K + 1) reverted. `pagestore_forkmeta_crash_matrix_test` is the
+regression suite that matters most here: a crash between publish and the
+next open must see identical state with or without the in-memory compaction,
+and it does by construction (the durable side never changes), which that
+suite's 273 checks confirm stayed green.
+
+Remaining follow-ups, deliberately out of this PR: (1)
 `fork_meta_snapshot_marker_page_retained()`'s version-chain walk (design C,
-optional, only if a later profile shows it dominating); (3) `def_idx` for
+optional, only if a later profile shows it dominating); (2) `def_idx` for
 the remaining newest-first SET/DEAD linear scans
 (`fork_block_death_through()`, the walidx planner loops, the snapshot
 builder's per-entry loop) if they are ever shown to matter.

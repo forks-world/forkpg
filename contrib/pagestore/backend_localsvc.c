@@ -64,6 +64,9 @@ static int	localsvc_timeline = 0;
  */
 static char *localsvc_read_lsn_str = NULL;
 static uint64 localsvc_read_lsn = 0;
+/* Automatic-generation artifact mode; see pagestore_localsvc_artifact_supersedable(). */
+static bool localsvc_artifact_supersedable = false;
+static bool localsvc_artifact_superseded = false;
 static uint64 localsvc_read_seq = 0;
 static bool localsvc_read_seq_loaded = false;
 static uint32 localsvc_read_epoch = 0;
@@ -127,6 +130,8 @@ static uint32	ls_nshards = 1;
 #define LS_MAX_TIMELINES	1024
 static uint64	localsvc_bound_incarnation[LS_MAX_TIMELINES];
 static bool	localsvc_incarnation_bound[LS_MAX_TIMELINES];
+/* Validated branch cut, inherited by children with the immutable binding. */
+static uint64	localsvc_checkpoint_floor[LS_MAX_TIMELINES];
 
 /* max logical pages that fit in one transfer (io_unit) for this engine */
 #define LS_MAX_PAGES_PER_OP		(PS_IO_UNIT / BLCKSZ)
@@ -198,20 +203,86 @@ ls_attach(void)
 	}
 
 	hdr = (PsShmHeader *) shm;
-	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
-		__atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) != PS_SHM_READY ||
-		hdr->page_size != BLCKSZ)
-	{
-		uint32		got_magic = hdr->magic;
-		uint32		got_version = hdr->version;
-		uint32		got_page_size = hdr->page_size;
 
-		munmap(shm, PS_SHM_SIZE);
-		close(fd);
-		ereport(ERROR,
-				(errmsg("pagestore localsvc shared memory incompatible"),
-				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=0x%x version=%u)",
-						   got_page_size, BLCKSZ, got_magic, got_version)));
+	/*
+	 * A daemon that died leaves its header READY, and its successor
+	 * rewrites the segment only after taking its locks; attach only to a
+	 * live, initialized daemon.  Take the shared init lock first (so no
+	 * daemon can be mid-initialization for as long as we hold it -- see
+	 * pagestore_shm.h), then validate the header and the lease, then
+	 * release the lock on every path.  ls_shm_fd is the only fd this
+	 * backend ever opens on the segment, so there is no risk of a second,
+	 * conflicting fcntl lock owner within this process.
+	 *
+	 * init_byte can also be held exclusively, briefly, by relation
+	 * inspection (bounded by its own ~5s timeout) as well as by an
+	 * initializing daemon; wait that out (up to PS_INIT_LOCK_WAIT_MS)
+	 * rather than raising ERROR immediately, or a backend's first touch of
+	 * the store could spuriously fail an in-flight query just because an
+	 * operator happened to run `pagestore_inspect relation` at the same
+	 * moment.  This drives its own loop, rather than using
+	 * ps_shm_hold_init_shared_wait(), so it stays interruptible: a query
+	 * cancel or backend termination must not be stuck behind this wait.
+	 */
+	{
+		int			held;
+		int			elapsed_ms = 0;
+		int			ready = -1;
+		uint32		got_magic = 0;
+		uint32		got_version = 0;
+		uint32		got_page_size = 0;
+		bool		header_ok = false;
+		bool		atomic_pins = false;
+
+		for (;;)
+		{
+			held = ps_shm_hold_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+			if (held != 0 || elapsed_ms >= PS_INIT_LOCK_WAIT_MS)
+				break;
+			pg_usleep(10000L);
+			CHECK_FOR_INTERRUPTS();
+			elapsed_ms += 10;
+		}
+
+		if (held == 1)
+		{
+			got_magic = hdr->magic;
+			got_version = hdr->version;
+			got_page_size = hdr->page_size;
+			atomic_pins = (hdr->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) != 0;
+			header_ok = (got_magic == PS_SHM_MAGIC && got_version == PS_SHM_VERSION &&
+						 __atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) == PS_SHM_READY &&
+						 got_page_size == BLCKSZ);
+			if (header_ok)
+				ready = ps_shm_lease_held(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
+			ps_shm_release_init_shared(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		}
+
+		if (held != 1 || !header_ok || ready != 1)
+		{
+			munmap(shm, PS_SHM_SIZE);
+			close(fd);
+			if (held == 1 && !header_ok)
+				ereport(ERROR,
+						(errmsg("pagestore localsvc shared memory incompatible"),
+						 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=0x%x version=%u)",
+								   got_page_size, BLCKSZ, got_magic, got_version)));
+			ereport(ERROR,
+					(errmsg("pagestore localsvc shared memory \"%s\" has no running, initialized daemon",
+							localsvc_shm_name),
+					 errhint("Is the pagestore daemon running?")));
+		}
+		/* Every P5 compute publishes finite checkpoint/artifact views.  A
+		 * frontend lacking the complete protocol must fail before startup
+		 * identity probes or writes, rather than during CONTROL draining. */
+		if (!atomic_pins)
+		{
+			munmap(shm, PS_SHM_SIZE);
+			close(fd);
+			ereport(ERROR,
+					(errmsg("pagestore daemon lacks atomic pin capability"),
+					 errhint("Use a daemon frontend supporting the complete P5 protocol.")));
+		}
 	}
 	ls_shm = shm;
 	ls_shm_fd = fd;
@@ -430,6 +501,23 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 
 	if (status == PS_STATUS_OK)
 		return;
+	/* An automatic generation refused because its LSN is already below the
+	 * page-reclaimed frontier was superseded by a newer checkpoint; say so,
+	 * and remember it for pagestore_localsvc_artifact_supersedable(). */
+	if (status == PS_STATUS_ERROR &&
+		ch->parent_timeline == PS_ARTIFACT_REQ_SUPERSEDABLE &&
+		ch->result == PS_ARTIFACT_REFUSE_UNFENCED &&
+		(ch->opcode == PS_OP_ARTIFACT_BEGIN || ch->opcode == PS_OP_ARTIFACT_COMMIT ||
+		 ch->opcode == PS_OP_ARTIFACT_DROP ||
+		 ((ch->opcode == PS_OP_EXTEND || ch->opcode == PS_OP_WRITEV) &&
+		  (ch->key.klass == PS_KLASS_SLRU || ch->key.klass == PS_KLASS_READER_SNAPSHOT))))
+	{
+		localsvc_artifact_superseded = true;
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore localsvc: artifact generation %X/%08X was superseded: its page history is already reclaimed",
+						LSN_FORMAT_ARGS(ch->req_lsn))));
+	}
 	/* An artifact BEGIN/COMMIT/DROP refusal, or a WRITE (EXTEND/WRITEV)
 	 * refusal on an SLRU/reader-artifact key, carries its reason in
 	 * ch->result (pagestore_daemon.c logs the same reason plus the
@@ -524,6 +612,7 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 	 * helper is reused for a split-phase request.
 	 */
 	ch->req_lsn = 0;
+	ch->req_floor_lsn = 0;
 	ch->req_seq = 0;
 }
 
@@ -641,25 +730,82 @@ ls_pinned_read_seq(void)
  * (GetCurrentReplayRecPtr; the last-REPLAYED pointer only advances after
  * rm_redo returns, i.e. it names the PREVIOUS record).
  *
- * End-of-transaction unlinks are the subtle case: smgrDoPendingDeletes()
- * runs after RecordTransactionCommit()/RecordTransactionAbort(), both of
- * which RESET XactLastRecEnd -- but the commit record's end survives in
- * XactLastCommitEnd and the abort record's in XactLastAbortEnd, and
- * whichever this backend produced LAST is the record that decided the
- * cleanup (a commit for a DROP, an abort for a created-then-rolled-back
- * relation; stamping the older one would sort the unlink below the
- * relation's own CREATE and resurrect it).  WAL-less mutations (unlogged
- * relations) can leave all of these at older records; their content is
- * not LSN-ordered to begin with.
+ * XactLastRecEnd == 0 falls back to one of two answers, and the two
+ * fallback callers are NOT interchangeable (Codex review finding
+ * 4097536209 on PR #294):
+ *
+ * - CREATE and TRUNCATE reach this fallback when they have no fresh WAL
+ *   record of their own for THIS operation yet (e.g. a route_all compute
+ *   issuing the op with no preceding log_smgrcreate/SMGR_TRUNCATE record in
+ *   this backend since its last commit/abort).  For them, the old
+ *   unconditional Max(XactLastCommitEnd, XactLastAbortEnd) fallback could
+ *   hand back a stale position -- possibly this session's last, unrelated
+ *   commit, or even 0 -- left over from long before some branch was forked
+ *   off the same timeline since.  Stamping that stale, too-low position let
+ *   the mutation sort at or below the branch's cap and leak into it
+ *   (pagestore Bug B: a branch observing parent post-fork metadata
+ *   changes).  GetXLogInsertRecPtr() is the honest fix: it can only be >=
+ *   anything this backend has produced, so it cannot sort a related
+ *   mutation before a record it must follow, and it cannot understate "now"
+ *   the way a leftover session value can.  A non-startup backend in
+ *   recovery (hot standby) never inserts WAL itself, so it uses the last
+ *   replayed position instead -- the same horizon ls_read_lsn() uses for
+ *   its own recovery case, just below.
+ *
+ * - UNLINK's non-redo path runs from smgrDoPendingDeletes() at
+ *   end-of-transaction cleanup, AFTER RecordTransactionCommit()/
+ *   RecordTransactionAbort() have already reset XactLastRecEnd -- that IS
+ *   the documented XactLastCommitEnd/XactLastAbortEnd case above, not a
+ *   caller with no WAL record of its own: the commit/abort record it must
+ *   sort after already happened, and whichever this backend produced LAST
+ *   is the record that decided the cleanup (a commit for a DROP, an abort
+ *   for a created-then-rolled-back relation; stamping the older one would
+ *   sort the unlink below the relation's own CREATE and resurrect it).
+ *   GetXLogInsertRecPtr() is NOT a safe stand-in here: unrelated concurrent
+ *   WAL insertion can push the global pointer arbitrarily far past that
+ *   commit/abort record, and a branch cut between the real transaction end
+ *   and that inflated position would then miss the unlink -- exposing a
+ *   dropped relation, or a relation created by an aborted transaction, to
+ *   the branch.  UNLINK therefore keeps the original
+ *   Max(XactLastCommitEnd, XactLastAbortEnd) fallback.
+ *
+ * WAL-less mutations (unlogged relations) can leave all of these at older
+ * records; their content is not LSN-ordered to begin with.
  */
-static uint64
-ls_op_lsn(void)
+/* A WAL-less mutation has no record identity. Keep its real-time lower
+ * bound separate so the daemon persists UNSTAMPED and orders finite branch
+ * views by admission sequence instead of treating a synthetic label as WAL. */
+static void
+ls_unstamped_lsn(PsChannel *ch)
 {
+	uint64 now;
+
 	if (AmStartupProcess())
-		return (uint64) GetCurrentReplayRecPtr(NULL);
-	if (XactLastRecEnd != 0)
-		return (uint64) XactLastRecEnd;
-	return (uint64) Max(XactLastCommitEnd, XactLastAbortEnd);
+		now = (uint64) GetCurrentReplayRecPtr(NULL);
+	else if (RecoveryInProgress())
+		now = (uint64) GetXLogReplayRecPtr(NULL);
+	else
+		now = (uint64) GetXLogInsertRecPtr();
+	if (now >= UINT64_MAX - 1)
+		ereport(ERROR, (errmsg("pagestore metadata time floor exhausted")));
+	ch->req_lsn = 0;
+	ch->req_floor_lsn = now + 1;
+}
+
+static void
+ls_op_lsn(PsChannel *ch, bool is_unlink)
+{
+	ch->req_floor_lsn = 0;
+	if (AmStartupProcess())
+		ch->req_lsn = (uint64) GetCurrentReplayRecPtr(NULL);
+	else if (XactLastRecEnd != 0)
+		ch->req_lsn = (uint64) XactLastRecEnd;
+	else if (is_unlink)
+		ch->req_lsn = (uint64) Max(XactLastCommitEnd, XactLastAbortEnd);
+	else
+		ch->req_lsn = 0;
+	if (ch->req_lsn == 0)
+		ls_unstamped_lsn(ch);
 }
 
 /* A materializer is writable, not a pinned reader, but during recovery it
@@ -707,7 +853,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo,
 
 	ch->opcode = PS_OP_CREATE;
 	ch->is_redo = isRedoEnsure ? 2 : (isRedo ? 1 : 0);
-	ch->req_lsn = ls_op_lsn();
+	ls_op_lsn(ch, false);
 	ls_exec(ch);
 }
 
@@ -737,7 +883,7 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 
 	ch->opcode = PS_OP_UNLINK;
 	ch->is_redo = isRedo ? 1 : 0;
-	ch->req_lsn = ls_op_lsn();
+	ls_op_lsn(ch, true);
 
 	/* WAL redo must fail if its durable DEAD event cannot be recorded. */
 	if (isRedo)
@@ -790,7 +936,7 @@ ls_truncate(const PageStoreRelKey *key, void *localreln,
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->old_nblocks = old_blocks;
 	ch->nblocks = nblocks;
-	ch->req_lsn = ls_op_lsn();
+	ls_op_lsn(ch, false);
 	ls_exec(ch);
 }
 
@@ -914,13 +1060,8 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
 	ch->skip_fsync = skipFsync ? 1 : 0;
-	/*
-	 * Zero-extends have no WAL record of their own (the extension is
-	 * implied by later content); the insert position is the best honest
-	 * upper bound, and never-written blocks read as zeros either way.
-	 */
-	ch->req_lsn = RecoveryInProgress() ?
-		(uint64) GetCurrentReplayRecPtr(NULL) : (uint64) GetXLogInsertRecPtr();
+	/* ZEROEXTEND has no WAL record of its own, including during replay. */
+	ls_unstamped_lsn(ch);
 	ls_exec(ch);
 }
 
@@ -1032,6 +1173,16 @@ pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
 	return 1;
 }
 
+/* Read-only compatibility preflight for safe preparation and creation. */
+void
+pagestore_localsvc_require_branch_seq(void)
+{
+	(void) ls_chan();
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities &
+		 PS_FRONTEND_CAP_BRANCH_SEQ) == 0)
+		ereport(ERROR, (errmsg("pagestore daemon does not support safe branch sequence caps")));
+}
+
 /*
  * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
@@ -1076,6 +1227,10 @@ pagestore_localsvc_require_branch_timeout(uint32 new_tl, uint32 parent_tl,
 	ch->incarnation = target_incarnation;
 	ch->req_seq = parent_incarnation;
 	ls_exec_timeout(ch, timeout_ms);
+	if (new_tl < LS_MAX_TIMELINES &&
+		localsvc_incarnation_bound[new_tl] &&
+		localsvc_bound_incarnation[new_tl] == target_incarnation)
+		localsvc_checkpoint_floor[new_tl] = branch_lsn;
 }
 
 /*
@@ -1113,6 +1268,14 @@ pagestore_localsvc_admission_fence_begin(uint64 redo_lsn, uint64 *token)
 	uint64		epoch;
 
 	*token = 0;
+	/* PITR promotion can checkpoint below the store branch cut.  Such a
+	 * checkpoint still needs its writer CONTROL mirror, but cannot name a
+	 * reader view of the retained ancestry.  Avoid opening a gate that the
+	 * atomic barrier must reject.  This cache requires no IPC in the hook's
+	 * critical section and was populated by startup manifest validation. */
+	if (localsvc_timeline > 0 && localsvc_timeline < LS_MAX_TIMELINES &&
+		redo_lsn < localsvc_checkpoint_floor[localsvc_timeline])
+		return false;
 	if (ls_shm == NULL)
 		return false;
 	hdr = (PsShmHeader *) ls_shm;
@@ -1138,14 +1301,18 @@ pagestore_localsvc_admission_fence_active(uint64 token)
 }
 
 uint64
-pagestore_localsvc_admission_barrier_timeout(int timeout_ms)
+pagestore_localsvc_admission_barrier_timeout(uint64 lsn, int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	PsChannel  *ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL,
-													(uint32) localsvc_timeline);
+												   (uint32) localsvc_timeline);
 
 	ch->key.klass = PS_KLASS_CONTROL;
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		ereport(ERROR, (errmsg("pagestore daemon lacks atomic pin capability")));
 	ch->opcode = PS_OP_ADMISSION_BARRIER;
+	ch->req_lsn = lsn;
+	ch->is_redo = PS_BARRIER_REGISTER;
 	ls_exec_timeout(ch, timeout_ms);
 	return ch->req_seq;
 }
@@ -1218,6 +1385,8 @@ pagestore_localsvc_retention_set_timeout(uint32 timeline, uint32 owner_kind,
 		return PS_STATUS_ERROR;
 	ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL, timeline);
 	ch->key.klass = PS_KLASS_CONTROL;
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		return PS_STATUS_ERROR;
 	ch->opcode = PS_OP_RETENTION_PIN_SET;
 	ch->timeline = timeline;
 	ch->blocknum = owner_kind;
@@ -1246,6 +1415,8 @@ pagestore_localsvc_retention_reserve_timeout(uint32 timeline,
 		return PS_STATUS_ERROR;
 	ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL, timeline);
 	ch->key.klass = PS_KLASS_CONTROL;
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		return PS_STATUS_ERROR;
 	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
 	ch->timeline = timeline;
 	ch->blocknum = owner_kind;
@@ -1419,23 +1590,49 @@ pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
  * for the pagestore_create_branch() SQL function.
  */
-void
-pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
-								 uint64 branch_lsn, uint64 target_incarnation,
-								 uint64 parent_incarnation)
+static bool
+pagestore_localsvc_create_branch_impl(uint32 new_tl, uint32 parent_tl,
+									  uint64 branch_lsn, uint64 target_incarnation,
+									  uint64 parent_incarnation, bool proven)
 {
 	PsChannel  *ch = ls_chan();
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("branch creation");
 
+	if (proven)
+		pagestore_localsvc_require_branch_seq();
+	ch->is_redo = proven ? PS_BRANCH_R2_PROVEN : 0;
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
 	ch->incarnation = target_incarnation;
 	ch->req_seq = parent_incarnation;
+	ch->result = 0;
 	ls_exec(ch);
+	if (proven && (ch->result & PS_BRANCH_RESULT_FINITE) == 0)
+		ereport(ERROR, (errmsg("safe branch preparation refused an unbounded legacy branch"),
+						errhint("Use a fresh timeline and receipt path.")));
+	return (ch->result & PS_BRANCH_RESULT_NEW) != 0;
+}
+
+bool
+pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
+								 uint64 branch_lsn, uint64 target_incarnation,
+								 uint64 parent_incarnation)
+{
+	return pagestore_localsvc_create_branch_impl(new_tl, parent_tl, branch_lsn,
+												 target_incarnation, parent_incarnation, false);
+}
+
+bool
+pagestore_localsvc_create_branch_proven(uint32 new_tl, uint32 parent_tl,
+										uint64 branch_lsn, uint64 target_incarnation,
+										uint64 parent_incarnation)
+{
+	return pagestore_localsvc_create_branch_impl(new_tl, parent_tl, branch_lsn,
+												 target_incarnation, parent_incarnation, true);
 }
 
 /*
@@ -1761,6 +1958,7 @@ pagestore_localsvc_walidx_progress(void)
 	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
 	ch->timeline = (uint32) localsvc_timeline;
 	ch->req_lsn = 0;
+	ch->req_floor_lsn = 0;
 	ch->req_seq = 0;
 	ch->incarnation = incarnation;
 	ls_exec(ch);
@@ -1824,6 +2022,7 @@ pagestore_localsvc_timeline_info(uint32 timeline, uint32 *parent_timeline,
 	ch->timeline = timeline;
 	ch->incarnation = ls_expected_incarnation(timeline);
 	ch->req_lsn = 0;
+	ch->req_floor_lsn = 0;
 	ch->req_seq = 0;
 	ch->parent_timeline = 0;
 	ch->result = 0;
@@ -1837,27 +2036,78 @@ pagestore_localsvc_timeline_info(uint32 timeline, uint32 *parent_timeline,
 	return true;
 }
 
+bool
+pagestore_localsvc_branch_is_finite(uint32 timeline, uint64 incarnation)
+{
+	PsChannel  *ch = ls_chan();
+
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_BRANCH_SEQ) == 0)
+		return false;
+	ch->opcode = PS_OP_TIMELINE_INFO;
+	ch->timeline = timeline;
+	ch->incarnation = incarnation;
+	ch->req_lsn = 0;
+	ch->req_seq = 0;
+	ch->req_floor_lsn = 0;
+	ch->result = 0;
+	ls_exec(ch);
+	return ch->result != 0 && ch->req_floor_lsn != 0 &&
+		ch->req_floor_lsn != UINT64_MAX;
+}
+
 uint8
 pagestore_localsvc_begin_delete(uint32 timeline, uint64 expected_incarnation)
 {
+	return pagestore_localsvc_begin_delete_reason(timeline,
+												  expected_incarnation, NULL);
+}
+
+/* As above; on failure *reason is the daemon's PsDeleteRefuseReason. */
+uint8
+pagestore_localsvc_begin_delete_reason(uint32 timeline,
+									   uint64 expected_incarnation,
+									   uint32 *reason)
+{
 	PsChannel  *ch = ls_chan();
+	uint8		status;
 
 	ch->opcode = PS_OP_BEGIN_DELETE;
 	ch->timeline = timeline;
 	ch->req_seq = expected_incarnation;
-	return ls_exec_wait(ch, 0);
+	ch->result = PS_DELETE_REFUSE_UNAVAILABLE;
+	status = ls_exec_wait(ch, 0);
+	if (reason != NULL)
+		*reason = status == PS_STATUS_OK ? 0 : ch->result;
+	return status;
 }
 
 bool
 pagestore_localsvc_timeline_state(uint32 timeline, uint32 *state,
 								  uint64 *incarnation)
 {
+	return pagestore_localsvc_timeline_state_known(timeline, state,
+												   incarnation, NULL);
+}
+
+/*
+ * As above; on failure *undefined says whether the store positively has no
+ * such timeline, as opposed to being unable to tell.
+ */
+bool
+pagestore_localsvc_timeline_state_known(uint32 timeline, uint32 *state,
+										uint64 *incarnation, bool *undefined)
+{
 	PsChannel  *ch = ls_chan();
 
 	ch->opcode = PS_OP_TIMELINE_STATE;
 	ch->timeline = timeline;
+	ch->result = PS_TIMELINE_STATE_UNAVAILABLE;
 	if (ls_exec_wait(ch, 0) != PS_STATUS_OK)
+	{
+		if (undefined != NULL)
+			*undefined = ch->result == PS_TIMELINE_STATE_UNDEFINED;
 		return false;
+	}
 	if (state != NULL)
 		*state = ch->result;
 	if (incarnation != NULL)
@@ -1957,17 +2207,50 @@ ls_artifact_channel(uint32 klass, const PageStoreRelKey *key, uint64 version)
 	ch->key.klass = klass;
 	ch->req_lsn = version;
 	ch->req_seq = 0;
+	ch->parent_timeline = localsvc_artifact_supersedable ?
+		PS_ARTIFACT_REQ_SUPERSEDABLE : 0;
 	return ch;
+}
+
+/*
+ * Enter (on = true) or leave (on = false) automatic-generation mode for this
+ * process's artifact requests.  In it, a refusal because the generation is
+ * below the page-reclaimed frontier and unfenced is reported by the daemon
+ * and by the raised ERROR as superseded (PS_ARTIFACT_REQ_SUPERSEDABLE).
+ * Returns whether such a refusal happened since the mode was entered; the
+ * caller leaves the mode on both its success and its error path.
+ */
+bool
+pagestore_localsvc_artifact_supersedable(bool on)
+{
+	bool		superseded = localsvc_artifact_superseded;
+
+	localsvc_artifact_supersedable = on;
+	localsvc_artifact_superseded = false;
+	return superseded;
 }
 
 uint64
 pagestore_localsvc_artifact_begin(uint32 klass, const PageStoreRelKey *key,
-	uint64 version, int timeout_ms)
+								  uint64 version, int timeout_ms)
 {
-	PsChannel *ch = ls_artifact_channel(klass, key, version);
+	PsChannel  *ch = ls_artifact_channel(klass, key, version);
+
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		ereport(ERROR, (errmsg("pagestore daemon lacks capped artifact capability")));
 	ch->opcode = PS_OP_ARTIFACT_BEGIN;
+	ch->is_redo = PS_ARTIFACT_BEGIN_CAPPED_READ;
 	ls_exec_timeout(ch, timeout_ms);
-	return ch->req_seq;
+	{
+		uint64		token = ch->req_seq;
+		PageStoreRelKey control_key = {0};
+		char		control_page[BLCKSZ];
+
+		if (!pagestore_localsvc_obj_read_capped_timeout(PS_KLASS_CONTROL, &control_key,
+														PS_CONTROL_IMAGE_BLOCK, version, token, control_page, NULL, timeout_ms))
+			ereport(ERROR, (errmsg("pagestore artifact has no retained control era at its publication cap")));
+		return token;
+	}
 }
 
 void
@@ -2044,8 +2327,17 @@ pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 	 * req_lsn (the caller's cutoff/dirtying/update LSN), so it reads back
 	 * as-of an LSN >= that version; ignored for relations (pd_lsn).
 	 */
+	/* A promoted branch may still emit CONTROL updates below its store cut.
+	 * Order those local mutations at the cut, like copied relation pages,
+	 * so a new control block can grow after forkmeta has reclaimed the
+	 * pre-cut prefix.  The payload retains the actual checkpoint/redo LSN. */
+	if (klass == PS_KLASS_CONTROL && localsvc_timeline > 0 &&
+		localsvc_timeline < LS_MAX_TIMELINES &&
+		version < localsvc_checkpoint_floor[localsvc_timeline])
+		version = localsvc_checkpoint_floor[localsvc_timeline];
 	ch->req_lsn = version;
 	ch->req_seq = 0;
+	ch->parent_timeline = 0;	/* never an automatic generation */
 	memcpy(ch->data, page, BLCKSZ);
 	ls_exec_timeout(ch, timeout_ms);
 	return ch->req_seq;
@@ -2062,7 +2354,8 @@ pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = block;
 	ch->nblocks = 1;
-	ch->req_lsn = 0;			/* explicit: channels are reused across op kinds */
+	ch->req_lsn = 0;
+	ch->req_floor_lsn = 0;			/* explicit: channels are reused across op kinds */
 	ls_exec(ch);
 	memcpy(page, ch->data, BLCKSZ);
 }
@@ -2090,14 +2383,24 @@ pagestore_localsvc_obj_read_at_timeout(uint32 klass, const PageStoreRelKey *key,
 									   void *page, uint64 *resolved,
 									   int timeout_ms)
 {
-	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass,
-													(uint32) localsvc_timeline);
+	return pagestore_localsvc_obj_read_capped_timeout(klass, key, block, version,
+													  klass == PS_KLASS_CONTROL && version == localsvc_read_lsn ? ls_pinned_read_seq() : 0,
+													  page, resolved, timeout_ms);
+}
+
+bool
+pagestore_localsvc_obj_read_capped_timeout(uint32 klass, const PageStoreRelKey *key,
+										   BlockNumber block, uint64 version, uint64 seq, void *page, uint64 *resolved,
+										   int timeout_ms)
+{
+	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass, (uint32) localsvc_timeline);
 	bool		found;
 
 	ch->key.klass = klass;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = version;
+	ch->req_seq = seq;
 	ls_exec_timeout(ch, timeout_ms);
 	memcpy(page, ch->data, BLCKSZ);
 	found = ch->result != 0;
@@ -2212,19 +2515,19 @@ ls_pinned_process_utility(PlannedStmt *pstmt, const char *queryString,
 		case T_RepackStmt:		/* REPACK (and its CLUSTER/VACUUM FULL legacy forms) */
 			deny = "REPACK";
 			break;
-#endif
+#else
 		/*
-		 * Before 19, REPACK does not exist (T_RepackStmt is a later
-		 * upstream unification of CLUSTER and VACUUM FULL, absent from
-		 * this build's nodetags.h) -- there is no case here for its 18
-		 * predecessor, T_ClusterStmt.  This switch is only a friendly,
-		 * early ERROR: any write-WAL utility that slips past it still hits
-		 * the wal_insert_restricted backstop below (xlog.c, C5) and PANICs
-		 * rather than executing, so the pinned-reader read-only guarantee
-		 * holds either way -- CLUSTER on 18 just gets the worse (PANIC)
-		 * failure mode instead of a clean ERROR here.  Left as a known gap
-		 * rather than inventing new deny-list design in this compat pass.
+		 * Before 19, CLUSTER is its own statement (T_ClusterStmt), not one
+		 * of RepackStmt's legacy forms -- deny it explicitly the same way
+		 * T_RepackStmt does on 19+.  VACUUM FULL needs no separate case
+		 * here: on 18 it is still a plain T_VacuumStmt (VACOPT_FULL is just
+		 * a flag on it), and the T_VacuumStmt case above already denies
+		 * VACUUM/ANALYZE unconditionally, FULL or not.
 		 */
+		case T_ClusterStmt:
+			deny = "CLUSTER";
+			break;
+#endif
 		case T_CopyStmt:
 			if (((CopyStmt *) pstmt->utilityStmt)->is_from)
 				deny = "COPY FROM";

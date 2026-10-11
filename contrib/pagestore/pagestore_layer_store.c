@@ -259,6 +259,8 @@ fail:
 static void
 local_close(void)
 {
+	/* a reopened store must verify what it reads again */
+	ps_image_layer_cache_reset();
 	layer_dir[0] = '\0';
 	object_dir[0] = '\0';
 	if (layer_owner != NULL)
@@ -307,12 +309,22 @@ local_layer_path(uint64_t layer_id, char *buf, size_t buflen)
 static int
 local_owner_current(void)
 {
+	int			current;
+
 	if (layer_owner == NULL)
 	{
 		errno = EPERM;
 		return 0;
 	}
-	return ps_store_owner_require_current(layer_owner) == 0;
+	current = ps_store_owner_require_current(layer_owner) == 0;
+	/* ps_store_owner_require_current() already sets errno on every failure
+	 * path, but every caller here does `if (!local_owner_current()) return
+	 * -1;`, so make that guarantee local instead of relying on a callee two
+	 * frames away: a future failure mode that forgets to set errno must not
+	 * leave the eventual open-path diagnostic reporting a stale value. */
+	if (!current && errno == 0)
+		errno = EPERM;
+	return current;
 }
 
 static int
@@ -1202,6 +1214,7 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 	const char *path = NULL;
 	int			fd;
 	ssize_t		n;
+	uint32_t	done = 0;
 	uint32_t	nlocs;
 
 	if (!local_owner_current())
@@ -1244,9 +1257,25 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 	}
 	if (fd < 0)
 		return -1;
-	n = pread(fd, buf, len, (off_t) off);
+	/*
+	 * One read(2) transfers at most 0x7ffff000 bytes on Linux, and
+	 * ps_image_layer_verify_data() asks for a layer's whole data section at
+	 * once: without the loop an image layer over 2 GiB -- which full-merge
+	 * compaction produces from a few GiB of page history -- could never be
+	 * verified, so every lookup through it failed and it could never be
+	 * compacted away either.
+	 */
+	while (done < len)
+	{
+		n = pread(fd, (char *) buf + done, len - done, (off_t) (off + done));
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;				/* error, or the file ends before 'len' */
+		done += (uint32_t) n;
+	}
 	close(fd);
-	return n == (ssize_t) len ? 0 : -1;
+	return done == len ? 0 : -1;
 }
 
 static const PsLayerLocation *

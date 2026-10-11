@@ -382,6 +382,43 @@ and compaction.  Enumeration is available over IPC, and churn is compacted off
 the request path.  Recovery truncates only an incomplete final record and fails
 closed on any complete corrupt record or a pin whose timeline is absent.
 
+Every durable mutation of `retention.meta` -- an in-place append (SET/DROP/
+admission-reserve), a full rewrite (churn compaction, and the identical
+v1 -> v2 migration), or the one-time bootstrap that installs `retention.state`
+over a v2 log that predates it -- is bracketed by a durable `retention.pending`
+marker that carries the mutation's *intent*: the committed (record count,
+rolling hash) pair the log had before the mutation and the one it is meant to
+reach after, CRC-protected.  The marker is published atomically (a private
+`retention.pending.tmp` is written, fsync'd, then renamed into place, then the
+directory is fsync'd) so it can never itself be observed torn; a crash before
+the rename leaves only an inert `.tmp` file, which open always removes
+regardless of what `retention.pending` holds.  A process death anywhere
+between the rename completing and the marker being removed again is not
+ambiguous: the next open reads the surviving intent, classifies whatever
+`retention.meta` actually holds against it (tolerating a torn or
+complete-but-unacknowledged trailing append record, or -- for the state
+bootstrap specifically -- a torn tail already present in a log that predates
+this crash-safety format at all), and deterministically rolls the mutation
+back or forward before clearing the marker and continuing the ordinary
+replay -- itself safe to redo verbatim after a second crash mid-recovery.  A
+small number of failures instead happen in a *live* process (an
+fsync/rename/unlink step reports an error while the daemon keeps running and
+keeps answering, i.e. rejecting, requests); those durably install
+`retention.failed`, a permanent marker that startup refuses to look past even
+once `retention.pending` is gone, so a later restart can never silently
+resurrect a mutation whose failure the process already observed.  A
+`retention.pending` shorter than one complete record -- including empty --
+still fails startup closed instead of being discarded: it is exactly the
+shape of the *previous* format's retention.pending, an intentionally empty
+guard created before and removed only after its whole mutation (for a DROP,
+including the matching `retention.state` write) was durable, and its shape
+alone cannot distinguish a crash before that mutation started from a crash
+after it committed but before the guard was removed -- discarding it could
+let an unacknowledged DROP silently take effect.  Startup logs which case
+applies and, for the unreconcilable short-marker case, instructs an operator
+to inspect `retention.meta`/`retention.state` and remove the marker by hand
+only after confirming no unacknowledged mutation is present.
+
 Managed readers and materializers install and advance durable owner generations
 before consuming retained history.  The effective-floor query projects
 explicit descendant pins through every branch cap, derives permanent fork-point
@@ -445,7 +482,16 @@ consumers the gate still required at that point have since landed:
 - shipped-WAL reclamation without crossing the durable control/WAL floor;
 - WAL-index log compaction/reclamation;
 - fork-metadata compaction/reclamation;
-- timeline deletion and its layer/WAL cleanup.  The first R5 lifecycle slice
+- timeline deletion and its layer/WAL cleanup.  Extension 1.3 gives the
+  operator its entry point: `pagestore_delete_branch(timeline, incarnation)`
+  issues BEGIN_DELETE from any compute of the store other than the branch's
+  own (stop that compute first; the store cannot see whether one is attached),
+  refuses timeline 0, an undefined timeline and a mismatched incarnation by
+  name, and reports the store's descendant/retention-owner veto;
+  `pagestore_timeline_state(timeline)` returns `live`/`deleting`/`deleted`
+  with the incarnation, which is how a caller learns the fence and watches
+  the asynchronous cleanup finish.  The golden scenario deletes its branch
+  this way.  The first R5 lifecycle slice
   now migrates legacy-only timeline logs to V2 and persists V2 create/event
   records, exposes LIVE/DELETING plus
   a reserved DELETED format value with incarnation, and vetoes BEGIN_DELETE
@@ -979,6 +1025,14 @@ covered segment.  A store written entirely by the fixed daemon now exercises
 the adoption rule above **never**: no timeline deletion it performs can ever
 create a rescan region.  The rule stays, unchanged, purely as recovery for a
 store that deleted a timeline before this fix (see the T7 follow-up below).
+**Resolved** (L6, see `RELEASE_VALIDATION.md`'s "Resolved: torn-tail garbage
+stalled a timeline deletion (L6)"): tombstoning's pass 1 used to validate a
+segment's whole file and fail closed forever on any torn tail, sealed
+rollover garbage, or SPDK-style zero padding past the point `recover()`
+itself already treats as end of log; it now scans only that same
+`recover()`-derived reachable region (invariant I4), so a stalled deletion
+resumes, and a genuinely stuck one now logs a once-per-tuple "deletion
+blocked" diagnostic instead of retrying silently forever.
 `integration_test.sh`
 now stops every cluster it started, reopens its own retained store against a
 fresh daemon, and asserts the reopen succeeds, that no segment tail was
@@ -1005,9 +1059,18 @@ hot table (O(N^2) per fork at recovery and per cutover); a
 counter with the old linear code kept as its fallback, now makes every one
 of those O(log N)/O(1).  Measured at K = 50,000 commit-class rewrites: live
 path 41.7 -> 11.9 us/write, cutover 0.536 s -> 0.143 s, reopen 1.052 s ->
-0.451 s; see `RELEASE_VALIDATION.md` for the full table and the still-open
-follow-up (bounding the in-memory array itself by compacting the markers a
-cutover already dropped durably).  One
+0.451 s.  The in-memory array is now also bounded per daemon lifetime
+(design B, same `RELEASE_VALIDATION.md` section): a successful cutover
+compacts each fork's array down to exactly the events the durable
+checkpoint/tail kept, dropping the inert markers it dropped, right after
+the publish succeeds instead of leaving that to the next restart.
+Recovery-equivalent by construction (the durable state no longer carries
+them either).  Measured with `fev_bench K periodic` (K = 50,000 WAL-less
+rewrites split into 10 reclaiming cutover rounds): the in-memory event
+count on that fork stays in the low teens after every round with this fix,
+versus growing to 50,001 without it.  See `RELEASE_VALIDATION.md` for the
+full detail and the two follow-ups left open (design C's version-chain
+lookup, `def_idx` for a few remaining newest-first linear scans).  One
 gap remains documented in the check: a
 page-segment record can never be the only copy of a page, because a cleanly
 stopped daemon flushes its memtable into a layer before it exits, so every
@@ -1074,3 +1137,25 @@ Performance refinements such as size-tiered compaction, layer key-range pruning,
 bloom filters, per-shard layer maps, asynchronous POSIX I/O, and explicit
 CPU/IO scheduling remain important, but they follow the functional and
 operational gates above unless measurement shows they block the MVP scenario.
+
+## Branch snapshot correctness: finite branch activation
+
+The controller-created branch path now freezes same-position ancestor rewrites
+with a durable admission-sequence cap (Bug B, P3b in
+`BRANCH_SNAPSHOT_SEQ_CAP.md`). Parent newest ordering is unchanged. The cap is
+used by reads and reclamation together, and physical layer reads retrieve the
+selected version identity after restart. Control-image and redo-note pairs are
+retained for the frozen view, including across forkmeta cutovers.
+
+Use the matching 1.6 extension/library, controller and POSIX daemon. Raw branch
+SQL and the older control-derived overloads require a session-only unsafe
+opt-in. Old unbounded branches remain legacy data; completed receipts are
+checked for a finite edge and cannot recertify them. An activated store cannot
+be opened by the earlier format-only daemon. Independent reader-pin and
+WAL-index-horizon activation (P5) is not included in this branch-only fix.
+
+The P4 localsvc metadata path now separates WAL-less classification from its
+real-time lower bound: fallback metadata and ZEROEXTEND send unstamped requests
+with `req_floor_lsn`, while actual WAL record identities are preserved. This
+uses the already deployed P3a protocol and durable flags. P5 independent pin,
+WAL-index-horizon and artifact activation remains outstanding.

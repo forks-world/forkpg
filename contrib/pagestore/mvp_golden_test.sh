@@ -285,16 +285,20 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_is_in_recovery();")" "t" \
 "${WP[@]}" -c "CREATE SCHEMA pagestore_ext;
 	CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.0';
 	ALTER EXTENSION pagestore UPDATE TO '1.1';
-	ALTER EXTENSION pagestore UPDATE TO '1.2';" >/dev/null ||
+	ALTER EXTENSION pagestore UPDATE TO '1.2';
+	ALTER EXTENSION pagestore UPDATE TO '1.3';
+	ALTER EXTENSION pagestore UPDATE TO '1.4';
+	ALTER EXTENSION pagestore UPDATE TO '1.5';
+    ALTER EXTENSION pagestore UPDATE TO '1.6';" >/dev/null ||
 fail "could not install the extension upgrade chain"
-assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.2" \
-	"extension upgrades from 1.0 through 1.1 to 1.2"
-api_count=$("${WP[@]}" -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pagestore_ext' AND p.oid IN ('pagestore_ext.pagestore_create_branch_with_incarnation(integer,integer,bigint,pg_lsn)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)'::regprocedure, 'pagestore_ext.pagestore_retention_drop_with_incarnation(integer,integer,bigint,bigint,bigint)'::regprocedure);")
-assert_eq "$api_count" "3" "1.2 exposes immutable branch and retention control APIs after upgrade"
-"${WP[@]}" -c "DROP EXTENSION pagestore; CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.2';" >/dev/null ||
-	fail "could not install a fresh 1.2 extension"
-assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.2" \
-	"fresh extension install uses version 1.2"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.6" \
+	"extension upgrades from 1.0 through 1.1 and 1.2 to 1.6"
+api_count=$("${WP[@]}" -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pagestore_ext' AND p.oid IN ('pagestore_ext.pagestore_create_branch_with_incarnation(integer,integer,bigint,pg_lsn)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)'::regprocedure, 'pagestore_ext.pagestore_retention_drop_with_incarnation(integer,integer,bigint,bigint,bigint)'::regprocedure, 'pagestore_ext.pagestore_timeline_state(integer)'::regprocedure, 'pagestore_ext.pagestore_delete_branch(integer,bigint)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,boolean)'::regprocedure, 'pagestore_ext.pagestore_branch_window_open()'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_window(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,xid8,integer)'::regprocedure, 'pagestore_ext.pagestore_branch_snapshot_is_safe(integer,bigint)'::regprocedure);")
+assert_eq "$api_count" "9" "1.6 exposes the branch, retention and timeline lifecycle control APIs after upgrade"
+"${WP[@]}" -c "DROP EXTENSION pagestore; CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.6';" >/dev/null ||
+	fail "could not install a fresh 1.6 extension"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.6" \
+	"fresh extension install uses version 1.6"
 "${WP[@]}" -c "CREATE FUNCTION pagestore_read_at(regclass, int, int, pg_lsn) RETURNS bytea
  AS 'pagestore','pagestore_read_at' LANGUAGE C STRICT;
 CREATE TABLE mvp_golden(id int primary key, note text);" >/dev/null ||
@@ -456,7 +460,11 @@ import sys
 from pathlib import Path
 
 journal = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert journal["schema"] == 3
 assert journal["state"] == "prepared"
+window = journal["window_snapshot"]
+assert window["checkpoint_redo_lsn"] == journal["checkpoint_redo_lsn"]
+assert int(window["next_xid"]) >= 3 and window["prepared_count"] == 0
 assert journal["retention_owned"] is True
 assert journal["retention_set_attempted"] is True
 assert journal["pause_owned"] is True
@@ -477,6 +485,48 @@ assert_eq "$("${RWP[@]}" -c "SELECT current_setting('listen_addresses') = ''; ")
 	"crashed controller leaves only the restricted writer reachable"
 assert_eq "$("${MP[@]}" -c "SELECT pagestore_ext.pagestore_retention_owner_lsn(0, 3, 1, $retention_generation) IS NOT NULL;")" "t" \
 	"crashed controller leaves the exact branch retention pin installed"
+
+# The controller's wait is not the server's R2-m proof.  With the materializer
+# paused, request a fork one byte beyond its durable marker.  Refuse before
+# publishing artifacts or creating another timeline, including directory reuse.
+IFS='|' read -r proof_base proof_redo proof_marker proof_xid <<EOF
+$(python3 -c 'import json, sys
+r = json.load(open(sys.argv[1]))
+print("|".join(r[k] for k in ("base_lsn", "checkpoint_redo_lsn", "fork_lsn"))
+      + "|" + r["window_snapshot"]["next_xid"])' \
+    "$PREPARED/pagestore_branch.prepare.json")
+EOF
+assert_eq "$("${RWP[@]}" -c "SELECT materialized_wal_lsn = '$proof_marker'::pg_lsn
+    FROM pagestore_ext.pagestore_materializer_status();")" "t" \
+    "writer observes the paused materializer's durable marker"
+LAGGING_PREPARED="$TMPROOT/lagging-prepared"
+mkdir "$LAGGING_PREPARED" || fail "could not create lagging-materializer test directory"
+materializer_rejected=$("${MP[@]}" -v VERBOSITY=verbose -c \
+    "SELECT pagestore_ext.pagestore_prepare_branch_from_window(
+    '$LAGGING_PREPARED', 2, 0, '$proof_base', '$proof_redo', '$proof_marker', 1, '$proof_xid', 0);" 2>&1) &&
+    fail "checked window preparation accepted a recovery materializer"
+case "$materializer_rejected" in
+    *"55000: branch transaction window requires an unpinned writer"*) ;;
+    *) fail "checked window preparation did not reject the recovery role: $materializer_rejected" ;;
+esac
+echo "ok   - checked window preparation rejects a recovery role before touching branch state"
+for proof_dir in "$LAGGING_PREPARED" "$PREPARED"; do
+    lag_rejected=$("${RWP[@]}" -v VERBOSITY=verbose -c \
+        "SELECT pagestore_ext.pagestore_prepare_branch_from_control(
+        '$proof_dir', 2, 0, '$proof_base', '$proof_redo',
+        '$proof_marker'::pg_lsn + 1, 1, true);" 2>&1) &&
+        fail "branch preparation accepted a fork beyond the materializer marker"
+    case "$lag_rejected" in
+        *"55000: branch fork LSN exceeds the durable materialized horizon"*) ;;
+        *) fail "lagging-materializer rejection did not report the R2-m error: $lag_rejected" ;;
+    esac
+done
+assert_eq "$(find "$LAGGING_PREPARED" -type f | wc -l | tr -d ' ')" "0" \
+    "lagging-materializer rejection creates no prepared artifacts"
+assert_eq "$("${RWP[@]}" -c "SELECT state IS NULL AND incarnation IS NULL
+    FROM pagestore_ext.pagestore_timeline_state(2);")" "t" \
+    "lagging-materializer rejection creates no store timeline"
+echo "ok   - server validates the materializer marker before preparing a controller branch"
 
 # Remove the one-shot report control before the recovery process.  The second
 # controller has no fault environment and therefore cannot consume stale arm
@@ -517,6 +567,56 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_get_wal_replay_pause_state();")" "not paus
 assert_eq "$("${WP[@]}" -c "SELECT NOT pg_is_in_recovery() AND current_setting('listen_addresses') <> ''; ")" "t" \
 	"recovery controller restored the normal public writer"
 echo "ok   - serialized branch window selected C=$base_lsn R=$checkpoint_redo E=$checkpoint_lsn L=$fork_lsn"
+# An older controller can leave either post-resume state without the checked
+# prepare API.  Revalidate through the normal writer, with no SLRU reseeding.
+cp "$PREPARED/pagestore_branch.prepare.json" "$TMPROOT/completed-journal.json" ||
+    fail "could not preserve the completed journal for recovery tests"
+for recovered_state in materializer_resumed writer_restored complete; do
+    for marker_ok in false true; do
+        python3 - "$TMPROOT/completed-journal.json" "$PREPARED/pagestore_branch.prepare.json" \
+            "$BIN" "$recovered_state" "$marker_ok" "$(wal_segment_size "$WRITER")" <<'PYRECOVER' || fail "could not construct the post-resume recovery journal"
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+import pagestore_artifact_schema as schema
+journal = json.loads(Path(sys.argv[1]).read_text())
+journal["state"] = sys.argv[4]
+if sys.argv[5] == "false":
+    high, low = journal["fork_lsn"].split("/")
+    fork = (int(high, 16) << 32) + int(low, 16) + int(sys.argv[6])
+    journal["fork_lsn"] = f"{fork >> 32:X}/{fork & 0xffffffff:08X}"
+Path(sys.argv[2]).write_text(json.dumps(schema.stamp("branch_journal", journal)) + "\n")
+PYRECOVER
+        if [ "$marker_ok" = false ]; then
+            cp "$PREPARED/pagestore_branch.prepare.json" "$TMPROOT/unvalidated-journal.json"
+            recovered_output=$("$BRANCHPREP" --config "$BRANCH_CONFIG" 2>&1) &&
+                fail "post-resume recovery accepted a fork beyond the materializer marker"
+            case "$recovered_output" in
+                *"durable materializer marker covering its fork"*) ;;
+                *) fail "post-resume recovery failed without checking the marker: $recovered_output" ;;
+            esac
+            cmp "$PREPARED/pagestore_branch.prepare.json" "$TMPROOT/unvalidated-journal.json" ||
+                fail "failed post-resume validation advanced the journal"
+        else
+            "$BRANCHPREP" --config "$BRANCH_CONFIG" >/dev/null ||
+                fail "post-resume recovery refused a covered fork"
+        fi
+    done
+done
+cp "$TMPROOT/completed-journal.json" "$PREPARED/pagestore_branch.prepare.json" ||
+    fail "could not restore the completed journal"
+echo "ok   - post-resume and completed journals validate the marker through the normal writer"
+assert_eq "$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_branch_snapshot_is_safe(1, 1);")" "t" \
+    "completed controller receipt names a durable finite branch"
+"${WP[@]}" -q -c "SET pagestore.allow_unsafe_branch_cut = on;
+    SELECT pagestore_ext.pagestore_create_branch_with_incarnation(98, 0, 1, '$proof_marker');" >/dev/null ||
+    fail "could not create the explicit legacy test branch"
+assert_eq "$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_branch_snapshot_is_safe(98, 1);")" "f" \
+    "unsafe legacy branch cannot be certified by the controller"
+"${WP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch(98, 1);" >/dev/null ||
+    fail "could not delete the explicit legacy test branch"
+
 # The persisted-format fixture for the controller's JSON artifacts
 # (harness/pagestore_controller_fixture.py --capture) takes what this real
 # controller run left behind: its configuration, the completed journal and
@@ -725,8 +825,71 @@ assert_eq "$("${BP[@]}" -c "SELECT note FROM mvp_golden WHERE id=3;")" \
 	"branch_local" "branch write survives compute restart on timeline 1"
 assert_eq "$("${BP[@]}" -c "SELECT count(*) FROM mvp_golden WHERE id=2;")" \
 	"0" "branch ancestry cutoff survives compute restart"
+if grep -q 'pg_control mirror ship failed' "$BRANCH/branch.log"; then
+	fail "branch checkpoints failed to publish their CONTROL mirrors"
+fi
+echo "ok   - pre-fork-redo branch checkpoints mirror CONTROL without reader admission"
 assert_eq "$("${WP[@]}" -c "SELECT count(*) FROM mvp_golden WHERE id=3;")" \
 	"0" "parent remains isolated from the branch write"
+
+# Operator-facing branch deletion.  The store already vetoes a timeline with
+# descendants or retention owners; the SQL entry point adds the refusals only
+# a compute can name, and the incarnation fence.
+assert_eq "$("${WP[@]}" -c "SELECT state || ':' || incarnation FROM pagestore_ext.pagestore_timeline_state(1);")" \
+	"live:1" "the writer reports the branch timeline live at its incarnation"
+assert_eq "$("${WP[@]}" -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_ext.pagestore_timeline_state(99);")" \
+	"t" "an undefined timeline has no lifecycle state"
+assert_eq "$("${WP[@]}" -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_ext.pagestore_timeline_state(500000);")" \
+	"t" "a timeline id beyond the store's range is undefined, not an error"
+expect_delete_error()
+{
+	local port_array=$1 args=$2 pattern=$3 message=$4 output
+
+	if [ "$port_array" = branch ]; then
+		output=$("${BP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch($args);" 2>&1) && fail "$message (accepted)"
+	else
+		output=$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch($args);" 2>&1) && fail "$message (accepted)"
+	fi
+	printf '%s\n' "$output" | grep -F "$pattern" >/dev/null ||
+		fail "$message (got: $output)"
+	echo "ok   - $message"
+}
+expect_delete_error branch "1, 1" "this server's own timeline" \
+	"a branch compute cannot delete its own timeline"
+expect_delete_error writer "0, 1" "main timeline" "the main timeline cannot be deleted"
+expect_delete_error writer "1, 2" "is at incarnation 1, not 2" \
+	"a stale or wrong incarnation does not delete the branch"
+expect_delete_error writer "99, 1" "does not exist" "an undefined timeline cannot be deleted"
+assert_eq "$("${BP[@]}" -c "SELECT note FROM mvp_golden WHERE id=3;")" \
+	"branch_local" "refused deletions leave the branch usable"
+
+"$BIN/pg_ctl" -D "$BRANCH" -m fast -w stop >/dev/null 2>&1 ||
+	fail "could not stop the branch compute before deleting its timeline"
+assert_eq "$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch(1, 1);")" \
+	"deleting" "the writer durably begins deleting the stopped branch"
+case "$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch(1, 1);")" in
+	deleting|deleted) echo "ok   - repeating an accepted deletion succeeds" ;;
+	*) fail "repeating an accepted deletion was refused" ;;
+esac
+timeline_deleted=no
+for _ in $(seq 1 600); do
+	if [ "$("${WP[@]}" -c "SELECT state FROM pagestore_ext.pagestore_timeline_state(1);")" = "deleted" ]; then
+		timeline_deleted=yes
+		break
+	fi
+	sleep 0.1
+done
+assert_eq "$timeline_deleted" "yes" "store maintenance finishes the deletion"
+assert_eq "$("${WP[@]}" -c "SELECT pagestore_ext.pagestore_delete_branch(1, 1);")" \
+	"deleted" "deleting an already deleted incarnation reports deleted"
+if "$BIN/pg_ctl" -D "$BRANCH" -l "$BRANCH/branch.log" -w start >/dev/null 2>&1; then
+	fail "a compute booted on a deleted timeline"
+fi
+echo "ok   - the deleted branch's compute no longer starts"
+assert_eq "$("${WP[@]}" -c "SELECT string_agg(note, ',' ORDER BY id) FROM mvp_golden;")" \
+	"before_fork,after_fork" "the parent is untouched by the branch's deletion"
+assert_eq "$("${MP[@]}" -c "SELECT string_agg(note, ',' ORDER BY id) FROM mvp_golden;")" \
+	"before_fork,after_fork" "the materializer still serves the parent from the store"
 
 echo "----"
 echo "pagestore MVP golden scenario: PASS"

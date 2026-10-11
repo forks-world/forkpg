@@ -1,0 +1,1041 @@
+/*-------------------------------------------------------------------------
+ *
+ * fuzz_common.c
+ *	  Persistent-work-directory driver shared by every persisted-format
+ *	  fuzz target.  See fuzz_common.h and fuzz/build.sh.
+ *
+ * Round 1 mkdtemp'd and fully recursive-copied a fresh store directory
+ * every iteration; that plus real fsync() calls in the product code held
+ * throughput to 1-2 exec/s.  Round 2 (see the coordinator's review):
+ *   - The whole template fixture store is read into memory once
+ *     (template_files[]) and written out to one persistent work_dir once,
+ *     at ps_fuzz_global_init() time.
+ *   - Each iteration only: (1) write the mutated bytes to the target file,
+ *     (2) ps_core_open()/bounded reads/ps_core_maintenance()/
+ *     ps_core_close(), (3) reset_work_dir() -- rewrite every cached
+ *     file's original bytes back (cheap in-place O_TRUNC writes, no new
+ *     inodes) and delete/recreate anything open()/maintenance() added or
+ *     removed, so the *next* iteration starts from the same pristine state
+ *     without a fresh mkdtemp/mkdir/rmdir per iteration.
+ *   - fsync()/fdatasync()/sync_file_range() are neutralized for the
+ *     instrumented binary only, via linker --wrap (fuzz_nosync.c); this
+ *     file never calls or overrides them itself.
+ *   - stdout is muted for the open/close window using an fd opened once at
+ *     init; stderr stays attached so sanitizer, assertion, and libFuzzer
+ *     diagnostics survive a fatal exit (see mute_output()).
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "pagestore_core.h"
+#include "fuzz_common.h"
+#include "fuzz_crc_fixup.h"
+
+#ifndef PS_FUZZ_FIXTURE_TGZ
+#error "PS_FUZZ_FIXTURE_TGZ must be defined at compile time (see fuzz/build.sh)"
+#endif
+
+/*
+ * Every persisted-format family in fixtures/posix-mvp-baseline/format.json
+ * that lives directly under the store directory, mapped to a representative
+ * file.  Sibling files of the same family/magic (e.g. seg_00000000 ..
+ * seg_00000004, layer_0_...0a/0b) are covered by seeding the same target's
+ * corpus with each of them -- the reader code path is identical, only the
+ * bytes differ.  "control" (the pg_control admission-fence mirror) is
+ * PGDATA-side state written by backend_localsvc.c, not a file ps_core_open()
+ * reads from the store directory, so it is out of scope for this layer.
+ *
+ * Codex finding on PR #303: page_segment names seg_00000005, a segment
+ * *past* the highest one the fixture actually has (seg_00000004, 16512
+ * bytes).  recover() (pagestore_core.c) does not scan every segment from
+ * byte 0 -- the durable flush watermark says shard 0's watermark segment is
+ * exactly seg_00000004 at offset 16512 (this fixture's seg_00000004 is
+ * *exactly* that many bytes: the whole file is the unsynced tail below the
+ * watermark), and recover()'s per-segment scan starts the *watermark*
+ * segment's own read at flush_watermark.seg_off, not 0 -- so a target
+ * naming seg_00000004 wrote fuzzer bytes recover() never reads at all: every
+ * input, mutated or pristine, replayed identically (zero records recovered
+ * from this file, every time). recover()'s loop (`for (int id = first;;
+ * id++) { uint64_t off = (id == first ...) ? watermark.seg_off : 0; ... }`)
+ * *does* scan every segment after the watermark one from byte 0 -- seg 5
+ * does not need to already exist in the template for this: write_file()
+ * O_CREAT|O_TRUNCs it fresh each iteration, ps_storage->seg_size() treats a
+ * missing/short file as "nothing here yet" (not a hard failure) rather than
+ * refusing to open, and reset_work_dir() (fuzz_common.c) already unlinks
+ * any file not part of the original template after every iteration -- the
+ * same mechanism every other target's mutated file relies on to leave no
+ * state behind. This makes the fuzz input the entire content the parser
+ * sees, from byte 0.
+ */
+const PsFuzzTarget ps_fuzz_targets[] = {
+	{"manifest", "layers.manifest"},
+	{"forkmeta", "forkmeta"},
+	{"forkmeta_snapshot_manifest", "forkmeta_snapshots/forkmeta_manifest_v1"},
+	{"forkmeta_snapshot_checkpoint", "forkmeta_snapshots/forkmeta_checkpoint_v1_00000000000000000001"},
+	{"forkmeta_snapshot_tail", "forkmeta_snapshots/forkmeta_tail_v1_00000000000000000001"},
+	{"image_layer", "layer_0_000000000000000a"},
+	{"page_frontier", "page-prune.frontiers"},
+	{"page_segment", "seg_00000005"},
+	{"retention_meta", "retention.meta"},
+	{"retention_state", "retention.state"},
+	{"store_config", ".pagestore-nshards"},
+	{"timelines", "timelines"},
+	{"wal_log", "wal_1"},
+	{"wal_store_identity", "wal_segments_0/wal_store_identity_v1"},
+	{"wal_segment", "wal_segments_0/walv1_1_00000000000000000000"},
+	{"walidx_frontier", "walidx-prune.frontiers"},
+	{"walidx_log_epoch", "walidx_0_0_e00000000000000000001"},
+	{"walidx_log_legacy", "walidx_1_0"},
+	{"walidx_watermark", "walidx_0_0_e00000000000000000001.size"},
+	{"walidx_snapshot_manifest", "walidx_snapshots_0/walidx_manifest_v1"},
+	{"walidx_snapshot_shard", "walidx_snapshots_0/walidxg1_00000000000000000001_000"},
+};
+const int	ps_fuzz_target_count =
+	(int) (sizeof(ps_fuzz_targets) / sizeof(ps_fuzz_targets[0]));
+
+/* ---- in-memory template cache + persistent work directory -------------- */
+
+typedef struct TemplateEntry
+{
+	char	   *relpath;		/* "" for the store root itself */
+	uint8_t    *data;			/* NULL for a directory */
+	size_t		len;
+	int			is_dir;
+} TemplateEntry;
+
+/*
+ * Every "this file is pristine" write (populate_work_dir(), a reset
+ * rewrite) stamps the file's mtime to this fixed, far-in-the-past sentinel
+ * via futimens() -- see write_pristine_file() -- overwriting whatever value
+ * the write() itself produced.  reset_entry() then treats "mtime ==
+ * sentinel" as proof the file is still pristine and skips rewriting it.
+ *
+ * An earlier version of this recorded each write's own resulting ("now")
+ * mtime per file and compared against *that*, which is unsound: kernel
+ * mtimes on some configurations come from a coarse periodic clock (single-
+ * digit milliseconds of granularity is common), while one fuzz iteration
+ * now completes in a couple of milliseconds. A product-code write landing
+ * in the same coarse tick as our own preceding write would read back with
+ * an unchanged mtime, and reset_entry() would wrongly conclude the file was
+ * never touched and skip restoring it -- leaving dirty bytes in place for
+ * the next iteration (a nondeterministic, unreproducible false crash or
+ * missed one, depending on what the dirty bytes happen to be).
+ *
+ * Comparing against a fixed sentinel instead of a recent "now" timestamp
+ * has no such collision risk: any write that does not explicitly request
+ * this exact sentinel -- i.e. every write product code makes, and the
+ * fuzz-content write of the target file itself (see write_file(), which
+ * deliberately does *not* set this) -- gets the real current time, which
+ * cannot equal a fixed point in 1970 regardless of clock coarseness.
+ *
+ * The three ways a file can actually change are all still handled
+ * correctly: a file product code deletes is recreated by reset_work_dir()'s
+ * second pass (a missing file trivially fails any mtime comparison); a file
+ * product code adds new (not in the template) is unconditionally unlinked
+ * by reset_entry(), independent of mtime; and a same-name file replaced via
+ * rename() lands with a fresh "now" mtime like any other write (rename()
+ * does not preserve or fabricate our sentinel), so it is rewritten like any
+ * other dirty file. See PS_FUZZ_VERIFY_RESET below for a runtime proof.
+ */
+static const struct timespec pristine_mtime = {1, 0};
+
+static TemplateEntry *template_entries;
+static int	template_entry_count;
+static int	template_ready = 0;
+static const char *scratch_root;
+static char work_dir[PATH_MAX];
+
+static int
+remove_entry(const char *fpath, const struct stat *sb, int typeflag,
+			 struct FTW *ftwbuf)
+{
+	(void) sb;
+	(void) ftwbuf;
+	if (typeflag == FTW_DP)
+		(void) rmdir(fpath);
+	else
+		(void) unlink(fpath);
+	return 0;
+}
+
+/*
+ * Codex finding on PR #303 (c959796): work_dir/extract_dir (both built from
+ * TMPDIR, so their bytes are outside this program's control) used to be
+ * interpolated into a single-quoted `rm -rf '...'` string and handed to
+ * system(), i.e. /bin/sh -c "...": a single quote anywhere in the path
+ * breaks out of the quoting and either fails outright or, worse, runs
+ * whatever shell-active bytes follow it. nftw() removes the tree directly,
+ * with no shell parsing of the path at all. Best-effort like the
+ * system("rm -rf ...") calls this replaces: a path nftw() cannot fully walk
+ * or remove (e.g. a permission error) is left behind rather than aborting
+ * the run over cleanup.
+ */
+static void
+remove_tree(const char *path)
+{
+	if (path == NULL || path[0] == '\0')
+		return;
+	nftw(path, remove_entry, 32, FTW_DEPTH | FTW_PHYS);
+}
+
+/* Round-4 coordinator review: the persistent work_dir (see the file header
+ * above) was never removed, so every process -- 21 of them for one
+ * `meson test --suite pagestore-fuzz` run, plus however many a fuzz
+ * campaign forks -- abandoned a full fixture-sized directory in TMPDIR.
+ * Remove it on a normal exit via atexit(); a crash (abort()/a signal) skips
+ * atexit handlers entirely, so a crashing run's work_dir is deliberately
+ * left behind for post-mortem inspection instead of raced with cleanup. */
+static void
+cleanup_work_dir(void)
+{
+	remove_tree(work_dir);
+}
+
+static const char *
+skip_root(const char *fpath, size_t root_len)
+{
+	const char *rel = fpath + root_len;
+
+	while (*rel == '/')
+		rel++;
+	return rel;
+}
+
+/* ---- building the template cache from the extracted fixture ------------ */
+
+static const char *g_walk_root;
+static size_t g_walk_root_len;
+
+static int
+cache_entry(const char *fpath, const struct stat *sb, int typeflag,
+			struct FTW *ftwbuf)
+{
+	const char *rel = skip_root(fpath, g_walk_root_len);
+	TemplateEntry *e;
+
+	(void) ftwbuf;
+	if (typeflag != FTW_D && typeflag != FTW_F)
+		return 0;
+
+	template_entries = realloc(template_entries,
+		(size_t) (template_entry_count + 1) * sizeof(TemplateEntry));
+	if (template_entries == NULL)
+	{
+		fprintf(stderr, "ps_fuzz_global_init: out of memory caching template\n");
+		abort();
+	}
+	e = &template_entries[template_entry_count++];
+	e->relpath = strdup(rel);
+	e->is_dir = (typeflag == FTW_D);
+	e->data = NULL;
+	e->len = 0;
+	if (typeflag == FTW_F)
+	{
+		e->len = (size_t) sb->st_size;
+		e->data = e->len > 0 ? malloc(e->len) : malloc(1);
+		if (e->data == NULL)
+		{
+			fprintf(stderr, "ps_fuzz_global_init: out of memory reading %s\n",
+					fpath);
+			abort();
+		}
+		if (e->len > 0)
+		{
+			int			fd = open(fpath, O_RDONLY);
+			size_t		off = 0;
+
+			if (fd < 0)
+			{
+				fprintf(stderr, "ps_fuzz_global_init: open %s: %s\n", fpath,
+						strerror(errno));
+				abort();
+			}
+			while (off < e->len)
+			{
+				ssize_t		n = read(fd, e->data + off, e->len - off);
+
+				if (n <= 0)
+				{
+					fprintf(stderr, "ps_fuzz_global_init: read %s failed\n",
+							fpath);
+					abort();
+				}
+				off += (size_t) n;
+			}
+			close(fd);
+		}
+	}
+	return 0;
+}
+
+static TemplateEntry *
+template_find(const char *relpath)
+{
+	for (int i = 0; i < template_entry_count; i++)
+		if (strcmp(template_entries[i].relpath, relpath) == 0)
+			return &template_entries[i];
+	return NULL;
+}
+
+const uint8_t *
+ps_fuzz_template_lookup(const char *relpath, size_t *len_out)
+{
+	const TemplateEntry *e = template_find(relpath);
+
+	if (e == NULL || e->is_dir)
+		return NULL;
+	if (len_out != NULL)
+		*len_out = e->len;
+	return e->data;
+}
+
+/* Plain write: the file ends up with whatever mtime the kernel gives a
+ * fresh write ("now"). Used only for the fuzz-content write of the target
+ * file itself (see ps_fuzz_run_one()) -- that content is deliberately not
+ * pristine, so it must not carry the sentinel mtime below. */
+static void
+write_file(const char *path, const uint8_t *data, size_t len)
+{
+	int			fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	size_t		off = 0;
+
+	if (fd < 0)
+	{
+		fprintf(stderr, "ps_fuzz: open %s: %s\n", path, strerror(errno));
+		abort();
+	}
+	while (off < len)
+	{
+		ssize_t		n = write(fd, data + off, len - off);
+
+		if (n <= 0)
+		{
+			fprintf(stderr, "ps_fuzz: write %s failed\n", path);
+			abort();
+		}
+		off += (size_t) n;
+	}
+	close(fd);
+}
+
+/* Write pristine template bytes and stamp the result with the fixed
+ * sentinel mtime (see pristine_mtime's comment above) instead of whatever
+ * "now" the write() itself produced -- this is what makes a later
+ * mtime_eq(sb->st_mtim, pristine_mtime) a sound "still pristine" test. */
+static void
+write_pristine_file(const char *path, const uint8_t *data, size_t len)
+{
+	int			fd;
+	struct timespec times[2];
+
+	write_file(path, data, len);
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+	{
+		fprintf(stderr, "ps_fuzz: reopen %s: %s\n", path, strerror(errno));
+		abort();
+	}
+	times[0].tv_sec = 0;
+	times[0].tv_nsec = UTIME_OMIT;	/* leave atime alone */
+	times[1] = pristine_mtime;
+	if (futimens(fd, times) != 0)
+	{
+		fprintf(stderr, "ps_fuzz: futimens %s: %s\n", path, strerror(errno));
+		abort();
+	}
+	close(fd);
+}
+
+/* One-time population of the persistent work_dir from the template cache
+ * (mirrors the order entries were discovered, i.e. directories before the
+ * files inside them, since nftw() visits a directory before its
+ * children). */
+static void
+populate_work_dir(void)
+{
+	for (int i = 0; i < template_entry_count; i++)
+	{
+		TemplateEntry *e = &template_entries[i];
+		char		path[PATH_MAX];
+
+		if (snprintf(path, sizeof(path), "%s/%s", work_dir, e->relpath) >=
+			(int) sizeof(path))
+			continue;
+		if (e->is_dir)
+			(void) mkdir(path, 0700);
+		else
+			write_pristine_file(path, e->data, e->len);
+	}
+}
+
+/* ---- resetting the persistent work directory between iterations -------- */
+
+/* True when a and b are the same second/nanosecond -- i.e. nothing has
+ * written to the file since we last recorded its mtime. */
+static int
+mtime_eq(const struct timespec *a, const struct timespec *b)
+{
+	return a->tv_sec == b->tv_sec && a->tv_nsec == b->tv_nsec;
+}
+
+static int
+reset_entry(const char *fpath, const struct stat *sb, int typeflag,
+			struct FTW *ftwbuf)
+{
+	const char *rel;
+	TemplateEntry *e;
+
+	(void) ftwbuf;
+	rel = skip_root(fpath, strlen(work_dir));
+	if (*rel == '\0')
+		return 0;				/* the work_dir root itself */
+	e = template_find(rel);
+	if (typeflag == FTW_F)
+	{
+		if (e != NULL && !e->is_dir)
+		{
+			/* sb is this very fstat(), already paid for by the nftw() walk
+			 * we have to do anyway to find product-code-created/removed
+			 * paths below -- comparing it against the fixed pristine
+			 * sentinel costs nothing extra, and lets every file product
+			 * code did not touch this iteration skip its rewrite entirely
+			 * (see pristine_mtime's comment above). */
+			if (!mtime_eq(&sb->st_mtim, &pristine_mtime))
+				write_pristine_file(fpath, e->data, e->len);
+		}
+		else
+			unlink(fpath);		/* a file open()/maintenance() created */
+	}
+	else if (typeflag == FTW_DP)
+	{
+		if (e == NULL || !e->is_dir)
+			rmdir(fpath);		/* a directory open()/maintenance() created */
+	}
+	return 0;
+}
+
+static void
+reset_work_dir(void)
+{
+	nftw(work_dir, reset_entry, 32, FTW_DEPTH | FTW_PHYS);
+	/* Recreate anything product code deleted outright (renamed away,
+	 * unlinked, ...): the walk above only rewrites/removes what it found on
+	 * disk, so a template entry that no longer exists needs a second pass. */
+	for (int i = 0; i < template_entry_count; i++)
+	{
+		TemplateEntry *e = &template_entries[i];
+		char		path[PATH_MAX];
+		struct stat st;
+
+		if (snprintf(path, sizeof(path), "%s/%s", work_dir, e->relpath) >=
+			(int) sizeof(path))
+			continue;
+		if (stat(path, &st) == 0)
+			continue;
+		if (e->is_dir)
+			(void) mkdir(path, 0700);
+		else
+			write_pristine_file(path, e->data, e->len);
+	}
+}
+
+/*
+ * Exported for gate_sweep.c (fuzz/tests/): that tool calls
+ * ps_fuzz_crc_fixup() and ps_core_open()/close() directly, one mutated
+ * field at a time, instead of going through ps_fuzz_run_one() -- it needs
+ * the exact same "the work directory is pristine again before the next
+ * call" guarantee ps_fuzz_run_one() gets from this function, or state a
+ * successful open leaves behind (a checkpoint, a compacted manifest, ...)
+ * silently drifts the store away from the fixture across thousands of
+ * sweep iterations, masking real gates instead of finding them.
+ */
+void
+ps_fuzz_reset_work_dir(void)
+{
+	reset_work_dir();
+}
+
+/* ---- optional post-reset self-check (fuzz-build only) -------------------- */
+
+/*
+ * PS_FUZZ_VERIFY_RESET=1: after every reset_work_dir(), read every template
+ * file back from work_dir and memcmp() it against the cached pristine
+ * bytes, aborting immediately on the first mismatch.  This is the sentinel-
+ * mtime optimization's own correctness proof: if the sentinel comparison
+ * were ever wrong (e.g. some future change reintroduced a "compare against
+ * a recent real timestamp" pattern, or a filesystem/kernel combination
+ * behaved unexpectedly), this turns "the next iteration silently runs
+ * against dirty bytes" into a hard, immediately-attributable abort instead
+ * of a nondeterministic, hard-to-reproduce crash several iterations later.
+ * Costs an O(total fixture size) read-and-compare every iteration, so it is
+ * off by default; none of this driver's throughput numbers include it.
+ */
+static int
+verify_reset_enabled(void)
+{
+	static int	checked = 0;
+	static int	enabled = 0;
+
+	if (!checked)
+	{
+		const char *v = getenv("PS_FUZZ_VERIFY_RESET");
+
+		enabled = (v != NULL && v[0] != '\0' && strcmp(v, "0") != 0);
+		checked = 1;
+	}
+	return enabled;
+}
+
+static void
+verify_reset(void)
+{
+	for (int i = 0; i < template_entry_count; i++)
+	{
+		TemplateEntry *e = &template_entries[i];
+		char		path[PATH_MAX];
+		struct stat st;
+		int			fd;
+		uint8_t    *buf;
+		size_t		off = 0;
+
+		if (e->is_dir)
+			continue;
+		if (snprintf(path, sizeof(path), "%s/%s", work_dir, e->relpath) >=
+			(int) sizeof(path))
+			continue;
+
+		fd = open(path, O_RDONLY);
+		if (fd < 0)
+		{
+			fprintf(stderr,
+					"ps_fuzz: PS_FUZZ_VERIFY_RESET: %s missing after reset: %s\n",
+					path, strerror(errno));
+			abort();
+		}
+		if (fstat(fd, &st) != 0 || (size_t) st.st_size != e->len)
+		{
+			fprintf(stderr,
+					"ps_fuzz: PS_FUZZ_VERIFY_RESET: %s size %lld != template %zu\n",
+					path, (long long) st.st_size, e->len);
+			abort();
+		}
+		buf = e->len > 0 ? malloc(e->len) : malloc(1);
+		if (buf == NULL)
+		{
+			fprintf(stderr, "ps_fuzz: PS_FUZZ_VERIFY_RESET: out of memory\n");
+			abort();
+		}
+		while (off < e->len)
+		{
+			ssize_t		n = read(fd, buf + off, e->len - off);
+
+			if (n <= 0)
+			{
+				fprintf(stderr,
+						"ps_fuzz: PS_FUZZ_VERIFY_RESET: read %s failed\n",
+						path);
+				abort();
+			}
+			off += (size_t) n;
+		}
+		close(fd);
+		if (e->len > 0 && memcmp(buf, e->data, e->len) != 0)
+		{
+			fprintf(stderr,
+					"ps_fuzz: PS_FUZZ_VERIFY_RESET: %s content mismatch after "
+					"reset -- the mtime-skip let dirty bytes through\n", path);
+			free(buf);
+			abort();
+		}
+		free(buf);
+	}
+}
+
+/*
+ * Codex finding on PR #303 (c959796): PS_FUZZ_FIXTURE_TGZ (a compile-time
+ * path baked in by build.sh/meson.build) and extract_dir (built from
+ * TMPDIR) used to be interpolated into a single-quoted
+ * `tar xzf '...' -C '...'` string and handed to system(), i.e.
+ * /bin/sh -c "...": a single quote anywhere in either path breaks out of
+ * the quoting and either aborts the fuzz run's startup with a shell syntax
+ * error or, worse, runs whatever shell-active bytes follow it.
+ * fork()+execlp() runs the tar binary directly with each path as its own
+ * argv element, so neither path's bytes are ever parsed by a shell.
+ */
+static int
+run_tar_extract(const char *tgz_path, const char *dest_dir)
+{
+	pid_t		pid;
+	int			status;
+
+	pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0)
+	{
+		execlp("tar", "tar", "xzf", tgz_path, "-C", dest_dir, (char *) NULL);
+		perror("ps_fuzz_global_init: execlp tar");
+		_exit(127);
+	}
+	while (waitpid(pid, &status, 0) < 0)
+	{
+		if (errno != EINTR)
+			return -1;
+	}
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return -1;
+	return 0;
+}
+
+/* ---- one-time global setup ---------------------------------------------- */
+
+void
+ps_fuzz_global_init(void)
+{
+	char		extract_dir[PATH_MAX];
+
+	if (template_ready)
+		return;
+
+	scratch_root = getenv("TMPDIR");
+	if (scratch_root == NULL || scratch_root[0] == '\0')
+		scratch_root = "/tmp";
+
+	if (snprintf(extract_dir, sizeof(extract_dir),
+				 "%s/psfuzz-extract-XXXXXX", scratch_root) >=
+			(int) sizeof(extract_dir) ||
+		mkdtemp(extract_dir) == NULL)
+	{
+		fprintf(stderr, "ps_fuzz_global_init: mkdtemp (extract) failed\n");
+		abort();
+	}
+	if (run_tar_extract(PS_FUZZ_FIXTURE_TGZ, extract_dir) != 0)
+	{
+		fprintf(stderr,
+				"ps_fuzz_global_init: failed to extract fixture %s into %s\n",
+				PS_FUZZ_FIXTURE_TGZ, extract_dir);
+		abort();
+	}
+
+	g_walk_root = extract_dir;
+	g_walk_root_len = strlen(extract_dir);
+	nftw(extract_dir, cache_entry, 32, FTW_PHYS);
+
+	if (snprintf(work_dir, sizeof(work_dir), "%s/psfuzz-work-XXXXXX",
+				 scratch_root) >= (int) sizeof(work_dir) ||
+		mkdtemp(work_dir) == NULL)
+	{
+		fprintf(stderr, "ps_fuzz_global_init: mkdtemp (work_dir) failed\n");
+		abort();
+	}
+	atexit(cleanup_work_dir);
+	populate_work_dir();
+
+	/* The extracted template tree is no longer needed once cached and
+	 * copied into work_dir; free the disk space, especially with many
+	 * parallel target processes sharing /tmp. */
+	remove_tree(extract_dir);
+
+	/* Matches fixtures/posix-mvp-baseline/fixture.json's daemon_env. */
+	setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1);
+
+	/* Matches fixtures/posix-mvp-baseline/fixture.json's daemon_args; set
+	 * once here rather than every ps_fuzz_run_one() call -- these globals
+	 * never change between iterations. */
+	page_size = 8192;
+	segment_size = 65536;
+	flush_pages = 8;
+	segment_gc_enabled = 0;
+	cache_pages = 0;
+	use_layers = 1;
+	ps_nshards = 1;
+	wal_reclaim_high_water_bytes = 8388608;
+	wal_reclaim_catchup_bytes = 1;
+	walidx_snapshot_trigger_option_bytes = 1048576;
+	page_reclaim_high_water_bytes = 0;
+	page_reclaim_catchup_bytes = 0;
+	walidx_reclaim_high_water_bytes = 0;
+	walidx_reclaim_catchup_bytes = 0;
+	forkmeta_reclaim_high_water_bytes = 0;
+	forkmeta_reclaim_catchup_bytes = 0;
+	ps_storage = &PsStoragePosix;
+
+	template_ready = 1;
+}
+
+/* ---- bounded post-open reads --------------------------------------------- */
+
+static void
+bounded_reads(void)
+{
+	static unsigned char buf[8192];
+	uint32_t	tl;
+
+	(void) ps_core_layer_count();
+
+	for (tl = 0; tl < 2; tl++)
+	{
+		PsTimelineState state;
+		uint64_t	incarnation;
+		int			defined;
+		uint32_t	rel;
+
+		ps_lock_map_rd();
+		defined = ps_timeline_defined(tl);
+		if (defined)
+			(void) ps_timeline_state(tl, &state, &incarnation);
+		ps_unlock_map();
+		if (!defined)
+			continue;
+		(void) ps_timeline_live(tl);
+
+		for (rel = 1; rel <= 6; rel++)
+		{
+			PsKey		key = {1, 1, rel, 0, PS_KLASS_RELATION};
+			uint32_t	shard = ps_shard_of(&key);
+			uint32_t	blk;
+
+			ps_lock_shard_rd(shard);
+			for (blk = 0; blk < 4; blk++)
+			{
+				uint64_t	ver = 0;
+
+				(void) read_resolve(tl, &key, blk, UINT64_MAX, UINT64_MAX,
+									 buf, &ver);
+			}
+			ps_unlock_shard(shard);
+		}
+	}
+}
+
+/* ---- output muting (fds opened once, not per iteration) ----------------- */
+
+static int	saved_stdout = -1;
+static int	devnull_fd = -1;
+
+static int
+muting_disabled(void)
+{
+	static int	checked = 0;
+	static int	disabled = 0;
+
+	if (!checked)
+	{
+		const char *v = getenv("PS_FUZZ_NO_MUTE");
+
+		disabled = (v != NULL && v[0] != '\0' && strcmp(v, "0") != 0);
+		checked = 1;
+	}
+	return disabled;
+}
+
+static void
+mute_output(void)
+{
+	if (muting_disabled())
+		return;
+	if (devnull_fd < 0)
+		devnull_fd = open("/dev/null", O_WRONLY);
+	if (devnull_fd < 0)
+		return;
+	fflush(stdout);
+	if (saved_stdout < 0)
+		saved_stdout = dup(1);
+	dup2(devnull_fd, 1);
+}
+
+static void
+unmute_output(void)
+{
+	if (muting_disabled())
+		return;
+	fflush(stdout);
+	if (saved_stdout >= 0)
+		dup2(saved_stdout, 1);
+}
+
+/* ---- CRC-fixup sampling --------------------------------------------------
+ * PS_FUZZ_CRC_FIXUP unset/"0": never fix up (round-1 behavior, the "cov/ft
+ * without fixup" baseline).  "always"/"1": every iteration.  Anything else
+ * (including the default when the variable is set but not recognized) and
+ * the documented default once the feature is on at all: split so roughly
+ * half of iterations get the fixed-up checksum and half stay pure mutation
+ * -- a mix of "past the gate" and "at the gate" inputs in the same run.
+ *
+ * Round-4 coordinator review: the split used to be a per-process iteration
+ * counter, so the identical input alternated between fixed-up and raw
+ * bytes depending on which call number it happened to land on -- replay
+ * and crash minimization (which re-run the same unit outside of any
+ * particular sequence) could not reproduce whichever coverage or crash the
+ * original run saw.  Hashing the input bytes themselves makes the choice a
+ * pure function of the unit: the same bytes always take the same path,
+ * however many times or in what order they are replayed, while still
+ * landing close to a 50/50 split across a corpus of distinct inputs. */
+typedef enum FixupMode
+{
+	FIXUP_OFF,
+	FIXUP_ALWAYS,
+	FIXUP_HALF,
+} FixupMode;
+
+static FixupMode
+fixup_mode(void)
+{
+	static int	checked = 0;
+	static FixupMode mode = FIXUP_OFF;
+
+	if (!checked)
+	{
+		const char *v = getenv("PS_FUZZ_CRC_FIXUP");
+
+		if (v == NULL || v[0] == '\0' || strcmp(v, "0") == 0)
+			mode = FIXUP_OFF;
+		else if (strcmp(v, "always") == 0)
+			mode = FIXUP_ALWAYS;
+		else
+			mode = FIXUP_HALF;
+		checked = 1;
+	}
+	return mode;
+}
+
+/* FNV-1a over the input bytes, same constants used by every checksum in
+ * fuzz_crc_fixup.c (and by the product formats it mirrors) -- not chosen
+ * for that reason, just a convenient, already-proven-good, already-in-use
+ * hash to key the split on. */
+static uint32_t
+fixup_sample_hash(const uint8_t *data, size_t size)
+{
+	uint32_t	h = 2166136261u;
+	size_t		i;
+
+	for (i = 0; i < size; i++)
+	{
+		h ^= data[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+static int
+should_fixup_this_iteration(const uint8_t *data, size_t size)
+{
+	switch (fixup_mode())
+	{
+		case FIXUP_OFF:
+			return 0;
+		case FIXUP_ALWAYS:
+			return 1;
+		case FIXUP_HALF:
+		default:
+			return (fixup_sample_hash(data, size) & 1) == 0;
+	}
+}
+
+/*
+ * Codex finding on PR #303 (c959796): a target name that matches nothing in
+ * ps_fuzz_targets (a typo'd PS_FUZZ_TARGET, or a bad replay-CLI argument)
+ * used to fall through ps_fuzz_run_one()'s lookup below and just return,
+ * having done nothing -- a direct libFuzzer campaign or a replay run then
+ * "succeeds" having never exercised a single line of pagestore code. NULL,
+ * "", and "all" are the documented ways to ask for the data[0]-selected
+ * "every target" mode (see ps_fuzz_run_one()) and are always valid; every
+ * other name must be one of ps_fuzz_targets's own. Every caller that
+ * accepts a target name from outside this program (PS_FUZZ_TARGET, a CLI
+ * argument) must call this once, before the first ps_fuzz_run_one(), and
+ * exit nonzero on failure -- see fuzz_target.c's LLVMFuzzerInitialize() and
+ * fuzz_standalone_driver.c's main().
+ */
+int
+ps_fuzz_target_is_valid(const char *target_name)
+{
+	int			i;
+
+	if (target_name == NULL || target_name[0] == '\0' ||
+		strcmp(target_name, "all") == 0)
+		return 1;
+
+	for (i = 0; i < ps_fuzz_target_count; i++)
+	{
+		if (strcmp(ps_fuzz_targets[i].name, target_name) == 0)
+			return 1;
+	}
+
+	fprintf(stderr, "ps_fuzz: unknown target \"%s\"; valid targets are"
+			" \"all\"", target_name);
+	for (i = 0; i < ps_fuzz_target_count; i++)
+		fprintf(stderr, ", \"%s\"", ps_fuzz_targets[i].name);
+	fprintf(stderr, "\n");
+	return 0;
+}
+
+/* ---- the per-iteration driver -------------------------------------------- */
+
+void
+ps_fuzz_run_one(const char *target_name, const uint8_t *data, size_t size)
+{
+	char		target_path[PATH_MAX];
+	const char *relpath = NULL;
+	const char *resolved_target_name = target_name;
+	uint8_t    *content;
+	size_t		content_len = size;
+
+	if (!template_ready)
+		return;
+
+	if (target_name != NULL && target_name[0] != '\0' &&
+		strcmp(target_name, "all") != 0)
+	{
+		int			i;
+
+		relpath = NULL;
+		for (i = 0; i < ps_fuzz_target_count; i++)
+		{
+			if (strcmp(ps_fuzz_targets[i].name, target_name) == 0)
+			{
+				relpath = ps_fuzz_targets[i].relpath;
+				break;
+			}
+		}
+		if (relpath == NULL)
+		{
+			/* Every caller must validate with ps_fuzz_target_is_valid()
+			 * before calling here (see its comment); reaching this with an
+			 * unknown name is that contract broken, not a normal input to
+			 * shrug off -- fail loudly instead of silently doing nothing. */
+			fprintf(stderr,
+					"ps_fuzz_run_one: unvalidated unknown target \"%s\"\n",
+					target_name);
+			abort();
+		}
+	}
+	else
+	{
+		/* "all" mode: the first input byte picks the file kind. */
+		int			idx;
+
+		if (size == 0)
+			return;
+		idx = data[0] % ps_fuzz_target_count;
+		relpath = ps_fuzz_targets[idx].relpath;
+		resolved_target_name = ps_fuzz_targets[idx].name;
+		data += 1;
+		size -= 1;
+		content_len = size;
+	}
+
+	content = content_len > 0 ? malloc(content_len) : malloc(1);
+	if (content == NULL)
+		return;
+	if (content_len > 0)
+		memcpy(content, data, content_len);
+
+	if (should_fixup_this_iteration(content, content_len))
+	{
+		/*
+		 * Codex finding on PR #303 (round 6): load_segment()
+		 * (pagestore_wal_store.c) requires the wal_segment target's own
+		 * on-disk file size to equal a fixed constant
+		 * (ps_fuzz_wal_segment_fixed_len(), independent of whatever length
+		 * the fuzz input happened to be) before it hashes a single payload
+		 * byte -- see fixup_wal_segment()'s own comment (fuzz_crc_fixup.c).
+		 * fixup_wal_segment() cannot satisfy that alone: it recomputes
+		 * fields *in* this buffer, but write_file() below always writes
+		 * exactly content_len bytes, and content_len is fixed by the time
+		 * ps_fuzz_crc_fixup() returns. So this resizes the buffer itself --
+		 * zero-padding a short input, truncating a long one -- to that
+		 * fixed length right here, before the fixup (or any of its crc
+		 * recomputation) ever runs, but only for a fixed-up iteration: the
+		 * raw half is deliberately left alone, since a length-changing
+		 * mutation reaching deeper parsing once fixed up is exactly what
+		 * this finding is about, not something to silently repair before
+		 * should_fixup_this_iteration() even had a say.
+		 */
+		/* A manifest cannot add shards absent from the fixture. Normalize
+		 * its size as well; raw iterations retain length mutations. */
+		if (strcmp(resolved_target_name, "wal_segment") == 0 ||
+			strcmp(resolved_target_name, "walidx_snapshot_manifest") == 0)
+		{
+			size_t want_len = strcmp(resolved_target_name, "wal_segment") == 0 ?
+				ps_fuzz_wal_segment_fixed_len() :
+				ps_fuzz_walidx_manifest_fixed_len();
+
+			if (want_len > 0 && want_len != content_len)
+			{
+				uint8_t    *resized = realloc(content, want_len);
+
+				if (resized != NULL)
+				{
+					if (want_len > content_len)
+						memset(resized + content_len, 0,
+							   want_len - content_len);
+					content = resized;
+					content_len = want_len;
+				}
+			}
+		}
+		ps_fuzz_crc_fixup(resolved_target_name, work_dir, content, content_len);
+	}
+
+	if (snprintf(target_path, sizeof(target_path), "%s/%s", work_dir,
+				 relpath) >= (int) sizeof(target_path))
+	{
+		free(content);
+		return;
+	}
+	write_file(target_path, content, content_len);
+	free(content);
+
+	/*
+	 * Codex finding on PR #303 (walidx_log_epoch, same class as this
+	 * round's page_segment finding): the mutated log file above is not the
+	 * only thing that decides whether walidx_recover_one() ever sees its
+	 * bytes -- posix_walidx_epoch_reconcile_locked() (storage_posix.c)
+	 * clamps every read of an epoch log to a *sibling* file's recorded
+	 * durable length, independent of this file's own on-disk length. That
+	 * sibling starts at 0 in this harness's fixture, so without this call
+	 * the walidx_log_epoch target's input -- mutated or pristine, raw or
+	 * CRC-fixed-up -- was silently discarded before a single byte reached
+	 * the parser. This has to run unconditionally, not only when
+	 * should_fixup_this_iteration() above decided to fix up this
+	 * iteration's checksums: raw mode still needs to actually reach
+	 * walidx_recover_one()'s crc/framing checks on whatever bytes the
+	 * mutation produced, not just get a chance to sometimes. See
+	 * fixup_walidx_log_epoch_watermark()'s own comment (fuzz_crc_fixup.c)
+	 * for the full mechanism and why the watermark is always synced to the
+	 * input's full length.
+	 */
+	if (strcmp(resolved_target_name, "walidx_log_epoch") == 0)
+		fixup_walidx_log_epoch_watermark(work_dir, (uint64_t) content_len);
+
+	mute_output();
+	if (ps_core_open(work_dir) == 0)
+	{
+		bounded_reads();
+		(void) ps_core_maintenance();
+		ps_core_close();
+	}
+	unmute_output();
+
+	reset_work_dir();
+	if (verify_reset_enabled())
+		verify_reset();
+}

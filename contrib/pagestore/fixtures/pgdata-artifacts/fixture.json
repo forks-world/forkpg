@@ -2,24 +2,24 @@
   "schema": 1,
   "name": "pgdata-artifacts",
   "role": "current",
-  "captured": "2026-09-12",
+  "captured": "2026-10-12",
   "description": "data-directory artifacts a real backend prepared: a branch (manifest and bootstrap), a reader (manifest, snapshot and catalog provenance) and the two raw-value markers with their identity trailers",
   "identity": {
     "branch": {
       "new_timeline": 3,
       "parent_timeline": 0,
-      "checkpoint_redo": "0/1103E7F0",
-      "recovery_lsn": "0/1103E8D0",
-      "fork_lsn": "0/1103E8D0"
+      "checkpoint_redo": "0/12000028",
+      "recovery_lsn": "0/120000A8",
+      "fork_lsn": "0/13000000"
     },
     "reader": {
       "timeline": 0,
-      "read_lsn": "0/131B5E90",
-      "system_identifier": "7684648545626646368"
+      "read_lsn": "0/181A7020",
+      "system_identifier": "7695506644115787419"
     },
     "markers": {
-      "reader_map_pending_horizon": "0/131B5E90",
-      "slru_primed_stamp": "0/0B054400"
+      "reader_map_pending_horizon": "0/181A7020",
+      "slru_primed_stamp": "0/0B054740"
     }
   },
   "artifacts": {
@@ -42,5 +42,16 @@
     "reader/pagestore_reader.catalog",
     "reader/pagestore_reader.manifest",
     "reader/pagestore_reader.snapshot"
-  ]
+  ],
+  "capture_source": {
+    "pagestore_sha": "fb4f2b3cd2e4c74ddec8b27076762d41bb99744f",
+    "postgres_core_sha": "fb4f2b3cd2e4c74ddec8b27076762d41bb99744f",
+    "postgres_major": 19,
+    "cassert": true
+  },
+  "pg_identity": {
+    "pg_control_version": 1902,
+    "xlog_page_magic": 53536,
+    "catalog_version_no": 202606091
+  }
 }

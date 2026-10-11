@@ -1617,6 +1617,30 @@ def cleanup_temporary_root(
 
 def remove_shm(shm: str) -> None:
     """Release a POSIX shm object without relying on Linux's /dev/shm view."""
+    if sys.platform == "darwin":
+        # pagestore_shm.h backs the segment with a regular file; no POSIX shm
+        # object exists, so this must run before the shm_unlink early returns.
+        path = shm_backing_path(shm)
+        try:
+            directory = os.open(
+                path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            )
+        except FileNotFoundError:
+            return
+        try:
+            info = os.fstat(directory)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) & 0o077):
+                raise PermissionError("shared-memory backing directory must be private and uid-owned")
+            # Anchor unlink to the verified directory, matching ps_shm_unlink.
+            # unlink does not follow a symlink in the final name.
+            try:
+                os.unlink(path.name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(directory)
+        return
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         unlink = libc.shm_unlink
@@ -1636,6 +1660,14 @@ def remove_shm(shm: str) -> None:
         pass
 
 
+def shm_backing_path(shm: str) -> Path:
+    """The macOS backing file for a shm name (see pagestore_shm.h)."""
+    name = shm.removeprefix("/").replace("/", "_")
+    if not name or name in {".", ".."} or len(os.fsencode(name)) >= 256:
+        raise ValueError("invalid shared-memory name")
+    return Path(f"/tmp/pagestore-shm-{os.getuid()}") / name
+
+
 def signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
     """Signal the daemon and every helper it started in its private session."""
     try:
@@ -1653,6 +1685,7 @@ class ProcessIdentity:
     pidfd: int | None = None
     already_exited: bool = False
     status: str = "captured"
+    darwin_pidversion: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1675,8 +1708,73 @@ def require_signaled_process_stop(result: ProcessStopResult, target: str) -> Non
         )
 
 
+DARWIN_PROCESS_IDENTITY = sys.platform == "darwin"
+
+
+def darwin_libproc_function(name: str):
+    """Fail closed when this host lacks the required libproc interface."""
+    try:
+        return getattr(ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True), name)
+    except (OSError, AttributeError) as error:
+        raise PlanError(f"Darwin process identity API unavailable: {name}") from error
+
+
+def darwin_process_identity(pid: int) -> tuple[int, int] | None:
+    """Read start time and pidversion together from one kernel process reference.
+
+    XNU's PROC_PIDT_BSDINFOWITHUNIQID (18) returns proc_bsdinfo (136 bytes)
+    followed by proc_uniqidentifierinfo (56 bytes). The latter's pidversion
+    distinguishes reused PIDs and exec generations. These libproc interfaces
+    are private: reject unsupported flavors or unexpected structure sizes.
+    """
+    proc_pidinfo = darwin_libproc_function("proc_pidinfo")
+    proc_pidinfo.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
+    ]
+    proc_pidinfo.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(192)
+    copied = proc_pidinfo(pid, 18, 0, buffer, len(buffer))
+    if copied == 0:
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            return None
+        raise PlanError(
+            f"cannot read process identity for pid {pid}: {os.strerror(error)}"
+        )
+    if copied != len(buffer):
+        raise PlanError(f"short process identity for pid {pid}: {copied} bytes")
+    tvsec, tvusec = struct.unpack_from("=QQ", buffer.raw, 120)
+    pidversion = struct.unpack_from("=I", buffer.raw, 136 + 32)[0]
+    return tvsec * 1_000_000 + tvusec, pidversion
+
+
+def darwin_process_starttime(pid: int) -> int | None:
+    identity = darwin_process_identity(pid)
+    return None if identity is None else identity[0]
+
+
+def darwin_signal_identity(identity: ProcessIdentity) -> int:
+    """Send SIGQUIT to the captured generation, never to a bare PID.
+
+    proc_signal_with_audittoken validates token words 5 (pid) and 7
+    (pidversion) in the kernel and holds a process reference while signaling.
+    It returns an errno value directly, rather than -1 with errno set.
+    """
+    if identity.darwin_pidversion is None:
+        raise PlanError("cannot signal Darwin process without a captured pidversion")
+    send = darwin_libproc_function("proc_signal_with_audittoken")
+    send.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    send.restype = ctypes.c_int
+    token = (ctypes.c_uint32 * 8)()
+    token[5] = identity.pid
+    token[7] = identity.darwin_pidversion
+    return send(token, signal.SIGQUIT)
+
+
 def read_process_starttime(pid: int, proc_root: Path = Path("/proc")) -> int | None:
     """Read Linux proc stat field 22, parsing comm through its final ')' safely."""
+    if DARWIN_PROCESS_IDENTITY and proc_root == Path("/proc"):
+        return darwin_process_starttime(pid)
     stat_path = proc_root / str(pid) / "stat"
     try:
         text = stat_path.read_text(encoding="utf-8")
@@ -1702,6 +1800,9 @@ def read_process_starttime(pid: int, proc_root: Path = Path("/proc")) -> int | N
 
 def procfs_available(proc_root: Path = Path("/proc")) -> bool:
     """Return whether this host exposes a usable procfs process view."""
+    if DARWIN_PROCESS_IDENTITY and proc_root == Path("/proc"):
+        # libproc stands in for procfs as the process identity source.
+        return True
     try:
         (proc_root / "self" / "stat").read_text(encoding="utf-8")
     except PermissionError as error:
@@ -1736,6 +1837,13 @@ def capture_process_identity(pid: int) -> ProcessIdentity:
     """Capture a stable identity without ever reacquiring a replacement PID."""
     if pid <= 0:
         raise PlanError(f"invalid process pid: {pid}")
+    if DARWIN_PROCESS_IDENTITY:
+        darwin_libproc_function("proc_signal_with_audittoken")
+        captured = darwin_process_identity(pid)
+        if captured is None:
+            return ProcessIdentity(pid, None, already_exited=True, status="already_exited")
+        starttime, pidversion = captured
+        return ProcessIdentity(pid, starttime, darwin_pidversion=pidversion)
     # Always take the first observation before pidfd_open.  If the process
     # disappears during pidfd_open, do not read the PID again: that read could
     # describe a supervisor replacement rather than the old postmaster.
@@ -1838,6 +1946,19 @@ def send_process_sigquit(identity: ProcessIdentity) -> tuple[str, str]:
         except OSError as error:
             raise PlanError(f"cannot signal pidfd for pid {identity.pid}: {error}") from error
 
+    if DARWIN_PROCESS_IDENTITY and identity.darwin_pidversion is not None:
+        error = darwin_signal_identity(identity)
+        if error == errno.ESRCH:
+            identity.already_exited = True
+            identity.status = "already_exited"
+        elif error:
+            raise PlanError(
+                f"cannot signal Darwin identity for pid {identity.pid}: {os.strerror(error)}"
+            )
+        else:
+            identity.status = "signaled"
+        return "proc_signal_with_audittoken", identity.status
+
     if identity.starttime is None:
         if not process_exists(identity.pid):
             identity.already_exited = True
@@ -1848,7 +1969,9 @@ def send_process_sigquit(identity: ProcessIdentity) -> tuple[str, str]:
         )
     before = read_process_starttime(identity.pid)
     if before is None:
-        if process_exists(identity.pid):
+        # libproc stops describing a process once it exits, even before it is
+        # reaped, while kill(pid, 0) still succeeds on the zombie.
+        if not DARWIN_PROCESS_IDENTITY and process_exists(identity.pid):
             raise PlanError(
                 f"cannot verify live pid {identity.pid} before SIGQUIT"
             )
@@ -1879,9 +2002,15 @@ def wait_process_exit(identity: ProcessIdentity, timeout: float) -> str:
         raise HarnessTimeout(f"timed out waiting for pidfd of pid {identity.pid}")
 
     while time.monotonic() < deadline:
+        if DARWIN_PROCESS_IDENTITY and identity.darwin_pidversion is not None:
+            current_identity = darwin_process_identity(identity.pid)
+            if current_identity is None or current_identity[1] != identity.darwin_pidversion:
+                return "darwin_pidversion"
+            time.sleep(.05)
+            continue
         current = read_process_starttime(identity.pid)
         if current is None:
-            if not process_exists(identity.pid):
+            if DARWIN_PROCESS_IDENTITY or not process_exists(identity.pid):
                 return "proc_starttime"
             raise PlanError(
                 f"cannot verify pid {identity.pid} while waiting: /proc identity unavailable"
@@ -2383,6 +2512,7 @@ FORKMETA_MANIFEST = FORKMETA_SNAPSHOTS / "forkmeta_manifest_v1"
 FORKMETA_PREPARED = FORKMETA_SNAPSHOTS / "forkmeta_prepared_v1"
 FORKMETA_V2_MAGIC = 0x324D4B46
 FORKMETA_V3_MAGIC = 0x334D4B46
+FORKMETA_V4_MAGIC = 0x344D4B46
 FORKMETA_SNAPSHOT_BASE_KIND = 10
 DELETE_BRANCH = 1
 MANIFEST_TMP = "layers.manifest.tmp"
@@ -2612,7 +2742,7 @@ def _timeline_events(store: Path) -> list[dict[str, int]]:
         magic, rec_len = struct.unpack_from("=II", data, offset)
         if magic != TIMELINE_META_MAGIC or rec_len < 8 or offset + rec_len > len(data):
             break
-        if rec_len == 56:
+        if rec_len in (48, 56, 64):
             kind, ident, _parent, state = struct.unpack_from("=IIiI", data, offset + 8)
             incarnation = struct.unpack_from("=Q", data, offset + 32)[0]
             events.append({"kind": kind, "id": ident, "state": state, "incarnation": incarnation})
@@ -2633,7 +2763,7 @@ def _forkmeta_timelines(store: Path) -> set[int]:
             magic, rec_len, timeline = struct.unpack_from("=III", data, offset)
             if rec_len != 64 or magic & 0x00FFFFFF != 0x4D4B46:   # "FKM?" family
                 break
-            kind = data[offset + 60]
+            kind = data[offset + 60] & 0x3f
             if kind < 10:                                        # not a snapshot marker
                 owners.add(timeline)
             offset += rec_len
@@ -2769,7 +2899,7 @@ def _forkmeta_source_head(store: Path) -> dict[str, Any] | None:
     key = struct.unpack_from("=IIIiI", record, 12)
     lsn, admission_seq, order_id = struct.unpack_from("=QQQ", record, 32)
     nblocks = struct.unpack_from("=I", record, 56)[0]
-    kind = record[60]
+    kind = record[60] & 0x3f
     pad = record[61:64]
     if not _forkmeta_record_wire_valid(record):
         return None
@@ -2793,10 +2923,18 @@ def _forkmeta_record_wire_valid(record: bytes) -> bool:
     magic, rec_len = struct.unpack_from("=II", record, 0)
     if rec_len != FORKMETA_RECORD_BYTES:
         return False
+    kind = record[60]
+    base = kind & 0x3f
+    if magic != FORKMETA_V4_MAGIC and kind != base:
+        return False
+    if magic == FORKMETA_V4_MAGIC and (
+            base > 10 or (base > 2 and kind != base) or
+            (kind & 0x80 and base == 0 and not kind & 0x40)):
+        return False
     pad = record[61:64]
     if magic == FORKMETA_V2_MAGIC:
         return pad == b"\x00\x00\x00"
-    if magic != FORKMETA_V3_MAGIC:
+    if magic not in (FORKMETA_V3_MAGIC, FORKMETA_V4_MAGIC):
         return False
     crc = 0xB704CE
     for byte in record[:61]:
@@ -2836,7 +2974,7 @@ def _forkmeta_source_records(store: Path, aligned: bool = False) -> list[dict[st
         records.append({
             "timeline": timeline, "key": struct.unpack_from("=IIIiI", record, 12),
             "lsn": lsn, "admission_seq": admission_seq, "order_id": order_id,
-            "nblocks": struct.unpack_from("=I", record, 56)[0], "kind": record[60],
+            "nblocks": struct.unpack_from("=I", record, 56)[0], "kind": record[60] & 0x3f,
         })
     return records
 
@@ -2983,7 +3121,7 @@ def _forkmeta_part_framing(store: Path, record: dict[str, Any], part: str) -> st
     if header is None:
         return f"{path.name} is shorter than its payload header"
     expected_index = 0 if part == "checkpoint" else 1
-    if header["magic"] != FORKMETA_PAYLOAD_MAGIC or header["version"] != 1 or \
+    if header["magic"] != FORKMETA_PAYLOAD_MAGIC or header["version"] not in (1, 2) or \
             header["header_bytes"] != FORKMETA_PAYLOAD_HEADER_BYTES or \
             header["record_bytes"] != FORKMETA_RECORD_BYTES or \
             header["part"] != expected_index or \
@@ -3049,7 +3187,7 @@ def _forkmeta_part_records(store: Path, record: dict[str, Any], part: str) -> li
             "lsn": struct.unpack_from("=Q", chunk, 32)[0],
             "admission_seq": struct.unpack_from("=Q", chunk, 40)[0],
             "order_id": struct.unpack_from("=Q", chunk, 48)[0],
-            "nblocks": struct.unpack_from("=I", chunk, 56)[0], "kind": chunk[60],
+            "nblocks": struct.unpack_from("=I", chunk, 56)[0], "kind": chunk[60] & 0x3f,
             "pad": chunk[61:64],
         })
     return records
@@ -3316,7 +3454,7 @@ def _forkmeta_event_records(store: Path, selected: dict[str, Any] | None,
             rel_number = struct.unpack_from("=I", data, offset + 20)[0]
             record_lsn = struct.unpack_from("=Q", data, offset + 32)[0]
             record_nblocks = struct.unpack_from("=I", data, offset + 56)[0]
-            if data[offset + 60] == kind and rel_number == rel and record_lsn == lsn:
+            if (data[offset + 60] & 0x3f) == kind and rel_number == rel and record_lsn == lsn:
                 if record_nblocks != nblocks:
                     raise OracleMismatch(
                         f"a record of relation {rel}'s event at {lsn} carries {record_nblocks} "
@@ -5128,11 +5266,14 @@ def run_writer_smoke(
         subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-l", str(trace / "writer.log"), "-w", "start"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         events.emit("ready", target="writer", health=health, port=port)
-        if any(action["op"] == "reader_base" for action in plan.actions):
+        if any(action["op"] in ("reader_base", "capture") for action in plan.actions):
             setup = (
                 "CREATE OR REPLACE FUNCTION "
                 "pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS void "
                 "AS 'pagestore','pagestore_ship_slru_snapshot' LANGUAGE C STRICT;"
+                "CREATE OR REPLACE FUNCTION pagestore_retention_set(integer, integer, bigint, bigint, integer, pg_lsn) "
+                "RETURNS integer AS 'pagestore','pagestore_retention_set' LANGUAGE C STRICT;"
+                "SELECT pagestore_retention_set(0, 1, 10000, 1, 7, '0/0');"
             )
             subprocess.run(
                 [str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port),
@@ -5166,6 +5307,15 @@ SELECT json_build_object(
   'oldest_commit_ts_xid', CASE WHEN oldest_commit_ts_xid::text = '0' THEN '1' ELSE oldest_commit_ts_xid::text END,
   'next_commit_ts_xid', CASE WHEN newest_commit_ts_xid::text = '0' THEN '1' ELSE ((newest_commit_ts_xid::text::bigint + 1) & 4294967295)::text END)
 FROM pg_control_checkpoint();"""
+                # Resolve/catalog-warm the horizon query before R. Hint-bit
+                # FPIs caused by its first invocation must not land after R
+                # in the stopped reader seed's WAL.
+                horizon_query = sql.split("CHECKPOINT;", 1)[1]
+                warm_pin = (
+                    "SELECT pagestore_retention_set(0, 1, 10000, 1, 7, '0/0');"
+                    if any(item["op"] == "capture" for item in plan.actions) else ""
+                )
+                sql = warm_pin + horizon_query + "CHECKPOINT;" + horizon_query
             elif action["op"] == "prepare_reader":
                 ref = action["read_lsn"]
                 base_ref = action["base"]
@@ -5345,6 +5495,22 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
                     raise PlanError(f"capture {action['id']} requires reader_datadir and checkpoint horizon")
                 seed = root / "reader-seeds" / action["name"]
                 seed.parent.mkdir(exist_ok=True)
+                # Hand off the checkpoint before shutdown/startup can evict
+                # its daemon-owned slot. Installation reuses this exact owner.
+                owner_id = reader_owner_ids.setdefault(
+                    action["name"], 10000 + len(reader_owner_ids) + 1
+                )
+                lsn = checkpoints[ref[1:]]["redo_lsn"]
+                pin_sql = (
+                    f"SELECT pagestore_retention_set(0, 1, {owner_id}, 1, 7, '{lsn}');"
+                )
+                pinned = subprocess.run(
+                    [str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port),
+                     "-U", "postgres", "-tA", "-v", "ON_ERROR_STOP=1", "-c", pin_sql],
+                    check=True, capture_output=True, encoding="utf-8", env=env,
+                )
+                if pinned.stdout.strip().splitlines()[-1] != "0":
+                    raise PlanError(f"capture {action['id']} could not retain checkpoint {lsn}")
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-m", "fast", "-w", "stop"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 shutil.copytree(data, seed)
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-l", str(trace / "writer.log"), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)

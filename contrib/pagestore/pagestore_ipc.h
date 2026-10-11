@@ -30,7 +30,11 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		47	/* 47: artifact publication and drop operations;
+#define PS_SHM_VERSION		49	/* 49: atomic pins and capped artifact producers;
+								 * CREATE_BRANCH result bit 0 reports a new create
+								 * (no layout change; old daemons return zero).
+								 * 48: unstamped metadata request floor;
+								 * 47: artifact publication and drop operations;
 								 * (no bump for the additional PsArtifactRefuseReason
 								 * values or the EXTEND/WRITEV ch->result use added
 								 * after 47: that value set is append-only for the
@@ -71,6 +75,12 @@
 							 * 19: checkpoint admission gate + barrier;
 								 * 18: req_seq caps same-LSN admission order;
 								 *     writes return their admission sequence
+								 *     -- except a mutation that turned out to be a
+								 *     durability no-op (e.g. a ZEROEXTEND whose target
+								 *     size was already reached), which returns req_seq
+								 *     == 0: its allocated sequence was never persisted,
+								 *     so it must not surface as a barrier the caller can
+								 *     rely on surviving a restart;
 								 * 17: NBLOCKS/EXISTS honour req_lsn as an
 								 *     as-of horizon; fork-mutating ops carry
 								 *     their WAL position in req_lsn;
@@ -141,7 +151,8 @@ typedef enum PsOpcode
 	PS_OP_CHECK_BRANCH,			/* validate timeline creation request, no mutation */
 	PS_OP_REQUIRE_BRANCH,		/* require existing timeline ancestry metadata */
 	PS_OP_CREATE_BRANCH,		/* create timeline from parent_timeline @ req_lsn */
-	PS_OP_TIMELINE_INFO,		/* return parent/fork metadata; result says has-parent */
+	PS_OP_TIMELINE_INFO,		/* parent/fork metadata; result says has-parent;
+								 * capable daemons return branch S in req_floor_lsn */
 	PS_OP_WAL_APPEND,			/* append datalen WAL bytes at LSN req_lsn (timeline) */
 	PS_OP_WAL_SIZE,				/* return end LSN of the timeline's WAL in req_lsn */
 	PS_OP_WAL_READ,				/* read datalen WAL bytes from LSN req_lsn into data */
@@ -171,6 +182,32 @@ typedef enum PsTimelineState
 	PS_TIMELINE_DELETING = 2,
 	PS_TIMELINE_DELETED = 3,
 } PsTimelineState;
+
+/*
+ * PS_OP_TIMELINE_STATE fails for a timeline the store has never defined and
+ * when it cannot tell (poisoned timeline metadata, a refused request).  On
+ * PS_STATUS_ERROR 'result' separates the two: a caller that reports absence
+ * to an operator must not read an unhealthy store as "no such timeline".
+ * Zero is what a daemon predating the distinction leaves there.
+ */
+#define PS_TIMELINE_STATE_UNDEFINED		0
+#define PS_TIMELINE_STATE_UNAVAILABLE	UINT32_MAX
+
+/*
+ * PS_OP_BEGIN_DELETE on PS_STATUS_ERROR: 'result' says why, so a caller can
+ * tell an ownership veto the operator can act on from a store that needs
+ * repair.  Zero is what a daemon predating the distinction leaves there.
+ */
+typedef enum PsDeleteRefuseReason
+{
+	PS_DELETE_REFUSE_UNKNOWN = 0,
+	PS_DELETE_REFUSE_INVALID,		/* undefined timeline, timeline 0, bad token */
+	PS_DELETE_REFUSE_INCARNATION,	/* token names another incarnation, or DELETED */
+	PS_DELETE_REFUSE_DESCENDANT,	/* a live or deleting descendant exists */
+	PS_DELETE_REFUSE_OWNER,			/* a retention owner is registered */
+	PS_DELETE_REFUSE_STORAGE,		/* the transition could not be made durable */
+	PS_DELETE_REFUSE_UNAVAILABLE,	/* poisoned timeline metadata */
+} PsDeleteRefuseReason;
 
 /* Status codes */
 #define PS_STATUS_OK		0
@@ -303,6 +340,16 @@ typedef struct PsWalIndexEntry
 	uint64_t	end_lsn;		/* record EndRecPtr; zero for legacy unknown */
 } PsWalIndexEntry;
 
+#define PS_BRANCH_RESULT_NEW (1u << 0)
+#define PS_BRANCH_RESULT_FINITE (1u << 1)
+#define PS_BRANCH_REFUSE_UNPROVEN_RETRY (1u << 2)
+/* Exact magic, never a reused boolean is_redo value. */
+#define PS_BRANCH_R2_PROVEN UINT32_C(0x52325042)
+#define PS_FRONTEND_CAP_BRANCH_SEQ (UINT32_C(1) << 1)
+#define PS_FRONTEND_CAP_ATOMIC_PINS (UINT32_C(1) << 2)
+#define PS_BARRIER_REGISTER UINT32_C(0x50494e35)
+#define PS_ARTIFACT_BEGIN_CAPPED_READ UINT32_C(0x43415035)
+
 /* Retention owners are intentionally few: structural branch pins are derived
  * from timeline metadata instead of duplicated in this mutable registry. */
 typedef enum PsRetentionOwnerKind
@@ -310,6 +357,8 @@ typedef enum PsRetentionOwnerKind
 	PS_RETENTION_OWNER_READER = 1,
 	PS_RETENTION_OWNER_MATERIALIZER = 2,
 	PS_RETENTION_OWNER_CONFIGURED = 3,
+	/* Daemon-owned checkpoint artifacts; never mutable through client IPC. */
+	PS_RETENTION_OWNER_CHECKPOINT_FENCE = 4,
 } PsRetentionOwnerKind;
 
 typedef enum PsRetentionResource
@@ -400,10 +449,13 @@ typedef struct PsChannel
 	uint32_t	nblocks;		/* WAL_INDEX_GET: optional result-page limit */
 	uint32_t	old_nblocks;		/* RETENTION_PIN_{SET,DROP}: generation */
 	uint32_t	timeline;		/* timeline this op targets (0 = main) */
-	uint32_t	parent_timeline;	/* CREATE_BRANCH parent; WAL_INDEX_GET cursor timeline */
+	uint32_t	parent_timeline;	/* CREATE_BRANCH parent; WAL_INDEX_GET cursor
+								 * timeline; artifact BEGIN/COMMIT/DROP/WRITE:
+								 * PS_ARTIFACT_REQ_SUPERSEDABLE or 0 */
 	uint32_t	datalen;		/* WAL_APPEND: number of WAL bytes in data[] */
 	uint32_t	pad1;			/* WAL_INDEX_GET: cursor is present */
 	uint64_t	req_lsn;		/* READ_AT/WAL_APPEND: LSN; WAL_SIZE: out end LSN */
+	uint64_t	req_floor_lsn; /* unstamped metadata placement lower bound */
 	uint64_t	req_seq;		/* admission sequence; WAL_INDEX_GET cursor LSN */
 	uint64_t	incarnation;	/* expected timeline incarnation; 0 = legacy inc-1 */
 	uint64_t	request_generation;	/* monotonically advances for every published request */
@@ -422,6 +474,17 @@ typedef struct PsChannel
 	/* payload: up to PS_IO_UNIT bytes (io_unit / page_size pages) */
 	unsigned char data[PS_IO_UNIT];
 } PsChannel;
+
+/*
+ * An automatic generation (the checkpoint-driven reader snapshot) marks its
+ * artifact requests with this value in parent_timeline.  A refusal because
+ * the generation's LSN is below the page-reclaimed frontier and unfenced then
+ * means a newer checkpoint already superseded it -- no reader can pin that
+ * generation any more -- so the daemon logs it as superseded rather than as
+ * a refused artifact operation.  The client still receives the refusal and
+ * its reason; every other refusal and every unmarked request is unchanged.
+ */
+#define PS_ARTIFACT_REQ_SUPERSEDABLE	0x53555044u	/* "SUPD" */
 
 /* The generation is written before the release that publishes REQUEST and is
  * never reset when a channel is reclaimed.  A zero value is the initial

@@ -98,6 +98,7 @@
 #include "utils/pg_lsn.h"
 #include "utils/plancache.h"
 #include "utils/rel.h"
+#include "utils/xid8.h"
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/wait_classes.h"
@@ -203,6 +204,7 @@ PGDLLEXPORT void pagestore_wal_index_worker_main(Datum main_arg);
 
 /* GUC state */
 static bool pagestore_route_all = false;
+static bool pagestore_allow_unsafe_branch_cut = false;
 static bool pagestore_route_user_tablespaces = false;
 static char *pagestore_backend_name = NULL;
 static char *pagestore_walredo_datadir = NULL;
@@ -849,6 +851,18 @@ pagestore_branch_routing_active(void)
 /* --- GUC plumbing ------------------------------------------------------- */
 
 static bool
+check_allow_unsafe_branch_cut(bool *newval, void **extra, GucSource source)
+{
+	/* Persistent defaults and connection options must never enable this. */
+	if (*newval && source != PGC_S_SESSION)
+	{
+		GUC_check_errdetail("Unsafe branch cuts require an explicit session SET.");
+		return false;
+	}
+	return true;
+}
+
+static bool
 check_backend_name(char **newval, void **extra, GucSource source)
 {
 	if (*newval == NULL || pagestore_lookup_backend(*newval) == NULL)
@@ -1186,6 +1200,195 @@ pagestore_retention_drop_with_incarnation(PG_FUNCTION_ARGS)
 		(uint32) generation, (uint64) incarnation));
 }
 
+PG_FUNCTION_INFO_V1(pagestore_timeline_state);
+PG_FUNCTION_INFO_V1(pagestore_delete_branch);
+
+static const char *
+pagestore_timeline_state_name(uint32 state)
+{
+	switch (state)
+	{
+		case PS_TIMELINE_LIVE:
+			return "live";
+		case PS_TIMELINE_DELETING:
+			return "deleting";
+		case PS_TIMELINE_DELETED:
+			return "deleted";
+	}
+	return NULL;
+}
+
+static void
+pagestore_require_timeline_control(int32 timeline)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to manage pagestore timelines")));
+	if (pagestore_backend_name == NULL ||
+		strcmp(pagestore_backend_name, "localsvc") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore timeline operations require the localsvc backend")));
+	if (timeline < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pagestore timeline must be >= 0")));
+}
+
+/*
+ * False only when the store positively has no such timeline.  A store that
+ * cannot tell -- poisoned timeline metadata, a refused request -- is an
+ * error: an operator must not read an unhealthy store as "absent".
+ */
+static bool
+pagestore_lookup_timeline(int32 timeline, uint32 *state, uint64 *incarnation)
+{
+	bool		undefined = false;
+
+	if (pagestore_localsvc_timeline_state_known((uint32) timeline, state,
+												incarnation, &undefined))
+		return true;
+	if (!undefined)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYSTEM_ERROR),
+				 errmsg("pagestore could not determine the state of timeline %d",
+						timeline),
+				 errhint("The store's timeline metadata may be poisoned; check the daemon log and pagestore_inspect.")));
+	return false;
+}
+
+/*
+ * Lifecycle state and incarnation of a store timeline; no row's worth of
+ * values (both NULL) for a timeline the store has never defined.  This is how
+ * an operator learns the incarnation pagestore_delete_branch() demands, and
+ * watches an accepted deletion finish.
+ */
+Datum
+pagestore_timeline_state(PG_FUNCTION_ARGS)
+{
+	int32		timeline = PG_GETARG_INT32(0);
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		nulls[2] = {true, true};
+	uint32		state = 0;
+	uint64		incarnation = 0;
+	const char *name;
+
+	pagestore_require_timeline_control(timeline);
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+	if (pagestore_lookup_timeline(timeline, &state, &incarnation))
+	{
+		name = pagestore_timeline_state_name(state);
+		if (name == NULL)
+			elog(ERROR, "unexpected pagestore timeline state %u", state);
+		values[0] = CStringGetTextDatum(name);
+		values[1] = Int64GetDatum((int64) incarnation);
+		nulls[0] = nulls[1] = false;
+	}
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * Durably begin deleting a branch timeline.  The store publishes LIVE ->
+ * DELETING before this returns; its maintenance then removes the branch's
+ * layers, WAL and metadata and publishes DELETED, which
+ * pagestore_timeline_state() reports.  Repeating the call for a timeline
+ * that is already deleting succeeds.
+ *
+ * The incarnation is the caller's fence: a retry that outlives the branch
+ * must not delete a later branch that reused the timeline id.
+ */
+Datum
+pagestore_delete_branch(PG_FUNCTION_ARGS)
+{
+	int32		timeline = PG_GETARG_INT32(0);
+	int64		incarnation = PG_GETARG_INT64(1);
+	uint32		state = 0;
+	uint64		current = 0;
+	uint32		refusal = 0;
+
+	pagestore_require_timeline_control(timeline);
+	if (timeline == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pagestore timeline 0 is the main timeline and cannot be deleted")));
+	if ((uint32) timeline == pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("pagestore timeline %d is this server's own timeline", timeline),
+				 errhint("Stop the branch compute and delete its timeline from another compute of the same store.")));
+	if (incarnation <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pagestore timeline incarnation must be > 0")));
+
+	/* Name the refusals the store's single status cannot tell apart. */
+	if (!pagestore_lookup_timeline(timeline, &state, &current))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("pagestore timeline %d does not exist", timeline)));
+	if (current != (uint64) incarnation)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore timeline %d is at incarnation %llu, not %lld",
+						timeline, (unsigned long long) current,
+						(long long) incarnation)));
+	if (state == PS_TIMELINE_DELETED)
+		PG_RETURN_TEXT_P(cstring_to_text("deleted"));
+
+	if (pagestore_localsvc_begin_delete_reason((uint32) timeline,
+											   (uint64) incarnation,
+											   &refusal) != PS_STATUS_OK)
+	{
+		/* Maintenance may have finished a deletion begun earlier between the
+		 * lookup above and this request; BEGIN_DELETE refuses a DELETED
+		 * timeline, but for the caller that retry succeeded. */
+		if (refusal == PS_DELETE_REFUSE_INCARNATION &&
+			pagestore_lookup_timeline(timeline, &state, &current) &&
+			current == (uint64) incarnation && state == PS_TIMELINE_DELETED)
+			PG_RETURN_TEXT_P(cstring_to_text("deleted"));
+		switch (refusal)
+		{
+			case PS_DELETE_REFUSE_DESCENDANT:
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_IN_USE),
+						 errmsg("pagestore timeline %d has a live or deleting descendant branch", timeline),
+						 errhint("Delete descendant branches first; pagestore_inspect lists them.")));
+			case PS_DELETE_REFUSE_OWNER:
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_IN_USE),
+						 errmsg("pagestore timeline %d has a registered retention owner", timeline),
+						 errdetail("A reader, materializer or branch-preparation pin still holds the timeline."),
+						 errhint("Release the timeline's retention owners first; pagestore_inspect owners lists them.")));
+			case PS_DELETE_REFUSE_INCARNATION:
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("pagestore timeline %d is no longer at incarnation %lld",
+								timeline, (long long) incarnation)));
+			case PS_DELETE_REFUSE_STORAGE:
+				ereport(ERROR,
+						(errcode(ERRCODE_IO_ERROR),
+						 errmsg("pagestore could not make the deletion of timeline %d durable", timeline),
+						 errhint("The store's timeline log could not be written or synced; check the daemon log.")));
+			case PS_DELETE_REFUSE_UNAVAILABLE:
+				ereport(ERROR,
+						(errcode(ERRCODE_SYSTEM_ERROR),
+						 errmsg("pagestore cannot delete timeline %d: timeline metadata is unavailable", timeline),
+						 errhint("The store's timeline metadata may be poisoned; check the daemon log and pagestore_inspect.")));
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_SYSTEM_ERROR),
+						 errmsg("pagestore refused to delete timeline %d (reason %u)",
+								timeline, refusal),
+						 errhint("Check the daemon log.")));
+		}
+	}
+	PG_RETURN_TEXT_P(cstring_to_text("deleting"));
+}
+
 PG_FUNCTION_INFO_V1(pagestore_retention_owner_lsn);
 
 static bool
@@ -1221,6 +1424,25 @@ pagestore_retention_owner_lsn(PG_FUNCTION_ARGS)
 	PG_RETURN_NULL();
 }
 
+/* Direct SQL entrypoints cannot establish the controller's G3 proof. */
+static void
+pagestore_require_unsafe_branch_cut(const char *entrypoint)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to create an unsafe pagestore branch")));
+	if (!pagestore_allow_unsafe_branch_cut)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore branch creation outside the controller flow is disabled"),
+				 errdetail("%s does not verify the branch transaction window and hint-bit safety proof.", entrypoint),
+				 errhint("Use pagestore_branch_prepare. For tests only, SET pagestore.allow_unsafe_branch_cut = on.")));
+	ereport(WARNING,
+			(errmsg("UNSAFE pagestore branch cut through %s", entrypoint),
+			 errdetail("The branch may contain parent hint bits written after its fork. Use only test data.")));
+}
+
 /*
  * pagestore_create_branch(new_timeline int, parent_timeline int, lsn pg_lsn)
  *
@@ -1239,6 +1461,8 @@ pagestore_create_branch(PG_FUNCTION_ARGS)
 	int32		parent_tl = PG_GETARG_INT32(1);
 	XLogRecPtr	lsn = PG_GETARG_LSN(2);
 
+	pagestore_require_unsafe_branch_cut("pagestore_create_branch");
+
 	if (new_tl <= 0)
 		ereport(ERROR,
 				(errmsg("pagestore branch timeline must be > 0 (0 is the main timeline)")));
@@ -1249,7 +1473,7 @@ pagestore_create_branch(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/* Explicit control-plane branch creation.  The legacy entrypoint above is
+/* Explicit-incarnation test-only creation.  The legacy entrypoint above is
  * intentionally pinned to incarnation one and therefore cannot authorize a
  * retry after DELETED. */
 PG_FUNCTION_INFO_V1(pagestore_create_branch_with_incarnation);
@@ -1261,6 +1485,8 @@ pagestore_create_branch_with_incarnation(PG_FUNCTION_ARGS)
 	int64		incarnation_arg = PG_GETARG_INT64(2);
 	uint64		incarnation;
 	XLogRecPtr	lsn = PG_GETARG_LSN(3);
+
+	pagestore_require_unsafe_branch_cut("pagestore_create_branch_with_incarnation");
 
 	if (new_tl <= 0 || parent_tl < 0 || incarnation_arg <= 0)
 		ereport(ERROR,
@@ -1904,6 +2130,23 @@ pagestore_require_localsvc_monitoring(void)
 				 errmsg("pagestore WAL monitoring requires the localsvc backend")));
 }
 
+/* Read-only certification for recovered/completed controller receipts. */
+PG_FUNCTION_INFO_V1(pagestore_branch_snapshot_is_safe);
+Datum
+pagestore_branch_snapshot_is_safe(PG_FUNCTION_ARGS)
+{
+	int32		timeline = PG_GETARG_INT32(0);
+	int64		incarnation = PG_GETARG_INT64(1);
+
+	pagestore_require_localsvc_monitoring();
+	if (timeline <= 0 || incarnation <= 0)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid branch timeline identity")));
+	PG_RETURN_BOOL(pagestore_localsvc_branch_is_finite((uint32) timeline,
+													   (uint64) incarnation));
+}
+
+
 static void
 pagestore_require_materializer(void)
 {
@@ -2433,6 +2676,12 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		 * block before lsn.  From that death on the block has no content: the
 		 * base is an all-zero page when the block exists again at lsn, and
 		 * nothing when it does not.
+		 *
+		 * Design doc S3.7(7) rev 3, S2: the replacement base a redo reader
+		 * uses is always max(death, image), never "death if present, else
+		 * image" -- ps_death_supersedes() is exactly that combination, and
+		 * this is the only place base_end/base_seq are consulted, so a
+		 * death can never be silently skipped in favor of an older image.
 		 */
 		if (result != NULL)
 		{
@@ -2729,6 +2978,10 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 * replaces it: an all-zero page, and only the records after the death
 	 * belong to this horizon's chain.  A block that does not exist again at
 	 * lsn has no page at all.
+	 *
+	 * Design doc S3.7(7) rev 3, S2: max(death, image), never "death if
+	 * present, else image" -- the same combination as the single-page
+	 * reader above, through the same ps_death_supersedes().
 	 */
 	{
 		uint64		death_seq = 0;
@@ -3615,7 +3868,7 @@ ps_checkpoint_matches_control(const CheckPoint *record,
  */
 static XLogRecPtr
 ps_checkpoint_record_end(XLogRecPtr checkpoint_lsn,
-						 const CheckPoint *expected)
+						 const CheckPoint *expected, uint8 *info_out)
 {
 	ReadLocalXLogPageNoWaitPrivate *pd = palloc0(sizeof(*pd));
 	XLogReaderState *reader;
@@ -3642,6 +3895,8 @@ ps_checkpoint_record_end(XLogRecPtr checkpoint_lsn,
 			(const CheckPoint *) XLogRecGetData(reader), expected))
 	{
 		end = reader->EndRecPtr;
+		if (info_out != NULL)
+			*info_out = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 		matches = true;
 	}
 
@@ -3935,7 +4190,7 @@ pagestore_clog_status_asof(PG_FUNCTION_ARGS)
  * whenever an image exists.
  */
 static bool
-ps_control_asof_timeout(XLogRecPtr lsn, ControlFileData *cf, int timeout_ms)
+ps_control_asof_capped_timeout(XLogRecPtr lsn, uint64 seq, ControlFileData *cf, int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	char		page[BLCKSZ];
@@ -3944,16 +4199,37 @@ ps_control_asof_timeout(XLogRecPtr lsn, ControlFileData *cf, int timeout_ms)
 
 	if (BLCKSZ < PG_CONTROL_FILE_SIZE)
 		return false;
-	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_CONTROL, &key,
-												PS_CONTROL_IMAGE_BLOCK,
-												(uint64) lsn, page, &resolved,
-												timeout_ms))
+	if (!pagestore_localsvc_obj_read_capped_timeout(PS_KLASS_CONTROL, &key,
+													PS_CONTROL_IMAGE_BLOCK,
+													(uint64) lsn, seq, page, &resolved,
+													timeout_ms))
 		return false;
 	memcpy(cf, page, sizeof(*cf));
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, cf, offsetof(ControlFileData, crc));
 	FIN_CRC32C(crc);
-	return EQ_CRC32C(crc, cf->crc);
+	if (!EQ_CRC32C(crc, cf->crc))
+		return false;
+#ifdef USE_ASSERT_CHECKING
+	if (seq != 0)
+	{
+		XLogRecPtr redo;
+
+		/* Both independently selected blocks must describe the same era. */
+		if (!pagestore_localsvc_obj_read_capped_timeout(PS_KLASS_CONTROL, &key,
+				PS_REDO_NOTE_BLOCK, (uint64) lsn, seq, page, NULL, timeout_ms))
+			return false;
+		memcpy(&redo, page, sizeof(redo));
+		Assert(redo == cf->checkPointCopy.redo);
+	}
+#endif
+	return true;
+}
+
+static bool
+ps_control_asof_timeout(XLogRecPtr lsn, ControlFileData *cf, int timeout_ms)
+{
+	return ps_control_asof_capped_timeout(lsn, 0, cf, timeout_ms);
 }
 
 static bool
@@ -8754,6 +9030,41 @@ pagestore_reader_mark_completions(XLogRecPtr start_lsn, XLogRecPtr end_lsn,
 	pfree(pd);
 }
 
+/*
+ * Test hook: while the file named by PAGESTORE_TEST_READER_SNAPSHOT_HOLD
+ * exists, hold an automatic job just before its first artifact BEGIN, so a
+ * test can let a newer checkpoint reclaim the job's page history first.
+ */
+static void
+pagestore_reader_snapshot_test_hold(XLogRecPtr read_lsn)
+{
+	const char *path = getenv("PAGESTORE_TEST_READER_SNAPSHOT_HOLD");
+	struct stat st;
+	bool		logged = false;
+
+	if (path == NULL || path[0] == '\0')
+		return;
+	while (stat(path, &st) == 0)
+	{
+		if (!logged)
+		{
+			ereport(LOG,
+					(errmsg("pagestore: test hold of automatic reader snapshot at %X/%08X",
+							LSN_FORMAT_ARGS(read_lsn))));
+			logged = true;
+		}
+		if (ShutdownRequestPending)
+			ereport(ERROR,
+					(errcode(ERRCODE_ADMIN_SHUTDOWN),
+					 errmsg("terminating automatic reader snapshot test hold due to administrator command")));
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 50L, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
 /* Build the database-independent half of a reader artifact off-checkpoint. */
 static bool
 pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
@@ -8864,6 +9175,20 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		snapshot.header.xmax = next_xid;
 		snapshot.xids = xids;
 		pagestore_reader_snapshot_crc(&snapshot.header, xids);
+		pagestore_reader_snapshot_test_hold(read_lsn);
+
+		/*
+		 * Nothing pins an automatic generation while it is built: a newer
+		 * checkpoint's note can move the page-history cutoff past read_lsn
+		 * and compaction reclaim it before these BEGINs.  No reader can pin
+		 * such a generation any more, so publish in superseded mode: the
+		 * daemon's unfenced refusal is reported as superseded, and the
+		 * catch below skips the job.  The newest job cannot be superseded
+		 * this way -- its redo is the newest note's, which is the cutoff --
+		 * so the queue always converges on a publishable generation once
+		 * checkpoints are further apart than a build.
+		 */
+		(void) pagestore_localsvc_artifact_supersedable(true);
 		blocks = pagestore_publish_reader_snapshot_data(&snapshot, InvalidOid);
 
 		/* READY stages the database-independent snapshot. Database workers
@@ -8883,6 +9208,7 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
 			&key, 0, page, (uint64) read_lsn, nblocks,
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+		(void) pagestore_localsvc_artifact_supersedable(false);
 		pagestore_localsvc_store_sync_timeout(
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 		MemoryContextSwitchTo(oldcontext);
@@ -8894,6 +9220,7 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 	{
 		ErrorData  *edata;
 		MemoryContext error_context;
+		bool		superseded = pagestore_localsvc_artifact_supersedable(false);
 
 		error_context = MemoryContextSwitchTo(TopMemoryContext);
 		edata = CopyErrorData();
@@ -8908,9 +9235,14 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 			PG_RE_THROW();
 		}
 		FlushErrorState();
-		ereport(WARNING,
-				(errmsg("pagestore: automatic reader snapshot publication failed at %X/%08X: %s",
-						LSN_FORMAT_ARGS(read_lsn), edata->message)));
+		if (superseded)
+			ereport(LOG,
+					(errmsg("pagestore: automatic reader snapshot at %X/%08X superseded: a newer checkpoint already reclaimed its page history",
+							LSN_FORMAT_ARGS(read_lsn))));
+		else
+			ereport(WARNING,
+					(errmsg("pagestore: automatic reader snapshot publication failed at %X/%08X: %s",
+							LSN_FORMAT_ARGS(read_lsn), edata->message)));
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
@@ -9570,13 +9902,12 @@ pagestore_adopt_reader_view_at_xact_start_impl(void)
 		if (XLogRecPtrIsInvalid(published) ||
 			published <= (XLogRecPtr) pagestore_localsvc_read_lsn())
 			goto adoption_done;
-		valid = ps_control_asof_timeout(published, &control,
-			PAGESTORE_READER_HORIZON_TIMEOUT_MS) &&
-			pagestore_reader_database_barrier_valid(published) &&
-			control.checkPointCopy.redo == published &&
-			(must_adopt || pagestore_localsvc_read_fence_timeout(
-				(uint64) published, &read_seq,
-				PAGESTORE_READER_HORIZON_TIMEOUT_MS));
+		valid = (must_adopt || pagestore_localsvc_read_fence_timeout(
+		(uint64) published, &read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS)) &&
+		ps_control_asof_capped_timeout(published, read_seq, &control,
+		PAGESTORE_READER_HORIZON_TIMEOUT_MS) &&
+		pagestore_reader_database_barrier_valid(published) &&
+		control.checkPointCopy.redo == published;
 		if (valid)
 		{
 			snapshot = pagestore_load_published_reader_snapshot(
@@ -11920,13 +12251,11 @@ pagestore_validate_datadir_branch_manifest(void)
 	uint64		read_lsn;
 	uint64		read_seq = 0;
 	uint64		pin_lsn;
-	uint64		provisional_seq;
 	bool		found;
 	uint8		retention_status;
 	PsRetentionPin existing_pin;
 	bool		have_existing_pin;
 	bool		set_reader_pin;
-	bool		provisional_reader_pin = false;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -12033,14 +12362,9 @@ pagestore_validate_datadir_branch_manifest(void)
 		if (reader_snapshot->xids != NULL)
 			pfree(reader_snapshot->xids);
 		pfree(reader_snapshot);
-		/*
-		 * This is the last local-only validation step.  Install a conservative
-		 * pin at a freshly drained admission barrier before reading the exact
-		 * checkpoint fence.  This conservative upper fence protects every
-		 * same-LSN variant that could belong to the artifact while the exact
-		 * fence is resolved, closing the read-fence/SET race for a new or
-		 * advancing owner without using the legacy zero-sequence sentinel.
-		 */
+		/* Read the exact checkpoint fence, then atomically hand it off from a
+		 * live registration. A later RESERVE cannot reconstruct an older S;
+		 * it would expose rewrites and let pruning lose intermediate versions. */
 		have_existing_pin = pagestore_find_retention_owner(
 			pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
 			pagestore_retention_owner_id, &existing_pin);
@@ -12071,28 +12395,11 @@ pagestore_validate_datadir_branch_manifest(void)
 						 errhint("Reprovision the fixed reader with a new owner identity at a retained horizon.")));
 			set_reader_pin = existing_pin.lsn < read_lsn;
 		}
-		if (set_reader_pin)
-		{
-			retention_status = pagestore_localsvc_retention_reserve_timeout(
-				pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
-				pagestore_retention_owner_id,
-				pagestore_retention_owner_generation,
-				PS_READER_RETENTION_RESOURCES, read_lsn, &provisional_seq,
-				PS_READER_RETENTION_TIMEOUT_MS);
-			if (retention_status == PS_STATUS_STALE)
-				ereport(FATAL,
-						(errmsg("pagestore reader retention generation is stale")));
-			if (retention_status != PS_STATUS_OK)
-				ereport(FATAL,
-						(errmsg("pagestore reader could not install its provisional retention owner")));
-			provisional_reader_pin = true;
-		}
 		/* An advancing reader may restart from an older boot image after its
 		 * durable owner already moved forward.  Resolve (or reuse) that newer
 		 * frontier; reclaimed boot-image fence history is no longer required. */
 		pin_lsn = read_lsn;
-		if (have_existing_pin && pagestore_advance_read_lsn &&
-			existing_pin.lsn > read_lsn)
+		if (have_existing_pin && existing_pin.lsn >= read_lsn)
 		{
 			pin_lsn = existing_pin.lsn;
 			read_seq = existing_pin.admission_seq;
@@ -12102,9 +12409,7 @@ pagestore_validate_datadir_branch_manifest(void)
 				PAGESTORE_READER_HORIZON_TIMEOUT_MS))
 			ereport(FATAL,
 					(errmsg("pagestore reader has no durable admission fence at its retained horizon")));
-		set_reader_pin = provisional_reader_pin ||
-			(have_existing_pin && existing_pin.lsn == pin_lsn &&
-			 existing_pin.admission_seq != read_seq);
+		set_reader_pin = !have_existing_pin || existing_pin.lsn < pin_lsn;
 		if (set_reader_pin)
 		{
 			retention_status = pagestore_localsvc_retention_set_timeout(
@@ -12131,6 +12436,8 @@ pagestore_validate_datadir_branch_manifest(void)
 				(XLogRecPtr) existing_pin.lsn;
 			SpinLockRelease(&pagestore_reader_horizon->mutex);
 		}
+	if (pin_lsn == read_lsn)
+		pagestore_localsvc_adopt_read_view(read_lsn, read_seq, 1);
 		pagestore_localsvc_detach();
 		if (pagestore_localsvc_timeline() != 0)
 		{
@@ -12987,10 +13294,13 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 
 typedef struct PagestoreBranchHorizons
 {
+	XLogRecPtr	checkpoint_lsn;
+	uint8		checkpoint_info;
 	XLogRecPtr	checkpoint_end_lsn;
 	uint64		system_identifier;
 	TransactionId oldest_xid;
 	TransactionId next_xid;
+	FullTransactionId checkpoint_next_xid;
 	TransactionId oldest_commit_ts_xid;
 	TransactionId next_commit_ts_xid;
 	MultiXactId oldest_multi;
@@ -13046,11 +13356,13 @@ pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
 	pagestore_localsvc_store_sync_timeout(PAGESTORE_READER_HORIZON_TIMEOUT_MS);
 
 	memset(h, 0, sizeof(*h));
+	h->checkpoint_lsn = control.checkPoint;
 	h->checkpoint_end_lsn = ps_checkpoint_record_end(control.checkPoint,
-												 checkpoint);
+												 checkpoint, &h->checkpoint_info);
 	h->system_identifier = control.system_identifier;
 	h->oldest_xid = checkpoint->oldestXid;
 	h->next_xid = XidFromFullTransactionId(checkpoint->nextXid);
+	h->checkpoint_next_xid = checkpoint->nextXid;
 	if (!TransactionIdIsNormal(h->oldest_xid) ||
 		!TransactionIdIsNormal(h->next_xid) ||
 		TransactionIdFollows(h->oldest_xid, h->next_xid))
@@ -13138,6 +13450,82 @@ pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
 						(long long) h->next_member)));
 }
 
+/* Early diagnostics only: the post-CREATE local WAL scan remains the proof. */
+static int
+pagestore_branch_prepared_count(void)
+{
+	int count;
+	bool isnull;
+	Datum value;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect SPI for branch transaction window");
+	if (SPI_execute("SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_prepared_xacts",
+					true, 1) != SPI_OK_SELECT || SPI_processed != 1)
+		elog(ERROR, "could not read prepared transactions for branch window");
+	value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+	if (isnull)
+		elog(ERROR, "prepared transaction count is null");
+	count = DatumGetInt32(value);
+	SPI_finish();
+	return count;
+}
+
+static void
+pagestore_branch_check_window(FullTransactionId expected_next, int expected_prepared)
+{
+	int prepared = pagestore_branch_prepared_count();
+	FullTransactionId current_next = ReadNextFullTransactionId();
+	if (!FullTransactionIdEquals(current_next, expected_next) ||
+		expected_prepared != 0 || prepared != expected_prepared)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("restricted writer changed since the branch window was opened"),
+				 errdetail("Next XID is " UINT64_FORMAT " (expected " UINT64_FORMAT
+						   "); prepared transactions %d (expected %d).",
+						   U64FromFullTransactionId(current_next),
+						   U64FromFullTransactionId(expected_next), prepared, expected_prepared)));
+}
+
+/* First SQL statement after the controller's read-only isolation health check. */
+PG_FUNCTION_INFO_V1(pagestore_branch_window_open);
+Datum
+pagestore_branch_window_open(PG_FUNCTION_ARGS)
+{
+	ControlFileData *control;
+	bool crc_ok;
+	uint8 info;
+	TupleDesc tupdesc;
+	HeapTuple tuple;
+	Datum values[3];
+	bool nulls[3] = {false, false, false};
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					   errmsg("must be superuser to open a pagestore branch window")));
+	pagestore_require_localsvc_monitoring();
+	if (RecoveryInProgress() || pagestore_localsvc_read_lsn() != 0)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					   errmsg("branch transaction window requires an unpinned writer")));
+	control = get_controlfile(DataDir, &crc_ok);
+	if (!crc_ok)
+		ereport(ERROR, (errmsg("local pg_control has an invalid CRC")));
+	(void) ps_checkpoint_record_end(control->checkPoint, &control->checkPointCopy, &info);
+	if (info != XLOG_CHECKPOINT_SHUTDOWN || control->checkPoint != control->checkPointCopy.redo)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					   errmsg("safe branch preparation requires a shutdown checkpoint")));
+	pagestore_branch_check_window(control->checkPointCopy.nextXid, 0);
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+	values[0] = LSNGetDatum(control->checkPointCopy.redo);
+	values[1] = FullTransactionIdGetDatum(control->checkPointCopy.nextXid);
+	values[2] = Int32GetDatum(0);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	pfree(control);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
 /*
  * Return the exact R/E pair for the local writer's current checkpoint, but
  * only after proving that the same checkpoint and its admission fence are
@@ -13197,7 +13585,7 @@ pagestore_branch_checkpoint(PG_FUNCTION_ARGS)
 						   LSN_FORMAT_ARGS(redo))));
 	pagestore_localsvc_store_sync_timeout(PAGESTORE_READER_HORIZON_TIMEOUT_MS);
 	end = ps_checkpoint_record_end(mirrored.checkPoint,
-								&mirrored.checkPointCopy);
+								&mirrored.checkPointCopy, NULL);
 	pfree(local);
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -13221,7 +13609,8 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 							  TransactionId next_commit_ts_xid,
 							  MultiXactId oldest_multi,
 							  MultiXactId next_multi,
-							  int64 oldest_member, int64 next_member)
+							  int64 oldest_member, int64 next_member,
+								  bool *created_new, bool proven)
 {
 	int64		seeded;
 	char		manifest_path[MAXPGPATH];
@@ -13287,9 +13676,12 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 												   oldest_member, next_member,
 												   &seeded))
 	{
-		pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-										 (uint64) target, incarnation,
-										 parent_incarnation);
+		bool created = (proven ? pagestore_localsvc_create_branch_proven :
+						pagestore_localsvc_create_branch)((uint32) new_tl,
+			(uint32) parent_tl, (uint64) target, incarnation, parent_incarnation);
+
+		if (created_new != NULL)
+			*created_new = created;
 		return seeded;
 	}
 
@@ -13319,9 +13711,14 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 											  next_commit_ts_xid,
 											  oldest_multi, next_multi,
 											  oldest_member, next_member);
-	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-									 (uint64) target, incarnation,
-									 parent_incarnation);
+	{
+		bool created = (proven ? pagestore_localsvc_create_branch_proven :
+						pagestore_localsvc_create_branch)((uint32) new_tl,
+			(uint32) parent_tl, (uint64) target, incarnation, parent_incarnation);
+
+		if (created_new != NULL)
+			*created_new = created;
+	}
 
 	/*
 	 * Publish the manifest only after the store-side timeline exists: the
@@ -13354,8 +13751,8 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
  *                          oldest_member bigint, next_member bigint)
  * returns bigint
  *
- * Legacy expert entrypoint.  Keep its ABI for existing operators and tests;
- * new control-plane callers should use pagestore_prepare_branch_from_control.
+ * Test-only expert entrypoint, gated by allow_unsafe_branch_cut.  Production
+ * callers should use the serialized branch controller and its window proof.
  */
 PG_FUNCTION_INFO_V1(pagestore_prepare_branch);
 Datum
@@ -13370,6 +13767,8 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	char		bootstrap_path[MAXPGPATH];
 	int			pathlen;
 
+	pagestore_require_unsafe_branch_cut("pagestore_prepare_branch");
+
 	seeded = pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
 										base, target,
 										1,
@@ -13381,7 +13780,7 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 											PG_GETARG_TRANSACTIONID(9),
 											PG_GETARG_TRANSACTIONID(10),
 											PG_GETARG_INT64(11),
-											PG_GETARG_INT64(12));
+											PG_GETARG_INT64(12), NULL, false);
 
 	/* The expert ABI does not produce the catalog/control-bound artifact. */
 	pathlen = snprintf(bootstrap_path, sizeof(bootstrap_path), "%s/%s",
@@ -13397,11 +13796,139 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(seeded);
 }
 
+/* R2-x uses the writer's local WAL even when SLRU reconstruction reads
+ * archived WAL from the store.  A commit not archived yet still matters. */
+static void
+pagestore_branch_wal_proof(XLogRecPtr checkpoint_lsn, XLogRecPtr fork_lsn)
+{
+	XLogRecPtr end = GetXLogInsertEndRecPtr();
+	XLogRecPtr volatile scanned = fork_lsn;
+	XLogRecPtr volatile unsafe_lsn = InvalidXLogRecPtr;
+	uint8 volatile unsafe_info = 0;
+	ReadLocalXLogPageNoWaitPrivate *pd;
+	XLogReaderState *reader;
+	char *errm = NULL;
+
+	if (RecoveryInProgress() || end < fork_lsn)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("branch WAL proof requires a writer whose WAL covers the fork")));
+	XLogFlush(end);
+	if (end == fork_lsn)
+		return;
+	pd = palloc0(sizeof(*pd));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+		XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+			.segment_open = &wal_segment_open, .segment_close = &wal_segment_close), pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+	PG_TRY();
+	{
+		/* The verified checkpoint is a known record boundary. Starting
+		 * there also covers records straddling an arbitrary direct-call
+		 * cutoff, including continuations from an earlier WAL segment. */
+		XLogBeginRead(reader, checkpoint_lsn);
+		while (XLogReadRecord(reader, &errm) != NULL)
+		{
+			uint8 info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+
+			CHECK_FOR_INTERRUPTS();
+			if (reader->EndRecPtr > fork_lsn &&
+				XLogRecGetRmid(reader) == RM_XACT_ID &&
+				(info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED ||
+				 info == XLOG_XACT_ABORT_PREPARED))
+			{
+				unsafe_lsn = reader->ReadRecPtr;
+				unsafe_info = info;
+				break;
+			}
+			scanned = MAXALIGN(reader->EndRecPtr);
+			if (scanned >= end)
+				break;
+		}
+	}
+	PG_FINALLY();
+	{
+		XLogReaderFree(reader);
+		pfree(pd);
+	}
+	PG_END_TRY();
+	if (!XLogRecPtrIsInvalid(unsafe_lsn))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("branch WAL proof found a transaction completion after the fork"),
+			errdetail("WAL record at %X/%08X has transaction info 0x%02X; fork is %X/%08X.",
+				LSN_FORMAT_ARGS(unsafe_lsn), unsafe_info, LSN_FORMAT_ARGS(fork_lsn))));
+	if (scanned < end)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("branch WAL proof could not read the complete post-fork window"),
+			errdetail("Scanned through %X/%08X; required %X/%08X.",
+				LSN_FORMAT_ARGS(scanned), LSN_FORMAT_ARGS(end))));
+}
+
+static void
+pagestore_branch_remove_readiness(const char *target_dir)
+{
+	const char *names[] = {PAGESTORE_BRANCH_BOOTSTRAP_FILE,
+		"pagestore_branch.manifest"};
+	char path[MAXPGPATH];
+
+	for (unsigned i = 0; i < lengthof(names); i++)
+	{
+		int len = snprintf(path, sizeof(path), "%s/%s", target_dir, names[i]);
+
+		PS_CHECK_PATH_FORMAT(len, path);
+		if (unlink(path) != 0 && errno != ENOENT)
+			ereport(ERROR, (errcode_for_file_access(),
+				errmsg("could not remove branch readiness artifact \"%s\": %m", path)));
+	}
+	fsync_fname(target_dir, true);
+}
+
+/*
+ * Remove the readiness artifacts this call published and, only when the call
+ * created the timeline, delete that exact incarnation.  A pre-existing
+ * timeline is preserved: an old daemon returns the zero "already existed"
+ * result, and that must never authorize deletion.  Return a diagnostic even
+ * if cleanup fails, so the caller can report it while preserving the original
+ * preparation error.
+ */
+static char *
+pagestore_branch_cleanup(const char *target_dir, uint32 timeline,
+						 uint64 incarnation, bool delete_timeline)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	char *volatile result = "complete";
+
+	PG_TRY();
+	{
+		pagestore_branch_remove_readiness(target_dir);
+		if (delete_timeline &&
+			pagestore_localsvc_begin_delete(timeline, incarnation) != PS_STATUS_OK)
+			ereport(ERROR, (errmsg("timeline deletion was refused")));
+	}
+	PG_CATCH();
+	{
+		ErrorData *error;
+
+		MemoryContextSwitchTo(oldcontext);
+		error = CopyErrorData();
+		FlushErrorState();
+		result = pstrdup(error->message);
+		FreeErrorData(error);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 /*
  * pagestore_prepare_branch_from_control(target_dir text, new_timeline int,
  *                                       parent_timeline int, base pg_lsn,
  *                                       checkpoint_redo pg_lsn,
- *                                       fork_lsn pg_lsn) returns bigint
+ *                                       fork_lsn pg_lsn [, incarnation bigint
+ *                                       [, require_materialized boolean]])
+ * returns bigint
+ *
+ * The serialized controller passes require_materialized=true so the writer
+ * verifies the store-observed restartpoint marker before creating a branch.
  *
  * Control-derived entrypoint: the caller supplies the proven exact base
  * snapshot cutoff C, a durably mirrored checkpoint redo R, and a materialized
@@ -13410,13 +13937,29 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
  * checkpoint/control state at R; the store branch is cut at L, where no
  * admission-sequence tie remains.  Retrying the operation is idempotent
  * through the same prepared-manifest and CREATE_BRANCH checks as the legacy
- * entrypoint.  The control plane must keep the parent quiescent between the
- * selected checkpoint and L; automatically establishing that quiesce together
- * with the proven base snapshot is the remaining producer-side protocol.
+ * entrypoint.  The serialized controller owns the parent quiesce and journals
+ * its transaction window; legacy callers must establish their own quiesce
+ * between the selected checkpoint and L.
  */
+static Datum pagestore_prepare_branch_from_control_impl(FunctionCallInfo fcinfo, bool window);
+
 PG_FUNCTION_INFO_V1(pagestore_prepare_branch_from_control);
 Datum
 pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
+{
+	return pagestore_prepare_branch_from_control_impl(fcinfo, false);
+}
+
+/* A new C symbol makes SQL upgrades fail closed against an older library. */
+PG_FUNCTION_INFO_V1(pagestore_prepare_branch_from_window);
+Datum
+pagestore_prepare_branch_from_window(PG_FUNCTION_ARGS)
+{
+	return pagestore_prepare_branch_from_control_impl(fcinfo, true);
+}
+
+static Datum
+pagestore_prepare_branch_from_control_impl(FunctionCallInfo fcinfo, bool window)
 {
 	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	int32		new_tl = PG_GETARG_INT32(1);
@@ -13424,11 +13967,13 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	XLogRecPtr	base = PG_GETARG_LSN(3);
 	XLogRecPtr	checkpoint_redo = PG_GETARG_LSN(4);
 	XLogRecPtr	fork_lsn = PG_GETARG_LSN(5);
-	int64		incarnation_arg = PG_NARGS() == 7 ? PG_GETARG_INT64(6) : 1;
+	int64		incarnation_arg = PG_NARGS() >= 7 ? PG_GETARG_INT64(6) : 1;
+	bool		require_materialized = window || (PG_NARGS() == 8 && PG_GETARG_BOOL(7));
 	uint64		incarnation;
 	uint64		parent_incarnation;
 	XLogRecPtr	materialized;
 	PagestoreBranchHorizons h;
+	bool		created_new = false;
 	int64		seeded;
 	char		bootstrap_path[MAXPGPATH];
 	PagestoreBranchBootstrapHeader *existing_header;
@@ -13438,6 +13983,17 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to prepare a branch")));
+	if (window)
+	{
+		pagestore_require_localsvc_monitoring();
+		/* Reject mixed-version deployments before any preparation can unlink
+		 * the old manifest or reseed a reusable directory. CREATE rechecks. */
+		pagestore_localsvc_require_branch_seq();
+		if (RecoveryInProgress() || pagestore_localsvc_read_lsn() != 0)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						   errmsg("branch transaction window requires an unpinned writer")));
+	}
+
 	if (new_tl <= 0 || parent_tl < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -13453,29 +14009,61 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 				 errmsg("branch incarnation must be positive")));
 	incarnation = (uint64) incarnation_arg;
 	pagestore_branch_horizons_from_control(base, checkpoint_redo, &h);
+	/* R2-s: an online checkpoint can contain running transactions whose
+	 * later hint updates are unsafe for a frozen branch.  Check the actual
+	 * WAL record, not the control file's current database state: restarting
+	 * a writer changes that state without changing its shutdown checkpoint. */
+	if (h.checkpoint_info != XLOG_CHECKPOINT_SHUTDOWN ||
+		h.checkpoint_lsn != checkpoint_redo)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("safe branch preparation requires a shutdown checkpoint"),
+				 errdetail("Checkpoint record at %X/%08X has info 0x%02X and redo %X/%08X.",
+						   LSN_FORMAT_ARGS(h.checkpoint_lsn), h.checkpoint_info,
+						   LSN_FORMAT_ARGS(checkpoint_redo)),
+				 errhint("Stop the writer cleanly, then prepare the branch through the serialized branch controller.")));
 	if (fork_lsn < h.checkpoint_end_lsn)
 		ereport(ERROR,
 				(errmsg("branch fork LSN does not cover the selected checkpoint"),
 				 errdetail("Fork %X/%08X precedes checkpoint record end %X/%08X.",
 							   LSN_FORMAT_ARGS(fork_lsn),
 							   LSN_FORMAT_ARGS(h.checkpoint_end_lsn))));
+	if (window)
+	{
+		FullTransactionId expected_next = PG_GETARG_FULLTRANSACTIONID(7);
+		int expected_prepared = PG_GETARG_INT32(8);
+
+		if (!FullTransactionIdIsNormal(expected_next) || expected_prepared != 0)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						   errmsg("invalid branch transaction window snapshot")));
+		if (!FullTransactionIdEquals(expected_next, h.checkpoint_next_xid))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						   errmsg("branch window snapshot does not match the selected checkpoint")));
+		pagestore_branch_check_window(expected_next, expected_prepared);
+	}
+
 	/*
-	 * The declared materializer can only fork at a restartpoint marker: that is
-	 * the point through which its replayed relation pages are durable.  Other
-	 * direct-write computes synchronously persist each routed page, including
-	 * pages whose WAL record is still in the current unarchived segment.  They
-	 * therefore need no materializer-watermark bound.
+	 * R2-m: the serialized controller's writer does not publish relation
+	 * pages.  Verify the store-observed marker here, before seeding SLRUs or
+	 * CREATE_BRANCH, rather than trusting the controller's earlier wait.
+	 * Missing or invalid markers read as InvalidXLogRecPtr and fail closed.
+	 * Legacy direct-write callers retain their existing contract until finite
+	 * branch activation; a declared materializer always needs this bound.
 	 */
-	if (pagestore_materializer)
+	if (require_materialized || pagestore_materializer)
 	{
 		materialized = pagestore_materialized_wal_lsn_internal();
-		if (fork_lsn > materialized)
+		if (XLogRecPtrIsInvalid(materialized) || fork_lsn > materialized)
 			ereport(ERROR,
-					(errmsg("branch fork LSN exceeds the durable materialized horizon"),
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("branch fork LSN exceeds the durable materialized horizon"),
 					 errdetail("Fork %X/%08X exceeds materialized horizon %X/%08X.",
 							   LSN_FORMAT_ARGS(fork_lsn),
 							   LSN_FORMAT_ARGS(materialized))));
 	}
+
+	if (!window)
+		pagestore_require_unsafe_branch_cut("pagestore_prepare_branch_from_control");
 
 	seeded = pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
 										base, fork_lsn, incarnation,
@@ -13484,7 +14072,7 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 											h.oldest_commit_ts_xid,
 											h.next_commit_ts_xid,
 											h.oldest_multi, h.next_multi,
-											h.oldest_member, h.next_member);
+											h.oldest_member, h.next_member, &created_new, window);
 	/*
 	 * The portable artifact is its own readiness marker in the prepared dir.
 	 * Publish it only after the SLRU manifest exists, and bind its checksum to
@@ -13507,10 +14095,42 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 		pfree(existing);
 	}
 	else if (errno == ENOENT)
-		pagestore_write_branch_bootstrap(target_dir, new_tl, parent_tl,
-									checkpoint_redo,
-									h.checkpoint_end_lsn, fork_lsn,
-									h.system_identifier);
+	{
+		MemoryContext oldcontext = CurrentMemoryContext;
+
+		/*
+		 * The proof and the bootstrap publication are the two steps that can
+		 * still fail after the timeline and its manifest exist.  On either
+		 * failure, remove the readiness artifacts this call published and
+		 * fsync the directory; delete the timeline only when this call
+		 * created it, so a pre-existing timeline is never destroyed.
+		 */
+		PG_TRY();
+		{
+			pagestore_branch_wal_proof(h.checkpoint_lsn, fork_lsn);
+			pagestore_write_branch_bootstrap(target_dir, new_tl, parent_tl,
+										checkpoint_redo,
+										h.checkpoint_end_lsn, fork_lsn,
+										h.system_identifier);
+		}
+		PG_CATCH();
+		{
+			ErrorData *prep_error;
+			char *cleanup;
+
+			MemoryContextSwitchTo(oldcontext);
+			prep_error = CopyErrorData();
+			FlushErrorState();
+			cleanup = pagestore_branch_cleanup(target_dir, new_tl, incarnation,
+											   created_new);
+			ereport(ERROR, (errcode(prep_error->sqlerrcode),
+				errmsg("%s", prep_error->message),
+				errdetail("Branch %u incarnation %llu; cleanup=%s. %s",
+					(uint32) new_tl, (unsigned long long) incarnation, cleanup,
+					prep_error->detail ? prep_error->detail : "")));
+		}
+		PG_END_TRY();
+	}
 	else
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -14008,6 +14628,15 @@ _PG_init(void)
 							 PGC_POSTMASTER,
 							 0,
 							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pagestore.allow_unsafe_branch_cut",
+							 "UNSAFE, test only: permits branches without the G3 hint-bit proof.",
+							 NULL,
+							 &pagestore_allow_unsafe_branch_cut,
+							 false,
+							 PGC_SUSET,
+							 GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
+							 check_allow_unsafe_branch_cut, NULL, NULL);
 
 	DefineCustomBoolVariable("pagestore.route_user_tablespaces",
 							 "Route relations in user-created tablespaces through the pagestore backend.",

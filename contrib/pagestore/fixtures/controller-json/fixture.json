@@ -2,8 +2,8 @@
   "schema": 1,
   "name": "controller-json",
   "role": "current",
-  "captured": "2026-09-12",
-  "description": "the JSON artifacts real runs of the branch controller and the materializer supervisor left behind: each tool's configuration, the controller's completed journal and retention generation authority, the supervisor's status and the materializer's retention generation authority",
+  "captured": "2026-10-07",
+  "description": "controller artifacts recaptured from the real PostgreSQL golden scenario with the schema-3 transaction-window journal; unchanged supervisor artifacts retained from the previous real-run fixture",
   "artifacts": {
     "branch_config": "controller/branch-prepare.json",
     "branch_journal": "controller/pagestore_branch.prepare.json",
