@@ -69,7 +69,7 @@ independent of whether the C1-C7 series is present.
 
 | Symbol | 19 (pagestore's base) | 18 | Sites (file:line, this PR's HEAD) | Status |
 |---|---|---|---|---|
-| `MultiXactIdToOffsetPage()`, `MXOffsetToMemberPage()` | public `static inline` in `access/multixact_internal.h` | `static` in `access/transam/multixact.c` on stock 18, not exported | `pagestore_slru.c` (the include guard's `#else` branch) | Guarded by the P1 sync pass, not this PR: identical formula re-implemented under the `#else`, see the guard's own comment. **Cross-branch conflict found verifying this PR, not fixed here** -- see the note right after this table |
+| `MultiXactIdToOffsetPage()`, `MXOffsetToMemberPage()` | public `static inline` in `access/multixact_internal.h` | `static` in `access/transam/multixact.c` on stock 18, not exported | `pagestore_slru.c` (the include guard's `#else` branch) | Guarded by the P1 sync pass, not this PR: identical formula re-implemented under the `#else`, see the guard's own comment. Local helpers use `ps_multixact_offset_page()` / `ps_multixact_member_page()` to avoid conflicting with C4 core exports; 19 aliases these names to its public inline helpers |
 | `ReplOriginId` | `access/xlogdefs.h` typedef, renamed from `RepOriginId` | `RepOriginId`, typedef in `access/xlogdefs.h:66` (not `replication/origin.h`, which only uses the type) | `pagestore.c`, `pagestore_slru.c` (both via `pagestore_backend.h`) | Guarded in this PR (`typedef RepOriginId ReplOriginId;` on 18) |
 | SLRU control struct (`SlruCtl`/`SlruDesc`, `ctl->options.X`) | `SlruDesc`, fields on a nested `options` sub-struct | `SlruCtlData` (typedef'd `SlruCtl`), fields directly on the struct | ~30 sites in `pagestore_slru.c` | Guarded in this PR (`PS_SLRU_OPT(ctl)` macro + `SlruDesc` alias on 18) |
 | `XLogFindNextRecord()` | 3 arguments (`char **errormsg` out-param) | 2 arguments | 10 sites in `pagestore.c` | Guarded in this PR (`PS_XLogFindNextRecord()` drops the extra argument on 18) |
@@ -94,34 +94,27 @@ itself — it needed a small export from core. The C1-C7 core series' C4 slice
 unconditional call compiles unmodified on both majors; nothing to guard
 here.
 
-**Cross-branch build conflict found while verifying this PR against
-`branchdb_18-rc`, not something `contrib/pagestore` can fix on its own.**
-`branchdb_18-rc`'s C4 slice made `MultiXactIdToOffsetPage()` and
-`MXOffsetToMemberPage()` themselves non-`static` in
-`src/backend/access/transam/multixact.c`, exported via `access/multixact.h`
-(comment there: "exported via access/multixact.h for contrib/pagestore's
-store-backed SLRU mirror on 18") — written before this table's own guard
-(the P1 sync pass) existed, on the assumption contrib would call the core
-export rather than reimplement the formula itself. The P1 guard instead
-re-implements both as `static inline` directly in `pagestore_slru.c`'s
-`#else` branch (row above). Combined, a real `branchdb_18-rc` build now
-fails: `error: static declaration of 'MultiXactIdToOffsetPage' follows
-non-static declaration`, and the same for `MXOffsetToMemberPage`
-(`pagestore_slru.c:128`/`134` against `multixact.h:121`-`122`), confirmed by
-compiling this PR's `contrib/pagestore` against a real `branchdb_18-rc`
-checkout. Reverting `branchdb_18-rc`'s now-redundant `MultiXactIdToOffsetPage()`/
-`MXOffsetToMemberPage()` export back to `static` (keeping only its
-`GetMultiXactInfo()` export, which contrib still has no alternative for)
-made the same build succeed cleanly and pass the full matrix
-(`meson test --suite pagestore` 76/76, `KEEPTMP=1 integration_test.sh` PASS
-including the `T_ClusterStmt` `CLUSTER` assertion); this was verified only
-in a throwaway scratch worktree, not committed anywhere. **This needs a
-fix on `branchdb_18-rc` itself** (drop the now-superseded
-`MultiXactIdToOffsetPage()`/`MXOffsetToMemberPage()` non-`static` export
-from its C4 slice) before that branch and a `pagestore` carrying this
-table's guards can build together; it is out of scope for `contrib/pagestore`
-(which stays byte-identical and correctly guards this on its own, per the
-row above) and out of scope for this PR.
+**C4 export compatibility.** The PG18 C4 slice exports
+`MultiXactIdToOffsetPage()` and `MXOffsetToMemberPage()` from
+`access/multixact.h`. The original contrib compatibility definitions used
+those same names as `static inline`, which made the combined build fail
+with "static declaration follows non-static declaration". Contrib now
+uses private `ps_multixact_offset_page()` and `ps_multixact_member_page()`
+names for the unchanged PG18 formulas. On PG19 those names alias the
+upstream inline helpers. This works with both stock PG18 headers and the
+C4 exports, without changing the core patch series or the byte-identical
+contrib requirement. `GetMultiXactInfo()` still requires its C4 export.
+
+**Clean-startup SLRU capture clock.** PG18 can flush the pages trimmed by
+`TrimCLOG()` / `TrimMultiXact()` before shared replay and redo pointers are
+available. Clean startup skips `PerformWalRecovery()`, so sampling those
+pointers used the bootstrap sentinel LSN `1` even on an existing store.
+After pruning, that write is correctly refused and the mirror retry can
+abort startup. `ps_slru_now_lsn()` now falls back to the already-read
+shutdown checkpoint's record end before using the bootstrap sentinel.
+This preserves a real WAL bound without relabeling staged bytes at drain
+time. The integration suite's clean restart after mirror-debt reset
+reproduces the original refusal and exercises the corrected clock.
 
 ## Known limitations for 18 (not fixed by this PR)
 
