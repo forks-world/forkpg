@@ -98,6 +98,8 @@
  */
 #if PG_VERSION_NUM >= 190000
 #include "access/multixact_internal.h"
+#define ps_multixact_offset_page MultiXactIdToOffsetPage
+#define ps_multixact_member_page MXOffsetToMemberPage
 #else
 #include "access/multixact.h"
 
@@ -110,7 +112,8 @@
  * not a guess -- it must be kept identical to upstream's should either
  * change again.  Unlike GetMultiXactInfo() below, these are pure arithmetic
  * over BLCKSZ/MultiXactOffset/TransactionId, so contrib can define them
- * itself without a core export.
+ * itself without a core export.  Keep the local names distinct from
+ * core: release-branch C4 patches can also export the original functions.
  */
 #define MULTIXACT_OFFSETS_PER_PAGE (BLCKSZ / sizeof(MultiXactOffset))
 #define MXACT_MEMBER_BITS_PER_XACT			8
@@ -125,13 +128,13 @@
 	(MULTIXACT_MEMBERGROUPS_PER_PAGE * MULTIXACT_MEMBERS_PER_MEMBERGROUP)
 
 static inline int64
-MultiXactIdToOffsetPage(MultiXactId multi)
+ps_multixact_offset_page(MultiXactId multi)
 {
 	return multi / MULTIXACT_OFFSETS_PER_PAGE;
 }
 
 static inline int64
-MXOffsetToMemberPage(MultiXactOffset offset)
+ps_multixact_member_page(MultiXactOffset offset)
 {
 	return offset / MULTIXACT_MEMBERS_PER_PAGE;
 }
@@ -756,10 +759,10 @@ ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 			 * wrapped truncation's tombstone reconstructible by the reset
 			 * repair path instead of being skipped.
 			 */
-			*cutoff = MultiXactIdToOffsetPage(prev);
+			*cutoff = ps_multixact_offset_page(prev);
 		}
 		else
-			*cutoff = MXOffsetToMemberPage(oldestOffset);
+			*cutoff = ps_multixact_member_page(oldestOffset);
 		return true;
 	}
 	return false;
@@ -3507,6 +3510,16 @@ ps_slru_now_lsn(void)
 			p = GetXLogReplayRecPtr(NULL);
 		if (XLogRecPtrIsInvalid(p))
 			p = GetRedoRecPtr();
+		/*
+		 * Clean startup skips PerformWalRecovery(), which initializes the
+		 * replay pointers. PG18 can flush TrimCLOG()/TrimMultiXact() here
+		 * before the shared redo pointer is available too. The shutdown
+		 * checkpoint has already been read, and its end bounds these
+		 * recovered bytes; use that real WAL position before the bootstrap
+		 * sentinel, which cannot be appended behind a retained frontier.
+		 */
+		if (XLogRecPtrIsInvalid(p))
+			p = GetCheckPointRecordEnd();
 		if (XLogRecPtrIsInvalid(p))
 			p = (XLogRecPtr) 1;
 		return p;
