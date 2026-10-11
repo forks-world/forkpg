@@ -5266,11 +5266,14 @@ def run_writer_smoke(
         subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-l", str(trace / "writer.log"), "-w", "start"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         events.emit("ready", target="writer", health=health, port=port)
-        if any(action["op"] == "reader_base" for action in plan.actions):
+        if any(action["op"] in ("reader_base", "capture") for action in plan.actions):
             setup = (
                 "CREATE OR REPLACE FUNCTION "
                 "pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS void "
                 "AS 'pagestore','pagestore_ship_slru_snapshot' LANGUAGE C STRICT;"
+                "CREATE OR REPLACE FUNCTION pagestore_retention_set(integer, integer, bigint, bigint, integer, pg_lsn) "
+                "RETURNS integer AS 'pagestore','pagestore_retention_set' LANGUAGE C STRICT;"
+                "SELECT pagestore_retention_set(0, 1, 10000, 1, 7, '0/0');"
             )
             subprocess.run(
                 [str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port),
@@ -5304,6 +5307,15 @@ SELECT json_build_object(
   'oldest_commit_ts_xid', CASE WHEN oldest_commit_ts_xid::text = '0' THEN '1' ELSE oldest_commit_ts_xid::text END,
   'next_commit_ts_xid', CASE WHEN newest_commit_ts_xid::text = '0' THEN '1' ELSE ((newest_commit_ts_xid::text::bigint + 1) & 4294967295)::text END)
 FROM pg_control_checkpoint();"""
+                # Resolve/catalog-warm the horizon query before R. Hint-bit
+                # FPIs caused by its first invocation must not land after R
+                # in the stopped reader seed's WAL.
+                horizon_query = sql.split("CHECKPOINT;", 1)[1]
+                warm_pin = (
+                    "SELECT pagestore_retention_set(0, 1, 10000, 1, 7, '0/0');"
+                    if any(item["op"] == "capture" for item in plan.actions) else ""
+                )
+                sql = warm_pin + horizon_query + "CHECKPOINT;" + horizon_query
             elif action["op"] == "prepare_reader":
                 ref = action["read_lsn"]
                 base_ref = action["base"]
@@ -5483,6 +5495,22 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
                     raise PlanError(f"capture {action['id']} requires reader_datadir and checkpoint horizon")
                 seed = root / "reader-seeds" / action["name"]
                 seed.parent.mkdir(exist_ok=True)
+                # Hand off the checkpoint before shutdown/startup can evict
+                # its daemon-owned slot. Installation reuses this exact owner.
+                owner_id = reader_owner_ids.setdefault(
+                    action["name"], 10000 + len(reader_owner_ids) + 1
+                )
+                lsn = checkpoints[ref[1:]]["redo_lsn"]
+                pin_sql = (
+                    f"SELECT pagestore_retention_set(0, 1, {owner_id}, 1, 7, '{lsn}');"
+                )
+                pinned = subprocess.run(
+                    [str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port),
+                     "-U", "postgres", "-tA", "-v", "ON_ERROR_STOP=1", "-c", pin_sql],
+                    check=True, capture_output=True, encoding="utf-8", env=env,
+                )
+                if pinned.stdout.strip().splitlines()[-1] != "0":
+                    raise PlanError(f"capture {action['id']} could not retain checkpoint {lsn}")
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-m", "fast", "-w", "stop"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 shutil.copytree(data, seed)
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-l", str(trace / "writer.log"), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)

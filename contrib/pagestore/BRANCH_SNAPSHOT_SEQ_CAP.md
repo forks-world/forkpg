@@ -1302,3 +1302,100 @@ WAL-index/artifact activation remain separate.
 The in-engine regression checks both the pre-create historical horizon and the
 actual FKM4 ZEROEXTEND record: UNSTAMPED, nonzero admission sequence, and an LSN
 strictly above the previously sampled insert position.
+
+## P5 implementation: finite pins, WAL horizons and artifact eras
+
+P5 activates PIN, WALIDX_HORIZON and ARTIFACT independently, after recovery
+observes every durable sequence and before serving requests. The three epochs
+use V3 CAP_ACTIVATION records; recovered pre-activation views retain their
+legacy semantics. IPC version 49 and `PS_FRONTEND_CAP_ATOMIC_PINS` require
+matching compute and daemon binaries. A P4 binary refuses the activated store.
+The POSIX frontend advertises the capability; SPDK does not yet advertise it.
+
+The registering barrier validates page, WAL and WAL-index ancestry frontiers
+under the admission and prune write locks. Two daemon-owned checkpoint slots
+retain the newest samples without accumulating owner tombstones. Explicit SET
+can only hand off a live identical `(timeline,R,S)` with a resource superset;
+source validation and target publication share the retention mutex. Readers
+resolve the checkpoint's original S and hand off directly, without a provisional
+RESERVE. A controller must acquire its owner before that checkpoint is evicted.
+
+Checkpoint publication writes the CONTROL image and redo note, including their
+exact-redo twins, before sampling S. The later admission-fence record publishes
+that sample. Reader startup, advancing adoption and CONTROL reads carry the
+original S. WAL-only owners also authorize their retained CONTROL views.
+Ordered operational writes move above a positional boundary only when their
+sequence is visible at that boundary; a strict finite S alone does not justify
+moving a write to R+1.
+
+WAL-index commits sample S_H while holding all shard locks in ascending order.
+WIPG v2 and WISD v4 persist finite horizons, including a consistent sample across
+snapshot shards. Replacement bases, death folds and forkmeta cutovers use full
+projected caps. Page closure preserves the selected visible identity at each
+retained position, while allowing fully invalidated positions to retire.
+
+Artifact BEGIN registers an in-flight `(C,token)` control cap, and the producer
+reads CONTROL with that cap before publishing data. COMMIT retains the cap,
+including empty generations, until its physical completion record is retired.
+Superseding BEGIN, DROP and restart remove unfinished attempts; recovery rebuilds
+committed generations only. Cap release schedules another control-pruning pass.
+Lifecycle-less seeds retain their legacy unbounded control eras.
+
+Focused coverage includes below-R rewrites, unregistered refusals, resource
+superset checks, concurrent source release versus hand-off, bounded checkpoint
+slots, high-word legacy sequences, durable activation, artifact supersession,
+empty COMMIT, restart and compaction. Validation results are recorded with the
+implementation change; local runs do not constitute release qualification.
+
+Local validation (2026-10-11, cassert build):
+
+- Meson `setup` + `pagestore` suites: 110/110 passed, including the bounded
+  soak, operation fuzzing, format replay and gate sweep.
+- PostgreSQL `integration_test.sh`: passed with finite reader hand-offs,
+  advancing adoption and the CONTROL/redo pair assertion enabled.
+- The new three-shard P5 regression under Clang ThreadSanitizer: 111 checks,
+  zero failures and no reported data races.
+- A P4 daemon refused a P5-activated store and left its timeline metadata
+  unchanged. Legacy fixtures and high-word pin upgrade/restart passed.
+
+P5 review follow-up: legacy CONTROL requests keep both sequence bounds
+unbounded. Relation compaction retains original first arrivals for finite
+WAL-index-only owners and progress, without granting those views relation-read
+or replacement-base authority and without extending artifact retention.
+Timeline deletion ignores the internal checkpoint slots as a veto, retires them
+after durable DELETING, and completes interrupted retirement during recovery;
+slot generations survive tombstones and timeline reuse. SPDK routes WAL-index
+progress to shard 0 before the shared stable-horizon sampler.
+
+The writer-smoke harness hands off reader ownership before stopped capture.
+It also invokes checkpoint and retention helpers before R so their initial
+catalog hint FPIs do not enter the reader seed's post-R WAL. Expanded regressions
+reproduce 14 failures against the original P5 core and pass with these fixes,
+including WAL-only first-arrival pruning, legacy CONTROL retries, deletion veto,
+incarnation reuse and crash recovery between DELETING and checkpoint retirement.
+
+PITR promotion can produce branch checkpoint redo below the store fork cut.
+Startup caches the validated cut with the immutable incarnation binding. Such
+checkpoints mirror writer CONTROL at the cut (preserving the real redo and
+checkpoint in the payload), and do not advertise a reader fence below it.
+This keeps new CONTROL blocks beyond forkmeta's reclaimed prefix without
+weakening atomic reader admission. Mirror failures also restore the caller's
+memory context before retaining ErrorData and reporting a warning, so repeated
+failures remain retryable. The MVP golden scenario asserts that branch
+checkpoint mirrors succeed across promotion, local writes and compute restart.
+
+Checkpoint barrier retries refresh an existing same-R slot before evicting a
+prior distinct checkpoint, including after restart. Fresh WAL_INDEX reserves
+validate page ancestry frontiers as well as WAL-index frontiers: a new owner
+cannot reconstruct a lost first-arrival identity after page compaction. This
+storage admission check does not grant PAGE_HISTORY authority. Regressions
+reproduce four failures without these guards and cover prior-checkpoint handoff,
+restart, late reserve refusal and valid WAL-only reserves without relation reads.
+
+P5 compute attachment requires ATOMIC_PINS before publishing startup identity
+or admitting any writes. SPDK intentionally leaves that capability clear:
+its frontend still bypasses token-aware artifact writes and does not implement
+artifact BEGIN/COMMIT. Advertising the bit merely for its checkpoint barrier
+would make the broader protocol unsafe. Integration simulates the missing bit,
+asserts startup refusal with the capability error, restores it and exercises
+the normal compute path; the startup assertions fail against the old client.

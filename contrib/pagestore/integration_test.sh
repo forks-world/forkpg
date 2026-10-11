@@ -226,6 +226,45 @@ listen_addresses = ''
 unix_socket_directories = '$MAIN_SOCK'
 port = $PORT
 EOF
+# A frontend without the complete P5 protocol (currently SPDK) must be
+# refused at startup, before a writer can leave checkpoint mirrors queued.
+CAPBOOT=$(mktemp -d "$SOCKROOT/p5-capability.XXXXXX")
+cc -I"$SCRIPT_DIR" -x c -o "$CAPBOOT/layout" - <<'C'
+#include <stddef.h>
+#include <stdio.h>
+#include "pagestore_ipc.h"
+int main(void) {
+    printf("%zu %u\n", offsetof(PsShmHeader, frontend_capabilities),
+           PS_FRONTEND_CAP_ATOMIC_PINS);
+    return 0;
+}
+C
+read -r p5_cap_offset p5_cap_bit < <("$CAPBOOT/layout")
+p5_cap_before=$(python3 - "$SHM_PATH" "$p5_cap_offset" "$p5_cap_bit" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    caps, = struct.unpack('=I', f.read(4))
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', caps & ~int(sys.argv[3])))
+    print(caps)
+PYTHON
+)
+p5BootRejected=yes
+if "$BIN/pg_ctl" -D "$DATA" -l "$DATA/p5-capability.log" -w start >/dev/null 2>&1; then
+    p5BootRejected=no
+    "$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1
+fi
+# Always restore the header before the normal compute starts.
+python3 - "$SHM_PATH" "$p5_cap_offset" "$p5_cap_before" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', int(sys.argv[3])))
+PYTHON
+assert "$p5BootRejected" "yes" "compute startup refuses a daemon without atomic P5 capability"
+assert "$(grep -c 'daemon lacks atomic pin capability' "$DATA/p5-capability.log" || true)" \
+    "1" "startup reports the missing P5 capability explicitly"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 
 # --- 1. localsvc round-trip: a routed table's I/O goes to the daemon --------
@@ -2035,6 +2074,10 @@ read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerO
 	FROM pg_control_checkpoint();")"
 assert "$($P -c "SELECT pg_wal_lsn_diff('$readerR', '$readerPinStart') > 0;")" "t" \
 	"prepared reader checkpoint R is strictly newer than its initial pin"
+# Hand off before shutdown and restart can evict this checkpoint from the
+# daemon's newest-two automatic registrations. Its original S remains retained.
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0" \
+    "controller hands off the prepared reader checkpoint before stopping the writer"
 # This test has no concurrent catalog-changing workload across the checkpoint,
 # so its stopped copy is the control-plane catalog artifact for R.  The
 # prepared reader bundle replaces its SLRUs; pg_control is restored
@@ -2046,7 +2089,7 @@ cp -a "$DATA" "$READERDATA"
 # The stop drained/terminated the old publication workers.  No queued
 # pre-R snapshot can now race this retention advance on the fresh writer.
 assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0" \
-	"controller advances the prepared reader owner to exact checkpoint R"
+	"controller retries its exact checkpoint hand-off after writer restart"
 $P -c "COMMIT PREPARED 'reader_running_at_r';" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT count(*) FROM reader_running;")" "1" \

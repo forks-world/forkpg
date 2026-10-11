@@ -745,14 +745,18 @@ psc_op_immedsync(void)
  * the daemon serves it before any per-timeline validation, see
  * pagestore_daemon.c's dispatcher around PS_OP_BEGIN_DELETE/ADMISSION_BARRIER
  * special-casing).  Out: req_seq, the admission sequence after every prior
- * mutation this process has observed complete. */
+ * mutation this process has observed complete.
+ */
 static int
-psc_op_admission_barrier(uint64_t *seq_out)
+psc_op_admission_barrier(uint32_t tl, uint64_t lsn, uint64_t *seq_out)
 {
 	PsChannel  *ch = psc_chan_ptr();
 
 	psc_setmeta(ch, 0, 0);
 	ch->opcode = PS_OP_ADMISSION_BARRIER;
+	ch->is_redo = PS_BARRIER_REGISTER;
+	ch->timeline = tl;
+	ch->req_lsn = lsn;
 	psc_cl_exec();
 	if (seq_out)
 		*seq_out = ch->req_seq;
@@ -1325,6 +1329,7 @@ psc_op_artifact_begin(uint32_t tl, uint64_t inc, uint32_t klass, uint32_t rel,
 
 	psc_set_channel_key(ch, tl, inc, klass, rel);
 	ch->opcode = PS_OP_ARTIFACT_BEGIN;
+	ch->is_redo = PS_ARTIFACT_BEGIN_CAPPED_READ;
 	ch->req_lsn = lsn;
 	ch->parent_timeline = supersedable ? PS_ARTIFACT_REQ_SUPERSEDABLE : 0;
 	psc_cl_exec();

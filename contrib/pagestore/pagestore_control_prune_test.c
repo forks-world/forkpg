@@ -531,12 +531,12 @@ test_retry_copies_collapse(void)
 					  PS_RETENTION_RESOURCE_ALL, 2500),
 		  "reader below and materializer above the second checkpoint");
 	run_maintenance(64);
-	check(ps_test_page_version_count(0, &key, 0) == 2 &&
-		  ps_test_page_version_count(0, &key, 1) == 2,
-		  "compaction keeps exactly one copy per retained version");
+	check(ps_test_page_version_count(0, &key, 0) == 4 &&
+		  ps_test_page_version_count(0, &key, 1) == 4,
+		  "finite views keep the first and selected copy per retained position");
 	check(wal_floor(0) == 800, "the reader's checkpoint keeps its floor");
 	{
-		uint64_t version = 0;
+		uint64_t	version = 0;
 
 		check(read_control_at(0, 0, 1500, &version) && version == 1000 &&
 			  read_control_at(0, 1, 1500, &version) && version == 800,

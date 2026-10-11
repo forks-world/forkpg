@@ -445,7 +445,10 @@ handle_request(PsChannel *ch)
 			{
 				PsArtifactRefuseReason reason = PS_ARTIFACT_REFUSE_NONE;
 
-				if (ps_artifact_begin(tl, &ch->key, ch->req_lsn, &ch->req_seq, &reason) != 0)
+				if (ch->is_redo != PS_ARTIFACT_BEGIN_CAPPED_READ)
+					reason = PS_ARTIFACT_REFUSE_INVALID;
+				if (reason != PS_ARTIFACT_REFUSE_NONE ||
+					ps_artifact_begin(tl, &ch->key, ch->req_lsn, &ch->req_seq, &reason) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					ch->result = (uint32_t) reason;
@@ -1009,13 +1012,16 @@ run_request(uint32_t channel, PsChannel *ch)
 
 	if (op == PS_OP_ADMISSION_BARRIER)
 	{
-		/* The barrier is an ordinary complete request: lifecycle-rd is held
-		 * while its inner admission-wr establishes the sequence.  BEGIN_DELETE
-		 * is the sole lifecycle-wr exception. */
+		/*
+		 * The barrier is an ordinary complete request: lifecycle-rd is held
+		 * while its inner admission-wr establishes the sequence.
+		 * BEGIN_DELETE is the sole lifecycle-wr exception.
+		 */
 		ps_lifecycle_read_lock();
 		ch->status = PS_STATUS_OK;
 		ch->result = 0;
-		ch->req_seq = ps_admission_barrier();
+		ch->req_seq = ch->is_redo == PS_BARRIER_REGISTER ?
+			ps_admission_barrier_register(ch->timeline, ch->req_lsn) : 0;
 		if (ch->req_seq == 0)
 			ch->status = PS_STATUS_ERROR;
 		ps_store_release(&ch->state, PS_STATE_DONE);
@@ -1562,7 +1568,7 @@ main(int argc, char **argv)
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
 	hdr->frontend_capabilities = PS_FRONTEND_CAP_RELATION_INSPECTION |
-		PS_FRONTEND_CAP_BRANCH_SEQ;
+		PS_FRONTEND_CAP_BRANCH_SEQ | PS_FRONTEND_CAP_ATOMIC_PINS;
 	hdr->daemon_instance = new_daemon_instance();
 	daemon_hdr = hdr;
 	ps_core_set_metrics_header(hdr);

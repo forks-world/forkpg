@@ -520,7 +520,8 @@ request_shard(const PsChannel *ch)
 {
 	PsOpcode	op = (PsOpcode) ch->opcode;
 
-	if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ)
+	if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ ||
+		op == PS_OP_WAL_INDEX_PROGRESS)
 		return 0;
 	if (op == PS_OP_WAL_RETAIN_FLOOR || op == PS_OP_RETENTION_FLOOR)
 	{
@@ -595,7 +596,8 @@ run_request(uint32_t i, PsChannel *ch)
 		pthread_rwlock_wrlock(&core_rwlock);
 		ch->status = PS_STATUS_OK;
 		ch->result = 0;
-		ch->req_seq = ps_admission_barrier();
+		ch->req_seq = ch->is_redo == PS_BARRIER_REGISTER ?
+			ps_admission_barrier_register(ch->timeline, ch->req_lsn) : 0;
 		if (ch->req_seq == 0)
 			ch->status = PS_STATUS_ERROR;
 		ps_store_release(&ch->state, PS_STATE_DONE);
@@ -985,6 +987,9 @@ main(int argc, char **argv)
 	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
+	/* Do not advertise ATOMIC_PINS: artifact BEGIN/COMMIT and token-aware
+	 * writes are not implemented by this frontend. P5 computes reject it
+	 * at attachment, before any checkpoint or artifact publication. */
 	ps_core_set_metrics_header(hdr);
 
 	memset(&sa, 0, sizeof(sa));

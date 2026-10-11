@@ -825,6 +825,10 @@ assert_eq "$("${BP[@]}" -c "SELECT note FROM mvp_golden WHERE id=3;")" \
 	"branch_local" "branch write survives compute restart on timeline 1"
 assert_eq "$("${BP[@]}" -c "SELECT count(*) FROM mvp_golden WHERE id=2;")" \
 	"0" "branch ancestry cutoff survives compute restart"
+if grep -q 'pg_control mirror ship failed' "$BRANCH/branch.log"; then
+	fail "branch checkpoints failed to publish their CONTROL mirrors"
+fi
+echo "ok   - pre-fork-redo branch checkpoints mirror CONTROL without reader admission"
 assert_eq "$("${WP[@]}" -c "SELECT count(*) FROM mvp_golden WHERE id=3;")" \
 	"0" "parent remains isolated from the branch write"
 

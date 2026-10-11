@@ -130,6 +130,8 @@ static uint32	ls_nshards = 1;
 #define LS_MAX_TIMELINES	1024
 static uint64	localsvc_bound_incarnation[LS_MAX_TIMELINES];
 static bool	localsvc_incarnation_bound[LS_MAX_TIMELINES];
+/* Validated branch cut, inherited by children with the immutable binding. */
+static uint64	localsvc_checkpoint_floor[LS_MAX_TIMELINES];
 
 /* max logical pages that fit in one transfer (io_unit) for this engine */
 #define LS_MAX_PAGES_PER_OP		(PS_IO_UNIT / BLCKSZ)
@@ -230,6 +232,7 @@ ls_attach(void)
 		uint32		got_version = 0;
 		uint32		got_page_size = 0;
 		bool		header_ok = false;
+		bool		atomic_pins = false;
 
 		for (;;)
 		{
@@ -246,6 +249,7 @@ ls_attach(void)
 			got_magic = hdr->magic;
 			got_version = hdr->version;
 			got_page_size = hdr->page_size;
+			atomic_pins = (hdr->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) != 0;
 			header_ok = (got_magic == PS_SHM_MAGIC && got_version == PS_SHM_VERSION &&
 						 __atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) == PS_SHM_READY &&
 						 got_page_size == BLCKSZ);
@@ -267,6 +271,17 @@ ls_attach(void)
 					(errmsg("pagestore localsvc shared memory \"%s\" has no running, initialized daemon",
 							localsvc_shm_name),
 					 errhint("Is the pagestore daemon running?")));
+		}
+		/* Every P5 compute publishes finite checkpoint/artifact views.  A
+		 * frontend lacking the complete protocol must fail before startup
+		 * identity probes or writes, rather than during CONTROL draining. */
+		if (!atomic_pins)
+		{
+			munmap(shm, PS_SHM_SIZE);
+			close(fd);
+			ereport(ERROR,
+					(errmsg("pagestore daemon lacks atomic pin capability"),
+					 errhint("Use a daemon frontend supporting the complete P5 protocol.")));
 		}
 	}
 	ls_shm = shm;
@@ -1212,6 +1227,10 @@ pagestore_localsvc_require_branch_timeout(uint32 new_tl, uint32 parent_tl,
 	ch->incarnation = target_incarnation;
 	ch->req_seq = parent_incarnation;
 	ls_exec_timeout(ch, timeout_ms);
+	if (new_tl < LS_MAX_TIMELINES &&
+		localsvc_incarnation_bound[new_tl] &&
+		localsvc_bound_incarnation[new_tl] == target_incarnation)
+		localsvc_checkpoint_floor[new_tl] = branch_lsn;
 }
 
 /*
@@ -1249,6 +1268,14 @@ pagestore_localsvc_admission_fence_begin(uint64 redo_lsn, uint64 *token)
 	uint64		epoch;
 
 	*token = 0;
+	/* PITR promotion can checkpoint below the store branch cut.  Such a
+	 * checkpoint still needs its writer CONTROL mirror, but cannot name a
+	 * reader view of the retained ancestry.  Avoid opening a gate that the
+	 * atomic barrier must reject.  This cache requires no IPC in the hook's
+	 * critical section and was populated by startup manifest validation. */
+	if (localsvc_timeline > 0 && localsvc_timeline < LS_MAX_TIMELINES &&
+		redo_lsn < localsvc_checkpoint_floor[localsvc_timeline])
+		return false;
 	if (ls_shm == NULL)
 		return false;
 	hdr = (PsShmHeader *) ls_shm;
@@ -1274,14 +1301,18 @@ pagestore_localsvc_admission_fence_active(uint64 token)
 }
 
 uint64
-pagestore_localsvc_admission_barrier_timeout(int timeout_ms)
+pagestore_localsvc_admission_barrier_timeout(uint64 lsn, int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	PsChannel  *ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL,
-													(uint32) localsvc_timeline);
+												   (uint32) localsvc_timeline);
 
 	ch->key.klass = PS_KLASS_CONTROL;
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		ereport(ERROR, (errmsg("pagestore daemon lacks atomic pin capability")));
 	ch->opcode = PS_OP_ADMISSION_BARRIER;
+	ch->req_lsn = lsn;
+	ch->is_redo = PS_BARRIER_REGISTER;
 	ls_exec_timeout(ch, timeout_ms);
 	return ch->req_seq;
 }
@@ -1354,6 +1385,8 @@ pagestore_localsvc_retention_set_timeout(uint32 timeline, uint32 owner_kind,
 		return PS_STATUS_ERROR;
 	ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL, timeline);
 	ch->key.klass = PS_KLASS_CONTROL;
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		return PS_STATUS_ERROR;
 	ch->opcode = PS_OP_RETENTION_PIN_SET;
 	ch->timeline = timeline;
 	ch->blocknum = owner_kind;
@@ -1382,6 +1415,8 @@ pagestore_localsvc_retention_reserve_timeout(uint32 timeline,
 		return PS_STATUS_ERROR;
 	ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL, timeline);
 	ch->key.klass = PS_KLASS_CONTROL;
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		return PS_STATUS_ERROR;
 	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
 	ch->timeline = timeline;
 	ch->blocknum = owner_kind;
@@ -2197,12 +2232,25 @@ pagestore_localsvc_artifact_supersedable(bool on)
 
 uint64
 pagestore_localsvc_artifact_begin(uint32 klass, const PageStoreRelKey *key,
-	uint64 version, int timeout_ms)
+								  uint64 version, int timeout_ms)
 {
-	PsChannel *ch = ls_artifact_channel(klass, key, version);
+	PsChannel  *ch = ls_artifact_channel(klass, key, version);
+
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_ATOMIC_PINS) == 0)
+		ereport(ERROR, (errmsg("pagestore daemon lacks capped artifact capability")));
 	ch->opcode = PS_OP_ARTIFACT_BEGIN;
+	ch->is_redo = PS_ARTIFACT_BEGIN_CAPPED_READ;
 	ls_exec_timeout(ch, timeout_ms);
-	return ch->req_seq;
+	{
+		uint64		token = ch->req_seq;
+		PageStoreRelKey control_key = {0};
+		char		control_page[BLCKSZ];
+
+		if (!pagestore_localsvc_obj_read_capped_timeout(PS_KLASS_CONTROL, &control_key,
+														PS_CONTROL_IMAGE_BLOCK, version, token, control_page, NULL, timeout_ms))
+			ereport(ERROR, (errmsg("pagestore artifact has no retained control era at its publication cap")));
+		return token;
+	}
 }
 
 void
@@ -2279,6 +2327,14 @@ pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 	 * req_lsn (the caller's cutoff/dirtying/update LSN), so it reads back
 	 * as-of an LSN >= that version; ignored for relations (pd_lsn).
 	 */
+	/* A promoted branch may still emit CONTROL updates below its store cut.
+	 * Order those local mutations at the cut, like copied relation pages,
+	 * so a new control block can grow after forkmeta has reclaimed the
+	 * pre-cut prefix.  The payload retains the actual checkpoint/redo LSN. */
+	if (klass == PS_KLASS_CONTROL && localsvc_timeline > 0 &&
+		localsvc_timeline < LS_MAX_TIMELINES &&
+		version < localsvc_checkpoint_floor[localsvc_timeline])
+		version = localsvc_checkpoint_floor[localsvc_timeline];
 	ch->req_lsn = version;
 	ch->req_seq = 0;
 	ch->parent_timeline = 0;	/* never an automatic generation */
@@ -2327,14 +2383,24 @@ pagestore_localsvc_obj_read_at_timeout(uint32 klass, const PageStoreRelKey *key,
 									   void *page, uint64 *resolved,
 									   int timeout_ms)
 {
-	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass,
-													(uint32) localsvc_timeline);
+	return pagestore_localsvc_obj_read_capped_timeout(klass, key, block, version,
+													  klass == PS_KLASS_CONTROL && version == localsvc_read_lsn ? ls_pinned_read_seq() : 0,
+													  page, resolved, timeout_ms);
+}
+
+bool
+pagestore_localsvc_obj_read_capped_timeout(uint32 klass, const PageStoreRelKey *key,
+										   BlockNumber block, uint64 version, uint64 seq, void *page, uint64 *resolved,
+										   int timeout_ms)
+{
+	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass, (uint32) localsvc_timeline);
 	bool		found;
 
 	ch->key.klass = klass;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = version;
+	ch->req_seq = seq;
 	ls_exec_timeout(ch, timeout_ms);
 	memcpy(page, ch->data, BLCKSZ);
 	found = ch->result != 0;

@@ -4190,7 +4190,7 @@ pagestore_clog_status_asof(PG_FUNCTION_ARGS)
  * whenever an image exists.
  */
 static bool
-ps_control_asof_timeout(XLogRecPtr lsn, ControlFileData *cf, int timeout_ms)
+ps_control_asof_capped_timeout(XLogRecPtr lsn, uint64 seq, ControlFileData *cf, int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	char		page[BLCKSZ];
@@ -4199,16 +4199,37 @@ ps_control_asof_timeout(XLogRecPtr lsn, ControlFileData *cf, int timeout_ms)
 
 	if (BLCKSZ < PG_CONTROL_FILE_SIZE)
 		return false;
-	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_CONTROL, &key,
-												PS_CONTROL_IMAGE_BLOCK,
-												(uint64) lsn, page, &resolved,
-												timeout_ms))
+	if (!pagestore_localsvc_obj_read_capped_timeout(PS_KLASS_CONTROL, &key,
+													PS_CONTROL_IMAGE_BLOCK,
+													(uint64) lsn, seq, page, &resolved,
+													timeout_ms))
 		return false;
 	memcpy(cf, page, sizeof(*cf));
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, cf, offsetof(ControlFileData, crc));
 	FIN_CRC32C(crc);
-	return EQ_CRC32C(crc, cf->crc);
+	if (!EQ_CRC32C(crc, cf->crc))
+		return false;
+#ifdef USE_ASSERT_CHECKING
+	if (seq != 0)
+	{
+		XLogRecPtr redo;
+
+		/* Both independently selected blocks must describe the same era. */
+		if (!pagestore_localsvc_obj_read_capped_timeout(PS_KLASS_CONTROL, &key,
+				PS_REDO_NOTE_BLOCK, (uint64) lsn, seq, page, NULL, timeout_ms))
+			return false;
+		memcpy(&redo, page, sizeof(redo));
+		Assert(redo == cf->checkPointCopy.redo);
+	}
+#endif
+	return true;
+}
+
+static bool
+ps_control_asof_timeout(XLogRecPtr lsn, ControlFileData *cf, int timeout_ms)
+{
+	return ps_control_asof_capped_timeout(lsn, 0, cf, timeout_ms);
 }
 
 static bool
@@ -9881,13 +9902,12 @@ pagestore_adopt_reader_view_at_xact_start_impl(void)
 		if (XLogRecPtrIsInvalid(published) ||
 			published <= (XLogRecPtr) pagestore_localsvc_read_lsn())
 			goto adoption_done;
-		valid = ps_control_asof_timeout(published, &control,
-			PAGESTORE_READER_HORIZON_TIMEOUT_MS) &&
-			pagestore_reader_database_barrier_valid(published) &&
-			control.checkPointCopy.redo == published &&
-			(must_adopt || pagestore_localsvc_read_fence_timeout(
-				(uint64) published, &read_seq,
-				PAGESTORE_READER_HORIZON_TIMEOUT_MS));
+		valid = (must_adopt || pagestore_localsvc_read_fence_timeout(
+		(uint64) published, &read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS)) &&
+		ps_control_asof_capped_timeout(published, read_seq, &control,
+		PAGESTORE_READER_HORIZON_TIMEOUT_MS) &&
+		pagestore_reader_database_barrier_valid(published) &&
+		control.checkPointCopy.redo == published;
 		if (valid)
 		{
 			snapshot = pagestore_load_published_reader_snapshot(
@@ -12231,13 +12251,11 @@ pagestore_validate_datadir_branch_manifest(void)
 	uint64		read_lsn;
 	uint64		read_seq = 0;
 	uint64		pin_lsn;
-	uint64		provisional_seq;
 	bool		found;
 	uint8		retention_status;
 	PsRetentionPin existing_pin;
 	bool		have_existing_pin;
 	bool		set_reader_pin;
-	bool		provisional_reader_pin = false;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -12344,14 +12362,9 @@ pagestore_validate_datadir_branch_manifest(void)
 		if (reader_snapshot->xids != NULL)
 			pfree(reader_snapshot->xids);
 		pfree(reader_snapshot);
-		/*
-		 * This is the last local-only validation step.  Install a conservative
-		 * pin at a freshly drained admission barrier before reading the exact
-		 * checkpoint fence.  This conservative upper fence protects every
-		 * same-LSN variant that could belong to the artifact while the exact
-		 * fence is resolved, closing the read-fence/SET race for a new or
-		 * advancing owner without using the legacy zero-sequence sentinel.
-		 */
+		/* Read the exact checkpoint fence, then atomically hand it off from a
+		 * live registration. A later RESERVE cannot reconstruct an older S;
+		 * it would expose rewrites and let pruning lose intermediate versions. */
 		have_existing_pin = pagestore_find_retention_owner(
 			pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
 			pagestore_retention_owner_id, &existing_pin);
@@ -12382,28 +12395,11 @@ pagestore_validate_datadir_branch_manifest(void)
 						 errhint("Reprovision the fixed reader with a new owner identity at a retained horizon.")));
 			set_reader_pin = existing_pin.lsn < read_lsn;
 		}
-		if (set_reader_pin)
-		{
-			retention_status = pagestore_localsvc_retention_reserve_timeout(
-				pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
-				pagestore_retention_owner_id,
-				pagestore_retention_owner_generation,
-				PS_READER_RETENTION_RESOURCES, read_lsn, &provisional_seq,
-				PS_READER_RETENTION_TIMEOUT_MS);
-			if (retention_status == PS_STATUS_STALE)
-				ereport(FATAL,
-						(errmsg("pagestore reader retention generation is stale")));
-			if (retention_status != PS_STATUS_OK)
-				ereport(FATAL,
-						(errmsg("pagestore reader could not install its provisional retention owner")));
-			provisional_reader_pin = true;
-		}
 		/* An advancing reader may restart from an older boot image after its
 		 * durable owner already moved forward.  Resolve (or reuse) that newer
 		 * frontier; reclaimed boot-image fence history is no longer required. */
 		pin_lsn = read_lsn;
-		if (have_existing_pin && pagestore_advance_read_lsn &&
-			existing_pin.lsn > read_lsn)
+		if (have_existing_pin && existing_pin.lsn >= read_lsn)
 		{
 			pin_lsn = existing_pin.lsn;
 			read_seq = existing_pin.admission_seq;
@@ -12413,9 +12409,7 @@ pagestore_validate_datadir_branch_manifest(void)
 				PAGESTORE_READER_HORIZON_TIMEOUT_MS))
 			ereport(FATAL,
 					(errmsg("pagestore reader has no durable admission fence at its retained horizon")));
-		set_reader_pin = provisional_reader_pin ||
-			(have_existing_pin && existing_pin.lsn == pin_lsn &&
-			 existing_pin.admission_seq != read_seq);
+		set_reader_pin = !have_existing_pin || existing_pin.lsn < pin_lsn;
 		if (set_reader_pin)
 		{
 			retention_status = pagestore_localsvc_retention_set_timeout(
@@ -12442,6 +12436,8 @@ pagestore_validate_datadir_branch_manifest(void)
 				(XLogRecPtr) existing_pin.lsn;
 			SpinLockRelease(&pagestore_reader_horizon->mutex);
 		}
+	if (pin_lsn == read_lsn)
+		pagestore_localsvc_adopt_read_view(read_lsn, read_seq, 1);
 		pagestore_localsvc_detach();
 		if (pagestore_localsvc_timeline() != 0)
 		{
