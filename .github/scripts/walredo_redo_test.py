@@ -69,9 +69,16 @@ def extract_record(start_lsn, end_lsn, desc_match):
     assert rec_start is not None, "no matching no-FPI record found"
     rec_end = min([x for x in all_lsns if x > rec_start] + [end_lsn])
     off = rec_start % SEGSIZE
-    assert (off % 8192) + (rec_end - rec_start) <= 8192, "record spans a WAL page; rerun"
     seg = "%08X%08X%08X" % (1, rec_start >> 32, (rec_start % (1 << 32)) // SEGSIZE)
-    data = open(f"{PGDATA}/pg_wal/{seg}", "rb").read()[off:off + (rec_end - rec_start)]
+    with open(f"{PGDATA}/pg_wal/{seg}", "rb") as wal_file:
+        wal = wal_file.read()
+    total_len = struct.unpack_from("<I", wal, off)[0]
+    assert total_len >= 24 and rec_start + total_len <= rec_end, "invalid record length"
+    assert (off % 8192) + total_len <= 8192, "record spans a WAL page; rerun"
+    # The next record starts at MAXALIGN(total_len); padding is not part of
+    # the framed record, although rec_end remains the aligned WAL position.
+    data = wal[off:off + total_len]
+    assert len(data) == total_len, "truncated WAL record"
     return rec_start, rec_end, data
 
 
@@ -109,7 +116,7 @@ Q("insert into wrt values (2,'bbbb');")                 # record A: FPI carrier
 base_hex = Q("select encode(get_raw_page('wrt',0),'hex');")
 base_lsn = lsn2int(Q("select lsn from page_header(get_raw_page('wrt',0));"))
 s = lsn2int(Q("select pg_current_wal_lsn();"))
-Q("insert into wrt values (3,'cccc');")                 # record B: the delta
+Q("insert into wrt values (3,'ccc');")                 # record B: the delta
 e = lsn2int(Q("select pg_current_wal_lsn();"))
 Q("checkpoint;")
 exp_hex = Q("select encode(get_raw_page('wrt',0),'hex');")
@@ -117,6 +124,7 @@ db = int(Q("select oid from pg_database where datname='postgres';"))
 rel = int(Q("select relfilenode from pg_class where relname='wrt';"))
 pg_ctl("stop", "-m", "fast")
 rs, re_, data = extract_record(s, e, lambda ln: "Heap" in ln and "INSERT" in ln)
+assert len(data) % 8 != 0, "INSERT regression must exercise alignment padding"
 fails += not check("heap INSERT delta", replay(db, rel, base_hex, base_lsn, rs, re_, data), exp_hex)
 
 # --- case: VM-clearing heap UPDATE delta (full_page_writes off) -----------

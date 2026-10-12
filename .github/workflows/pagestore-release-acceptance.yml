@@ -484,6 +484,11 @@ jobs:
             --require-build-match \
             | tee in-engine-pgdata-fixture-check.log
 
+      - name: Run capped-selection and finite-view merge blockers
+        run: |
+          meson test -C build pagestore_prune_capped pagestore_forkmeta_prune_capped \
+            pagestore_viewcap pagestore_p5 --print-errorlogs
+
       - name: Check G3 branch SQL entry gates
         run: contrib/pagestore/branch_gate_test.sh "$(pwd)/build"
 

@@ -35,6 +35,8 @@ on:
       - 'src/include/storage/smgr.h'
       - 'src/include/storage/procarray.h'
       - '.github/workflows/pagestore-test.yml'
+      - 'scripts/branchdb-sync.sh'
+      - '.github/scripts/test_branchdb_sync.py'
   pull_request:
     paths:
       - 'contrib/pagestore/**'
@@ -58,6 +60,8 @@ on:
       - 'src/include/storage/smgr.h'
       - 'src/include/storage/procarray.h'
       - '.github/workflows/pagestore-test.yml'
+      - 'scripts/branchdb-sync.sh'
+      - '.github/scripts/test_branchdb_sync.py'
   workflow_dispatch:
 
 # A branch update fires both push and pull_request.  Keep only the newest run
@@ -553,6 +557,11 @@ jobs:
             --postgres-payload-identity-tool build/contrib/pagestore/pagestore_control_restore \
             ${{ (github.ref_name == 'pagestore' || (startsWith(github.ref_name, 'branchdb_') && steps.release-plan.outputs.supported == 'true') || (github.event_name == 'pull_request' && (github.base_ref == 'pagestore' || (startsWith(github.base_ref, 'branchdb_') && steps.release-plan.outputs.supported == 'true')))) && '--require-build-match' || '' }}
 
+      - name: Run capped-selection and finite-view merge blockers
+        run: |
+          meson test -C build pagestore_prune_capped pagestore_forkmeta_prune_capped \
+            pagestore_viewcap pagestore_p5 --print-errorlogs
+
       - name: Check G3 branch SQL entry gates
         run: contrib/pagestore/branch_gate_test.sh "$(pwd)/build"
 
@@ -567,7 +576,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: pagestore-integration-logs
+          name: pagestore-integration-logs-attempt-${{ github.run_attempt }}
           path: build/pagestore-integration-logs/*.log
           if-no-files-found: warn
           retention-days: 7

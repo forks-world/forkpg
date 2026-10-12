@@ -65,6 +65,20 @@ class BranchSyncSafety(unittest.TestCase):
         result = self.assert_refused_without_rewrite("forward", "branchdb_19", "branchdb_18", "REL_18_7")
         self.assertIn("differs from requested tag", result.stderr)
 
+    def test_verify_rejects_unlanded_same_contrib_tree(self):
+        self.git("update-ref", "refs/remotes/origin/pagestore", "branchdb_19")
+        self.git("checkout", "-q", "branchdb_18-rc")
+        self.git("commit", "-q", "--allow-empty", "-m", "unlanded source")
+        result = self.assert_refused_without_rewrite("verify", "branchdb_18-rc", "HEAD")
+        self.assertIn("not an ancestor of origin/pagestore", result.stderr)
+
+    def test_verify_accepts_landed_source(self):
+        self.git("tag", "-d", "REL_17_6")  # keep the PG18 base tag unambiguous
+        self.git("update-ref", "refs/remotes/origin/pagestore", "branchdb_19")
+        result = self.run_sync("verify", "branchdb_18-rc", self.base)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS", result.stdout)
+
     def test_forward_resumes_matching_base_and_skips_applied_series(self):
         result = self.run_sync("forward", "branchdb_19", "branchdb_18", "REL_18_6")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

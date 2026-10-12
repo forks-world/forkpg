@@ -455,7 +455,11 @@ cmd_verify() {
   local ref="$branch"
   git rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || ref="origin/$branch"
   git rev-parse --verify --quiet "$ref" >/dev/null || die "no ref '$branch' or 'origin/$branch'"
-  git rev-parse --verify --quiet "$sha" >/dev/null || die "unknown commit '$sha'"
+  git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null || die "unknown commit '$sha'"
+  git rev-parse --verify --quiet origin/pagestore >/dev/null || die "no origin/pagestore (run '$SELF fetch'?)"
+  if ! git merge-base --is-ancestor "$sha" origin/pagestore; then
+    die "'$sha' is not an ancestor of origin/pagestore; verify requires a landed pagestore source"
+  fi
 
   local upref
   upref=$(upstream_ref "$v") || die "no upstream ref for PG $v"
