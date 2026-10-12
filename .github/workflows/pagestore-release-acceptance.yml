@@ -490,7 +490,7 @@ jobs:
       - name: Run capped-selection and finite-view merge blockers
         run: |
           meson test -C build pagestore_prune_capped pagestore_forkmeta_prune_capped \
-            pagestore_viewcap pagestore_p5 --print-errorlogs
+            pagestore_viewcap pagestore_p5 pagestore_inspect_mailbox --print-errorlogs
 
       - name: Check G3 branch SQL entry gates
         run: contrib/pagestore/branch_gate_test.sh "$(pwd)/build"

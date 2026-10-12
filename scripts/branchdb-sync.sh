@@ -220,6 +220,28 @@ cmd_status() {
   fi
 }
 
+# A release requires one squashed commit for each core integration series.
+check_complete_series() {
+  local range=$1 label count
+  local commit_sha commit_labels
+  while IFS= read -r commit_sha; do
+    commit_labels=$(git show -s --format=%B "$commit_sha" | grep -cE '^Branchdb-Series: C[1-7]$' || true)
+    if (( commit_labels > 1 )); then
+      echo "FAIL - $commit_sha has multiple core-series trailers" >&2
+      return 1
+    fi
+  done < <(git rev-list "$range")
+  local labels
+  labels=$(git log --format=%B "$range" | grep -E '^Branchdb-Series: C[1-7]$' || true)
+  for label in C1 C2 C3 C4 C5 C6 C7; do
+    count=$(grep -cFx "Branchdb-Series: $label" <<<"$labels" || true)
+    if [[ "$count" != 1 ]]; then
+      echo "FAIL - $range requires exactly one $label trailer; found $count" >&2
+      return 1
+    fi
+  done
+}
+
 # ---- minor -------------------------------------------------------------------
 
 cmd_minor() {
@@ -227,7 +249,8 @@ cmd_minor() {
   [[ -n "$v" ]] || die "usage: $SELF minor <N> [TAG]"
   local branch="branchdb_$v"
   refuse_protected_branch "$branch"
-  git rev-parse --verify --quiet "$branch" >/dev/null || die "no local branch '$branch' (checkout: git checkout -b $branch origin/$branch)"
+  local branch_ref="refs/heads/$branch"
+  git show-ref --verify --quiet "$branch_ref" || die "no local branch '$branch' (checkout: git checkout -b $branch origin/$branch)"
   if [[ -z "$tag" ]]; then
     tag=$(newest_release_tag "$v")
     [[ -n "$tag" ]] || die "no non-prerelease REL_${v}_* tag exists yet; pass TAG explicitly"
@@ -236,14 +259,15 @@ cmd_minor() {
   local upref
   upref=$(upstream_ref "$v") || die "no upstream ref for PG $v"
   local oldbase
-  oldbase=$(git merge-base "$branch" "$upref")
+  oldbase=$(git merge-base "$branch_ref" "$upref")
   local merges
-  merges=$(git rev-list --count --merges "$oldbase..$branch")
+  merges=$(git rev-list --count --merges "$oldbase..$branch_ref")
   if [[ "$merges" != "0" ]]; then
     die "$branch carries $merges merge commit(s) above $oldbase; minor only rebases a linear series (see 'verify')"
   fi
   echo ">> rebasing $branch's patch series: $oldbase -> $tag"
-  run git rebase --onto "$tag" "$oldbase" "$branch"
+  run git switch --no-guess "$branch"
+  run git rebase --onto "$tag" "$oldbase"
   echo ">> done; $branch is now based on $tag"
 }
 
@@ -283,8 +307,10 @@ cmd_forward() {
   else
     local from_v
     from_v=$(major_of_branch "$from") || die "FROM must be 'pagestore' or a branchdb_<N>[-rc] branch, not '$from'"
-    git rev-parse --verify --quiet "$from" >/dev/null 2>&1 || from="origin/$from"
-    git rev-parse --verify --quiet "$from" >/dev/null || die "no ref '$from' or 'origin/$from'"
+    local source_branch=$from
+    from="refs/heads/$source_branch"
+    git show-ref --verify --quiet "$from" || from="refs/remotes/origin/$source_branch"
+    git show-ref --verify --quiet "$from" || die "no release branch '$source_branch'"
     local from_upref
     from_upref=$(upstream_ref "$from_v") || die "no upstream ref for PG $from_v"
     from_base=$(git merge-base "$from" "$from_upref")
@@ -318,6 +344,8 @@ EOF
     return 1
   fi
 
+  check_complete_series "$from_base..$from" || die "incomplete or duplicate source core series"
+
   echo ">> ${#series_commits[@]} core-series commit(s) found in $from_base..$from:"
   for sha in "${series_commits[@]}"; do
     local trailer subject
@@ -326,10 +354,11 @@ EOF
     printf '   %s  %-10s %s\n' "${sha:0:12}" "$trailer" "$subject"
   done
 
-  if git rev-parse --verify --quiet "$rc_branch" >/dev/null; then
+  local rc_ref="refs/heads/$rc_branch"
+  if git show-ref --verify --quiet "$rc_ref"; then
     local target_upref staging_base requested_base
     target_upref=$(upstream_ref "$to_major") || die "no upstream ref for PG $to_major"
-    staging_base=$(git merge-base "$rc_branch" "$target_upref")
+    staging_base=$(git merge-base "$rc_ref" "$target_upref")
     requested_base=$(git rev-parse "refs/tags/${tag}^{commit}")
     [[ "$staging_base" == "$requested_base" ]] || die "$rc_branch base $staging_base differs from requested tag $tag; rebase or recreate staging deliberately before retrying"
     # Resume onto the existing staging branch instead of force-resetting it
@@ -337,9 +366,9 @@ EOF
     # already made on it. Skip commits already applied there (identified by
     # the "-x" cherry-pick provenance trailer `cherry-pick` stamps).
     echo ">> $rc_branch already exists; resuming onto it (not resetting to $tag)"
-    run git checkout "$rc_branch"
+    run git switch --no-guess "$rc_branch"
     local applied
-    applied=$(git log --format=%B "$rc_branch")
+    applied=$(git log --format=%B "$rc_ref")
     local -a pending=()
     for sha in "${series_commits[@]}"; do
       grep -qF "(cherry picked from commit ${sha}" <<<"$applied" || pending+=("$sha")
@@ -501,6 +530,10 @@ cmd_verify() {
     echo "ok   - contrib/pagestore is byte-identical to pagestore@${sha:0:12}"
   else
     echo "FAIL - contrib/pagestore differs from pagestore@${sha:0:12}"
+    failures=$((failures + 1))
+  fi
+
+  if ! check_complete_series "$base..$ref"; then
     failures=$((failures + 1))
   fi
 
