@@ -15,6 +15,7 @@ on:
       - 'branchdb_*'
     paths:
       - 'contrib/pagestore/**'
+      - 'contrib/meson.build'
       # core seams the pagestore module depends on: a core-only PR (e.g. the
       # control-file write hook) must still run the in-engine tests
       - 'src/backend/access/transam/xlog.c'
@@ -40,6 +41,7 @@ on:
   pull_request:
     paths:
       - 'contrib/pagestore/**'
+      - 'contrib/meson.build'
       # core seams the pagestore module depends on: a core-only PR (e.g. the
       # control-file write hook) must still run the in-engine tests
       - 'src/backend/access/transam/xlog.c'

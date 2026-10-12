@@ -148,13 +148,13 @@ upstream_ref() {
 # none exists yet (e.g. PG 19 before its first GA/RC tag).
 newest_release_tag() {
   local v=$1
-  git tag -l "REL_${v}_*" | { grep -vE 'BETA|RC' || true; } | sort -V | tail -1
+  git tag -l "REL_${v}_*" | { grep -E "^REL_${v}_[0-9]+$" || true; } | sort -V | tail -1
 }
 
 # Refuse foreign-major names and branch/SHA aliases before any rewrite.
 require_release_tag() {
   local tag=$1 major=$2
-  [[ "$tag" == REL_${major}_* ]] || die "tag '$tag' is not an upstream REL_${major}_* release tag"
+  [[ "$tag" =~ ^REL_${major}_([0-9]+|BETA[1-9][0-9]*|RC[1-9][0-9]*)$ ]] || die "tag '$tag' is not an upstream REL_${major}_* release tag"
   git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" >/dev/null || die "unknown release tag '$tag' (run '$SELF fetch'?)"
 }
 

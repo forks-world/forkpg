@@ -56,6 +56,20 @@ class BranchSyncSafety(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         return result
 
+    def test_rewrite_rejects_malformed_same_major_tags(self):
+        for tag in ("REL_18_backup", "REL_18_fake", "REL_18_7_extra", "REL_18_RC0"):
+            self.git("tag", tag)
+            self.assert_refused_without_rewrite("minor", "18", tag)
+            self.assert_refused_without_rewrite("forward", "branchdb_19", "18", tag)
+
+    def test_automatic_minor_ignores_malformed_tags(self):
+        self.git("tag", "REL_18_zzz", self.base)
+        result = self.run_sync("minor", "18")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("REL_18_7", result.stdout)
+        self.assertEqual(self.git("merge-base", "HEAD", "REL_18_7"),
+                         self.git("rev-parse", "REL_18_7"))
+
     def test_minor_rejects_foreign_major_tag(self):
         result = self.assert_refused_without_rewrite("minor", "18", "REL_17_6")
         self.assertIn("REL_18_", result.stderr)
