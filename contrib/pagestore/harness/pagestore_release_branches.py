@@ -37,8 +37,11 @@ lookup ``scripts/branchdb-sync.sh status`` uses).
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +110,17 @@ def load(path: Path | None = None) -> dict[str, Any]:
                     f"{path}: supported major {entry.get('major')} is missing '{field}' "
                     "(null is fine before it is synced; the key must still be present)"
                 )
+        if entry["status"] in CANDIDATE_STATUSES:
+            major = entry["major"]
+            tag = entry["base_tag"]
+            sha = entry["contrib_sha"]
+            if not isinstance(tag, str) or not re.fullmatch(
+                    rf"REL_{major}_(?:[0-9]+(?:_[0-9]+)*|BETA[1-9][0-9]*|RC[1-9][0-9]*)", tag):
+                raise ReleaseBranchesError(
+                    f"{path}: {entry['status']} major {major} requires a matching upstream base_tag")
+            if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+                raise ReleaseBranchesError(
+                    f"{path}: {entry['status']} major {major} requires a full contrib_sha commit ID")
     for entry in unsupported:
         _check_common(path, entry, seen_majors)
         if not isinstance(entry.get("reason"), str) or not entry["reason"]:
@@ -145,8 +159,39 @@ def entry_for_major(major: int, data: dict[str, Any] | None = None) -> dict[str,
     return None
 
 
+def _test_release_evidence(data: dict[str, Any]) -> None:
+    """Exercise hand-edited promotions without changing the checked-in manifest."""
+    with tempfile.TemporaryDirectory(prefix="pagestore-release-evidence-") as tmp:
+        path = Path(tmp) / "release-branches.json"
+        for status in sorted(CANDIDATE_STATUSES):
+            promoted = copy.deepcopy(data)
+            entry = promoted["supported"][0]
+            major = entry["major"]
+            entry.update(status=status, base_tag=f"REL_{major}_1", contrib_sha="a" * 40)
+            path.write_text(json.dumps(promoted), encoding="utf-8")
+            assert entry["branch"] in candidate_branches(load(path))
+            for field, bad_values in (
+                    ("base_tag", (None, "", f"REL_{major + 1}_1", "origin/pagestore", 1)),
+                    ("contrib_sha", (None, "", "abc123", "z" * 40, "origin/pagestore", 1))):
+                for value in bad_values:
+                    invalid = copy.deepcopy(promoted)
+                    invalid["supported"][0][field] = value
+                    path.write_text(json.dumps(invalid), encoding="utf-8")
+                    try:
+                        load(path)
+                    except ReleaseBranchesError:
+                        pass
+                    else:
+                        raise AssertionError(f"{status} accepted invalid {field}: {value!r}")
+        planned = copy.deepcopy(data)
+        planned["supported"][0].update(status="planned", base_tag=None, contrib_sha=None)
+        path.write_text(json.dumps(planned), encoding="utf-8")
+        load(path)
+
+
 def _self_test() -> int:
     data = load()
+    _test_release_evidence(data)
     majors = supported_majors(data)
     unsupported = unsupported_majors(data)
     assert len(majors) == len(set(majors)), "duplicate majors in 'supported' slipped past validation"

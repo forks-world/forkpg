@@ -1040,6 +1040,8 @@ pagestore_format_fuzz_replay = executable('pagestore_format_fuzz_replay',
   dependencies: [dependency('threads')],
   install: false,
 )
+# The baseline and corpus encode native little-endian persisted structures.
+if host_machine.endian() == 'little'
 foreach fuzz_target : [
   'manifest', 'forkmeta', 'forkmeta_snapshot_manifest',
   'forkmeta_snapshot_checkpoint', 'forkmeta_snapshot_tail', 'image_layer',
@@ -1055,6 +1057,7 @@ foreach fuzz_target : [
     timeout: 60,
   )
 endforeach
+endif
 test('pagestore_fuzz_runner_regressions',
   find_program(meson.current_source_dir() / 'fuzz' / 'tests' /
                'check_runner_regression.sh'),
