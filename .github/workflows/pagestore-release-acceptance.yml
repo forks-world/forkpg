@@ -65,6 +65,12 @@ jobs:
               exit 1
               ;;
           esac
+          # The tag is also an artifact name component and a bundle filename.
+          # Restrict it before resolving/building so publication cannot fail late.
+          if [[ ! "$tag" =~ ^pagestore-candidate-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "refusing '$tag': candidate suffix must use ASCII letters, digits, dots, underscores or hyphens" >&2
+            exit 1
+          fi
           # Resolve through the tag ref explicitly (not `commits/<tag>`, which
           # would also accept a same-named branch) so a dispatch input that
           # names something other than an actual tag is refused rather than
