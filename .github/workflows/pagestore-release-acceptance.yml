@@ -484,6 +484,9 @@ jobs:
             --require-build-match \
             | tee in-engine-pgdata-fixture-check.log
 
+      - name: Run persisted-format fuzz regression suite
+        run: meson test -C build --suite pagestore-fuzz --timeout-multiplier 3 --print-errorlogs
+
       - name: Run capped-selection and finite-view merge blockers
         run: |
           meson test -C build pagestore_prune_capped pagestore_forkmeta_prune_capped \
@@ -504,6 +507,13 @@ jobs:
           if [ -d build/pagestore-integration-logs ]; then
             cp build/pagestore-integration-logs/*.log evidence-integration-logs/ 2>/dev/null || true
           fi
+
+      - name: Check WAL-redo protocol and heap/VM redo deltas
+        run: |
+          pg_bin="$PWD/build/tmp_install/usr/local/pgsql/bin"
+          "$pg_bin/initdb" -D walredo-scratch --no-locale -U postgres
+          python3 .github/scripts/walredo_smoke.py "$pg_bin/postgres" walredo-scratch
+          python3 .github/scripts/walredo_redo_test.py "$pg_bin" walredo-scratch 5499
 
       - name: Run WAL-redo worker demo
         run: contrib/pagestore/redo_worker_demo.sh "$(pwd)/build"
@@ -539,6 +549,7 @@ jobs:
         with:
           name: release-acceptance-in-engine-${{ needs.resolve.outputs.tag }}
           path: |
+            build/meson-logs/testlog.*
             in-engine-store-fixture-check.log
             in-engine-pgdata-fixture-check.log
             evidence-integration-logs/*.log
@@ -597,48 +608,31 @@ jobs:
   bundle:
     name: bundle evidence
     needs: [resolve, standalone, in-engine, soak]
+    if: ${{ always() && needs.resolve.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.resolve.outputs.sha }}
 
-      - name: Download standalone evidence
+      # Pattern downloads preserve each available artifact in its own directory.
+      # A failed job may have no artifact at all; still bundle the partial evidence.
+      - name: Download available acceptance evidence
         uses: actions/download-artifact@v4
         with:
-          name: release-acceptance-standalone-${{ needs.resolve.outputs.tag }}
-          path: evidence/standalone
-
-      - name: Download in-engine evidence
-        uses: actions/download-artifact@v4
-        with:
-          name: release-acceptance-in-engine-${{ needs.resolve.outputs.tag }}
-          path: evidence/in-engine
-
-      - name: Download soak report (seed 20260909)
-        uses: actions/download-artifact@v4
-        with:
-          name: release-acceptance-soak-${{ needs.resolve.outputs.tag }}-seed-20260909
-          path: evidence/soak
-
-      - name: Download soak report (seed 7)
-        uses: actions/download-artifact@v4
-        with:
-          name: release-acceptance-soak-${{ needs.resolve.outputs.tag }}-seed-7
-          path: evidence/soak
-
-      - name: Download soak report (seed 4242)
-        uses: actions/download-artifact@v4
-        with:
-          name: release-acceptance-soak-${{ needs.resolve.outputs.tag }}-seed-4242
-          path: evidence/soak
+          pattern: release-acceptance-*${{ needs.resolve.outputs.tag }}*
+          path: evidence
 
       - name: Assemble evidence-<tag>.tar.gz
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
         run: |
           tag="${{ needs.resolve.outputs.tag }}"
           bundle="evidence-${tag}"
           mkdir -p "$bundle"
-          cp -r evidence/standalone evidence/in-engine evidence/soak "$bundle"/
+          mkdir -p evidence
+          cp -r evidence/. "$bundle"/
+          printf '%s\n' "$JOB_RESULTS" > "$bundle/job-results.json"
           {
             echo "tag: $tag"
             echo "sha: ${{ needs.resolve.outputs.sha }}"

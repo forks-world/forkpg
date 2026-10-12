@@ -557,6 +557,9 @@ jobs:
             --postgres-payload-identity-tool build/contrib/pagestore/pagestore_control_restore \
             ${{ (github.ref_name == 'pagestore' || (startsWith(github.ref_name, 'branchdb_') && steps.release-plan.outputs.supported == 'true') || (github.event_name == 'pull_request' && (github.base_ref == 'pagestore' || (startsWith(github.base_ref, 'branchdb_') && steps.release-plan.outputs.supported == 'true')))) && '--require-build-match' || '' }}
 
+      - name: Run persisted-format fuzz regression suite
+        run: meson test -C build --suite pagestore-fuzz --timeout-multiplier 3 --print-errorlogs
+
       - name: Run capped-selection and finite-view merge blockers
         run: |
           meson test -C build pagestore_prune_capped pagestore_forkmeta_prune_capped \
