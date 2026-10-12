@@ -79,6 +79,38 @@ class BranchSyncSafety(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS", result.stdout)
 
+    def test_sync_records_immutable_oid_when_alias_moves(self):
+        self.git("tag", "-d", "REL_17_6")
+        path = self.repo / "contrib/pagestore/example"
+        path.parent.mkdir(parents=True)
+        path.write_text("first capture\n")
+        self.git("add", "contrib/pagestore")
+        self.git("commit", "-q", "-m", "source capture")
+        source = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/pagestore", source)
+        result = self.run_sync("sync-contrib", "branchdb_18-rc", "origin/pagestore")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        message = self.git("log", "-1", "--format=%B")
+        self.assertIn("pagestore@" + source, message)
+        self.assertNotIn("pagestore@origin/pagestore", message)
+        self.git("checkout", "-q", "branchdb_19")
+        path.write_text("later capture\n")
+        self.git("add", "contrib/pagestore")
+        self.git("commit", "-q", "-m", "later source")
+        self.git("update-ref", "refs/remotes/origin/pagestore", "HEAD")
+        result = self.run_sync("verify", "branchdb_18-rc", source)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git("show", "branchdb_18-rc:contrib/pagestore/example"),
+                         "first capture")
+
+    def test_verify_resolves_source_alias_once(self):
+        self.git("tag", "-d", "REL_17_6")
+        self.git("update-ref", "refs/remotes/origin/pagestore", self.base)
+        result = self.run_sync("verify", "branchdb_18-rc", "origin/pagestore")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(self.base, result.stdout)
+        self.assertNotIn("pagestore@origin/pagestore", result.stdout)
+
     def test_forward_resumes_matching_base_and_skips_applied_series(self):
         result = self.run_sync("forward", "branchdb_19", "branchdb_18", "REL_18_6")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

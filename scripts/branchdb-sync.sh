@@ -379,7 +379,9 @@ cmd_sync_contrib() {
   local branch=${1:-} sha=${2:-}
   [[ -n "$branch" && -n "$sha" ]] || die "usage: $SELF sync-contrib <branch> <SHA>"
   refuse_protected_branch "$branch"
-  git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null || die "unknown commit '$sha'"
+  local source_oid
+  source_oid=$(git rev-parse --verify --quiet "${sha}^{commit}") || die "unknown commit '$sha'"
+  sha=$source_oid
   git rev-parse --verify --quiet origin/pagestore >/dev/null || die "no origin/pagestore (run '$SELF fetch'?)"
   if ! git merge-base --is-ancestor "$sha" origin/pagestore; then
     die "'$sha' is not an ancestor of origin/pagestore; contrib/pagestore is only ever synced from a commit that has actually landed on pagestore"
@@ -455,7 +457,9 @@ cmd_verify() {
   local ref="$branch"
   git rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || ref="origin/$branch"
   git rev-parse --verify --quiet "$ref" >/dev/null || die "no ref '$branch' or 'origin/$branch'"
-  git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null || die "unknown commit '$sha'"
+  local source_oid
+  source_oid=$(git rev-parse --verify --quiet "${sha}^{commit}") || die "unknown commit '$sha'"
+  sha=$source_oid
   git rev-parse --verify --quiet origin/pagestore >/dev/null || die "no origin/pagestore (run '$SELF fetch'?)"
   if ! git merge-base --is-ancestor "$sha" origin/pagestore; then
     die "'$sha' is not an ancestor of origin/pagestore; verify requires a landed pagestore source"
