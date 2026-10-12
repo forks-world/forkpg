@@ -388,6 +388,9 @@ cmd_sync_contrib() {
     die "'$sha' is not an ancestor of origin/pagestore; contrib/pagestore is only ever synced from a commit that has actually landed on pagestore"
   fi
 
+  [[ "$(git cat-file -t "$sha:contrib/pagestore" 2>/dev/null || true)" == "tree" ]] ||
+    die "source '$sha' has no contrib/pagestore tree; nothing changed"
+
   local current
   current=$(git rev-parse --abbrev-ref HEAD)
   if [[ "$current" != "$branch" ]]; then
@@ -455,9 +458,9 @@ cmd_verify() {
   refuse_protected_branch "$branch"
   local v
   v=$(major_of_branch "$branch") || die "verify expects a branchdb_<N>[-rc] branch, not '$branch'"
-  local ref="$branch"
-  git rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || ref="origin/$branch"
-  git rev-parse --verify --quiet "$ref" >/dev/null || die "no ref '$branch' or 'origin/$branch'"
+  local ref="refs/heads/$branch"
+  git show-ref --verify --quiet "$ref" || ref="refs/remotes/origin/$branch"
+  git show-ref --verify --quiet "$ref" || die "no local or origin release branch '$branch'"
   local source_oid
   source_oid=$(git rev-parse --verify --quiet "${sha}^{commit}") || die "unknown commit '$sha'"
   sha=$source_oid

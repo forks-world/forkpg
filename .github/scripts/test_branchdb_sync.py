@@ -90,6 +90,37 @@ class BranchSyncSafety(unittest.TestCase):
                 self.assertEqual(self.git("symbolic-ref", "HEAD"),
                                  "refs/heads/branchdb_19")
 
+    def test_sync_rejects_source_without_contrib_before_mutating(self):
+        path = self.repo / "contrib/pagestore/example"
+        path.parent.mkdir(parents=True)
+        path.write_text("preserve me\n")
+        self.git("add", "contrib/pagestore")
+        self.git("commit", "-q", "-m", "source tree")
+        self.git("update-ref", "refs/remotes/origin/pagestore", "HEAD")
+        result = self.assert_refused_without_rewrite("sync-contrib", "branchdb_19", self.base)
+        self.assertIn("no contrib/pagestore tree", result.stderr)
+        self.assertEqual(path.read_text(), "preserve me\n")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_verify_ignores_tag_shadowing_release_branch(self):
+        self.git("tag", "-d", "REL_17_6")
+        self.git("update-ref", "refs/remotes/origin/pagestore", self.base)
+        self.git("tag", "branchdb_18-rc", self.base)
+        self.git("checkout", "-q", "branchdb_18-rc")
+        path = self.repo / "rogue"
+        path.write_text("not a permitted release commit\n")
+        self.git("add", "rogue")
+        self.git("commit", "-q", "-m", "rogue change")
+        result = self.run_sync("verify", "branchdb_18-rc", self.base)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rogue change", result.stdout + result.stderr)
+        self.git("update-ref", "refs/remotes/origin/branchdb_18-rc", "HEAD")
+        self.git("checkout", "-q", "branchdb_19")
+        self.git("branch", "-D", "branchdb_18-rc")
+        result = self.run_sync("verify", "branchdb_18-rc", self.base)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rogue change", result.stdout + result.stderr)
+
     def test_sync_records_immutable_oid_when_alias_moves(self):
         self.git("tag", "-d", "REL_17_6")
         path = self.repo / "contrib/pagestore/example"

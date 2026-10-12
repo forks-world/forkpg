@@ -626,8 +626,9 @@ jobs:
       - name: Assemble evidence-<tag>.tar.gz
         env:
           JOB_RESULTS: ${{ toJSON(needs) }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          tag="${{ needs.resolve.outputs.tag }}"
+          tag="$TAG"
           bundle="evidence-${tag}"
           mkdir -p "$bundle"
           mkdir -p evidence
