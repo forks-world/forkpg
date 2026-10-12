@@ -379,6 +379,7 @@ cmd_sync_contrib() {
   local branch=${1:-} sha=${2:-}
   [[ -n "$branch" && -n "$sha" ]] || die "usage: $SELF sync-contrib <branch> <SHA>"
   refuse_protected_branch "$branch"
+  git show-ref --verify --quiet "refs/heads/$branch" || die "sync-contrib target must be an existing local branch: '$branch'"
   local source_oid
   source_oid=$(git rev-parse --verify --quiet "${sha}^{commit}") || die "unknown commit '$sha'"
   sha=$source_oid
@@ -390,7 +391,7 @@ cmd_sync_contrib() {
   local current
   current=$(git rev-parse --abbrev-ref HEAD)
   if [[ "$current" != "$branch" ]]; then
-    run git checkout "$branch"
+    run git switch --no-guess "$branch"
   fi
 
   if [[ "$DRY_RUN" != "1" ]]; then

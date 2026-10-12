@@ -79,6 +79,17 @@ class BranchSyncSafety(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS", result.stdout)
 
+    def test_sync_rejects_remote_tag_and_missing_targets(self):
+        self.git("update-ref", "refs/remotes/origin/pagestore", "branchdb_19")
+        self.git("update-ref", "refs/remotes/origin/branchdb_18", self.base)
+        for target in ("origin/branchdb_18", "REL_18_6", "branchdb_20"):
+            with self.subTest(target=target):
+                result = self.assert_refused_without_rewrite(
+                    "sync-contrib", target, "origin/pagestore")
+                self.assertIn("existing local branch", result.stderr)
+                self.assertEqual(self.git("symbolic-ref", "HEAD"),
+                                 "refs/heads/branchdb_19")
+
     def test_sync_records_immutable_oid_when_alias_moves(self):
         self.git("tag", "-d", "REL_17_6")
         path = self.repo / "contrib/pagestore/example"
