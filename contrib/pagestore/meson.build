@@ -1005,6 +1005,12 @@ test('pagestore_persisted_format_fixture',
 # PostgreSQL build, also loads every artifact through the backend's loaders
 # and applies the declared mutations (harness/pagestore_pgdata_fixture.py
 # --build).
+test('pagestore_pgdata_identity_guards',
+  pagestore_harness_python,
+  args: [files('harness/tests/test_pgdata_identity.py')],
+  suite: ['pagestore'],
+  timeout: 60,
+)
 test('pagestore_pgdata_format_fixture',
   pagestore_harness_python,
   args: [files('harness/pagestore_pgdata_fixture.py'),
