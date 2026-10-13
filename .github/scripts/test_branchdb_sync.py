@@ -113,6 +113,21 @@ class BranchSyncSafety(unittest.TestCase):
         result = self.assert_refused_without_rewrite("verify", "branchdb_18-rc", self.no_contrib)
         self.assertIn("no contrib/pagestore tree", result.stderr)
 
+    def test_malformed_extra_series_declaration_is_rejected(self):
+        self.git("tag", "-d", "REL_17_6")
+        self.git("update-ref", "refs/remotes/origin/pagestore", self.base)
+        complete = self.git("rev-parse", "HEAD")
+        for declaration in ("Branchdb-Series: C8", "Branchdb-Series: placeholder"):
+            with self.subTest(declaration=declaration):
+                self.git("reset", "--hard", complete)
+                self.git("commit", "-q", "--amend", "-m",
+                         "core 7\n\nBranchdb-Series: C7\n" + declaration)
+                self.git("branch", "-f", "branchdb_18-rc", "HEAD")
+                for command in (("verify", "branchdb_18-rc", self.base),
+                                ("forward", "branchdb_19", "18", "REL_18_6")):
+                    result = self.assert_refused_without_rewrite(*command)
+                    self.assertIn("one valid core-series declaration", result.stderr)
+
     def test_verify_accepts_landed_source(self):
         self.git("tag", "-d", "REL_17_6")  # keep the PG18 base tag unambiguous
         self.git("update-ref", "refs/remotes/origin/pagestore", "branchdb_19")

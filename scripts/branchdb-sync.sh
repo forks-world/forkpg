@@ -223,11 +223,12 @@ cmd_status() {
 # A release requires one squashed commit for each core integration series.
 check_complete_series() {
   local range=$1 label count
-  local commit_sha commit_labels
+  local commit_sha commit_labels declarations
   while IFS= read -r commit_sha; do
     commit_labels=$(git show -s --format=%B "$commit_sha" | grep -cE '^Branchdb-Series: C[1-7]$' || true)
-    if (( commit_labels > 1 )); then
-      echo "FAIL - $commit_sha has multiple core-series trailers" >&2
+    declarations=$(git show -s --format=%B "$commit_sha" | grep -cE '^Branchdb-Series:' || true)
+    if (( declarations > 0 && (declarations != 1 || commit_labels != 1) )); then
+      echo "FAIL - $commit_sha must have exactly one valid core-series declaration" >&2
       return 1
     fi
   done < <(git rev-list "$range")
