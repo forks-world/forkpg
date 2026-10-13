@@ -171,6 +171,54 @@ def load_authoritative(*, candidate_sha: str | None = None, repo: Path | None = 
     return data
 
 
+def staged_release_entry(entry: dict[str, Any], candidate: str, repo: Path,
+                         upstream: str) -> dict[str, Any]:
+    """Check a planned sync for PR review without claiming release promotion.
+
+    Provenance comes from the mechanical sync and cited core sources. Reviewed
+    port pins are recorded on pagestore only after this release PR lands.
+    """
+    major = entry["major"]
+    stable = f"refs/pagestore-release-check/{major}/staged-stable"
+    _git(repo, "fetch", "--no-tags", upstream, f"+refs/heads/REL_{major}_STABLE:{stable}")
+    base = _git(repo, "merge-base", candidate, stable)
+    advertised = _git(repo, "ls-remote", "--tags", upstream, f"refs/tags/REL_{major}_*")
+    tags: dict[str, dict[str, str]] = {}
+    for line in advertised.splitlines():
+        oid, ref = line.split()
+        tag = ref.removeprefix("refs/tags/").removesuffix("^{}")
+        if re.fullmatch(rf"REL_{major}_(?:[0-9]+|BETA[1-9][0-9]*|RC[1-9][0-9]*)", tag):
+            tags.setdefault(tag, {})["commit" if ref.endswith("^{}") else "object"] = oid
+    matching = [tag for tag, objects in tags.items()
+                if objects.get("commit", objects.get("object")) == base]
+    if not matching:
+        raise ReleaseBranchesError("planned release base has no authoritative upstream release tag")
+    staged = copy.deepcopy(entry)
+    staged["base_tag"] = sorted(matching)[0]
+    messages = _git(repo, "log", "--format=%s", f"{base}..{candidate}")
+    source = re.search(r"^contrib/pagestore: sync to pagestore@([0-9a-f]{40})$", messages, re.M)
+    if source is None:
+        raise ReleaseBranchesError("planned release needs a mechanical sync with a full pagestore source SHA")
+    staged["contrib_sha"] = source.group(1)
+    staged["core_series"] = {}
+    for commit in _git(repo, "rev-list", f"{base}..{candidate}").splitlines():
+        message = _git(repo, "show", "-s", "--format=%B", commit)
+        labels = re.findall(r"^Branchdb-Series: (C[1-7])$", message, re.M)
+        if not labels:
+            continue
+        if len(labels) != 1 or labels[0] in staged["core_series"]:
+            raise ReleaseBranchesError("planned release has duplicate core series labels")
+        citations = re.findall(r"\(cherry picked from commit ([0-9a-f]{40})\)", message)
+        section = re.search(r"Source commits?[^:]*:\s*(.*?)(?:\n\s*\n|$)", message, re.S)
+        if section:
+            citations += re.findall(r"(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])", section.group(1))
+        if not citations:
+            raise ReleaseBranchesError(f"planned {labels[0]} port {commit} has no source provenance")
+        sources = sorted({_git(repo, "rev-parse", "--verify", f"{sha}^{{commit}}") for sha in citations})
+        staged["core_series"][labels[0]] = {"commit": commit, "sources": sources}
+    return staged
+
+
 def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
                              upstream: str = "https://github.com/postgres/postgres.git",
                              candidate_sha: str | None = None,
@@ -190,7 +238,13 @@ def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
         if version is None:
             raise ReleaseBranchesError("candidate has no PostgreSQL major identity")
         major = int(version.group(1))
-        entries = [e for e in entries if e["major"] == major]
+        if not require_lineage and major in unsupported_majors(data):
+            print(f"skip - PG{major} is an unsupported reference branch without release evidence")
+            return {}
+        if not require_lineage:
+            entries = [e for e in data["supported"] if e["major"] == major]
+        else:
+            entries = [e for e in entries if e["major"] == major]
         if not entries:
             raise ReleaseBranchesError(f"candidate PG{major} has no promoted authoritative manifest entry")
     if not entries:
@@ -209,14 +263,19 @@ def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
     main_ref = git("rev-parse", f"{main_ref}^{{commit}}")
     revisions: dict[str, str] = {}
     for entry in entries:
+        if entry["status"] == "planned":
+            if candidate_sha is None or require_lineage:
+                raise ReleaseBranchesError("planned entries cannot qualify release candidates")
+            entry = staged_release_entry(entry, candidate_sha, repo, upstream)
         major, branch, tag, source = (entry[k] for k in ("major", "branch", "base_tag", "contrib_sha"))
         prefix = f"refs/pagestore-release-check/{major}"
         tag_ref, stable_ref, branch_ref = (prefix + suffix for suffix in ("/tag", "/stable", "/branch"))
         git("fetch", "--no-tags", upstream, f"+refs/tags/{tag}:{tag_ref}",
             f"+refs/heads/REL_{major}_STABLE:{stable_ref}")
-        git("fetch", "--no-tags", "origin", f"+refs/heads/{branch}:{branch_ref}")
-        release_head = git("rev-parse", f"{branch_ref}^{{commit}}")
-        branch_ref = release_head
+        if candidate_sha is None or require_lineage:
+            git("fetch", "--no-tags", "origin", f"+refs/heads/{branch}:{branch_ref}")
+            release_head = git("rev-parse", f"{branch_ref}^{{commit}}")
+            branch_ref = release_head
         stable_ref = git("rev-parse", f"{stable_ref}^{{commit}}")
         if candidate_sha is not None:
             git("rev-parse", "--verify", f"{candidate_sha}^{{commit}}")
@@ -244,15 +303,17 @@ def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
                                  "--", "src", "contrib/meson.build", "contrib/Makefile")
                 if not core_paths:
                     raise ReleaseBranchesError(f"{branch}: {label} has no PostgreSQL core/build changes")
+                source_has_core = False
                 for origin_sha in approved["sources"]:
                     citations = re.findall(r"(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])", message.lower())
                     if not any(origin_sha.lower().startswith(citation) for citation in citations):
                         raise ReleaseBranchesError(f"{branch}: {label} does not cite approved source {origin_sha}")
                     git("rev-parse", "--verify", f"{origin_sha}^{{commit}}")
                     git("merge-base", "--is-ancestor", origin_sha, main_ref)
-                    if not git("diff-tree", "--no-commit-id", "--name-only", "-r", origin_sha,
-                               "--", "src", "contrib/meson.build", "contrib/Makefile"):
-                        raise ReleaseBranchesError(f"{branch}: {label} source has no core/build changes")
+                    source_has_core |= bool(git("diff-tree", "--no-commit-id", "--name-only", "-r", origin_sha,
+                                                "--", "src", "contrib/meson.build", "contrib/Makefile"))
+                if not source_has_core:
+                    raise ReleaseBranchesError(f"{branch}: {label} sources have no core/build changes")
                 labels.append(label)
                 continue
             paths = git("diff-tree", "--no-commit-id", "--name-only", "-r", commit,

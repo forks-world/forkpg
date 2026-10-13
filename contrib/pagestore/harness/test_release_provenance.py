@@ -52,7 +52,7 @@ class ProvenanceTests(unittest.TestCase):
         self.source = self.git("rev-parse", "HEAD")
         self.git("checkout", "-q", "-b", "branchdb_18", self.base)
         self.git("checkout", self.source, "--", "contrib/pagestore")
-        self.git("commit", "-q", "-m", "release tree copy")
+        self.git("commit", "-q", "-m", f"contrib/pagestore: sync to pagestore@{self.source}")
         self.core_series = {}
         for label, source in self.source_commits.items():
             self.git("cherry-pick", "-x", source)
@@ -63,7 +63,7 @@ class ProvenanceTests(unittest.TestCase):
         self.origin = root / "origin.git"
         subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(self.origin)], check=True)
         self.git("remote", "add", "origin", str(self.origin))
-        self.data = {"supported": [{"major": 18, "branch": "branchdb_18", "status": "candidate",
+        self.data = {"schema": 1, "unsupported": [], "supported": [{"major": 18, "branch": "branchdb_18", "status": "candidate",
                                    "base_tag": "REL_18_6", "contrib_sha": self.source,
                                    "core_series": self.core_series}]}
 
@@ -243,6 +243,64 @@ class ProvenanceTests(unittest.TestCase):
         self.git("commit", "-q", "-m", "ci: later branch")
         self.git("push", "origin", "branchdb_18")
         self.assertEqual(revisions["branchdb_18"], self.candidate)
+
+    def test_first_planned_sync_can_be_reviewed_but_not_accepted(self):
+        data = copy.deepcopy(self.data)
+        data["supported"][0].update(status="planned", base_tag=None, contrib_sha=None, core_series=None)
+        revisions = manifest_reader.check_release_provenance(data, repo=self.repo,
+            upstream=str(self.upstream), candidate_sha=self.candidate, require_lineage=False)
+        self.assertEqual(revisions, {"branchdb_18": self.candidate})
+        with self.assertRaises(ReleaseBranchesError):
+            manifest_reader.check_release_provenance(data, repo=self.repo,
+                upstream=str(self.upstream), candidate_sha=self.candidate)
+        self.assertIsNone(data["supported"][0]["contrib_sha"])
+        subprocess.run(["git", "--git-dir", str(self.origin), "update-ref", "-d",
+                        "refs/heads/branchdb_18"], check=True)
+        self.assertEqual(manifest_reader.check_release_provenance(data, repo=self.repo,
+            upstream=str(self.upstream), candidate_sha=self.candidate, require_lineage=False),
+            {"branchdb_18": self.candidate})
+
+    def test_unsupported_reference_skips_only_pr_validation(self):
+        (self.repo / "configure.ac").write_text("AC_INIT([PostgreSQL], [13.23])\n")
+        self.git("add", "configure.ac")
+        self.git("commit", "-q", "-m", "ci: synthetic PG13 reference")
+        sha = self.git("rev-parse", "HEAD")
+        data = copy.deepcopy(self.data)
+        data["unsupported"] = [{"major": 13, "branch": "branchdb_13", "reason": "EOL"}]
+        self.assertEqual(manifest_reader.check_release_provenance(data, repo=self.repo,
+            upstream=str(self.upstream), candidate_sha=sha, require_lineage=False), {})
+        with self.assertRaises(ReleaseBranchesError):
+            manifest_reader.check_release_provenance(data, repo=self.repo,
+                upstream=str(self.upstream), candidate_sha=sha)
+
+    def test_planned_port_accepts_documented_short_source_commit(self):
+        source = self.source_commits["C7"]
+        self.git("commit", "-q", "--amend", "-m",
+                 f"build port\n\nSource commit: {source[:11]}.\n\nBranchdb-Series: C7")
+        sha = self.git("rev-parse", "HEAD")
+        data = copy.deepcopy(self.data)
+        data["supported"][0].update(status="planned", base_tag=None, contrib_sha=None, core_series=None)
+        self.assertEqual(manifest_reader.check_release_provenance(data, repo=self.repo,
+            upstream=str(self.upstream), candidate_sha=sha, require_lineage=False), {"branchdb_18": sha})
+
+    def test_core_squash_may_include_landed_documentation_sources(self):
+        self.git("checkout", "-q", "pagestore")
+        (self.repo / "port-notes").write_text("source documentation\n")
+        self.git("add", "port-notes")
+        self.git("commit", "-q", "-m", "port documentation")
+        doc = self.git("rev-parse", "HEAD")
+        self.git("push", "origin", "pagestore")
+        self.git("checkout", "-q", "branchdb_18")
+        source = self.source_commits["C7"]
+        self.git("commit", "-q", "--amend", "-m",
+                 f"build port\n\nSource commits: {source}, {doc}.\n\nBranchdb-Series: C7")
+        record = self.data["supported"][0]["core_series"]["C7"]
+        record.update(commit=self.git("rev-parse", "HEAD"), sources=[source, doc])
+        self.git("push", "--force", "origin", "branchdb_18")
+        self.check()
+        record["sources"] = [doc]
+        with self.assertRaisesRegex(ReleaseBranchesError, "sources have no core/build"):
+            self.check()
 
     def test_planned_entries_need_no_repository(self):
         self.data["supported"][0].update(status="planned", base_tag=None, contrib_sha=None)

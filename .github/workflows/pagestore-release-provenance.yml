@@ -1,0 +1,35 @@
+# Every release update needs provenance validation, regardless of changed paths.
+name: pagestore release provenance
+
+on:
+  push:
+    branches: ['branchdb_*']
+  pull_request:
+    branches: ['branchdb_*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-provenance-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  provenance:
+    name: release branch provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Validate the actual head, with complete history, never a depth-1
+          # synthetic merge ref whose head parent may not exist locally.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Check provenance regressions
+        run: python3 contrib/pagestore/harness/test_release_provenance.py
+      - name: Validate checked-out release commit
+        env:
+          RELEASE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 contrib/pagestore/harness/pagestore_release_branches.py \
+            --authoritative-manifest --release-pr-sha "$RELEASE_SHA"

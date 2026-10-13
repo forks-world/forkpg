@@ -125,17 +125,9 @@ jobs:
             --format-tool ./pagestore_format_versions
 
       - name: Validate release manifest and promotion evidence
-        env:
-          TARGET_BRANCH: ${{ github.base_ref || github.ref_name }}
-          RELEASE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           python3 contrib/pagestore/harness/test_release_provenance.py
-          if [[ "$TARGET_BRANCH" =~ ^branchdb_[0-9]+$ ]]; then
-            python3 contrib/pagestore/harness/pagestore_release_branches.py \
-              --authoritative-manifest --release-pr-sha "$RELEASE_SHA"
-          else
-            python3 contrib/pagestore/harness/pagestore_release_branches.py
-          fi
+          python3 contrib/pagestore/harness/pagestore_release_branches.py
 
       - name: Run standalone test suite
         working-directory: contrib/pagestore

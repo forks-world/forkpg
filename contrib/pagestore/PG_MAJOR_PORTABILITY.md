@@ -164,3 +164,11 @@ changes, requires source citations in the port/cherry-pick commit message,
 checks source ancestry on pagestore, and compares each release series
 commit to its approved pin. Update these pins with the base/source fields after
 a deliberate minor rebase. Planned entries need no such release evidence.
+
+The unfiltered release-provenance workflow validates the actual PR head with
+complete history. A first planned sync is reviewable before promotion: its
+upstream base must be a real release tag, its mechanical sync records the full
+landed source SHA, and its core ports cite landed core sources. This staged
+validation does not promote the manifest or qualify candidate acceptance. After
+the PR lands, record its approved pins and promote metadata on pagestore.
+Unsupported reference majors skip PR release evidence, never candidate acceptance.
