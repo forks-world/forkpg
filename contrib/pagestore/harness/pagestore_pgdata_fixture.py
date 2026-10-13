@@ -24,7 +24,10 @@ given, a ``current`` fixture that recorded a ``pg_identity`` for another
 PostgreSQL release (a different ``pg_control_version``/``xlog_page_magic``,
 e.g. a PG 19 capture checked on a PG 18 build) is skipped rather than failed,
 mirroring the store fixture's ``ForeignPayload`` rule; a fixture that
-predates this field is checked as before.  ``--require-build-match`` then
+predates this field is checked as before. An identity that is present must
+contain both gate fields as positive JSON integers; incomplete or malformed
+identity evidence fails instead of matching or being skipped as foreign.
+``--require-build-match`` then
 turns "no current fixture matches this build" from a warning into a failure,
 the same switch the store checker has.
 """
@@ -83,6 +86,30 @@ class FixtureError(Exception):
 # minor catalog change.
 PG_IDENTITY_GATE_KEYS = ("pg_control_version", "xlog_page_magic")
 PG_IDENTITY_KEYS = PG_IDENTITY_GATE_KEYS + ("catalog_version_no",)
+
+
+def validate_pg_identity(identity: Any, context: str) -> dict[str, Any]:
+    """A partial identity cannot establish either a match or a foreign major."""
+    if not isinstance(identity, dict):
+        raise FixtureError(f"{context}: pg_identity must be an object")
+    for key in PG_IDENTITY_GATE_KEYS:
+        value = identity.get(key)
+        if type(value) is not int or value <= 0:
+            raise FixtureError(f"{context}: pg_identity requires a positive integer {key}")
+    if "catalog_version_no" in identity:
+        value = identity["catalog_version_no"]
+        if type(value) is not int or value <= 0:
+            raise FixtureError(f"{context}: catalog_version_no must be a positive integer")
+    return identity
+
+
+def pg_build_identity(args: argparse.Namespace) -> dict[str, Any] | None:
+    identity = build_payload_identity(args)
+    supplied = (args.postgres_payload_identity is not None or
+                args.postgres_payload_identity_tool is not None)
+    if supplied or identity is not None:
+        validate_pg_identity(identity, "PostgreSQL build")
+    return identity
 
 
 def format_identities(tool: Path) -> list[dict[str, Any]]:
@@ -380,7 +407,7 @@ def capture(args: argparse.Namespace) -> int:
     # completely untouched instead of half-updated (new artifacts.tar.gz
     # and format.json but a stale fixture.json, since the exception used to
     # be raised only after both were already overwritten).
-    build_identity = build_payload_identity(args)
+    build_identity = pg_build_identity(args)
     pg_identity: dict[str, Any] | None = None
     if build_identity is not None:
         pg_identity = {key: build_identity[key] for key in PG_IDENTITY_KEYS
@@ -399,7 +426,7 @@ def capture(args: argparse.Namespace) -> int:
                 "capture was not given --postgres-payload-identity[-tool], so the new artifacts' "
                 "actual PostgreSQL identity was never checked; pass one of those, or pass "
                 "--keep-pg-identity to explicitly carry the old identity forward unchanged")
-        pg_identity = previous["pg_identity"]
+        pg_identity = validate_pg_identity(previous["pg_identity"], "previous capture")
 
     fixture.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="pagestore-pgdata-capture-") as temp:
@@ -504,11 +531,13 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int | None:
     metadata = fixture_metadata(fixture)
     role = metadata["role"]
     print(f"--- fixture {fixture.name} ({role})")
-    build_identity = build_payload_identity(args)
+    build_identity = pg_build_identity(args)
     recorded = metadata.get("pg_identity")
-    if build_identity is not None and isinstance(recorded, dict):
+    if "pg_identity" in metadata:
+        validate_pg_identity(recorded, str(fixture))
+    if build_identity is not None and recorded is not None:
         mismatch = [key for key in PG_IDENTITY_GATE_KEYS
-                   if key in recorded and int(recorded[key]) != int(build_identity[key])]
+                   if recorded[key] != build_identity[key]]
         if mismatch:
             building = {key: build_identity[key] for key in PG_IDENTITY_GATE_KEYS}
             print(f"skip - fixture pg_identity {recorded} does not match this build's "
