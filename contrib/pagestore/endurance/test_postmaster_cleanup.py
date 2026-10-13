@@ -33,6 +33,30 @@ class CleanupTests(unittest.TestCase):
         self.numeric_kill = patch.object(endurance.os, 'kill', side_effect=AssertionError('numeric kill')).start()
         self.group_kill = patch.object(endurance.os, 'killpg', side_effect=AssertionError('group kill')).start()
 
+    def test_refresh_replaces_exited_controller_generation(self):
+        self.handle.exited.return_value = True
+        replacement = Mock()
+        self.pg.pid = Mock(return_value=67890)
+        with patch.object(endurance.PostmasterHandle, 'open', return_value=replacement):
+            self.pg.refresh_postmaster()
+        self.handle.wait_children.assert_called_once()
+        self.handle.close.assert_called_once()
+        self.assertIs(self.pg.postmaster, replacement)
+
+    def test_slow_children_are_waited_before_halt_returns(self):
+        self.handle.exited.side_effect = [False, True]
+        self.pg.halt()
+        self.handle.wait_children.assert_called_once()
+        self.handle.close.assert_called_once()
+
+    def test_child_timeout_retains_handles_for_retry(self):
+        self.handle.exited.side_effect = [False, True]
+        self.handle.wait_children.side_effect = endurance.Failure('cleanup_timeout', 'slow child')
+        with self.assertRaises(endurance.Failure):
+            self.pg.halt()
+        self.handle.close.assert_not_called()
+        self.assertIs(self.pg.postmaster, self.handle)
+
     def test_ordinary_stop_releases_retired_generation_handle(self):
         self.handle.exited.return_value = True
         self.pg.ctl = Mock(return_value=SimpleNamespace(returncode=0))
@@ -179,6 +203,35 @@ class RealHandleTests(unittest.TestCase):
         self.process.wait(timeout=5)
         self.process.stdout.close()
 
+    def test_halt_waits_for_a_child_with_delayed_parent_death_exit(self):
+        child_code = ("import os,time; parent=os.getppid(); print('ready',flush=True); "
+                      "exec('while os.getppid()==parent: time.sleep(0.01)'); time.sleep(0.3)")
+        parent_code = ("import subprocess,sys,time; "
+                       f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}],stdout=subprocess.PIPE); "
+                       "child.stdout.readline(); print(child.pid,flush=True); time.sleep(60)")
+        parent = subprocess.Popen([sys.executable, '-c', parent_code, '-D', str(self.datadir)],
+                                  stdout=subprocess.PIPE, text=True)
+        child_pid = int(parent.stdout.readline())
+        child_fd = os.pidfd_open(child_pid)
+        handle = endurance.PostmasterHandle.open(parent.pid, self.datadir, Path(sys.executable))
+        pg = endurance.Pg(SimpleNamespace(root=self.datadir, bin=Path(sys.executable).parent),
+                          'slow-child', self.datadir)
+        pg.postmaster = handle
+        pg.stop = Mock(side_effect=subprocess.TimeoutExpired('pg_ctl', 300))
+        started = time.monotonic()
+        try:
+            pg.halt()
+            self.assertTrue(select.select([child_fd], [], [], 0)[0])
+            self.assertGreaterEqual(time.monotonic() - started, 0.25)
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+            parent.wait(timeout=5)
+            parent.stdout.close()
+            os.close(child_fd)
+            if pg.postmaster is not None:
+                pg.postmaster.close()
+
     def test_handle_kills_only_owned_process(self):
         handle = endurance.PostmasterHandle.open(self.process.pid, self.datadir, Path(sys.executable))
         try:
@@ -245,10 +298,15 @@ class RealPostgresTests(unittest.TestCase):
                 self.assertIsNotNone(backend_fd, 'the real backend must be running before injection')
                 with patch.object(pg, 'stop', side_effect=subprocess.TimeoutExpired('pg_ctl', 300)):
                     pg.halt()
-                self.assertTrue(select.select([backend_fd], [], [], 30)[0],
+                self.assertTrue(select.select([backend_fd], [], [], 0)[0],
                                 'backend must observe postmaster death')
                 backend.wait(timeout=10)
                 pg.start()                      # recovery after the forced crash
+                original = pg.postmaster
+                pg.ctl('-m', 'immediate', '-w', 'stop')
+                pg.ctl('-l', str(pg.log), '-w', 'start')
+                pg.refresh_postmaster()         # external branch controller restart
+                self.assertIsNot(pg.postmaster, original)
                 self.assertEqual(pg.sql('SELECT 42'), '42')
                 pg.halt()                       # the ordinary pg_ctl path
                 self.assertIsNone(pg.postmaster)
