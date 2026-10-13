@@ -28,7 +28,7 @@ Consumers:
   YAML list.
 
 Run this file directly (no arguments) for a self-test: it validates the
-manifest's own structure (schema, no duplicate or misnamed majors, every
+manifest's structure and promoted entries' Git provenance (schema, no duplicate or misnamed majors, every
 supported major has a status this reader recognises, 13 and 14 are exactly
 the unsupported set) and prints a one-line summary. Run it with
 ``--major N --field FIELD`` to print one manifest field for major N (the
@@ -41,6 +41,7 @@ import copy
 import json
 import re
 import sys
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -69,11 +70,13 @@ def _check_common(path: Path, entry: dict[str, Any], seen_majors: set[int]) -> N
         )
 
 
-def load(path: Path | None = None) -> dict[str, Any]:
+def load(path: Path | None = None, *, verify_provenance: bool = True) -> dict[str, Any]:
     """Parse and validate release-branches.json.  Raises
     ReleaseBranchesError on any structural problem, so a workflow fans its
-    matrix out from a manifest that is at least internally consistent rather
-    than failing later with a confusing branch-not-found error."""
+    matrix out from a manifest whose promoted entries match authoritative
+    upstream tags and origin release trees. Promoted entries require network
+    access; verification fails closed when authoritative refs are unavailable.
+    verify_provenance=False is only for isolated structural validation tests."""
     path = path or DEFAULT_PATH
     try:
         raw = path.read_text(encoding="utf-8")
@@ -128,7 +131,54 @@ def load(path: Path | None = None) -> dict[str, Any]:
                 f"{path}: unsupported major {entry.get('major')} is missing a 'reason'"
             )
 
+    if verify_provenance:
+        check_release_provenance(data)
     return data
+
+
+def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
+                             upstream: str = "https://github.com/postgres/postgres.git") -> None:
+    """Confirm promoted entries against freshly fetched authoritative Git refs.
+
+    Fetches update only dedicated verification refs, never local branches/tags.
+    Planned entries require no Git repository or network access.
+    """
+    entries = [e for e in data["supported"] if e["status"] in CANDIDATE_STATUSES]
+    if not entries:
+        return
+    repo = repo or DEFAULT_PATH.parents[2]
+
+    def git(*args: str) -> str:
+        try:
+            result = subprocess.run(["git", *args], cwd=repo, capture_output=True,
+                                    text=True, check=True, timeout=120)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+            raise ReleaseBranchesError(f"cannot verify release provenance: git {' '.join(args)}: {error}") from error
+        return result.stdout.strip()
+
+    main_ref = "refs/pagestore-release-check/pagestore"
+    git("fetch", "--no-tags", "origin", f"+refs/heads/pagestore:{main_ref}")
+    # A shallow checkout cannot prove ancestry/base identity. Obtain complete
+    # history before making a promotion decision.
+    if git("rev-parse", "--is-shallow-repository") == "true":
+        git("fetch", "--unshallow", "--no-tags", "origin", f"+refs/heads/pagestore:{main_ref}")
+    for entry in entries:
+        major, branch, tag, source = (entry[k] for k in ("major", "branch", "base_tag", "contrib_sha"))
+        prefix = f"refs/pagestore-release-check/{major}"
+        tag_ref, stable_ref, branch_ref = (prefix + suffix for suffix in ("/tag", "/stable", "/branch"))
+        git("fetch", "--no-tags", upstream, f"+refs/tags/{tag}:{tag_ref}",
+            f"+refs/heads/REL_{major}_STABLE:{stable_ref}")
+        git("fetch", "--no-tags", "origin", f"+refs/heads/{branch}:{branch_ref}")
+        base = git("rev-parse", f"{tag_ref}^{{commit}}")
+        if git("merge-base", branch_ref, stable_ref) != base:
+            raise ReleaseBranchesError(f"{branch}: recorded base_tag {tag} differs from its upstream merge base")
+        git("rev-parse", "--verify", f"{source}^{{commit}}")
+        git("merge-base", "--is-ancestor", source, main_ref)
+        source_tree = git("rev-parse", f"{source}:contrib/pagestore")
+        if git("cat-file", "-t", source_tree) != "tree":
+            raise ReleaseBranchesError(f"{branch}: source contrib/pagestore is not a tree")
+        if git("rev-parse", f"{branch_ref}:contrib/pagestore") != source_tree:
+            raise ReleaseBranchesError(f"{branch}: contrib tree differs from recorded contrib_sha {source}")
 
 
 def supported_majors(data: dict[str, Any] | None = None) -> list[int]:
@@ -169,7 +219,7 @@ def _test_release_evidence(data: dict[str, Any]) -> None:
             major = entry["major"]
             entry.update(status=status, base_tag=f"REL_{major}_1", contrib_sha="a" * 40)
             path.write_text(json.dumps(promoted), encoding="utf-8")
-            assert entry["branch"] in candidate_branches(load(path))
+            assert entry["branch"] in candidate_branches(load(path, verify_provenance=False))
             for field, bad_values in (
                     ("base_tag", (None, "", f"REL_{major + 1}_1", "origin/pagestore", 1)),
                     ("contrib_sha", (None, "", "abc123", "z" * 40, "origin/pagestore", 1))):
@@ -178,7 +228,7 @@ def _test_release_evidence(data: dict[str, Any]) -> None:
                     invalid["supported"][0][field] = value
                     path.write_text(json.dumps(invalid), encoding="utf-8")
                     try:
-                        load(path)
+                        load(path, verify_provenance=False)
                     except ReleaseBranchesError:
                         pass
                     else:
@@ -186,7 +236,7 @@ def _test_release_evidence(data: dict[str, Any]) -> None:
         planned = copy.deepcopy(data)
         planned["supported"][0].update(status="planned", base_tag=None, contrib_sha=None)
         path.write_text(json.dumps(planned), encoding="utf-8")
-        load(path)
+        load(path, verify_provenance=False)
 
 
 def _self_test() -> int:

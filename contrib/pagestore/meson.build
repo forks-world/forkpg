@@ -792,6 +792,12 @@ test('pagestore_harness_plan',
 # Self-validates contrib/pagestore/release-branches.json, the supported-major
 # manifest scripts/branchdb-sync.sh's `status` and the release workflows (V4
 # plan, P4) read; no build or fixture inputs needed.
+test('pagestore_release_provenance',
+  pagestore_harness_python,
+  args: [files('harness/test_release_provenance.py')],
+  suite: ['pagestore'],
+  timeout: 60,
+)
 test('pagestore_release_branches',
   pagestore_harness_python,
   args: [files('harness/pagestore_release_branches.py')],

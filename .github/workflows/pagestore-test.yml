@@ -125,7 +125,9 @@ jobs:
             --format-tool ./pagestore_format_versions
 
       - name: Validate release manifest and promotion evidence
-        run: python3 contrib/pagestore/harness/pagestore_release_branches.py
+        run: |
+          python3 contrib/pagestore/harness/test_release_provenance.py
+          python3 contrib/pagestore/harness/pagestore_release_branches.py
 
       - name: Run standalone test suite
         working-directory: contrib/pagestore
