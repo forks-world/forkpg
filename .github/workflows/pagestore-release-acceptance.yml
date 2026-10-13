@@ -138,6 +138,22 @@ jobs:
                     fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/posix-timeline-delete-holes-horizon-v2 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 fixtures/pgdata-artifacts fixtures/pgdata-artifacts-pg18 \
             --format-tool ./pagestore_format_versions
 
+      - name: Validate release manifest and promotion evidence
+        env:
+          CANDIDATE_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          git fetch --no-tags origin +refs/heads/pagestore:refs/pagestore-release-check/acceptance-checker
+          trusted_revision=$(git rev-parse refs/pagestore-release-check/acceptance-checker)
+          mkdir -p "$RUNNER_TEMP/pagestore-trusted-checker"
+          for file in pagestore_release_branches.py test_release_provenance.py; do
+            git show "$trusted_revision:contrib/pagestore/harness/$file" \
+              > "$RUNNER_TEMP/pagestore-trusted-checker/$file"
+          done
+          python3 "$RUNNER_TEMP/pagestore-trusted-checker/test_release_provenance.py"
+          python3 "$RUNNER_TEMP/pagestore-trusted-checker/pagestore_release_branches.py" \
+            --repository "$GITHUB_WORKSPACE" --authoritative-manifest \
+            --candidate-sha "$CANDIDATE_SHA"
+
       - name: Run standalone test suite
         working-directory: contrib/pagestore
         run: |

@@ -152,3 +152,39 @@ do not guess), add the `#if PG_VERSION_NUM` guard on `pagestore`, update
 this table, and re-run a real compile against `REL_18_6` (ideally with
 `branchdb_18-rc`, so the compile reaches these sites instead of failing
 earlier on a missing core hook).
+
+### Promotion evidence for the core series
+
+Before marking a major candidate/released, the authoritative pagestore manifest
+must record `core_series`: keys C1-C7 each map to `{"commit": "<full approved port SHA>",
+"sources": ["<full landed pagestore source SHA>", ...]}`. These pins identify
+the reviewed per-major squash/conflict resolution; raw patch equality across
+majors is not required. Verification requires actual PostgreSQL core/build
+changes, requires source citations in the port/cherry-pick commit message,
+checks source ancestry on pagestore, and compares each release series
+commit to its approved pin. Update these pins with the base/source fields after
+a deliberate minor rebase. Planned entries need no such release evidence.
+
+The unfiltered release-provenance workflow validates the actual PR head with
+complete history. A first planned sync is reviewable before promotion: its
+upstream base must be a real release tag, its mechanical sync records the full
+landed source SHA, and its core ports cite landed core sources. This staged
+validation does not promote the manifest or qualify candidate acceptance. After
+the PR lands, record its approved pins and promote metadata on pagestore.
+Unsupported reference majors skip PR release evidence, never candidate acceptance.
+
+PR review evidence also covers proposed minor/source updates to already-promoted
+branches. It checks the proposed commit's real upstream tag, mechanical sync
+and landed core sources without requiring post-landing metadata to exist first.
+Frozen candidate acceptance and weekly release qualification still require the
+approved authoritative base/source/core pins; metadata transitions never become
+qualified merely because the unmerged PR is structurally reviewable.
+
+The release workflow binds PR validation to the target branch's major, then
+extracts validator/regression code from the freshly fetched authoritative
+pagestore revision into a temporary directory. Candidate acceptance uses the
+same trusted bootstrap. Proposed release code cannot replace its own checker.
+Every commit changing contrib/pagestore must be a pure mechanical sync with a
+full landed source SHA and an identical tree at that commit, not just at HEAD.
+Legacy prototype history with direct contrib edits requires a clean release
+cut before qualification; a later tree restore does not attest earlier edits.

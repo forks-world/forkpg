@@ -1,0 +1,78 @@
+# Every release update needs provenance validation, regardless of changed paths.
+name: pagestore release provenance
+
+on:
+  push:
+    branches: ['branchdb_*']
+  pull_request:
+    branches: ['branchdb_*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-provenance-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  provenance:
+    name: release branch provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Validate the actual head, with complete history, never a depth-1
+          # synthetic merge ref whose head parent may not exist locally.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Read authoritative reference-branch policy
+        id: policy
+        env:
+          TARGET_BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: |
+          git fetch --no-tags origin +refs/heads/pagestore:refs/pagestore-release-check/workflow-policy
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os, re, subprocess, sys
+          branch = os.environ["TARGET_BRANCH"]
+          match = re.fullmatch(r"branchdb_([0-9]+)(?:-rc)?", branch)
+          if match is None:
+              raise SystemExit("invalid release branch name: " + branch)
+          major = int(match.group(1))
+          print(f"major={major}")
+          revision = subprocess.check_output(["git", "rev-parse", "refs/pagestore-release-check/workflow-policy"], text=True).strip()
+          print(f"revision={revision}")
+          data = json.loads(subprocess.check_output([
+              "git", "show", "refs/pagestore-release-check/workflow-policy:contrib/pagestore/release-branches.json"
+          ], text=True))
+          supported = {entry["major"] for entry in data["supported"]}
+          unsupported = {entry["major"] for entry in data["unsupported"]}
+          if major in supported and major not in unsupported:
+              print("supported=true")
+          elif major in unsupported and major not in supported:
+              print("supported=false")
+              print(f"skip - PG{major} is an unsupported reference branch", file=sys.stderr)
+          else:
+              raise SystemExit("major missing or duplicated in authoritative support policy")
+          PY
+      - name: Extract authoritative validation code
+        if: steps.policy.outputs.supported == 'true'
+        env:
+          TRUSTED_REVISION: ${{ steps.policy.outputs.revision }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pagestore-trusted-checker"
+          for file in pagestore_release_branches.py test_release_provenance.py; do
+            git show "$TRUSTED_REVISION:contrib/pagestore/harness/$file" \
+              > "$RUNNER_TEMP/pagestore-trusted-checker/$file"
+          done
+      - name: Check authoritative provenance regressions
+        if: steps.policy.outputs.supported == 'true'
+        run: python3 "$RUNNER_TEMP/pagestore-trusted-checker/test_release_provenance.py"
+      - name: Validate checked-out release commit
+        if: steps.policy.outputs.supported == 'true'
+        env:
+          RELEASE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_MAJOR: ${{ steps.policy.outputs.major }}
+        run: |
+          python3 "$RUNNER_TEMP/pagestore-trusted-checker/pagestore_release_branches.py" \
+            --repository "$GITHUB_WORKSPACE" --authoritative-manifest \
+            --release-pr-sha "$RELEASE_SHA" --expected-major "$EXPECTED_MAJOR"

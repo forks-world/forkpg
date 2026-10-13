@@ -792,11 +792,18 @@ test('pagestore_harness_plan',
 # Self-validates contrib/pagestore/release-branches.json, the supported-major
 # manifest scripts/branchdb-sync.sh's `status` and the release workflows (V4
 # plan, P4) read; no build or fixture inputs needed.
+test('pagestore_release_provenance',
+  pagestore_harness_python,
+  args: [files('harness/test_release_provenance.py')],
+  suite: ['pagestore'],
+  timeout: 300,
+)
 test('pagestore_release_branches',
   pagestore_harness_python,
   args: [files('harness/pagestore_release_branches.py')],
   suite: ['pagestore'],
-  timeout: 30,
+  # Promoted metadata verifies several upstream/origin refs over the network.
+  timeout: 600,
 )
 if host_system != 'windows'
   test('pagestore_materializer_supervisor',
@@ -1040,6 +1047,8 @@ pagestore_format_fuzz_replay = executable('pagestore_format_fuzz_replay',
   dependencies: [dependency('threads')],
   install: false,
 )
+# The baseline and corpus encode native little-endian persisted structures.
+if host_machine.endian() == 'little'
 foreach fuzz_target : [
   'manifest', 'forkmeta', 'forkmeta_snapshot_manifest',
   'forkmeta_snapshot_checkpoint', 'forkmeta_snapshot_tail', 'image_layer',
@@ -1055,6 +1064,7 @@ foreach fuzz_target : [
     timeout: 60,
   )
 endforeach
+endif
 test('pagestore_fuzz_runner_regressions',
   find_program(meson.current_source_dir() / 'fuzz' / 'tests' /
                'check_runner_regression.sh'),

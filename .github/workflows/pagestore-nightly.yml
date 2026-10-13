@@ -269,10 +269,10 @@ jobs:
           import sys
 
           sys.path.insert(0, "contrib/pagestore/harness")
-          from pagestore_release_branches import ReleaseBranchesError, candidate_branches
+          from pagestore_release_branches import ReleaseBranchesError, candidate_revisions
 
           try:
-              branches = [b for b in candidate_branches() if b != "pagestore"]
+              revisions = candidate_revisions()
           except ReleaseBranchesError as error:
               print(f"::error::release-branches.json is invalid: {error}", file=sys.stderr)
               raise SystemExit(1)
@@ -280,16 +280,9 @@ jobs:
           # Same default seeds/rounds as a plain (unparameterized) dispatch or
           # the daily schedule; the weekly release matrix takes no inputs.
           seeds = ["20260909", "7", "4242"]
-          repo = os.environ["GITHUB_REPOSITORY"]
           combos = []
-          for branch in branches:
-              # One SHA per branch, resolved once and shared by every seed of
-              # that branch -- same reasoning as the `plan` job's `revision`
-              # step: every seed of one branch's soak is one experiment.
-              sha = subprocess.run(
-                  ["gh", "api", f"repos/{repo}/commits/{branch}", "--jq", ".sha"],
-                  check=True, capture_output=True, text=True,
-              ).stdout.strip()
+          # Use the exact commit snapshots that passed provenance validation.
+          for branch, sha in revisions.items():
               for seed in seeds:
                   combos.append({"branch": branch, "sha": sha, "seed": seed})
           print("combos=" + json.dumps(combos))
