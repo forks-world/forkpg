@@ -45,6 +45,12 @@ class BranchSyncSafety(unittest.TestCase):
         self.git("branch", "-f", "branchdb_18", "HEAD")
         self.git("branch", "-f", "branchdb_18-rc", "HEAD")
 
+        remote = tempfile.TemporaryDirectory(prefix="branchdb-upstream-test-")
+        self.addCleanup(remote.cleanup)
+        subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), remote.name],
+                       check=True, timeout=30)
+        self.git("remote", "add", "upstream", remote.name)
+
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.repo, check=True,
                               capture_output=True, text=True, timeout=30).stdout.strip()
@@ -82,6 +88,22 @@ class BranchSyncSafety(unittest.TestCase):
         self.git("update-ref", "refs/remotes/origin/pagestore", self.base)
         result = self.assert_refused_without_rewrite("verify", "branchdb_18-rc", self.base)
         self.assertIn("REL_18_backup", result.stdout)
+
+    def test_local_only_or_replaced_release_tag_is_rejected(self):
+        self.git("tag", "REL_18_999", self.base)
+        result = self.assert_refused_without_rewrite("minor", "18")
+        self.assertIn("cannot confirm release tag", result.stderr)
+        self.assert_refused_without_rewrite("forward", "19", "18", "REL_18_999")
+        self.git("tag", "-f", "REL_18_6", "HEAD")
+        result = self.assert_refused_without_rewrite("minor", "18", "REL_18_6")
+        self.assertIn("unverified provenance", result.stderr)
+
+    def test_verify_rejects_local_only_base_tag(self):
+        self.git("tag", "-d", "REL_18_6", "REL_17_6")
+        self.git("tag", "REL_18_999", self.base)
+        self.git("update-ref", "refs/remotes/origin/pagestore", self.base)
+        result = self.assert_refused_without_rewrite("verify", "branchdb_18-rc", self.base)
+        self.assertIn("cannot confirm release tag", result.stderr)
 
     def test_minor_rejects_foreign_major_tag(self):
         result = self.assert_refused_without_rewrite("minor", "18", "REL_17_6")

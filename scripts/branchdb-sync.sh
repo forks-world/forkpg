@@ -156,6 +156,16 @@ require_release_tag() {
   local tag=$1 major=$2
   [[ "$tag" =~ ^REL_${major}_([0-9]+|BETA[1-9][0-9]*|RC[1-9][0-9]*)$ ]] || die "tag '$tag' is not an upstream REL_${major}_* release tag"
   git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" >/dev/null || die "unknown release tag '$tag' (run '$SELF fetch'?)"
+  local advertised remote_object remote_commit local_object local_commit
+  advertised=$(git ls-remote --exit-code --tags "$UPSTREAM" "refs/tags/$tag" "refs/tags/$tag^{}") ||
+    die "cannot confirm release tag '$tag' on $UPSTREAM"
+  remote_object=$(awk -v ref="refs/tags/$tag" '$2 == ref { print $1 }' <<<"$advertised")
+  remote_commit=$(awk -v ref="refs/tags/$tag^{}" '$2 == ref { print $1 }' <<<"$advertised")
+  remote_commit=${remote_commit:-$remote_object}
+  local_object=$(git rev-parse "refs/tags/$tag")
+  local_commit=$(git rev-parse "refs/tags/$tag^{commit}")
+  [[ -n "$remote_object" && "$local_object" == "$remote_object" && "$local_commit" == "$remote_commit" ]] ||
+    die "release tag '$tag' differs from $UPSTREAM; refusing unverified provenance"
 }
 
 # ---- fetch -----------------------------------------------------------------
@@ -512,6 +522,7 @@ cmd_verify() {
   local base_tag
   if base_tag=$(git describe --tags --exact-match "$base" 2>/dev/null) && \
       [[ "$base_tag" =~ ^REL_${v}_([0-9]+|BETA[1-9][0-9]*|RC[1-9][0-9]*)$ ]]; then
+    require_release_tag "$base_tag" "$v"
     echo "ok   - base $base_tag is an upstream REL_${v}_* tag"
   elif [[ -n "${base_tag:-}" ]]; then
     echo "FAIL - base ${base:0:12} is tagged '$base_tag', which is not a REL_${v}_* tag (wrong major, or a non-release tag such as a pagestore-candidate-* tag reused as a base)"
