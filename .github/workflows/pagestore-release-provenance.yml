@@ -25,9 +25,37 @@ jobs:
           # synthetic merge ref whose head parent may not exist locally.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+      - name: Read authoritative reference-branch policy
+        id: policy
+        env:
+          TARGET_BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: |
+          git fetch --no-tags origin +refs/heads/pagestore:refs/pagestore-release-check/workflow-policy
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os, re, subprocess
+          branch = os.environ["TARGET_BRANCH"]
+          match = re.fullmatch(r"branchdb_([0-9]+)(?:-rc)?", branch)
+          if match is None:
+              raise SystemExit("invalid release branch name: " + branch)
+          major = int(match.group(1))
+          data = json.loads(subprocess.check_output([
+              "git", "show", "refs/pagestore-release-check/workflow-policy:contrib/pagestore/release-branches.json"
+          ], text=True))
+          supported = {entry["major"] for entry in data["supported"]}
+          unsupported = {entry["major"] for entry in data["unsupported"]}
+          if major in supported and major not in unsupported:
+              print("supported=true")
+          elif major in unsupported and major not in supported:
+              print("supported=false")
+              print(f"skip - PG{major} is an unsupported reference branch", file=__import__('sys').stderr)
+          else:
+              raise SystemExit("major missing or duplicated in authoritative support policy")
+          PY
       - name: Check provenance regressions
+        if: steps.policy.outputs.supported == 'true'
         run: python3 contrib/pagestore/harness/test_release_provenance.py
       - name: Validate checked-out release commit
+        if: steps.policy.outputs.supported == 'true'
         env:
           RELEASE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
