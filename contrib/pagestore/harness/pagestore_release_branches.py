@@ -136,25 +136,56 @@ def load(path: Path | None = None, *, verify_provenance: bool = True) -> dict[st
     return data
 
 
+def _git(repo: Path, *args: str) -> str:
+    try:
+        result = subprocess.run(["git", *args], cwd=repo, capture_output=True,
+                                text=True, check=True, timeout=120)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+        raise ReleaseBranchesError(f"cannot verify release provenance: git {' '.join(args)}: {error}") from error
+    return result.stdout.strip()
+
+
+def load_authoritative(*, candidate_sha: str | None = None, repo: Path | None = None,
+                       upstream: str = "https://github.com/postgres/postgres.git") -> dict[str, Any]:
+    repo = repo or DEFAULT_PATH.parents[2]
+    ref = "refs/pagestore-release-check/manifest"
+    _git(repo, "fetch", "--no-tags", "origin", f"+refs/heads/pagestore:{ref}")
+    manifest = _git(repo, "show", f"{ref}:contrib/pagestore/release-branches.json")
+    with tempfile.TemporaryDirectory(prefix="pagestore-authoritative-manifest-") as tmp:
+        path = Path(tmp) / "release-branches.json"
+        path.write_text(manifest, encoding="utf-8")
+        data = load(path, verify_provenance=False)
+    check_release_provenance(data, repo=repo, upstream=upstream, candidate_sha=candidate_sha)
+    return data
+
+
 def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
-                             upstream: str = "https://github.com/postgres/postgres.git") -> None:
+                             upstream: str = "https://github.com/postgres/postgres.git",
+                             candidate_sha: str | None = None) -> None:
     """Confirm promoted entries against freshly fetched authoritative Git refs.
 
     Fetches update only dedicated verification refs, never local branches/tags.
     Planned entries require no Git repository or network access.
     """
+    repo = repo or DEFAULT_PATH.parents[2]
     entries = [e for e in data["supported"] if e["status"] in CANDIDATE_STATUSES]
+    if candidate_sha is not None:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", candidate_sha):
+            raise ReleaseBranchesError("candidate SHA must be a full commit ID")
+        configure = _git(repo, "show", f"{candidate_sha}:configure.ac")
+        version = re.search(r"AC_INIT\(\[PostgreSQL\],\s*\[([0-9]+)", configure)
+        if version is None:
+            raise ReleaseBranchesError("candidate has no PostgreSQL major identity")
+        major = int(version.group(1))
+        entries = [e for e in entries if e["major"] == major]
+        if not entries:
+            raise ReleaseBranchesError(f"candidate PG{major} has no promoted authoritative manifest entry")
     if not entries:
         return
     repo = repo or DEFAULT_PATH.parents[2]
 
     def git(*args: str) -> str:
-        try:
-            result = subprocess.run(["git", *args], cwd=repo, capture_output=True,
-                                    text=True, check=True, timeout=120)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
-            raise ReleaseBranchesError(f"cannot verify release provenance: git {' '.join(args)}: {error}") from error
-        return result.stdout.strip()
+        return _git(repo, *args)
 
     main_ref = "refs/pagestore-release-check/pagestore"
     git("fetch", "--no-tags", "origin", f"+refs/heads/pagestore:{main_ref}")
@@ -168,10 +199,33 @@ def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
         tag_ref, stable_ref, branch_ref = (prefix + suffix for suffix in ("/tag", "/stable", "/branch"))
         git("fetch", "--no-tags", upstream, f"+refs/tags/{tag}:{tag_ref}",
             f"+refs/heads/REL_{major}_STABLE:{stable_ref}")
-        git("fetch", "--no-tags", "origin", f"+refs/heads/{branch}:{branch_ref}")
+        if candidate_sha is None:
+            git("fetch", "--no-tags", "origin", f"+refs/heads/{branch}:{branch_ref}")
+        else:
+            branch_ref = candidate_sha
+            git("rev-parse", "--verify", f"{branch_ref}^{{commit}}")
         base = git("rev-parse", f"{tag_ref}^{{commit}}")
         if git("merge-base", branch_ref, stable_ref) != base:
             raise ReleaseBranchesError(f"{branch}: recorded base_tag {tag} differs from its upstream merge base")
+        release_range = f"{base}..{branch_ref}"
+        if git("rev-list", "--count", "--merges", release_range) != "0":
+            raise ReleaseBranchesError(f"{branch}: release contains merge commits above base")
+        labels: list[str] = []
+        for commit in git("rev-list", release_range).splitlines():
+            message = git("show", "-s", "--format=%B", commit)
+            declarations = [line for line in message.splitlines() if line.startswith("Branchdb-Series:")]
+            if declarations:
+                if len(declarations) != 1 or not re.fullmatch(r"Branchdb-Series: C[1-7]", declarations[0]):
+                    raise ReleaseBranchesError(f"{branch}: invalid core-series declarations on {commit}")
+                labels.append(declarations[0].split()[-1])
+                continue
+            paths = git("diff-tree", "--no-commit-id", "--name-only", "-r", commit,
+                        "--", ".", ":!contrib/pagestore")
+            subject = message.splitlines()[0] if message else ""
+            if paths and not subject.startswith(("ci:", "docs:", "fixtures:")):
+                raise ReleaseBranchesError(f"{branch}: unallowed release commit {commit}: {subject}")
+        if sorted(labels) != [f"C{n}" for n in range(1, 8)]:
+            raise ReleaseBranchesError(f"{branch}: release must contain exactly one C1-C7 commit each")
         git("rev-parse", "--verify", f"{source}^{{commit}}")
         git("merge-base", "--is-ancestor", source, main_ref)
         source_tree = git("rev-parse", f"{source}:contrib/pagestore")
@@ -267,7 +321,7 @@ def _print_field(major: int, field: str) -> int:
     so the shell script does not duplicate the manifest's parsing/lookup
     logic -- this module is the one place that knows the schema."""
     try:
-        entry = entry_for_major(major)
+        entry = entry_for_major(major, load(verify_provenance=False))
     except ReleaseBranchesError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
@@ -285,12 +339,23 @@ def main(argv: list[str] | None = None) -> int:
                         help="print one manifest field for major N instead of self-testing")
     parser.add_argument("--field", metavar="FIELD",
                         help="the field to print (requires --major), e.g. contrib_sha, base_tag")
+    parser.add_argument("--authoritative-manifest", action="store_true",
+                        help="validate the manifest freshly fetched from origin/pagestore")
+    parser.add_argument("--candidate-sha", help="validate this frozen candidate commit instead of a branch head")
     args = parser.parse_args(argv)
+    if args.candidate_sha and not args.authoritative_manifest:
+        parser.error("--candidate-sha requires --authoritative-manifest")
+    if args.authoritative_manifest and (args.major is not None or args.field is not None):
+        parser.error("authoritative validation cannot be combined with field lookup")
     if args.major is not None or args.field is not None:
         if args.major is None or args.field is None:
             parser.error("--major and --field must be given together")
         return _print_field(args.major, args.field)
     try:
+        if args.authoritative_manifest:
+            load_authoritative(candidate_sha=args.candidate_sha)
+            print("ok   - authoritative release manifest and Git provenance verified")
+            return 0
         return _self_test()
     except (ReleaseBranchesError, AssertionError) as error:
         print(f"ERROR: {error}", file=sys.stderr)

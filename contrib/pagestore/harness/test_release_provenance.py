@@ -1,9 +1,14 @@
 """Release promotions must correspond to real upstream/source/branch objects."""
 import copy
+import contextlib
+import io
+import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
+import pagestore_release_branches as manifest_reader
 
 from pagestore_release_branches import check_release_provenance, ReleaseBranchesError
 
@@ -20,7 +25,9 @@ class ProvenanceTests(unittest.TestCase):
                            ("commit.gpgSign", "false"), ("tag.gpgSign", "false"),
                            ("core.hooksPath", "/dev/null")):
             self.git("config", key, value)
-        self.git("commit", "-q", "--allow-empty", "-m", "upstream base")
+        (self.repo / "configure.ac").write_text("AC_INIT([PostgreSQL], [18.6])\n")
+        self.git("add", "configure.ac")
+        self.git("commit", "-q", "-m", "upstream base")
         self.base = self.git("rev-parse", "HEAD")
         self.git("tag", "REL_18_6")
         self.git("checkout", "-q", "-b", "REL_18_STABLE")
@@ -38,6 +45,11 @@ class ProvenanceTests(unittest.TestCase):
         self.git("checkout", "-q", "-b", "branchdb_18", self.base)
         self.git("checkout", self.source, "--", "contrib/pagestore")
         self.git("commit", "-q", "-m", "release tree copy")
+        for label in range(1, 8):
+            (self.repo / f"core{label}").write_text(f"core {label}\n")
+            self.git("add", f"core{label}")
+            self.git("commit", "-q", "-m", f"core {label}\n\nBranchdb-Series: C{label}")
+        self.candidate = self.git("rev-parse", "HEAD")
         self.origin = root / "origin.git"
         subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(self.origin)], check=True)
         self.git("remote", "add", "origin", str(self.origin))
@@ -75,7 +87,7 @@ class ProvenanceTests(unittest.TestCase):
     def test_stale_source_tree_is_rejected(self):
         (self.repo / "contrib/pagestore/example").write_text("changed release tree\n")
         self.git("add", "contrib")
-        self.git("commit", "-q", "-m", "changed release")
+        self.git("commit", "-q", "-m", "ci: changed release")
         self.git("push", "origin", "branchdb_18")
         with self.assertRaisesRegex(ReleaseBranchesError, "contrib tree differs"):
             self.check()
@@ -98,6 +110,81 @@ class ProvenanceTests(unittest.TestCase):
                         "refs/heads/branchdb_18"], check=True)
         with self.assertRaises(ReleaseBranchesError):
             self.check()
+
+    def test_release_shape_is_enforced(self):
+        for message in ("untrailered core edit", "duplicate\n\nBranchdb-Series: C7",
+                        "malformed\n\nBranchdb-Series: C7\nBranchdb-Series: C8"):
+            with self.subTest(message=message):
+                self.git("reset", "--hard", self.candidate)
+                (self.repo / "unrelated").write_text("extra core change\n")
+                self.git("add", "unrelated")
+                self.git("commit", "-q", "-m", message)
+                self.git("push", "--force", "origin", "branchdb_18")
+                with self.assertRaises(ReleaseBranchesError):
+                    self.check()
+        self.git("reset", "--hard", self.candidate + "~1")
+        self.git("push", "--force", "origin", "branchdb_18")
+        with self.assertRaisesRegex(ReleaseBranchesError, "exactly one C1-C7"):
+            self.check()
+
+    def test_merge_commits_are_rejected(self):
+        self.git("checkout", "-q", "-b", "side")
+        (self.repo / "side").write_text("side\n")
+        self.git("add", "side")
+        self.git("commit", "-q", "-m", "ci: side")
+        self.git("checkout", "-q", "branchdb_18")
+        self.git("merge", "--no-ff", "side", "-m", "ci: merge")
+        self.git("push", "origin", "branchdb_18")
+        with self.assertRaisesRegex(ReleaseBranchesError, "merge commits"):
+            self.check()
+
+    def test_authoritative_manifest_and_frozen_candidate(self):
+        self.git("checkout", "-q", "pagestore")
+        path = self.repo / "contrib/pagestore/release-branches.json"
+        data = {"schema": 1, "unsupported": [], **self.data}
+        path.write_text(json.dumps(data))
+        self.git("add", str(path.relative_to(self.repo)))
+        self.git("commit", "-q", "-m", "record authoritative promotion")
+        self.git("push", "origin", "pagestore")
+        # A stale local manifest must not shadow the authoritative copy.
+        local = copy.deepcopy(data)
+        local["supported"][0].update(status="planned", base_tag=None, contrib_sha=None)
+        path.write_text(json.dumps(local))
+        self.assertEqual(manifest_reader.load_authoritative(
+            candidate_sha=self.candidate, repo=self.repo, upstream=str(self.upstream)), data)
+        # Moving the branch must not change what the frozen tag validates.
+        path.write_text(json.dumps(data))
+        self.git("checkout", "-q", "branchdb_18")
+        (self.repo / "contrib/pagestore/example").write_text("later branch tree\n")
+        self.git("add", "contrib/pagestore/example")
+        self.git("commit", "-q", "-m", "ci: later branch change")
+        self.git("push", "origin", "branchdb_18")
+        manifest_reader.check_release_provenance(self.data, repo=self.repo,
+            upstream=str(self.upstream), candidate_sha=self.candidate)
+        with self.assertRaises(ReleaseBranchesError):
+            self.check()
+        later = self.git("rev-parse", "HEAD")
+        with self.assertRaises(ReleaseBranchesError):
+            manifest_reader.load_authoritative(candidate_sha=later, repo=self.repo,
+                                               upstream=str(self.upstream))
+
+    def test_planned_authoritative_entry_cannot_accept_candidate(self):
+        self.data["supported"][0].update(status="planned", base_tag=None, contrib_sha=None)
+        with self.assertRaisesRegex(ReleaseBranchesError, "no promoted authoritative"):
+            manifest_reader.check_release_provenance(self.data, repo=self.repo,
+                upstream=str(self.upstream), candidate_sha=self.candidate)
+
+    def test_field_lookup_is_offline(self):
+        path = Path(self.temp.name) / "manifest.json"
+        path.write_text(json.dumps({"schema": 1, "unsupported": [], **self.data}))
+        output = io.StringIO()
+        with mock.patch.object(manifest_reader, "DEFAULT_PATH", path), \
+             mock.patch.object(manifest_reader, "check_release_provenance",
+                               side_effect=AssertionError("network must not run")) as check, \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(manifest_reader._print_field(18, "contrib_sha"), 0)
+            check.assert_not_called()
+        self.assertEqual(output.getvalue().strip(), self.source)
 
     def test_planned_entries_need_no_repository(self):
         self.data["supported"][0].update(status="planned", base_tag=None, contrib_sha=None)
