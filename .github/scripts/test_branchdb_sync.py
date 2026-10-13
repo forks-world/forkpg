@@ -1,0 +1,285 @@
+"""Exercise release-branch rewrite guards in an isolated Git repository."""
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts/branchdb-sync.sh"
+
+
+class BranchSyncSafety(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="branchdb-sync-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+        self.git("init", "-q")
+        self.git("config", "user.name", "Sync test")
+        self.git("config", "user.email", "sync-test@example.invalid")
+        self.git("config", "commit.gpgSign", "false")
+        self.git("config", "tag.gpgSign", "false")
+        self.git("config", "core.hooksPath", "/dev/null")
+        self.git("commit", "-q", "--allow-empty", "-m", "base")
+        self.no_contrib = self.git("rev-parse", "HEAD")
+        path = self.repo / "contrib/pagestore/example"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("baseline\n")
+        self.git("add", "contrib/pagestore")
+        self.git("commit", "-q", "-m", "base with pagestore")
+        self.base = self.git("rev-parse", "HEAD")
+        for tag in ("REL_18_6", "REL_17_6"):
+            self.git("tag", tag)
+        self.git("branch", "branchdb_18", self.base)
+        self.git("branch", "branchdb_18-rc", self.base)
+        self.git("commit", "-q", "--allow-empty", "-m", "new minor")
+        self.git("tag", "REL_18_7")
+        self.git("update-ref", "refs/remotes/upstream/REL_18_STABLE", "HEAD")
+        self.git("update-ref", "refs/remotes/upstream/REL_19_STABLE", self.base)
+        self.git("checkout", "-q", "-b", "branchdb_19", self.base)
+        (self.repo / "feature").write_text("core feature\n")
+        self.git("add", "feature")
+        self.git("commit", "-q", "-m", "core feature\n\nBranchdb-Series: C1")
+        for label in range(2, 8):
+            (self.repo / f"core{label}").write_text(f"core {label}\n")
+            self.git("add", f"core{label}")
+            self.git("commit", "-q", "-m", f"core {label}\n\nBranchdb-Series: C{label}")
+        self.git("branch", "-f", "branchdb_18", "HEAD")
+        self.git("branch", "-f", "branchdb_18-rc", "HEAD")
+
+        remote = tempfile.TemporaryDirectory(prefix="branchdb-upstream-test-")
+        self.addCleanup(remote.cleanup)
+        subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), remote.name],
+                       check=True, timeout=30)
+        self.git("remote", "add", "upstream", remote.name)
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.repo, check=True,
+                              capture_output=True, text=True, timeout=30).stdout.strip()
+
+    def run_sync(self, *args):
+        return subprocess.run(["bash", str(SCRIPT), *args], cwd=self.repo,
+                              capture_output=True, text=True, timeout=30)
+
+    def assert_refused_without_rewrite(self, *args):
+        before = self.git("show-ref")
+        head = self.git("rev-parse", "HEAD")
+        result = self.run_sync(*args)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.git("show-ref"), before)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        return result
+
+    def test_rewrite_rejects_malformed_same_major_tags(self):
+        for tag in ("REL_18_backup", "REL_18_fake", "REL_18_7_extra", "REL_18_RC0"):
+            self.git("tag", tag)
+            self.assert_refused_without_rewrite("minor", "18", tag)
+            self.assert_refused_without_rewrite("forward", "branchdb_19", "18", tag)
+
+    def test_automatic_minor_ignores_malformed_tags(self):
+        self.git("tag", "REL_18_zzz", self.base)
+        result = self.run_sync("minor", "18")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("REL_18_7", result.stdout)
+        self.assertEqual(self.git("merge-base", "HEAD", "REL_18_7"),
+                         self.git("rev-parse", "REL_18_7"))
+
+    def test_verify_rejects_malformed_base_tag(self):
+        self.git("tag", "-d", "REL_18_6", "REL_17_6")
+        self.git("tag", "REL_18_backup", self.base)
+        self.git("update-ref", "refs/remotes/origin/pagestore", self.base)
+        result = self.assert_refused_without_rewrite("verify", "branchdb_18-rc", self.base)
+        self.assertIn("REL_18_backup", result.stdout)
+
+    def test_local_only_or_replaced_release_tag_is_rejected(self):
+        self.git("tag", "REL_18_999", self.base)
+        result = self.assert_refused_without_rewrite("minor", "18")
+        self.assertIn("cannot confirm release tag", result.stderr)
+        self.assert_refused_without_rewrite("forward", "19", "18", "REL_18_999")
+        self.git("tag", "-f", "REL_18_6", "HEAD")
+        result = self.assert_refused_without_rewrite("minor", "18", "REL_18_6")
+        self.assertIn("unverified provenance", result.stderr)
+
+    def test_verify_rejects_local_only_base_tag(self):
+        self.git("tag", "-d", "REL_18_6", "REL_17_6")
+        self.git("tag", "REL_18_999", self.base)
+        self.git("update-ref", "refs/remotes/origin/pagestore", self.base)
+        result = self.assert_refused_without_rewrite("verify", "branchdb_18-rc", self.base)
+        self.assertIn("cannot confirm release tag", result.stderr)
+
+    def test_minor_rejects_foreign_major_tag(self):
+        result = self.assert_refused_without_rewrite("minor", "18", "REL_17_6")
+        self.assertIn("REL_18_", result.stderr)
+
+    def test_forward_rejects_foreign_major_tag(self):
+        self.assert_refused_without_rewrite("forward", "branchdb_19", "branchdb_18", "REL_17_6")
+
+    def test_minor_rejects_branch_named_like_a_release_tag(self):
+        self.git("branch", "REL_18_fake", self.base)
+        self.assert_refused_without_rewrite("minor", "18", "REL_18_fake")
+
+    def test_forward_refuses_resume_on_different_minor_base(self):
+        result = self.assert_refused_without_rewrite("forward", "branchdb_19", "branchdb_18", "REL_18_7")
+        self.assertIn("differs from requested tag", result.stderr)
+
+    def test_verify_rejects_unlanded_same_contrib_tree(self):
+        self.git("update-ref", "refs/remotes/origin/pagestore", "branchdb_19")
+        self.git("checkout", "-q", "branchdb_18-rc")
+        self.git("commit", "-q", "--allow-empty", "-m", "unlanded source")
+        result = self.assert_refused_without_rewrite("verify", "branchdb_18-rc", "HEAD")
+        self.assertIn("not an ancestor of origin/pagestore", result.stderr)
+
+    def test_verify_rejects_source_and_release_without_pagestore(self):
+        self.git("update-ref", "refs/remotes/origin/pagestore", "branchdb_19")
+        self.git("checkout", "-q", "branchdb_18-rc")
+        self.git("rm", "-r", "contrib/pagestore")
+        self.git("commit", "-q", "-m", "ci: remove contrib for negative test")
+        result = self.assert_refused_without_rewrite("verify", "branchdb_18-rc", self.no_contrib)
+        self.assertIn("no contrib/pagestore tree", result.stderr)
+
+    def test_malformed_extra_series_declaration_is_rejected(self):
+        self.git("tag", "-d", "REL_17_6")
+        self.git("update-ref", "refs/remotes/origin/pagestore", self.base)
+        complete = self.git("rev-parse", "HEAD")
+        for declaration in ("Branchdb-Series: C8", "Branchdb-Series: placeholder"):
+            with self.subTest(declaration=declaration):
+                self.git("reset", "--hard", complete)
+                self.git("commit", "-q", "--amend", "-m",
+                         "core 7\n\nBranchdb-Series: C7\n" + declaration)
+                self.git("branch", "-f", "branchdb_18-rc", "HEAD")
+                for command in (("verify", "branchdb_18-rc", self.base),
+                                ("forward", "branchdb_19", "18", "REL_18_6")):
+                    result = self.assert_refused_without_rewrite(*command)
+                    self.assertIn("one valid core-series declaration", result.stderr)
+
+    def test_verify_accepts_landed_source(self):
+        self.git("tag", "-d", "REL_17_6")  # keep the PG18 base tag unambiguous
+        self.git("update-ref", "refs/remotes/origin/pagestore", "branchdb_19")
+        result = self.run_sync("verify", "branchdb_18-rc", self.base)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS", result.stdout)
+
+    def test_sync_rejects_remote_tag_and_missing_targets(self):
+        self.git("update-ref", "refs/remotes/origin/pagestore", "branchdb_19")
+        self.git("update-ref", "refs/remotes/origin/branchdb_18", self.base)
+        for target in ("origin/branchdb_18", "REL_18_6", "branchdb_20"):
+            with self.subTest(target=target):
+                result = self.assert_refused_without_rewrite(
+                    "sync-contrib", target, "origin/pagestore")
+                self.assertIn("existing local branch", result.stderr)
+                self.assertEqual(self.git("symbolic-ref", "HEAD"),
+                                 "refs/heads/branchdb_19")
+
+    def test_sync_rejects_source_without_contrib_before_mutating(self):
+        path = self.repo / "contrib/pagestore/example"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("preserve me\n")
+        self.git("add", "contrib/pagestore")
+        self.git("commit", "-q", "-m", "source tree")
+        self.git("update-ref", "refs/remotes/origin/pagestore", "HEAD")
+        result = self.assert_refused_without_rewrite("sync-contrib", "branchdb_19", self.no_contrib)
+        self.assertIn("no contrib/pagestore tree", result.stderr)
+        self.assertEqual(path.read_text(), "preserve me\n")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_verify_ignores_tag_shadowing_release_branch(self):
+        self.git("tag", "-d", "REL_17_6")
+        self.git("update-ref", "refs/remotes/origin/pagestore", self.base)
+        self.git("tag", "branchdb_18-rc", self.base)
+        self.git("checkout", "-q", "branchdb_18-rc")
+        path = self.repo / "rogue"
+        path.write_text("not a permitted release commit\n")
+        self.git("add", "rogue")
+        self.git("commit", "-q", "-m", "rogue change")
+        result = self.run_sync("verify", "branchdb_18-rc", self.base)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rogue change", result.stdout + result.stderr)
+        self.git("update-ref", "refs/remotes/origin/branchdb_18-rc", "HEAD")
+        self.git("checkout", "-q", "branchdb_19")
+        self.git("branch", "-D", "branchdb_18-rc")
+        result = self.run_sync("verify", "branchdb_18-rc", self.base)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rogue change", result.stdout + result.stderr)
+
+    def test_minor_updates_local_branch_despite_same_named_tag(self):
+        self.git("tag", "branchdb_18", self.base)
+        result = self.run_sync("minor", "18", "REL_18_7")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git("symbolic-ref", "HEAD"), "refs/heads/branchdb_18")
+        self.assertEqual(self.git("merge-base", "refs/heads/branchdb_18", "REL_18_7"),
+                         self.git("rev-parse", "REL_18_7"))
+        self.assertEqual(self.git("rev-parse", "refs/tags/branchdb_18"), self.base)
+
+    def test_minor_rejects_tag_without_local_branch(self):
+        self.git("branch", "-D", "branchdb_18")
+        self.git("tag", "branchdb_18", self.base)
+        self.assert_refused_without_rewrite("minor", "18", "REL_18_7")
+
+    def test_forward_tag_does_not_count_as_local_staging_branch(self):
+        self.git("branch", "-D", "branchdb_18-rc")
+        self.git("tag", "branchdb_18-rc", self.base)
+        result = self.run_sync("forward", "branchdb_19", "18", "REL_18_6")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git("symbolic-ref", "HEAD"), "refs/heads/branchdb_18-rc")
+        self.assertTrue((self.repo / "core7").is_file())
+
+    def test_missing_or_duplicate_core_series_is_rejected(self):
+        self.git("tag", "-d", "REL_17_6")
+        self.git("update-ref", "refs/remotes/origin/pagestore", self.base)
+        complete = self.git("rev-parse", "HEAD")
+        for duplicate in (False, True):
+            with self.subTest(duplicate=duplicate):
+                self.git("reset", "--hard", complete)
+                if duplicate:
+                    self.git("commit", "-q", "--allow-empty", "-m", "duplicate\n\nBranchdb-Series: C7")
+                else:
+                    self.git("reset", "--hard", "HEAD~1")
+                self.git("branch", "-f", "branchdb_18-rc", "HEAD")
+                result = self.assert_refused_without_rewrite("verify", "branchdb_18-rc", self.base)
+                self.assertIn("exactly one C7", result.stderr)
+                result = self.assert_refused_without_rewrite("forward", "branchdb_19", "18", "REL_18_6")
+                self.assertIn("exactly one C7", result.stderr)
+
+    def test_sync_records_immutable_oid_when_alias_moves(self):
+        self.git("tag", "-d", "REL_17_6")
+        path = self.repo / "contrib/pagestore/example"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("first capture\n")
+        self.git("add", "contrib/pagestore")
+        self.git("commit", "-q", "-m", "source capture")
+        source = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/pagestore", source)
+        result = self.run_sync("sync-contrib", "branchdb_18-rc", "origin/pagestore")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        message = self.git("log", "-1", "--format=%B")
+        self.assertIn("pagestore@" + source, message)
+        self.assertNotIn("pagestore@origin/pagestore", message)
+        self.git("checkout", "-q", "branchdb_19")
+        path.write_text("later capture\n")
+        self.git("add", "contrib/pagestore")
+        self.git("commit", "-q", "-m", "later source")
+        self.git("update-ref", "refs/remotes/origin/pagestore", "HEAD")
+        result = self.run_sync("verify", "branchdb_18-rc", source)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git("show", "branchdb_18-rc:contrib/pagestore/example"),
+                         "first capture")
+
+    def test_verify_resolves_source_alias_once(self):
+        self.git("tag", "-d", "REL_17_6")
+        self.git("update-ref", "refs/remotes/origin/pagestore", self.base)
+        result = self.run_sync("verify", "branchdb_18-rc", "origin/pagestore")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(self.base, result.stdout)
+        self.assertNotIn("pagestore@origin/pagestore", result.stdout)
+
+    def test_forward_resumes_matching_base_and_skips_applied_series(self):
+        self.git("branch", "-f", "branchdb_18-rc", self.base)
+        result = self.run_sync("forward", "branchdb_19", "branchdb_18", "REL_18_6")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.repo / "feature").read_text(), "core feature\n")
+        head = self.git("rev-parse", "branchdb_18-rc")
+        result = self.run_sync("forward", "branchdb_19", "branchdb_18", "REL_18_6")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git("rev-parse", "branchdb_18-rc"), head)
+
+
+if __name__ == "__main__":
+    unittest.main()

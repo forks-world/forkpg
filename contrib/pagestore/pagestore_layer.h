@@ -177,6 +177,11 @@ extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 								  void *out, uint32_t page_size,
 								  uint64_t *out_lsn, uint64_t *out_seq);
 
+/* Match both identity words exactly, including sequence zero. */
+extern int ps_image_layer_lookup_exact(const PsLayerDesc *layer, const PsKey *key,
+		uint32_t block, uint64_t lsn, uint64_t seq, void *out,
+		uint32_t page_size, uint64_t *out_lsn, uint64_t *out_seq);
+
 /*
  * Read an image layer's full index (every (key, block, lsn) entry), for
  * rebuilding the in-memory version index at startup without scanning page data.
@@ -186,6 +191,8 @@ extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
 									  PsImgIndexEnt **out, uint32_t *n);
 /* Force a fresh data-section checksum verification (ignores cached state). */
+/* Empty the process-wide image index cache; the layer store calls it on close. */
+extern void ps_image_layer_cache_reset(void);
 extern int	ps_image_layer_verify_data(const PsLayerDesc *layer,
 								 uint32_t page_size);
 extern int	ps_delta_layer_verify_data(const PsLayerDesc *layer);

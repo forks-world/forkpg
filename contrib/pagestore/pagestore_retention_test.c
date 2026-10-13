@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -49,7 +50,7 @@ test_fnv1a(uint32_t h, const void *data, size_t len)
 }
 
 static int
-write_v1_registry(const char *dir)
+write_v1_registry(const char *dir, uint32_t kind)
 {
 	char path[512];
 	TestRetentionRecordV1 rec = {0};
@@ -61,7 +62,7 @@ write_v1_registry(const char *dir)
 	rec.type = 1;
 	rec.len = sizeof(rec);
 	rec.pin.timeline = 7;
-	rec.pin.owner_kind = PS_RETENTION_OWNER_READER;
+	rec.pin.owner_kind = kind;
 	rec.pin.resources = PS_RETENTION_RESOURCE_ALL;
 	rec.pin.generation = 3;
 	rec.pin.owner_id = 9001;
@@ -123,13 +124,118 @@ done:
 	return rc;
 }
 
+typedef struct TestRetentionRecord
+{
+	uint32_t magic, version, type, len;
+	PsRetentionPin pin;
+	uint32_t crc, pad;
+} TestRetentionRecord;
+
+/* Write original bytes and hashes, rather than reopening with the new writer. */
+static int
+write_registry(const char *dir, uint32_t version, uint32_t kind)
+{
+	TestRetentionRecord rec = {0};
+	TestRetentionState state = {0};
+	char path[512];
+	int fd;
+
+	rec.magic = TEST_RETENTION_MAGIC;
+	rec.version = version;
+	rec.type = 1;
+	rec.len = sizeof(rec);
+	rec.pin = (PsRetentionPin) {7, kind, PS_RETENTION_RESOURCE_ALL, 3,
+		9001, 456, 23};
+	rec.crc = test_fnv1a(TEST_FNV_INIT, &rec, offsetof(TestRetentionRecord, crc));
+	snprintf(path, sizeof(path), "%s/retention.meta", dir);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0 || write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec) ||
+		fsync(fd) != 0 || close(fd) != 0)
+		return -1;
+	state.magic = TEST_RETENTION_STATE_MAGIC;
+	state.version = version;
+	state.nrecords = 1;
+	state.log_hash = test_fnv1a(TEST_FNV_INIT, &rec, sizeof(rec));
+	state.crc = test_fnv1a(TEST_FNV_INIT, &state, offsetof(TestRetentionState, crc));
+	snprintf(path, sizeof(path), "%s/retention.state", dir);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0 || write(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
+		fsync(fd) != 0 || close(fd) != 0)
+		return -1;
+	snprintf(path, sizeof(path), "%s/retention.initialized", dir);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	return fd >= 0 && close(fd) == 0 ? 0 : -1;
+}
+
+static void
+test_checkpoint_owner(void)
+{
+	char dir[] = "/tmp/psretentionv2XXXXXX";
+	PsRetentionPin pin = {7, PS_RETENTION_OWNER_CHECKPOINT_FENCE,
+		PS_RETENTION_RESOURCE_ALL, 1, 9001, 400, 24};
+	PsRetentionPin got;
+	uint64_t seq;
+
+	check(mkdtemp(dir) != NULL &&
+		  write_registry(dir, 2, PS_RETENTION_OWNER_READER) == 0,
+		  "write committed original v2 registry");
+	check(ps_retention_open(dir) == 0 &&
+		  ps_retention_lookup(7, PS_RETENTION_OWNER_READER, 9001, &got) == 1 &&
+		  got.admission_seq == 23, "replay original v2 bytes and state hash");
+	check(ps_retention_reserve_and_set(&pin) == PS_RETENTION_OK,
+		  "checkpoint owner has a separate namespace from the reader");
+	ps_retention_close();
+	check(ps_retention_open(dir) == 0 &&
+		  ps_retention_lookup(7, pin.owner_kind, pin.owner_id, &got) == 1 &&
+		  memcmp(&got, &pin, sizeof(pin)) == 0,
+		  "reopen mixed v2/v3 log with checkpoint fence intact");
+	check(ps_retention_page_fence_active(7, pin.lsn, pin.admission_seq) == 1,
+		"checkpoint owner participates in page-history fence scans");
+	check(ps_retention_compact() == 0, "compact mixed registry to v3");
+	ps_retention_close();
+	check(ps_retention_open(dir) == 0 &&
+		  ps_retention_admission_highwater(&seq) == 0 && seq == 24 &&
+		  ps_retention_lookup(7, pin.owner_kind, pin.owner_id, &got) == 1 &&
+		  memcmp(&got, &pin, sizeof(pin)) == 0,
+		  "compaction preserves checkpoint fence and reservation");
+	check(ps_retention_drop(7, pin.owner_kind, pin.owner_id, 1) == PS_RETENTION_OK,
+		  "daemon can release a checkpoint owner");
+	ps_retention_close();
+	check(ps_retention_open(dir) == 0 &&
+		  ps_retention_lookup(7, pin.owner_kind, pin.owner_id, &got) == 0 &&
+		  ps_retention_generation_stale(7, pin.owner_kind, pin.owner_id, 1) == 1 &&
+		  ps_retention_lookup(7, PS_RETENTION_OWNER_READER, 9001, &got) == 1,
+		  "checkpoint release survives restart without releasing a reader");
+	ps_retention_close();
+	{
+		char bad[] = "/tmp/psretentionbadv1XXXXXX";
+		check(mkdtemp(bad) != NULL &&
+			write_v1_registry(bad, PS_RETENTION_OWNER_CHECKPOINT_FENCE) == 0,
+			"write valid-CRC v1 checkpoint owner");
+		check(ps_retention_open(bad) != 0,
+			"v1 migration cannot assign a previously undefined owner");
+		ps_retention_close();
+	}
+	for (uint32_t version = 2; version <= 4; version++)
+	{
+		char bad[] = "/tmp/psretentionbadownerXXXXXX";
+		check(mkdtemp(bad) != NULL && write_registry(bad, version,
+			version == 3 ? 99 : PS_RETENTION_OWNER_CHECKPOINT_FENCE) == 0,
+			"write valid-CRC invalid owner or version");
+		check(ps_retention_open(bad) != 0,
+			"reject legacy checkpoint owner, unknown owner and future version");
+		ps_retention_close();
+	}
+}
+
 int
-main(void)
+main(int argc, char **argv)
 {
 	char		dir[] = "/tmp/psretentionXXXXXX";
 	char		faildir[] = "/tmp/psretentionfailXXXXXX";
 	char		legacydir[] = "/tmp/psretentionlegacyXXXXXX";
 	char		migratedir[] = "/tmp/psretentionmigrateXXXXXX";
+	char		clearpendingdir[] = "/tmp/psretentionclearpendingXXXXXX";
 	char		path[512];
 	char		tmp[520];
 	char		backup[520];
@@ -146,13 +252,43 @@ main(void)
 	unsigned char byte;
 	uint32_t	format_version;
 
+	/* Offline fixture capture uses the production durable registry writer. */
+	if (argc == 3 && strcmp(argv[1], "--seed-checkpoint-fence") == 0)
+	{
+		PsRetentionPin checkpoint = {0, PS_RETENTION_OWNER_CHECKPOINT_FENCE,
+			PS_RETENTION_RESOURCE_ALL, 1, 9001, 0, 0};
+		int rc = ps_retention_open(argv[2]);
+
+		if (rc == 0)
+		{
+			uint64_t highwater;
+			PsRetentionPin reader;
+
+			rc = ps_retention_admission_highwater(&highwater);
+			if (rc == 0 && highwater < UINT64_MAX - 2 &&
+				ps_retention_lookup(0, PS_RETENTION_OWNER_READER, 5001, &reader) == 1)
+			{
+				checkpoint.admission_seq = highwater + 1;
+				checkpoint.lsn = reader.lsn;
+				rc = ps_retention_reserve_and_set(&checkpoint);
+			}
+			else
+				rc = -1;
+		}
+		ps_retention_close();
+		return rc == 0 ? 0 : 1;
+	}
+	if (argc != 1)
+		return 2;
+	test_checkpoint_owner();
+
 	if (mkdtemp(dir) == NULL)
 	{
 		perror("mkdtemp");
 		return 2;
 	}
 	check(mkdtemp(migratedir) != NULL, "create v1 migration directory");
-	check(write_v1_registry(migratedir) == 0, "write committed v1 registry");
+	check(write_v1_registry(migratedir, PS_RETENTION_OWNER_READER) == 0, "write committed v1 registry");
 	check(ps_retention_open(migratedir) == 0, "migrate committed v1 registry");
 	check(ps_retention_get(0, &got, &count) == 1 && count == 1 &&
 		  got.owner_id == 9001 && got.generation == 3 && got.lsn == 456 &&
@@ -163,7 +299,7 @@ main(void)
 	fd = open(path, O_RDONLY);
 	check(fd >= 0 && pread(fd, &format_version, sizeof(format_version),
 						 sizeof(uint32_t)) == (ssize_t) sizeof(format_version) &&
-		  format_version == 2,
+		  format_version == 3,
 		  "v1 migration publishes the current record format");
 	if (fd >= 0)
 		close(fd);
@@ -186,6 +322,21 @@ main(void)
 	legacy.owner_id = 41;
 	legacy.lsn = 80;
 	legacy.admission_seq = 1;
+	{
+		uint64_t before, after, stable;
+
+		check(ps_retention_epoch(&before) == 0 &&
+			  ps_retention_epoch(&stable) == 0 && before == stable,
+			  "registry epoch stays stable across reads");
+		check(ps_retention_set(&legacy) == 0 &&
+			  ps_retention_epoch(&after) == 0 && after != before,
+			  "owner SET invalidates registration caches");
+		before = after;
+		check(ps_retention_drop(legacy.timeline, legacy.owner_kind,
+			  legacy.owner_id, legacy.generation) == 0 &&
+			  ps_retention_epoch(&after) == 0 && after != before,
+			  "owner DROP invalidates registration caches");
+	}
 	check(ps_retention_set(&legacy) == PS_RETENTION_OK &&
 		  ps_retention_drop(legacy.timeline, legacy.owner_kind, legacy.owner_id,
 							legacy.generation) == PS_RETENTION_OK,
@@ -373,6 +524,33 @@ main(void)
 		  "restart rejects a registry with an uncertain full DROP");
 	ps_retention_close();
 
+	/* Bug finding #2: retention_clear_pending() must not ignore its
+	 * directory fsync result.  A failed directory fsync after a genuinely
+	 * successful unlink is exactly the window where the marker's directory
+	 * entry could reappear after a machine crash, so an append/compact that
+	 * hits it must never be acknowledged as committed. */
+	check(mkdtemp(clearpendingdir) != NULL,
+		  "create clear-pending-fsync-failure test directory");
+	check(setenv("PS_TEST_FAIL_RETENTION_CLEAR_PENDING_DIR_FSYNC", "1", 1) == 0,
+		  "enable clear-pending directory-fsync fault injection");
+	check(ps_retention_open(clearpendingdir) == 0,
+		  "open registry for clear-pending-fsync-failure test");
+	check(ps_retention_set(&pin) != PS_RETENTION_OK,
+		  "an append is not acknowledged when clearing its pending marker "
+		  "cannot prove the directory fsync durable");
+	unsetenv("PS_TEST_FAIL_RETENTION_CLEAR_PENDING_DIR_FSYNC");
+	check(ps_retention_count(&count) != 0,
+		  "the registry is poisoned in-memory immediately after the failure");
+	ps_retention_close();
+	snprintf(path, sizeof(path), "%s/retention.failed", clearpendingdir);
+	check(stat(path, &before) == 0,
+		  "a clear-pending directory-fsync failure installs the durable "
+		  "retention.failed guard");
+	check(ps_retention_open(clearpendingdir) != 0,
+		  "restart permanently refuses a store whose clear-pending "
+		  "directory fsync could not be proven durable");
+	ps_retention_close();
+
 	check(mkdtemp(legacydir) != NULL, "create legacy-guard test directory");
 	check(ps_retention_open(legacydir) == 0,
 		  "open registry for legacy-guard test");
@@ -413,6 +591,19 @@ main(void)
 	snprintf(path, sizeof(path), "%s/retention.state.tmp", faildir);
 	unlink(path);
 	rmdir(faildir);
+	snprintf(path, sizeof(path), "%s/retention.meta", clearpendingdir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.initialized", clearpendingdir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.state", clearpendingdir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.state.tmp", clearpendingdir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.pending", clearpendingdir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.failed", clearpendingdir);
+	unlink(path);
+	rmdir(clearpendingdir);
 	snprintf(path, sizeof(path), "%s/retention.meta", legacydir);
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/retention.initialized", legacydir);

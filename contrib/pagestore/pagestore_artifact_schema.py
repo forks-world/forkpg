@@ -63,7 +63,7 @@ BRANCH_JOURNAL_KEYS = frozenset({
     "archived_through_lsn", "fork_lsn", "seeded_slru_pages", "retention_generation",
     "pause_owned", "writer_owned", "retention_owned", "retention_set_attempted",
     "restricted_writer_running", "materializer_resumed", "writer_restored",
-    "prepared_dir", "crc32",
+    "prepared_dir", "window_snapshot", "crc32",
 })
 SUPERVISOR_CONFIG_FIELDS = frozenset({
     "schema", "pg_ctl", "psql", "data_dir", "socket_dir", "port", "log_file", "state_dir",
@@ -98,10 +98,11 @@ ARTIFACTS: dict[str, ArtifactSpec] = {
         required=BRANCH_CONFIG_REQUIRED, closed=True,
         optional=BRANCH_CONFIG_FIELDS - BRANCH_CONFIG_REQUIRED),
     # the controller's crash journal: schema 1 was a receipt without the
-    # prepared-manifest identity and is refused by name
+    # prepared-manifest identity; schema 2 lacks a transaction window.
+    # Neither can be upgraded by fabricating a snapshot, so both are refused.
     "branch_journal": ArtifactSpec(
         "controller", "pagestore_branch.prepare.json (JSON, schema member, crc32)",
-        schema=2, accepted=frozenset({2}), refused=frozenset({1}), crc_from=2,
+        schema=3, accepted=frozenset({3}), refused=frozenset({1, 2}), crc_from=2,
         required=BRANCH_JOURNAL_KEYS, closed=True),
     # the controller's own retention generation authority; schema 1 had no
     # checksum and is read as legacy

@@ -46,6 +46,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pagestore_admissible.h"
 #include "pagestore_artifact_format.h"
 #include "pagestore_compat.h"
 #include "pagestore_core.h"
@@ -62,6 +63,47 @@
 #include "pagestore_fault.h"
 #include "pagestore_forkmeta_prune.h"
 #include "pagestore_forkmeta_snapshot.h"
+
+/* In-memory history fences carry both positional and exact-LSN bounds.
+ * Durable page frontiers and format records retain their two-word layout. */
+typedef struct PsHistoryFence
+{
+	uint64_t lsn;
+	uint64_t admission_seq; /* X; UINT64_MAX means unbounded */
+	uint64_t seq;           /* S; UINT64_MAX means unbounded */
+} PsHistoryFence;
+
+static inline PsViewFence
+history_fence_view(PsHistoryFence f)
+{
+	return (PsViewFence)
+	{
+		f.lsn, f.seq, f.admission_seq
+	};
+}
+
+static int
+history_prune_plan(const PsPruneVersion *versions, uint32_t n,
+				   PsPruneFence floor, const PsHistoryFence *fences,
+				   uint32_t nfences, uint64_t inherited_below,
+				   int has_inherited_below, unsigned char *keep)
+{
+	PsViewFence local[8] = {{0}};
+	PsViewFence *views = nfences > 8 ? malloc((size_t) nfences * sizeof(*views)) : local;
+	int			rc;
+
+	if (views == NULL)
+		return -1;
+	for (uint32_t i = 0; i < nfences; i++)
+		views[i] = history_fence_view(fences[i]);
+	rc = ps_page_prune_plan_capped(versions, n, floor, views, nfences,
+								   inherited_below, has_inherited_below, keep, NULL);
+	if (views != local)
+		free(views);
+	return rc;
+}
+
+static inline uint64_t timeline_inherited_below(uint32_t tl, bool *has_range);
 
 /*
  * Debug-only invariant checks, matching the project's cassert convention:
@@ -249,6 +291,7 @@ static uint64_t inspection_mutation_epoch;
 static uint64_t inspection_published_epoch;
 static uint64_t inspection_next_refresh_ns;
 static volatile int inspection_timeline_cache_dirty = 1;
+static uint64_t page_view_timeline_epoch;
 static int inspection_timeline_cache_valid;
 static int inspection_timeline_cache_retention_usable;
 static uint64_t inspection_timeline_cache_retention_epoch;
@@ -291,10 +334,14 @@ static void inspection_metrics_changed(void);
 static void inspection_timeline_cache_changed(void);
 static void publish_inspection_metrics(int force);
 static int branch_frontiers_allow(int parent, uint64_t branch_lsn);
-static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+static int page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 								 uint32_t *nfences_out);
+static int page_storage_fences(uint32_t timeline, const PsHistoryFence *views,
+	uint32_t nviews, PsHistoryFence **fences_out, uint32_t *nfences_out);
 static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
 								   uint32_t *nfences_out);
+static int walidx_view_fences(uint32_t timeline, PsHistoryFence **fences_out,
+	uint32_t *nfences_out);
 static int retention_effective_floor(uint32_t timeline, uint32_t resource,
 									 uint64_t *floor_out);
 static void retention_floor_add(uint64_t candidate, uint64_t *floor);
@@ -435,6 +482,10 @@ static PsBackpressureController forkmeta_backpressure;
 #define MAX_TIMELINES	1024
 _Static_assert(MAX_TIMELINES == PS_INSPECTION_MAX_TIMELINES,
 			   "inspection timeline capacity must match core capacity");
+
+/* parked data verifications; see layer_map_lookup_impl() */
+static void layer_verified_forget(uint64_t layer_id);
+static void layer_verified_reset(void);
 static unsigned char walidx_snapshot_force_due[MAX_TIMELINES];
 static unsigned char walidx_snapshot_gc_force_due[MAX_TIMELINES];
 /* Set by the WAL reclaimer (wal_segment_reclaim_one) when a complete segment
@@ -811,11 +862,11 @@ typedef struct ArtifactPruneCache ArtifactPruneCache;
 static void artifact_prune_cache_free(ArtifactPruneCache *cache);
 static int artifact_prune_versions(uint32_t timeline, const PsKey *key,
 	uint32_t block, const PsPruneVersion *versions, uint32_t nversions,
-	uint64_t floor, const PsPruneFence *fences, uint32_t nfences,
+	uint64_t floor, const PsHistoryFence *fences, uint32_t nfences,
 	unsigned char *keep, ArtifactPruneCache **cache);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 									uint64_t admission_seq);
-static int control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+static int control_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 								uint32_t *nfences_out);
 /* Retention plan for one control block chain.  Blocks 0-2 (image, redo-floor
  * note, admission fence) are written as a same-version group and follow the
@@ -848,12 +899,13 @@ typedef struct PsControlChainPlan
 
 static int control_chain_plan(uint32_t timeline, const PsKey *key,
 							  uint32_t block, uint64_t floor,
-							  const PsPruneFence *fences, uint32_t nfences,
+							  const PsHistoryFence *fences, uint32_t nfences,
 							  PsControlChainPlan *plan);
 struct PageEnt;
 static int control_chain_keeps(const PsControlChainPlan *plan,
 							   const struct PageEnt *entry, uint32_t block,
-							   const PsPruneVersion *v);
+							   const PsPruneVersion *v,
+							   const PsHistoryFence *fences, uint32_t nfences);
 static struct PageEnt *page_find(uint32_t timeline, const PsKey *key, uint32_t block);
 static int prune_version_cmp(const void *va, const void *vb);
 struct PageVer;
@@ -870,14 +922,14 @@ static uint64_t walidx_progress_read(uint32_t tl);
 static int prune_version_needed(uint32_t timeline, const PsKey *key, uint32_t block,
 								const PsPruneVersion *versions, uint32_t n,
 								uint32_t idx, uint64_t floor,
-								const PsPruneFence *fences, uint32_t nfences);
+								const PsHistoryFence *fences, uint32_t nfences);
 static int retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
 											  uint64_t *floor_out, int map_locked,
 											  uint64_t *pin_floor_out,
 											  uint32_t *note_timeline_out,
 											  uint64_t *note_lsn_out,
 											  uint64_t *note_seq_out);
-static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+static int page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 							 uint32_t *nfences_out);
 
 #define PS_WALIDX_FRONTIER_MAGIC 0x46584957U /* "WIXF" */
@@ -931,12 +983,121 @@ admission_seq_observe(uint64_t seq)
 {
 	uint64_t	next = __atomic_load_n(&next_admission_seq, __ATOMIC_RELAXED);
 
+	/* Unbounded view caps are not allocated admission identities. */
+	if (seq == UINT64_MAX)
+		return;
+
 	while (next <= seq && next != UINT64_MAX &&
 		   !__atomic_compare_exchange_n(&next_admission_seq, &next,
 								 seq == UINT64_MAX ? UINT64_MAX : seq + 1,
 									 false, __ATOMIC_RELAXED,
 									 __ATOMIC_RELAXED))
 		;
+}
+
+/*
+ * WAL-index publish vs. concurrent fork admissions: design doc S3.7(7)
+ * rev 3 (amendment; supersedes the rev 1/rev 2 plan-epoch/lsn-range gates
+ * that PR #300 first landed and then found unworkable -- see that PR's
+ * history for the two liveness regressions, and the design doc amendment
+ * for the proof).  A fork-event/PAGE-GROW admission at or below the
+ * WAL-index progress horizon H is routine traffic (materializer redo and
+ * writer page evictions both routinely lag the writer-side index worker),
+ * so no gate on it -- skip, block, or refuse -- is workable: every one
+ * tried either starved publication under sustained load or introduced its
+ * own correctness regression.
+ *
+ * Rev 3 removes the gate entirely: the WAL-index plan does not need a
+ * stable fork state to stay valid.  For a fixed reader view, a later
+ * admission can only *add* to that view's visible set (S3.7(7)'s
+ * monotonicity lemma), so a reader's replacement base at any horizon --
+ * max(death, image), S2 below -- is non-decreasing over time, and a plan
+ * built from an earlier fork-event snapshot always retains at least what
+ * every later reader needs (S1, S3, S4).  walidx_snapshot_publish_one()
+ * therefore takes no admission lock and gates nothing on this account; see
+ * the property test in pagestore_walidx_prune_test.c.
+ *
+ * What remains is a pure statistic, kept because it is cheap and useful
+ * for a soak report: a per-timeline maximum admission_seq of any fork
+ * event or PAGE GROW admitted for it, sampled once a plan starts depending
+ * on the current fork-event state and re-checked right before the
+ * generation switch, purely to *count* how often a late admission actually
+ * landed in that window -- never to act on it.  fork_event_admit_seq_bump()
+ * is called from fork_event_add()/fork_event_add_seg_marker(), the two
+ * entry points every production fork-event insertion goes through (the
+ * I-ALLOC audit), under the caller's existing key-shard write lock.
+ */
+static uint64_t fork_event_admit_seq_by_tl[MAX_TIMELINES];
+
+static inline void
+fork_event_admit_seq_bump(uint32_t timeline, uint64_t seq)
+{
+	uint64_t	cur;
+
+	if (timeline >= MAX_TIMELINES || seq == 0)
+		return;
+	cur = __atomic_load_n(&fork_event_admit_seq_by_tl[timeline], __ATOMIC_ACQUIRE);
+	while (seq > cur &&
+		   !__atomic_compare_exchange_n(&fork_event_admit_seq_by_tl[timeline],
+										&cur, seq, true, __ATOMIC_RELEASE,
+										__ATOMIC_ACQUIRE))
+		;
+}
+
+/* Sample the current epoch for timeline tl, to be re-checked later under a
+ * stronger lock (fork_event_plan_epoch_validate()) right before publishing
+ * a plan built from this sample. */
+static inline uint64_t
+fork_event_plan_epoch_capture(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return __atomic_load_n(&fork_event_admit_seq_by_tl[timeline], __ATOMIC_ACQUIRE);
+}
+
+/* True iff no fork event/PAGE GROW has been admitted for tl since
+ * `captured` was sampled. */
+static inline bool
+fork_event_plan_epoch_validate(uint32_t timeline, uint64_t captured)
+{
+	if (timeline >= MAX_TIMELINES)
+		return true;
+	return __atomic_load_n(&fork_event_admit_seq_by_tl[timeline],
+						   __ATOMIC_ACQUIRE) == captured;
+}
+
+/* Test-only: observe the current epoch, and force a bump, so a test can
+ * deterministically inject "an admission raced the plan" between a capture
+ * and a validate. */
+uint64_t
+ps_test_plan_epoch(uint32_t timeline)
+{
+	return fork_event_plan_epoch_capture(timeline);
+}
+
+void
+ps_test_plan_epoch_bump(uint32_t timeline, uint64_t seq)
+{
+	fork_event_admit_seq_bump(timeline, seq);
+}
+
+int
+ps_test_plan_epoch_validate(uint32_t timeline, uint64_t captured)
+{
+	return fork_event_plan_epoch_validate(timeline, captured) ? 1 : 0;
+}
+
+/* Design doc S3.7(7) rev 3: a pure soak-report counter of
+ * walidx_snapshot_publish_one() attempts that observed a late admission
+ * (see fork_event_plan_epoch_validate() below) between sampling the plan
+ * epoch and the generation switch.  Never gates publication; the name is
+ * kept for the existing test accessor. */
+static uint64_t walidx_publish_plan_epoch_aborts;
+
+uint64_t
+ps_test_walidx_plan_epoch_aborts(void)
+{
+	return __atomic_load_n(&walidx_publish_plan_epoch_aborts, __ATOMIC_ACQUIRE);
 }
 
 void
@@ -1858,7 +2019,21 @@ segment_order_id_observe(uint64_t order_id)
  * (block- and timeline-independent), so a key's blocks and all its timelines
  * stay on one shard.
  */
+/*
+ * Overridable at compile time (must stay a power of two -- IDX_MASK below
+ * assumes it) for the throughput-sensitive fuzz/build.sh binaries: every
+ * ps_core_open()/ps_core_close() unconditionally sweeps all MAX_SHARDS *
+ * IDX_BUCKETS buckets in free_page_fork_indexes()/free_walidx_indexes() to
+ * reset these hash tables, regardless of how many entries (if any) they
+ * hold.  That sweep is pure bucket-array bookkeeping -- it has no bearing on
+ * any persisted format or validation bound -- so a fuzz binary whose fixture
+ * only ever populates a handful of entries can shrink it without changing
+ * any code path's semantics.  Ordinary builds are unaffected (no -D, same
+ * 65536 as before).
+ */
+#ifndef IDX_BUCKETS
 #define IDX_BUCKETS		(1 << 16)
+#endif
 #define IDX_MASK		(IDX_BUCKETS - 1)
 
 struct PageEnt;
@@ -2069,28 +2244,73 @@ account_page_gc_coverage(Shard *s, uint32_t old_boundary,
 static pthread_rwlock_t shard_locks[MAX_SHARDS];
 static pthread_rwlock_t map_lock = PTHREAD_RWLOCK_INITIALIZER;
 /* Which shard locks this thread holds, so a reader of another shard's index
- * can tell an already-held lock from one it must still take. */
+ * can tell an already-held lock from one it must still take.  Also backs
+ * I-ALLOC (below): PS_SHARD_HELD_RD/WR distinguish the mode, since I-ALLOC
+ * specifically requires the write mode. */
+#define PS_SHARD_HELD_NONE	0
+#define PS_SHARD_HELD_RD	1
+#define PS_SHARD_HELD_WR	2
 static __thread unsigned char shard_held_by_thread[MAX_SHARDS];
+
+/*
+ * Set only across ps_core_open_impl()'s single-threaded recovery section
+ * (from fork_meta_snapshot_load()/load_fork_meta() through
+ * recover_layer_prefix()/recover()/replay_page_record()/
+ * fork_grow_replay()), before any worker or maintenance thread exists and
+ * so before any shard lock could meaningfully be contended.  I-ALLOC
+ * exempts this window instead of requiring recovery to take shard-wr on
+ * every record it replays.
+ */
+static int core_open_exclusive;
 
 void
 ps_lock_shard_rd(uint32_t shard)
 {
 	pthread_rwlock_rdlock(&shard_locks[shard]);
-	shard_held_by_thread[shard] = 1;
+	shard_held_by_thread[shard] = PS_SHARD_HELD_RD;
 }
 
 void
 ps_lock_shard_wr(uint32_t shard)
 {
 	pthread_rwlock_wrlock(&shard_locks[shard]);
-	shard_held_by_thread[shard] = 1;
+	shard_held_by_thread[shard] = PS_SHARD_HELD_WR;
 }
 
 void
 ps_unlock_shard(uint32_t shard)
 {
-	shard_held_by_thread[shard] = 0;
+	shard_held_by_thread[shard] = PS_SHARD_HELD_NONE;
 	pthread_rwlock_unlock(&shard_locks[shard]);
+}
+
+/*
+ * I-ALLOC (BRANCH_SNAPSHOT_SEQ_CAP.md S2): every admission_seq that ends up
+ * indexed is allocated and published within one hold of that key's shard
+ * write lock, under admission-rd.  Checked against shard_held_by_thread[]
+ * (must be the write mode specifically) with a single exemption for
+ * ps_core_open_impl()'s single-threaded recovery window
+ * (core_open_exclusive).
+ *
+ * Wired in by an investigation (see the P2 report) that traced every
+ * page_add_version()/fork_event_add()/fork_event_add_seg_marker() call
+ * site reachable in the POSIX daemon and its tests: every live (non-
+ * recovery, non-test-harness) path already holds the key's shard write
+ * lock here. The test binaries that called these functions directly,
+ * bypassing the daemon's own opcode dispatch (and so its locking), now
+ * either take the lock themselves or go through an _unchecked() test-only
+ * variant (self-tests building a throwaway ForkEnt that was never
+ * inserted into any shard's index).
+ */
+static inline void
+ps_assert_shard_held_for_key(const PsKey *key)
+{
+#ifdef PAGESTORE_ASSERT_CHECKING
+	PS_ASSERT(shard_held_by_thread[ps_shard_of(key)] == PS_SHARD_HELD_WR ||
+			  core_open_exclusive);
+#else
+	(void) key;
+#endif
 }
 
 /*
@@ -2110,7 +2330,7 @@ shard_try_scan_lock(uint32_t shard)
 	{
 		if (pthread_rwlock_tryrdlock(&shard_locks[shard]) == 0)
 		{
-			shard_held_by_thread[shard] = 1;
+			shard_held_by_thread[shard] = PS_SHARD_HELD_RD;
 			return 1;
 		}
 		sched_yield();
@@ -2664,6 +2884,7 @@ gc_resume(void)
 		if (tier_remote_location(&remote) != NULL &&
 			ps_layer_store->delete_remote_layer(&remote) != 0)
 			remote_failed = 1;
+		layer_verified_forget(dead[k].layer_id);
 		if (ps_layer_store->delete_local_layer(&dead[k]) != 0 || remote_failed)
 			continue;
 		if (map_locks_ready)
@@ -2759,6 +2980,7 @@ gc_finish_local(uint64_t layer_id, int remote_done)
 	}
 	if (remote_done)
 		layer->remote_cleanup_done = true;
+	layer_verified_forget(layer_id);
 	if (ps_layer_store->delete_local_layer(layer) != 0 ||
 		ps_manifest_remove_layer(layer_id) != 0)
 	{
@@ -3082,7 +3304,7 @@ artifact_generation_at(const uint64_t *generations, uint32_t ngenerations,
  */
 static uint32_t
 artifact_required_generations(const uint64_t *generations, uint32_t ngenerations,
-							  uint64_t floor, const PsPruneFence *fences,
+							  uint64_t floor, const PsHistoryFence *fences,
 							  uint32_t nfences, int replay_base,
 							  uint64_t *required)
 {
@@ -3173,9 +3395,13 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	PsImgRec   *dropped;
 	uint32_t	out = 0;
 	uint32_t	ndropped = 0;
-	PsPruneFence *fences = NULL;
+	bool has_B;
+	uint64_t B = timeline_inherited_below(timeline, &has_B);
+	PsHistoryFence *fences = NULL;
 	uint32_t	nfences = 0;
-	PsPruneFence *control_fences = NULL;
+	PsHistoryFence *relation_fences = NULL;
+	uint32_t nrelation_fences = 0;
+	PsHistoryFence *control_fences = NULL;
 	uint32_t	ncontrol_fences = 0;
 	uint64_t   *obj_generations = NULL;
 	uint32_t	obj_ngenerations = 0;
@@ -3183,12 +3409,25 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	uint32_t	obj_nrequired = 0;
 	uint32_t	obj_hi = 0;
 	ArtifactPruneCache *artifact_cache = NULL;
+	/* Codex 4114217409: vfences/closure_protect used to be allocated (and
+	 * vfences converted) once per relation page group below; for a
+	 * relation-heavy compaction that is a heap allocation/free pair per
+	 * input record, plus rebuilding the identical vfences array whenever
+	 * there are more than 8 fences.  Both are sized for the whole
+	 * compaction and built once here instead; each group below still only
+	 * touches its own [0, end - first) prefix, exactly like `keep` already
+	 * does. */
+	PsViewFence	vfences_local[8];
+	PsViewFence *vfences = vfences_local;
+	unsigned char *closure_protect;
 
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return -1;
-	if (control_prune_fences(timeline, &control_fences, &ncontrol_fences) != 0)
+	if (page_storage_fences(timeline, fences, nfences, &relation_fences, &nrelation_fences) != 0 ||
+		control_prune_fences(timeline, &control_fences, &ncontrol_fences) != 0)
 	{
 		free(fences);
+		free(relation_fences);
 		return -1;
 	}
 
@@ -3200,8 +3439,12 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	obj_generations = malloc((size_t) *nrec * sizeof(*obj_generations));
 	/* one required generation per fence, plus the floor's */
 	obj_required = malloc(((size_t) nfences + 1) * sizeof(*obj_required));
+	closure_protect = malloc((size_t) *nrec);
+	if (nrelation_fences > 8)
+		vfences = malloc((size_t) nrelation_fences * sizeof(*vfences));
 	if (!order || !versions || !keep || !selected || !dropped ||
-		!obj_generations || !obj_required)
+		!obj_generations || !obj_required || !closure_protect ||
+		(nrelation_fences > 8 && !vfences))
 	{
 		free(order);
 		free(versions);
@@ -3210,11 +3453,17 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		free(dropped);
 		free(obj_generations);
 		free(obj_required);
+		free(closure_protect);
+		if (vfences != vfences_local)
+			free(vfences);
 		free(fences);
+		free(relation_fences);
 		free(control_fences);
 		artifact_prune_cache_free(artifact_cache);
 		return -1;
 	}
+	for (uint32_t i = 0; i < nrelation_fences; i++)
+		vfences[i] = history_fence_view(relation_fences[i]);
 	for (uint32_t i = 0; i < *nrec; i++)
 	{
 		order[i].key = recs[i].key;
@@ -3332,8 +3581,8 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				 * version collapses to the newest tuple like any other. */
 				for (uint32_t i = first; i < end; i++)
 					versions[i - first] = order[i].version;
-				if (ps_page_prune_plan(versions, end - first, plan_floor,
-									   fences, nfences, keep) < 0)
+				if (history_prune_plan(versions, end - first, plan_floor,
+								   fences, nfences, B, has_B, keep) < 0)
 					memset(keep, 1, end - first);
 				/* A page copy below the floor is kept only when it belongs to
 				 * the newest generation at or below some retained horizon;
@@ -3392,7 +3641,11 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				free(dropped);
 				free(obj_generations);
 				free(obj_required);
+				free(closure_protect);
+				if (vfences != vfences_local)
+					free(vfences);
 				free(fences);
+				free(relation_fences);
 				free(control_fences);
 				artifact_prune_cache_free(artifact_cache);
 				return -1;
@@ -3405,34 +3658,53 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				for (uint32_t i = first; i < end; i++)
 					keep[i - first] = control_chain_keeps(&plan, entry,
 														  order[first].block,
-														  &order[i].version);
+													  &order[i].version,
+													  control_fences, ncontrol_fences);
 			}
 			free(plan.chain);
 			free(plan.kept);
 			free(plan.pending);
 		}
-		else if (ps_page_prune_plan(versions, end - first,
-								(PsPruneFence) {floor, UINT64_MAX}, fences,
-									 nfences, keep) < 0)
-		{
-			free(order);
-			free(versions);
-			free(keep);
-			free(selected);
-			free(dropped);
-			free(fences);
-			free(control_fences);
-			artifact_prune_cache_free(artifact_cache);
-			return -1;
-		}
 		else
 		{
+			/*
+			 * P2 (design doc S3.5, checklist item 8): route relation pages
+			 * through the closure-aware planner so a position closure
+			 * requires cannot be dropped by the forkmeta-invalidation check
+			 * below. Checked branch edges now supply finite S, including
+			 * the minimum-sequence facts needed by future late arrivals.
+			 * vfences and closure_protect are the function-scope buffers
+			 * allocated once above (Codex 4114217409); this group only
+			 * touches their [0, end - first) prefix.
+			 */
+			int			rc;
+
+			rc = ps_page_prune_plan_capped(versions, end - first,
+										   (PsPruneFence) {floor, UINT64_MAX},
+										   vfences, nrelation_fences, B, has_B, keep,
+										   closure_protect);
+			if (rc < 0)
+			{
+				free(order);
+				free(versions);
+				free(keep);
+				free(selected);
+				free(dropped);
+				free(closure_protect);
+				if (vfences != vfences_local)
+					free(vfences);
+				free(fences);
+				free(relation_fences);
+				free(control_fences);
+				artifact_prune_cache_free(artifact_cache);
+				return -1;
+			}
 			for (uint32_t i = first; i < end; i++)
 				if (keep[i - first] && order[i].version.lsn < floor &&
 					!prune_version_needed(timeline, &order[first].key,
 										  order[first].block, versions,
 										  end - first, i - first, floor,
-										  fences, nfences))
+										  relation_fences, nrelation_fences))
 					keep[i - first] = 0;
 		}
 		out = compact_emit_grouped(order, first, end, keep, recs, selected,
@@ -3446,7 +3718,11 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	free(versions);
 	free(keep);
 	free(selected);
+	free(closure_protect);
+	if (vfences != vfences_local)
+		free(vfences);
 	free(fences);
+	free(relation_fences);
 	free(control_fences);
 	artifact_prune_cache_free(artifact_cache);
 	*nrec = out;
@@ -3547,7 +3823,11 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 
 		if (read_image_index_refreshing(&old[k], &idx, &n) != 0)
 			goto cleanup;
-		if (verify_image_layer_refreshing(&old[k]) != 0)
+		/* materialize_compaction_inputs() checksummed this local copy just
+		 * before the locks were taken, and only an eviction -- excluded by
+		 * the map write lock held here -- clears the flag.  Checksumming every
+		 * input again would double the time all writers of this shard wait. */
+		if (!old[k].data_verified && verify_image_layer_refreshing(&old[k]) != 0)
 		{
 			free(idx);
 			goto cleanup;
@@ -3752,6 +4032,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		/* The replacement is visible and this source is now durably retired. */
 		if (ps_fault_probe(PS_FAULT_POINT_PAGE_GC_AFTER_MARK_DELETE) != 0)
 			goto cleanup;
+		layer_verified_forget(old[k].layer_id);
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
 		/*
@@ -3991,6 +4272,91 @@ segment_hole_magic_for_header_size(uint64_t header_size)
 
 /* PageVer (one stored version's location) is defined in pagestore_core.h. */
 
+/*
+ * View caps (BRANCH_SNAPSHOT_SEQ_CAP.md S1.2/S1.3, phase P1).
+ *
+ * A ViewCap is the read-side admissibility window for one timeline level:
+ *   lsn         L  -- position cap (today's read_lsn)
+ *   seq         S  -- the "hides same-position rewrites admitted after the
+ *                      view froze" bound; PS_SEQ_UNBOUNDED (infinity) means
+ *                      no such bound -- every admission_seq passes.
+ *   strict_seq  X  -- an *extra* bound that applies only exactly at
+ *                      position == L (today's single read_seq parameter).
+ *   legacy         -- true while every constituent view predates its kind's
+ *                      cap activation (S2.2); P1 never gates on this, it is
+ *                      carried only so P2/P5 have a stable field to read.
+ *
+ * P1 introduces this machinery with every cap fixed at PS_SEQ_UNBOUNDED, so
+ * every call converges on today's page_visible()/fork_asof_hop() behaviour
+ * bit for bit (see the "Equivalence argument" in S9.3 of the design doc).
+ * Only P2 (the planner) and P3b/P5 (activation) ever construct a ViewCap
+ * with a finite seq or strict_seq in production; P1 exercises the finite
+ * case only from test code.
+ */
+#define PS_SEQ_UNBOUNDED	UINT64_MAX
+
+enum { CAP_PIN = 1, CAP_WALIDX = 2, CAP_ARTIFACT = 3, CAP_COUNT = 4 };
+static uint64_t cap_activation[CAP_COUNT];
+
+static uint64_t
+cap_effective_seq(unsigned kind, uint64_t seq)
+{
+	return seq && seq != PS_SEQ_UNBOUNDED && cap_activation[kind] &&
+		seq > cap_activation[kind] ? seq : PS_SEQ_UNBOUNDED;
+}
+
+typedef struct ViewCap
+{
+	uint64_t	lsn;			/* L */
+	uint64_t	seq;			/* S; PS_SEQ_UNBOUNDED = infinity */
+	uint64_t	strict_seq;		/* X: extra bound exactly at position == L */
+	bool		legacy;			/* every constituent view predates activation */
+} ViewCap;
+
+/*
+ * Map today's request pair (read_lsn, read_seq) onto a ViewCap: uncapped by
+ * S, with read_seq (or infinity, for read_seq == 0) as the strict bound at
+ * L.  read_lsn == UINT64_MAX ("newest") falls out of the same formula,
+ * since PS_SEQ_UNBOUNDED == UINT64_MAX already means "no LSN bound" too.
+ * A ViewCap's seq/strict_seq are never constructed as literal 0 (see the
+ * PS_ASSERT in viewcap_compose()/here): "no cap" is always spelled
+ * PS_SEQ_UNBOUNDED, so a legacy record's admission_seq == 0 can never be
+ * confused with "no cap" (S3.8).
+ */
+static inline ViewCap
+viewcap_from_request(uint64_t read_lsn, uint64_t read_seq)
+{
+	ViewCap		c;
+
+	c.lsn = read_lsn;
+	c.seq = cap_effective_seq(CAP_PIN, read_seq);
+	c.strict_seq = read_seq ? read_seq : PS_SEQ_UNBOUNDED;
+	c.legacy = c.seq == PS_SEQ_UNBOUNDED;
+	return c;
+}
+
+/*
+ * Compose a cap across one branch edge (L_e, S_e): the single function used
+ * by tl_walk_next(), the P2 planner's retention_project_cap(), the P2/P5
+ * registration gates and every fence builder (design doc S1.2).  Proved
+ * exact (the intersection of the constituents' admissible sets) in S1.2.
+ */
+static inline ViewCap
+viewcap_compose(ViewCap c, uint64_t edge_lsn, uint64_t edge_seq)
+{
+	ViewCap		r;
+
+	r.strict_seq = (edge_lsn < c.lsn) ? PS_SEQ_UNBOUNDED : c.strict_seq;
+	r.lsn = c.lsn < edge_lsn ? c.lsn : edge_lsn;
+	r.seq = c.seq < edge_seq ? c.seq : edge_seq;
+	r.legacy = c.legacy && edge_seq == PS_SEQ_UNBOUNDED;
+	return r;
+}
+
+static int page_view_registered(uint32_t timeline, const ViewCap *cap);
+static int control_view_registered(uint32_t timeline, const ViewCap *cap);
+static int retention_project_cap(uint32_t descendant, uint32_t target, ViewCap *cap);
+
 /* Hash entry: all versions of one (timeline, key, block), in arrival order. */
 typedef struct PageEnt
 {
@@ -4026,7 +4392,25 @@ typedef struct ForkEvent
 	uint8_t		kind;
 	uint8_t		marker_kind;	/* durable ordered marker kind, even after activation */
 	uint8_t		cached_state;
+	uint8_t		flags;			/* FEV_F_* below; bit0 is the former
+								 * snapshot_dropped (set by the last
+								 * fork_meta_snapshot_build() pass over this
+								 * fork's events -- 1 iff this event did not
+								 * make it into the new checkpoint/tail;
+								 * consumed once, right after a successful
+								 * publish, by
+								 * fork_event_compact_dropped_markers()).
+								 * The other bits classify the event for the
+								 * BRANCH_SNAPSHOT_SEQ_CAP.md S1.1/S1.3 rule;
+								 * META and UNSTAMPED are persisted;
+								 * META_FIRST is recomputed on load,
+								 * and have no effect while every ViewCap's
+								 * seq stays PS_SEQ_UNBOUNDED (P1). */
 } ForkEvent;
+
+/* In-memory only (never persisted); this just documents that the added
+ * uint8_t above still fits the padding byte the struct already carried. */
+_Static_assert(sizeof(ForkEvent) == 40, "ForkEvent grew past its padding");
 
 #define FEV_GROW	0
 #define FEV_SET		1
@@ -4039,6 +4423,24 @@ typedef struct ForkEvent
 #define FEV_SEG_COMMIT_BOUND 8 /* FEV_SEG_COMMIT paired with a segment identity */
 #define FEV_SEG_ID 9			/* second record carrying a bound marker's identity */
 #define FEV_SNAPSHOT_BASE 10	/* source-log epoch marker after snapshot cutover */
+
+/* V4 kind-byte classification; marker kinds never carry these flags. */
+#define FEV_W_META 0x40
+#define FEV_W_UNSTAMPED 0x80
+#define FEV_KIND(k) ((k) & 0x3f)
+
+/* ForkEvent.flags bits (design doc S3.2). */
+#define FEV_F_SNAPSHOT_DROPPED	0x01	/* former snapshot_dropped byte */
+#define FEV_F_META				0x02	/* SET/DEAD, or a ZEROEXTEND-origin GROW */
+#define FEV_F_META_FIRST		0x04	/* the min-seq META event at its own lsn */
+_Static_assert(FEV_F_META == PS_ADM_F_META &&
+			   FEV_F_META_FIRST == PS_ADM_F_META_FIRST,
+			   "FEV_F_* must track pagestore_admissible.h's PS_ADM_F_* "
+			   "bit for bit -- fork_event_hidden() passes ForkEvent.flags "
+			   "straight through with no translation");
+#define FEV_F_UNSTAMPED			0x08 /* persisted req_lsn == 0 classification */
+_Static_assert(FEV_F_UNSTAMPED == PS_ADM_F_UNSTAMPED,
+			   "FEV_F_UNSTAMPED must track PS_ADM_F_UNSTAMPED");
 
 typedef struct ForkEnt
 {
@@ -4053,6 +4455,15 @@ typedef struct ForkEnt
 	uint32_t   *def_idx;		/* indexes of SET/DEAD events only */
 	uint32_t	ndef;
 	uint32_t	defcap;
+	uint32_t   *late_meta_idx;	/* indexes of non-FEV_F_META_FIRST META events */
+	uint32_t	nlate_meta;
+	uint32_t	late_meta_cap;
+	uint64_t	max_meta_seq;	/* max seq over the META/UNSTAMPED events
+								 * currently present (0 if none); a pure
+								 * function of the present set (S3.2/S9.3) */
+	uint64_t	max_inherited_page_seq;	/* max seq over PAGE-class GROWs
+								 * currently present at lsn <= this fork's
+								 * own branch_lsn (0 if none) */
 	PageEnt    *pages;			/* local pages belonging to this fork */
 	uint64_t	last_def_lsn;	/* newest SET/DEAD lsn (growth-clamp floor) */
 	uint64_t	last_page_lsn;	/* newest durable local page tuple */
@@ -4067,6 +4478,7 @@ static void artifact_fence_reset(void);
 static void artifact_fence_note(uint32_t timeline, uint64_t lsn);
 static void artifact_fence_reserve(uint32_t timeline, uint64_t lsn);
 static void artifact_fence_release(uint32_t timeline, uint64_t lsn);
+static void artifact_cap_forget_commit(uint32_t timeline, const PsKey *meta, uint64_t commit_seq);
 static void artifact_fence_forget_versions(uint32_t timeline, uint64_t lsn,
 										   uint32_t versions);
 static void artifact_fence_forget(uint32_t timeline);
@@ -4098,6 +4510,7 @@ free_page_fork_indexes(void)
 
 				free(fork->ev);
 				free(fork->def_idx);
+				free(fork->late_meta_idx);
 				free(fork);
 				fork = next;
 			}
@@ -4125,9 +4538,38 @@ typedef struct TimelineMeta
 	uint32_t	state;			/* PsTimelineState; published after durable append */
 	uint64_t	incarnation;		/* nonzero fencing generation */
 	uint64_t	parent_incarnation;	/* immutable generation of parent, or 1 for root */
+	uint64_t	branch_seq;		/* durable edge cap; unbounded until activation */
 } TimelineMeta;
 
 static TimelineMeta timelines[MAX_TIMELINES];
+static int branch_caps_active;
+
+/* Legacy edges stay unbounded; checked creates persist a finite edge cap. */
+static inline uint64_t
+timeline_branch_seq(uint32_t timeline)
+{
+	return timeline < MAX_TIMELINES && timelines[timeline].defined ?
+		timelines[timeline].branch_seq : PS_SEQ_UNBOUNDED;
+}
+
+/*
+ * B_k: the inherited-range boundary for timeline k (design doc S1.5) --
+ * this timeline's own branch_lsn, or "-infinity" (has_range = 0) for the
+ * root.  Do not encode the root's B_k as 0: LSN-0 positions must stay
+ * escape-eligible at the root.
+ */
+static inline uint64_t
+timeline_inherited_below(uint32_t tl, bool *has_range)
+{
+	if (timeline_has_parent(tl))
+	{
+		*has_range = true;
+		return timelines[tl].branch_lsn;
+	}
+	*has_range = false;
+	return 0;					/* unused by callers when *has_range is false */
+}
+
 /* A metadata append failure is ambiguous: the lower layer may have made the
  * record durable before reporting an error.  Refuse all timeline services
  * until the process reopens and replays the log. */
@@ -4209,6 +4651,37 @@ static int timeline_used[MAX_TIMELINES];
 static unsigned char timeline_wal_cleanup_done[MAX_TIMELINES];
 static unsigned char timeline_page_cleanup_done[MAX_TIMELINES];
 static uint32_t timeline_page_cleanup_cursor;
+
+/*
+ * Filled by page_cleanup_tombstone_segment() at the point it fails closed on
+ * a malformed record inside the reachable region (invariant I4), so
+ * timeline_delete_page_cleanup_one() can log which record is blocking a
+ * stalled deletion.  Set only for an actual parse failure (nonzero unknown
+ * magic, a hole with the wrong len, or an impossible timeline owner on an
+ * otherwise complete record) -- never for an allocation or storage I/O
+ * failure, which is not a data problem and gets no "malformed record"
+ * diagnostic.  Plain statics: page_cleanup_tombstone_segment() runs under
+ * every shard write lock and the map write lock, one maintenance turn at a
+ * time, matching the rest of this file's daemon-wide scheduling state.
+ */
+typedef struct PsCleanupFailure
+{
+	uint32_t	shard;
+	int			seg;
+	uint64_t	off;
+	uint32_t	magic;
+	uint32_t	len;
+} PsCleanupFailure;
+
+static PsCleanupFailure cleanup_last_failure;
+static int cleanup_last_failure_valid;
+
+/* Dedup state for the "deletion blocked" diagnostic: the last
+ * malformed-record tuple already printed for each timeline, so a stalled
+ * deletion logs once per distinct cause instead of once per maintenance
+ * turn. */
+static PsCleanupFailure timeline_cleanup_blocked_last[MAX_TIMELINES];
+static unsigned char timeline_cleanup_blocked_last_valid[MAX_TIMELINES];
 
 static void timeline_reset_reuse_runtime(uint32_t timeline);
 
@@ -4902,17 +5375,52 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
  * record's boundary is unchanged either way, so recovery fails closed
  * (an unrecognized magic) rather than misparsing.
  *
- * Two passes.  Pass 1 walks and validates every record exactly as a
- * read-only scan would (no write), collecting the target's; a parse failure
- * here leaves the segment completely untouched, so a malformed segment
- * fails closed and stays retryable without ever writing a hole for data it
- * could not fully account for.  Pass 2 (only once pass 1 has validated the
- * whole segment) writes the collected holes; a failure here is a genuine
- * storage I/O failure, not a data problem, and leaves some records already
- * tombstoned and some not -- both states are safe per the write order
- * above, and the next maintenance turn resumes, since an already-holed
- * record is recognized by its magic and skipped, making the retry
- * idempotent.
+ * Two passes.  Pass 1 walks and validates only the *reachable region*
+ * (invariant I4): the prefix recover() would actually replay, bounded for
+ * the current segment by the append cursor (limit = min(bytes, cur_off)
+ * when cur_off < segment_size).  It stops -- exactly where recover() stops,
+ * not with a failure -- on the same end-of-log shapes recover() treats as
+ * "nothing more was ever indexed here": a short header, a zero magic, a
+ * torn (non-page_size) record header, a body that does not fit before
+ * limit, or a torn bound/admission trailer field.  Those bytes are never
+ * touched: a torn tail, sealed-segment garbage after a rollover, or an
+ * SPDK-style zero-padded tail is not corruption, it is unreached.
+ *
+ * The one wrinkle is the watermark segment.  recover() does not start that
+ * segment's scan at 0; it starts at flush_watermark.seg_off (segments are
+ * not synced before ps_manifest_set_flush_watermark() durably records that
+ * cursor), so an end-of-log shape *below* the watermark -- e.g. a header
+ * sector lost to a crash while the pages after it and the watermark itself
+ * survived -- says nothing about whether the bytes at/after the watermark
+ * are reachable: recover() never looks below the watermark on this segment
+ * in the first place.  Pass 1 mirrors that: on an end-of-log shape below
+ * the watermark it resumes the scan at the watermark (always a record
+ * boundary -- it is a previously recorded flush cursor) instead of
+ * stopping; only an end-of-log shape at or after the watermark ends the
+ * reachable region.  Below the watermark, unreachable-but-still-referenced
+ * bytes (the power-loss-reordering case: a record whose header page was
+ * lost while a later record's pages and the watermark survived) stay
+ * physically present until segment GC, same as any other bytes below R the
+ * scan does not touch -- deletion never needs to see them because they are
+ * not reachable from this segment's own scan, only from a layer.
+ *
+ * Only a nonzero *unknown* magic, a hole record with the wrong len, or a
+ * complete record naming an impossible timeline -- all inside the reachable
+ * region, i.e. bytes recover() actually replayed or would replay -- fail
+ * the whole pass closed; the segment is then left completely untouched, so
+ * a genuinely malformed segment fails closed and stays retryable without
+ * ever writing a hole for data it could not fully account for.  A seg_read()
+ * I/O failure (header or trailer) is a distinct case: it is not a parse
+ * decision at all, so it fails the pass closed the same way but without the
+ * "malformed record" diagnostic (PsCleanupFailure is reserved for an actual
+ * parse failure).  Pass 2 (only once pass 1 has validated the whole
+ * reachable region) writes the collected holes, every one of them at or
+ * below the same cursor pass 1 never scanned past (PS_ASSERT below); a
+ * failure here is a genuine storage I/O failure, not a data problem, and
+ * leaves some records already tombstoned and some not -- both states are
+ * safe per the write order above, and the next maintenance turn resumes,
+ * since an already-holed record is recognized by its magic and skipped,
+ * making the retry idempotent.
  *
  * Caller holds every shard write lock and map write lock.  Returns 1 when
  * this pass tombstoned at least one record, 0 when no target record remains
@@ -4933,6 +5441,8 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 	SegmentHole *holes = NULL;
 	uint32_t nholes = 0, hole_cap = 0;
 	uint64_t off = 0;
+	uint64_t limit;
+	uint64_t wm = 0;
 
 	errno = 0;
 	bytes = ps_storage->seg_size(s->id, seg);
@@ -4940,38 +5450,84 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 		(uint64_t) bytes > SIZE_MAX ||
 		(uint64_t) bytes > (uint64_t) LLONG_MAX)
 		return -1;
-	/* Pass 1: validate, no writes. */
-	while (off < (uint64_t) bytes)
+	/*
+	 * Pass 1: validate the reachable region only, no writes.  'limit' is R
+	 * from invariant I4: the whole file for a sealed/retired segment (there
+	 * is no cursor to clamp it), min(bytes, cur_off) for the current
+	 * segment while its cursor is still inside this file.  An end-of-log
+	 * shape stops the scan (`break`, via the `end_of_log` label below),
+	 * exactly recover()'s rule for that same shape -- except below the
+	 * watermark ('wm'), where it resumes at the watermark instead, since
+	 * recover() replays the watermark segment starting there regardless of
+	 * what an unsynced sector below it looks like; only the bytes annotated
+	 * 'corruption' below fail the pass closed.
+	 */
 	{
-		SegRecHdr hdr;
-		uint64_t header_size, rec_len, end;
+		uint64_t limit_bytes = (uint64_t) bytes;
+
+		limit = limit_bytes;
+		if (seg == s->cur_seg && s->cur_off < segment_size &&
+			s->cur_off < limit_bytes)
+			limit = s->cur_off;
+	}
+	/*
+	 * I4/M1: recover() replays the watermark segment starting at
+	 * flush_watermark.seg_off, not at 0 (recover()'s start offset for this
+	 * segment) -- segments
+	 * are not synced before ps_manifest_set_flush_watermark(), so an
+	 * end-of-log shape below the watermark (e.g. a lost header sector after
+	 * a crash) does not mean the bytes at/after the watermark are
+	 * unreachable; recover() never even looks below the watermark on this
+	 * segment.  'wm' is 0 (a no-op resume point) for every segment other
+	 * than the one flush_watermark currently names.
+	 */
+	if (s->flush_watermark_valid && s->flush_watermark.seg_id == (uint32_t) seg)
+		wm = s->flush_watermark.seg_off;
+	while (off < limit)
+	{
+		SegRecHdr hdr = {0};	/* zeroed so a seg_read() I/O failure below
+								 * reports magic 0, not an uninitialized read */
+		uint64_t header_size, rec_len;
 		uint64_t order_id = 0, admission_seq = 0;
 		int wal_less, bound, admission, hole;
 
-		if ((uint64_t) bytes - off < sizeof(hdr) ||
-			ps_storage->seg_read(s->id, seg, off, &hdr, sizeof(hdr)) != 0 ||
-			segment_record_shape(hdr.magic, &header_size, &wal_less,
-								 &bound, &admission, &hole) != 0 ||
-			hdr.len != page_size || header_size > UINT64_MAX - hdr.len)
-			goto fail;
+		if (limit - off < sizeof(hdr))
+			goto end_of_log;	/* end of log: short header (recover() short-read) */
+		if (ps_storage->seg_read(s->id, seg, off, &hdr, sizeof(hdr)) != 0)
+			goto fail;			/* I/O error, not a parse decision: no malformed-record diagnostic */
+		if (hdr.magic == 0)
+			goto end_of_log;	/* end of log: zero padding / lost header (recover()'s zero-magic end-of-log check) */
+		if (segment_record_shape(hdr.magic, &header_size, &wal_less,
+								 &bound, &admission, &hole) != 0)
+			goto fail_malformed;	/* nonzero unknown magic: corruption inside the reachable region */
+		if (hole && hdr.len != page_size)
+			goto fail_malformed;	/* hole with the wrong len: corruption (recover()'s hole-length check) */
+		if (!hole && hdr.len != page_size)
+			goto end_of_log;	/* end of log: torn header (recover()'s torn-header check) */
 		rec_len = header_size + hdr.len;
-		if (rec_len > UINT32_MAX || rec_len > (uint64_t) bytes - off)
-			goto fail;
-		end = off + rec_len;
+		if (rec_len > limit - off)
+			goto end_of_log;	/* end of log: torn body (recover()'s torn-body check) */
 		if (!hole)
 		{
+			if (bound)
+			{
+				if (ps_storage->seg_read(s->id, seg, off + sizeof(hdr), &order_id,
+										 sizeof(order_id)) != 0)
+					goto fail;			/* I/O error, not a parse decision */
+				if (order_id == 0)
+					goto end_of_log;	/* end of log: torn bound trailer (recover()'s torn-bound-trailer check) */
+			}
+			if (admission)
+			{
+				if (ps_storage->seg_read(s->id, seg,
+										 off + header_size - sizeof(admission_seq),
+										 &admission_seq, sizeof(admission_seq)) != 0)
+					goto fail;			/* I/O error, not a parse decision */
+				if (admission_seq == 0)
+					goto end_of_log;	/* end of log: torn admission trailer (recover()'s torn-admission-trailer check) */
+			}
 			if (hdr.timeline >= MAX_TIMELINES)
-				goto fail;
-			if (bound &&
-				(ps_storage->seg_read(s->id, seg, off + sizeof(hdr), &order_id,
-								   sizeof(order_id)) != 0 || order_id == 0))
-				goto fail;
-			if (admission &&
-				(ps_storage->seg_read(s->id, seg,
-								 off + header_size - sizeof(admission_seq),
-								 &admission_seq, sizeof(admission_seq)) != 0 ||
-				 admission_seq == 0))
-				goto fail;
+				goto fail_malformed;	/* complete record, impossible owner: corruption */
 			if (hdr.timeline == target)
 			{
 				if (nholes == hole_cap)
@@ -4998,7 +5554,31 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 				nholes++;
 			}
 		}
-		off = end;
+		off += rec_len;
+		continue;
+
+end_of_log:
+		/* I4/M1: recover() replays [wm, ...) on this segment regardless of
+		 * what lies below wm -- an end-of-log shape below the flush
+		 * watermark must not hide the records recover() would still replay
+		 * starting at wm (wm is always a record boundary: it is a cursor
+		 * position recorded by a previous flush).  Only an end-of-log shape
+		 * at or after wm is a real end of the reachable region. */
+		if (off < wm && wm <= limit)
+		{
+			off = wm;
+			continue;
+		}
+		break;
+
+fail_malformed:
+		cleanup_last_failure.shard = s->id;
+		cleanup_last_failure.seg = seg;
+		cleanup_last_failure.off = off;
+		cleanup_last_failure.magic = hdr.magic;
+		cleanup_last_failure.len = hdr.len;
+		cleanup_last_failure_valid = 1;
+		goto fail;
 	}
 	if (nholes == 0)
 	{
@@ -5017,6 +5597,12 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 		uint32_t hole_magic =
 			segment_hole_magic_for_header_size(holes[i].header_size);
 
+		/* I4: pass 1 never scanned past the cursor for the current segment,
+		 * so pass 2 must never write one there either.  Vacuously true for
+		 * any other segment (sealed/retired: no cursor bound applies). */
+		PS_ASSERT(seg != s->cur_seg || s->cur_off == segment_size ||
+				 holes[i].off + holes[i].header_size + holes[i].len <=
+					 s->cur_off);
 		if (ps_storage->seg_write(s->id, seg,
 								  holes[i].off + holes[i].header_size,
 								  zero_body, holes[i].len) != 0 ||
@@ -5243,6 +5829,9 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 				 ((uint32_t) v->seg < g_shards[v->shard].flush_watermark.seg_id ||
 				  ((uint32_t) v->seg == g_shards[v->shard].flush_watermark.seg_id &&
 				   v->off + page_size <= g_shards[v->shard].flush_watermark.seg_off))));
+			if (remove && e->key.klass == PS_KLASS_ARTIFACT &&
+				e->block == PS_ARTIFACT_COMMIT_BLOCK)
+				artifact_cap_forget_commit(timeline, &e->key, v->admission_seq);
 			if (!remove)
 				e->vers[out++] = *v;
 			else if (e->key.klass == PS_KLASS_SLRU ||
@@ -5324,6 +5913,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	PageEnt    *e = page_find(timeline, key, block);
 	ForkEnt    *fork = fork_get_or_create(timeline, key);
 
+	ps_assert_shard_held_for_key(key);
 	timeline_mark_used(timeline);
 	if (!e)
 	{
@@ -5374,25 +5964,115 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 		fork->has_wal_less = 1;
 }
 
-/* Newest version on this entry with lsn <= read_lsn, or NULL if none. */
+/*
+ * Is v the minimum-admission_seq version at its own lsn within e, counting
+ * only versions with admission_seq < max_seq_exclusive?  Used by
+ * page_select()'s escape path (v->admission_seq > c->seq), which is
+ * unreachable in production while every ViewCap stays PS_SEQ_UNBOUNDED
+ * (P1); legacy (admission_seq == 0) versions never need it (they always
+ * pass the plain seq <= S disjunct, since a ViewCap's seq is never a
+ * literal 0).  Also reused, with a finite filter, by artifact_visible()'s
+ * no-commit fallback (pagestore_artifact_lifecycle.inc), which must apply
+ * the same escape rule within the "pre-first-BEGIN" admission_seq domain
+ * rather than the whole entry.  O(nver) worst case, same bound as
+ * page_select() itself.
+ */
+static bool
+page_select_is_smin_below(const PageEnt *e, const PageVer *v,
+						  uint64_t max_seq_exclusive)
+{
+	for (int j = 0; j < e->nver; j++)
+		if (e->vers[j].lsn == v->lsn &&
+			e->vers[j].admission_seq < max_seq_exclusive &&
+			e->vers[j].admission_seq < v->admission_seq)
+			return false;
+	return true;
+}
+
+static bool
+page_select_is_smin(const PageEnt *e, const PageVer *v)
+{
+	return page_select_is_smin_below(e, v, PS_SEQ_UNBOUNDED);
+}
+
+/*
+ * The design doc's S1.3 admissibility rule for relation pages: the
+ * admissible version with the greatest (lsn, seq), where
+ *
+ *   admissible(v) <=> p <= L
+ *                   && (p < L || v.seq <= X)
+ *                   && (v.seq <= S || (p > B_k && v.seq == s_min(p)))
+ *
+ * B/has_B is B_k (design doc S1.5): has_B false means "-infinity" (the
+ * root), where the escape is always available.
+ *
+ * At c->seq == PS_SEQ_UNBOUNDED (the only case P1 ever reaches in
+ * production) the third conjunct is trivially true for every version, so
+ * this reduces, line for line, to the first two conjuncts plus the
+ * greatest-(lsn,seq) reduction -- exactly today's page_visible() body with
+ * read_lsn = c->lsn, read_seq = c->strict_seq.  See the "Equivalence
+ * argument" in the design doc's S9.3, and the differential tests in
+ * ps_test_viewcap_differential().
+ */
 static PageVer *
-page_visible(PageEnt *e, uint64_t read_lsn, uint64_t read_seq)
+page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
 {
 	PageVer    *best = NULL;
+	PsAdmitCap	ac;
 
+	ac.lsn = c->lsn;
+	ac.seq = c->seq;
+	ac.strict_seq = c->strict_seq;
 	for (int i = 0; i < e->nver; i++)
 	{
 		PageVer    *v = &e->vers[i];
+		uint64_t	vseq = v->admission_seq;
+		bool		is_smin;
 
-		if (v->lsn <= read_lsn &&
-			(v->lsn < read_lsn || read_seq == 0 || v->admission_seq == 0 ||
-			 v->admission_seq <= read_seq) &&
-			(!best || v->lsn > best->lsn ||
-			 (v->lsn == best->lsn &&
-			  v->admission_seq >= best->admission_seq)))
+		/*
+		 * Codex 4104350506: check the L/X boundary (the cheap, O(1) part
+		 * of ps_version_admissible()) *before* even considering
+		 * page_select_is_smin(), which is O(nver).  page_select() has no
+		 * sort order to break out of early, unlike the planner's fence
+		 * loop, so without this a page with many versions past L, under a
+		 * finite S, would pay an O(nver) is_smin scan for every one of
+		 * them, only to have ps_version_admissible() reject each on the
+		 * boundary anyway -- O(nver^2) for no reason. Restores the
+		 * pre-refactor ordering (boundary first, escape computed only when
+		 * it could still matter).
+		 */
+		if (!ps_admit_boundary_ok(v->lsn, vseq, &ac))
+			continue;
+		/*
+		 * page_select_is_smin() is O(nver) per call; skip it unless the
+		 * boundary test already passed and the plain seq <= S disjunct
+		 * already failed, exactly as the pre-refactor inline logic did (the
+		 * escape is unreachable in P1 production, where c->seq stays
+		 * PS_SEQ_UNBOUNDED -- see ps_version_admissible()'s own short
+		 * circuit on that same condition).
+		 */
+		is_smin = (vseq != 0 && c->seq != PS_SEQ_UNBOUNDED &&
+				   vseq > c->seq) ?
+			page_select_is_smin(e, v) : false;
+
+		if (!ps_version_admissible(v->lsn, vseq, is_smin, &ac, B, has_B))
+			continue;
+		if (!best || v->lsn > best->lsn ||
+			(v->lsn == best->lsn && vseq >= best->admission_seq))
 			best = v;
 	}
 	return best;
+}
+
+/* Newest version on this entry with lsn <= read_lsn, or NULL if none.  Kept
+ * as a thin wrapper for callers that have not adopted a ViewCap/TlWalk. */
+static PageVer *
+page_visible(PageEnt *e, uint64_t read_lsn, uint64_t read_seq)
+{
+	ViewCap		c = {read_lsn, PS_SEQ_UNBOUNDED,
+		read_seq ? read_seq : PS_SEQ_UNBOUNDED, true};
+
+	return page_select(e, &c, 0, false);
 }
 
 uint32_t
@@ -5543,11 +6223,117 @@ fork_event_identity_range(const ForkEnt *e, uint64_t lsn, uint64_t admission_seq
 	}
 }
 
+/* viewcap_from_request() under another name, for call sites that only have
+ * a bare (lsn, seq_cap) pair -- today's calling convention -- rather than a
+ * TlWalk-carried ViewCap: identical mapping (S = infinity, X = seq_cap or
+ * infinity for seq_cap == 0), spelled out separately here because these
+ * call sites are not "requests" in the read-path sense. */
+static inline ViewCap
+viewcap_lsn_seq(uint64_t lsn, uint64_t seq_cap)
+{
+	return (ViewCap) {lsn, PS_SEQ_UNBOUNDED,
+  seq_cap ? seq_cap : PS_SEQ_UNBOUNDED, true};
+}
+
+/*
+ * The single hidden-event predicate (design doc S3.2), shared by the read
+ * path's slow-path fold here and, from P2 on, by the planner's retention
+ * masks -- requirement 2 of the P1 scope ("a single admissibility
+ * predicate").  Returns true iff event e->ev[i] is NOT admissible under cap
+ * c at this fork's inherited-range boundary B/has_B (design doc S1.5):
+ *
+ *   PAGE-class GROW: hidden <=> seq > S && lsn <= B_k
+ *   META (incl. ZEROEXTEND-origin GROW): hidden <=> seq > S && (!META_FIRST || lsn <= B_k)
+ *   UNSTAMPED: hidden <=> seq > S   (no escape at all, design doc S1.6)
+ *
+ * The boundary conjuncts (p <= L, and X at p == L) are shared by every
+ * class and checked first.  Only ever reached from the slow-path fold
+ * below, itself only reached when c->seq != PS_SEQ_UNBOUNDED -- i.e. never
+ * in P1 production, where every ViewCap stays unbounded.
+ */
+static bool
+fork_event_hidden(const ForkEnt *e, uint32_t i, const ViewCap *c,
+				  uint64_t B, bool has_B)
+{
+	const ForkEvent *v = &e->ev[i];
+	PsAdmitCap	ac;
+
+	ac.lsn = c->lsn;
+	ac.seq = c->seq;
+	ac.strict_seq = c->strict_seq;
+	/* PS_ADM_F_* is defined bit-for-bit identical to FEV_F_* (see
+	 * pagestore_admissible.h); v->flags is passed straight through. */
+	return ps_event_hidden(v->lsn, v->admission_seq, v->flags, &ac, B, has_B);
+}
+
+/*
+ * Slow-path fold: a full linear fold over every non-hidden GROW/SET/DEAD
+ * event at or below c->lsn (S1.3's X bound applies at lsn == c->lsn exactly
+ * as fork_event_cache_from()'s cached fold does).  Only ever reached with a
+ * finite c->seq, so it is exercised solely by the P1 test suite (production
+ * caps stay PS_SEQ_UNBOUNDED); correctness, not speed, is what matters
+ * here, so unlike the cached-prefix fast path this does not try to resume
+ * from a cached midpoint.
+ */
 static int
-fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
+fork_asof_hop_slow(const ForkEnt *e, const ViewCap *c, uint64_t B, bool has_B,
+					uint32_t *nb_out)
+{
+	uint8_t		state = FORK_HOP_NONE;
+	uint32_t	nb = 0;
+
+	*nb_out = 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		const ForkEvent *v = &e->ev[i];
+
+		if (v->lsn > c->lsn)
+			break;
+		if (v->kind > FEV_DEAD)
+			continue;
+		if (fork_event_hidden(e, i, c, B, has_B))
+			continue;
+		if (v->kind == FEV_GROW)
+		{
+			if (v->nblocks > nb)
+				nb = v->nblocks;
+			state = (state == FORK_HOP_NONE || state == FORK_HOP_GROW) ?
+				FORK_HOP_GROW : FORK_HOP_DEF;
+		}
+		else if (v->kind == FEV_SET)
+		{
+			nb = v->nblocks;
+			state = FORK_HOP_DEF;
+		}
+		else if (v->kind == FEV_DEAD)
+		{
+			nb = 0;
+			state = FORK_HOP_DEAD;
+		}
+	}
+	*nb_out = nb;
+	return state;
+}
+
+/*
+ * Resolve one timeline hop's contribution to an as-of size/existence query
+ * under cap c (design doc S1.3/S3.2/S9.3).  The fast path below, taken
+ * whenever c->seq == PS_SEQ_UNBOUNDED or every event that could need the
+ * escape is already within S, is byte-for-byte today's fork_asof_hop() body
+ * (cap = c->lsn, seq_cap = c->strict_seq); see the "Equivalence argument"
+ * in the design doc's S9.3.  P1 never takes the slow path in production.
+ */
+static int
+fork_asof_hop(const ForkEnt *e, const ViewCap *c, uint64_t B, bool has_B,
 			  uint32_t *nb_out)
 {
+	uint64_t	cap = c->lsn;
+	uint64_t	seq_cap = c->strict_seq;
+
 	*nb_out = 0;
+	if (c->seq != PS_SEQ_UNBOUNDED &&
+		!(e->max_meta_seq <= c->seq && e->max_inherited_page_seq <= c->seq))
+		return fork_asof_hop_slow(e, c, B, has_B, nb_out);
 	if (seq_cap == 0)
 	{
 		uint32_t lo = 0;
@@ -5699,33 +6485,51 @@ fork_def_index_insert(ForkEnt *e, uint32_t event_idx, int definitive)
 	e->ndef++;
 }
 
-/* Size of e as of cap, hop-local (for the GROW-dedup below). */
+/* Size of e as of cap, hop-local (for the GROW-dedup below).  Not a
+ * read-path view: no S/escape notion existed here before P1, so it is
+ * wrapped with the same (S = infinity, X = seq_cap) mapping
+ * viewcap_from_request() uses, and B/has_B = 0/false, matching the absence
+ * of any inherited-range concept in the pre-P1 code this preserves. */
 static uint32_t
 fork_size_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap)
 {
+	ViewCap		c = viewcap_lsn_seq(cap, seq_cap);
 	uint32_t	nb;
 
-	(void) fork_asof_hop(e, cap, seq_cap, &nb);
+	(void) fork_asof_hop(e, &c, 0, false, &nb);
 	return nb;
 }
 
-/* A later truncate/drop invalidates old page bytes even if subsequent growth
+/*
+ * A later truncate/drop invalidates old page bytes even if subsequent growth
  * makes the block addressable again.  The current fast path avoids touching
- * event history unless a definitive event is newer than the selected page. */
+ * event history unless a definitive event is newer than the selected page.
+ * Only SET/DEAD (always META) events are ever consulted, so the slow-path
+ * gate only needs max_meta_seq.
+ */
 static int
 fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
-					  uint64_t cap, uint64_t seq_cap)
+					  const ViewCap *c, uint64_t B, bool has_B)
 {
+	bool		slow;
+
 	if (e == NULL || page == NULL || e->last_def_lsn < page->lsn)
 		return 0;
+	slow = c->seq != PS_SEQ_UNBOUNDED && e->max_meta_seq > c->seq;
 	for (int i = (int) e->ndef - 1; i >= 0; i--)
 	{
-		const ForkEvent *v = &e->ev[e->def_idx[i]];
+		uint32_t	idx = e->def_idx[i];
+		const ForkEvent *v = &e->ev[idx];
 
-		if (v->lsn > cap ||
-			(seq_cap != 0 && v->lsn == cap && v->admission_seq != 0 &&
-			 v->admission_seq > seq_cap) ||
-			(v->kind != FEV_SET && v->kind != FEV_DEAD))
+		if (v->lsn > c->lsn)
+			continue;
+		if (slow)
+		{
+			if (fork_event_hidden(e, idx, c, B, has_B))
+				continue;
+		}
+		else if (c->strict_seq != PS_SEQ_UNBOUNDED && v->lsn == c->lsn &&
+				 v->admission_seq != 0 && v->admission_seq > c->strict_seq)
 			continue;
 		/* Nonzero LSN is the primary order, including across legacy and
 		 * sequenced records.  WAL-less records have no LSN order, so retain
@@ -5746,12 +6550,39 @@ fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
 	return 0;
 }
 
+/* Same predicate family as fork_asof_hop(); only SET/DEAD events ever
+ * update cached_fence_nblocks (fork_event_cache_from()), so the slow-path
+ * gate here is max_meta_seq too. */
 static int
 fork_inheritance_fenced(const ForkEnt *e, uint32_t block,
-						uint64_t cap, uint64_t seq_cap)
+						const ViewCap *c, uint64_t B, bool has_B)
 {
+	uint64_t	cap = c->lsn;
+	uint64_t	seq_cap = c->strict_seq;
+
 	if (e == NULL)
 		return 0;
+	if (c->seq != PS_SEQ_UNBOUNDED && e->max_meta_seq > c->seq)
+	{
+		uint32_t	fence = UINT32_MAX;
+
+		for (uint32_t i = 0; i < e->nev; i++)
+		{
+			const ForkEvent *v = &e->ev[i];
+
+			if (v->lsn > cap)
+				break;
+			if (v->kind != FEV_SET && v->kind != FEV_DEAD)
+				continue;
+			if (fork_event_hidden(e, i, c, B, has_B))
+				continue;
+			if (v->kind == FEV_DEAD)
+				fence = 0;
+			else if (v->nblocks < fence)
+				fence = v->nblocks;
+		}
+		return fence != UINT32_MAX && block >= fence;
+	}
 	if (seq_cap == 0)
 	{
 		uint32_t lo = 0;
@@ -5902,7 +6733,63 @@ fork_event_check_order(const ForkEnt *e)
 			e->ev[i - 1].admission_seq > e->ev[i].admission_seq)
 			return 0;
 	}
-	return zero == e->nlegacy_seq;
+	if (zero != e->nlegacy_seq)
+		return 0;
+
+	/*
+	 * META_FIRST / late_meta_idx consistency (design doc S9.3): within each
+	 * lsn run, at most one META event carries META_FIRST, it must be the
+	 * minimum-admission_seq META event in that run, and late_meta_idx names
+	 * exactly the other META events, each exactly once.
+	 */
+	{
+		uint32_t	run_start = 0;
+		uint32_t	nlate_seen = 0;
+
+		for (uint32_t i = 0; i <= e->nev; i++)
+		{
+			if (i < e->nev && e->ev[i].lsn == e->ev[run_start].lsn &&
+				i != run_start)
+				continue;
+			if (i > run_start)
+			{
+				uint32_t	best = UINT32_MAX;
+
+				for (uint32_t j = run_start; j < i; j++)
+				{
+					if (!(e->ev[j].flags & FEV_F_META))
+						continue;
+					if (e->ev[j].flags & FEV_F_META_FIRST)
+					{
+						if (best != UINT32_MAX)
+							return 0;	/* two META_FIRSTs in one run */
+						best = j;
+					}
+				}
+				for (uint32_t j = run_start; j < i; j++)
+					if ((e->ev[j].flags & FEV_F_META) && best != UINT32_MAX &&
+						j != best &&
+						e->ev[j].admission_seq < e->ev[best].admission_seq)
+						return 0;	/* best is not the minimum */
+			}
+			run_start = i;
+		}
+		for (uint32_t i = 0; i < e->nev; i++)
+			if ((e->ev[i].flags & FEV_F_META) &&
+				!(e->ev[i].flags & FEV_F_META_FIRST))
+				nlate_seen++;
+		if (nlate_seen != e->nlate_meta)
+			return 0;
+		for (uint32_t k = 0; k < e->nlate_meta; k++)
+		{
+			uint32_t	idx = e->late_meta_idx[k];
+
+			if (idx >= e->nev || !(e->ev[idx].flags & FEV_F_META) ||
+				(e->ev[idx].flags & FEV_F_META_FIRST))
+				return 0;
+		}
+	}
+	return 1;
 }
 
 /*
@@ -5914,19 +6801,136 @@ fork_event_check_order(const ForkEnt *e)
  * markers (fork_event_add_seg_marker(), below) are one event per ordered
  * write; every lookup that needs to find or bound a specific (lsn,
  * admission_seq) tuple goes through the position index above instead of
- * scanning, except on the legacy forks the index does not cover.
+ * scanning, except on the legacy forks the index does not cover.  An inert
+ * ordered marker (kind > FEV_DEAD, never activated to a size event) is not
+ * bounded by distinct sizes the way a GROW is; it is instead bounded per
+ * daemon lifetime by fork_event_compact_dropped_markers(), which runs right
+ * after every successful fork_meta_snapshot_build() and drops exactly the
+ * inert markers it drops from the new checkpoint/tail.
 */
 static _Thread_local int fork_event_cache_defer = 0;
 
+/*
+ * Recompute FEV_F_META_FIRST and late_meta_idx from the present META set
+ * (design doc S3.2/S9.3: "recomputed exactly on load and after in-memory
+ * compaction; it is a pure function of the present set").  O(e->nev);
+ * called only when a META event is inserted, so it never runs on the
+ * PAGE-class GROW hot path.  The array is lsn-ordered (fork_event_add()'s
+ * own invariant), so same-lsn events are always contiguous: one linear
+ * pass buckets by lsn and, within each META run, marks the min-seq event
+ * (legacy seq 0 sorts first) as META_FIRST and every other one as late.
+ */
+/*
+ * late_meta_idx stores array indexes, exactly like def_idx; an insert at
+ * event_idx shifts every existing surviving event at or after it up by one
+ * slot (fork_event_insert_pos()), so any stored index >= event_idx must
+ * shift too.  Called on every insert that does NOT itself trigger
+ * fork_event_recompute_meta_first() (which instead rebuilds the whole
+ * array from the current, already-inserted state and so needs no prior
+ * shift).
+ */
 static void
-fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
-			   uint32_t nblocks, uint8_t kind)
+fork_late_meta_shift(ForkEnt *e, uint32_t event_idx)
+{
+	for (uint32_t k = 0; k < e->nlate_meta; k++)
+		if (e->late_meta_idx[k] >= event_idx)
+			e->late_meta_idx[k]++;
+}
+
+static void
+fork_event_recompute_meta_first(ForkEnt *e)
+{
+	uint32_t	run_start = 0;
+
+	e->nlate_meta = 0;
+	for (uint32_t i = 0; i <= e->nev; i++)
+	{
+		if (i < e->nev && e->ev[i].lsn == e->ev[run_start].lsn && i != run_start)
+			continue;
+		if (i > run_start)
+		{
+			uint32_t	best = UINT32_MAX;
+
+			for (uint32_t j = run_start; j < i; j++)
+			{
+				if (!(e->ev[j].flags & FEV_F_META))
+					continue;
+				e->ev[j].flags &= (uint8_t) ~FEV_F_META_FIRST;
+				if (best == UINT32_MAX ||
+					e->ev[j].admission_seq < e->ev[best].admission_seq)
+					best = j;
+			}
+			if (best != UINT32_MAX)
+			{
+				e->ev[best].flags |= FEV_F_META_FIRST;
+				for (uint32_t j = run_start; j < i; j++)
+				{
+					if (j == best || !(e->ev[j].flags & FEV_F_META))
+						continue;
+					if (e->nlate_meta == e->late_meta_cap)
+					{
+						e->late_meta_cap = e->late_meta_cap ?
+							e->late_meta_cap * 2 : 4;
+						e->late_meta_idx = realloc(e->late_meta_idx,
+							(size_t) e->late_meta_cap * sizeof(*e->late_meta_idx));
+					}
+					e->late_meta_idx[e->nlate_meta++] = j;
+				}
+			}
+		}
+		run_start = i;
+	}
+}
+
+/*
+ * Test-only escape hatch (I-ALLOC, BRANCH_SNAPSHOT_SEQ_CAP.md S2): the
+ * self-tests build a throwaway ForkEnt on the stack that is never inserted
+ * into any shard's index, so no shard lock is meaningful for it.
+ * fork_event_add() itself asserts I-ALLOC and calls this.
+ *
+ * Returns whether an event was actually inserted (Codex 4104350482).  For
+ * an idempotent GROW whose requested size is already visible (the early
+ * return just below), nothing about the fork's state changes, so the
+ * caller must not bump any admission-observation counter for it: a
+ * replayed no-op growth at or below a WAL-index horizon must not
+ * manufacture a "late admission" observation when fork metadata never
+ * actually changed.
+ */
+static bool
+fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
+			   uint32_t nblocks, uint8_t kind, bool meta)
 {
 	uint32_t	i;
+	uint8_t wire_flags = kind & (FEV_W_META | FEV_W_UNSTAMPED);
+	bool is_meta;
 
-	if (!fork_event_cache_defer && kind == FEV_GROW &&
+	kind = FEV_KIND(kind);
+	is_meta = kind == FEV_SET || kind == FEV_DEAD || meta ||
+		(wire_flags & FEV_W_META);
+
+	if (!fork_event_cache_defer && is_meta && kind == FEV_GROW &&
 		fork_size_asof_hop(e, lsn, admission_seq) >= nblocks)
-		return;
+		return false;
+	if (kind == FEV_GROW && !is_meta)
+	{
+		uint32_t end = fork_event_index_usable(e, admission_seq) ?
+			fork_event_upper_bound(e, lsn, admission_seq) : e->nev;
+
+		for (uint32_t j = end; j > 0; j--)
+		{
+			const ForkEvent *v = &e->ev[j - 1];
+
+			if (v->lsn < lsn)
+				break;
+			if (v->lsn == lsn && v->admission_seq == admission_seq &&
+				v->kind == FEV_GROW && v->marker_kind == 0 &&
+				v->nblocks == nblocks && !(v->flags & FEV_F_META))
+				return false;
+			if (fork_event_index_usable(e, admission_seq) &&
+				v->admission_seq < admission_seq)
+				break;
+		}
+	}
 	if (kind != FEV_GROW && lsn > e->last_def_lsn)
 		e->last_def_lsn = lsn;
 	if (e->nev == e->evcap)
@@ -5941,12 +6945,36 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->ev[i].marker_kind = 0;
+	e->ev[i].flags = (is_meta ? FEV_F_META : 0) |
+		(wire_flags & FEV_W_UNSTAMPED ? FEV_F_UNSTAMPED : 0);
 	e->nev++;
 	if (admission_seq == 0)
 		e->nlegacy_seq++;
 	fork_def_index_insert(e, i, kind == FEV_SET || kind == FEV_DEAD);
+	if (kind == FEV_GROW)
+	{
+		if (is_meta)
+		{
+			if (admission_seq > e->max_meta_seq)
+				e->max_meta_seq = admission_seq;
+		}
+		else
+		{
+			bool		has_range;
+			uint64_t	B = timeline_inherited_below(e->timeline, &has_range);
+
+			if (has_range && lsn <= B && admission_seq > e->max_inherited_page_seq)
+				e->max_inherited_page_seq = admission_seq;
+		}
+	}
+	else if (admission_seq > e->max_meta_seq)
+		e->max_meta_seq = admission_seq;	/* SET/DEAD: always META */
+	if (is_meta)
+		fork_event_recompute_meta_first(e);
+	else
+		fork_late_meta_shift(e, i);
 	if (fork_event_cache_defer)
-		return;
+		return true;
 	fork_event_cache_from(e, i);
 
 	/*
@@ -5971,21 +6999,36 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	{
 		for (uint32_t j = e->nev - 1; j > i; j--)
 			if (e->ev[j].kind == FEV_SET || e->ev[j].kind == FEV_DEAD)
-				return;			/* covered by a newer definitive event */
+				return true;	/* covered by a newer definitive event */
 		if (nblocks > e->nblocks)
 			e->nblocks = nblocks;
 	}
 	else
 		e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
+	return true;
+}
+
+static void
+fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
+			   uint32_t nblocks, uint8_t kind, bool meta)
+{
+	ps_assert_shard_held_for_key(&e->key);
+	/* Only an actual insert changes what any reader or planner sees, so
+	 * only bump the (now purely informational) admission-observation
+	 * counter on one (Codex 4104350482). */
+	if (fork_event_add_unchecked(e, lsn, admission_seq, nblocks, kind, meta))
+		fork_event_admit_seq_bump(e->timeline, admission_seq);
 }
 
 /*
  * Preserve a segment growth's position among equal-LSN fork-meta events without
  * making the marker itself a size event.  Recovery activates the placeholder
  * only after validating the matching segment header and complete page body.
+ * fork_event_add_seg_marker_unchecked() is the I-ALLOC escape hatch for the
+ * self-tests, exactly like fork_event_add_unchecked() above.
  */
 static void
-fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
+fork_event_add_seg_marker_unchecked(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 						  uint8_t kind, uint64_t order_id,
 						  uint64_t admission_seq)
 {
@@ -6003,11 +7046,28 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->ev[i].marker_kind = kind;
+	/* Ordered/segment markers are always PAGE-class (S1.1): they mirror a
+	 * page append, never a ZEROEXTEND.  Not META, so no META_FIRST bit and
+	 * no recompute; a fresh assignment (not &=) since e->ev[i] can be a
+	 * reused, previously-populated slot. */
+	e->ev[i].flags = 0;
 	e->nev++;
 	if (admission_seq == 0)
 		e->nlegacy_seq++;
 	fork_def_index_insert(e, i, 0);
+	fork_late_meta_shift(e, i);
 	fork_event_cache_from(e, i);
+}
+
+static void
+fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
+						  uint8_t kind, uint64_t order_id,
+						  uint64_t admission_seq)
+{
+	ps_assert_shard_held_for_key(&e->key);
+	fork_event_add_seg_marker_unchecked(e, lsn, nblocks, kind, order_id,
+										admission_seq);
+	fork_event_admit_seq_bump(e->timeline, admission_seq);
 }
 
 static int
@@ -6032,7 +7092,13 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 		{
 			if (v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_GROW_BOUND)
 			{
-				v->kind = FEV_GROW;
+				bool		has_range;
+				uint64_t	B = timeline_inherited_below(e->timeline, &has_range);
+
+				v->kind = FEV_GROW;	/* still PAGE-class: flags unchanged */
+				if (has_range && v->lsn <= B &&
+					v->admission_seq > e->max_inherited_page_seq)
+					e->max_inherited_page_seq = v->admission_seq;
 				fork_event_cache_from(e, i);
 				e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
 			}
@@ -6130,7 +7196,7 @@ fork_event_adopt_orphaned_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
  * and recover()'s deferred look-ahead): fe exists, the record's identity is
  * nonzero and fork_meta_orphan_proven() (a necessary filter only -- see its
  * header comment), and the fork's size at this position already covers the
- * block -- the same decision the live write made (segment_grows == 0) --
+ * block -- the same decision the live write made (extends_uncapped == 0) --
  * with no event already occupying this exact (lsn, admission_seq).  An
  * inert marker never contributes to fork_size_asof_hop() (only GROW/SET/DEAD
  * do), so the only effect of admitting it is to admit the page version.
@@ -6356,6 +7422,10 @@ fork_event_selftest_rand(uint64_t *state)
 	return x * 0x2545F4914F6CDD1DULL;
 }
 
+/* Defined below, near fork_meta_snapshot_build(); forward-declared here so
+ * the self-test hook's compact phase can call it on its private ForkEnt. */
+static void fork_event_compact_entry(ForkEnt *e);
+
 typedef struct FevSelftestMarker
 {
 	uint64_t	lsn;
@@ -6457,7 +7527,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 			uint32_t	nblocks = (uint32_t) (fork_event_selftest_rand(&rngstate) % 9);
 
 			kind = roll == 0 ? FEV_SET : roll == 1 ? FEV_DEAD : FEV_GROW;
-			fork_event_add(&fe, lsn, admission_seq, nblocks, kind);
+			fork_event_add_unchecked(&fe, lsn, admission_seq, nblocks, kind, false);
 			/* A GROW that does not raise the size at (lsn, admission_seq) is
 			 * deduped (fork_event_add() returns early, nev unchanged); the
 			 * slot promise has nothing to check in that case. */
@@ -6475,7 +7545,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 			uint32_t	nblocks = 1 + (uint32_t) (fork_event_selftest_rand(&rngstate) % 8);
 			uint64_t	order_id = 1 + fork_event_selftest_rand(&rngstate) % UINT32_MAX;
 
-			fork_event_add_seg_marker(&fe, lsn, nblocks, kind, order_id,
+			fork_event_add_seg_marker_unchecked(&fe, lsn, nblocks, kind, order_id,
 									  admission_seq);
 			FEV_ST_CHECK(fe.nev == old_nev + 1);
 			FEV_ST_CHECK(fe.ev[expected_slot].lsn == lsn &&
@@ -6519,7 +7589,7 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 		}
 		else if (i % 3 == 1 && m->kind == FEV_SEG_COMMIT_BOUND)
 		{
-			fork_event_add(&fe, m->lsn, m->admission_seq, 100, FEV_GROW);
+			fork_event_add_unchecked(&fe, m->lsn, m->admission_seq, 100, FEV_GROW, false);
 			FEV_ST_CHECK(fork_event_check_order(&fe));
 		}
 	}
@@ -6546,16 +7616,18 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 		}
 
 		{
+			ViewCap		qc = viewcap_lsn_seq(cap, seq_cap);
 			uint32_t	nb_fast = 0,
 						nb_ref = 0;
-			int			s_fast = fork_asof_hop(&fe, cap, seq_cap, &nb_fast);
+			int			s_fast = fork_asof_hop(&fe, &qc, 0, false, &nb_fast);
 			int			s_ref = fork_asof_hop_reference(&fe, cap, seq_cap, &nb_ref);
 
 			FEV_ST_CHECK(s_fast == s_ref && nb_fast == nb_ref);
 		}
 		{
+			ViewCap		qc = viewcap_lsn_seq(cap, seq_cap);
 			uint32_t	block = (uint32_t) (fork_event_selftest_rand(&rngstate) % 12);
-			int			f_fast = fork_inheritance_fenced(&fe, block, cap, seq_cap);
+			int			f_fast = fork_inheritance_fenced(&fe, block, &qc, 0, false);
 			int			f_ref = fork_inheritance_fenced_reference(&fe, block, cap,
 																	 seq_cap);
 
@@ -6603,12 +7675,549 @@ ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 		FEV_ST_CHECK(zero == fe.nlegacy_seq);
 	}
 
+	/*
+	 * Compact phase (design B): flag a random subset of the surviving inert
+	 * markers (kind > FEV_DEAD) as if the last snapshot build had dropped
+	 * them, run the same per-entry compaction fork_meta_snapshot_maintenance()
+	 * calls after every successful cutover, and check it keeps every promise
+	 * -- array order, nlegacy_seq, def_idx, and every surviving event's own
+	 * fields, including its cached_* triple (a no-op element removed from a
+	 * prefix fold changes nothing below it).
+	 */
+	{
+		ForkEvent  *pre;
+		uint8_t    *flagged;
+		uint32_t	npre = fe.nev;
+		uint32_t	nsurvive = 0;
+		uint32_t	j,
+					k,
+					zero;
+
+		pre = npre ? malloc((size_t) npre * sizeof(*pre)) : NULL;
+		flagged = calloc(npre ? npre : 1, 1);
+		FEV_ST_CHECK((npre == 0 || pre != NULL) && flagged != NULL);
+		if (npre > 0)
+			memcpy(pre, fe.ev, (size_t) npre * sizeof(*pre));
+
+		for (uint32_t i = 0; i < npre; i++)
+		{
+			if (fe.ev[i].kind > FEV_DEAD &&
+				(fork_event_selftest_rand(&rngstate) % 2) == 0)
+			{
+				fe.ev[i].flags |= FEV_F_SNAPSHOT_DROPPED;
+				flagged[i] = 1;
+			}
+			else
+				nsurvive++;
+		}
+
+		fork_event_compact_entry(&fe);
+
+		FEV_ST_CHECK(fe.nev == nsurvive);
+		FEV_ST_CHECK(fork_event_check_order(&fe));
+
+		j = k = zero = 0;
+		for (uint32_t i = 0; i < npre; i++)
+		{
+			if (flagged[i])
+				continue;
+			FEV_ST_CHECK(j < fe.nev);
+			FEV_ST_CHECK(fe.ev[j].lsn == pre[i].lsn &&
+						 fe.ev[j].admission_seq == pre[i].admission_seq &&
+						 fe.ev[j].order_id == pre[i].order_id &&
+						 fe.ev[j].nblocks == pre[i].nblocks &&
+						 fe.ev[j].kind == pre[i].kind &&
+						 fe.ev[j].marker_kind == pre[i].marker_kind &&
+						 fe.ev[j].cached_nblocks == pre[i].cached_nblocks &&
+						 fe.ev[j].cached_fence_nblocks == pre[i].cached_fence_nblocks &&
+						 fe.ev[j].cached_state == pre[i].cached_state &&
+						 !(fe.ev[j].flags & FEV_F_SNAPSHOT_DROPPED));
+			if (fe.ev[j].kind == FEV_SET || fe.ev[j].kind == FEV_DEAD)
+			{
+				FEV_ST_CHECK(k < fe.ndef && fe.def_idx[k] == j);
+				k++;
+			}
+			if (fe.ev[j].admission_seq == 0)
+				zero++;
+			j++;
+		}
+		FEV_ST_CHECK(j == fe.nev && k == fe.ndef && zero == fe.nlegacy_seq);
+		free(pre);
+		free(flagged);
+	}
+
+	/*
+	 * Compact-to-index-usable case (Low-2 review finding): a fork whose
+	 * only legacy (admission_seq == 0) events are inert markers must
+	 * regain fork_event_index_usable() -- the (lsn, admission_seq) index,
+	 * disabled by nlegacy_seq != 0 -- once compaction removes every one of
+	 * them, and its array must stay in tuple order at that point.  Build a
+	 * small private fork mixing nonzero-seq inert markers with legacy
+	 * (seq 0) inert markers, flag every legacy one, compact, and check
+	 * nlegacy_seq reaches exactly 0, the array is still tuple-ordered, the
+	 * index is now usable, and no seq-0 event remains.
+	 */
+	{
+		ForkEnt		fe2;
+		uint64_t	rng2 = seed ? seed * 7 + 3 : 5;
+
+		memset(&fe2, 0, sizeof(fe2));
+		for (uint32_t i = 0; i < 40; i++)
+		{
+			uint64_t	lsn = 1 + fork_event_selftest_rand(&rng2) % 4;
+			uint32_t	nblocks = 1 + (uint32_t) (fork_event_selftest_rand(&rng2) % 8);
+			uint64_t	order_id = 1 + fork_event_selftest_rand(&rng2) % UINT32_MAX;
+
+			if (i % 3 == 0)
+				fork_event_add_seg_marker_unchecked(&fe2, lsn, nblocks,
+										  FEV_SEG_COMMIT_BOUND, order_id, 0);
+			else
+				fork_event_add_seg_marker_unchecked(&fe2, lsn, nblocks,
+										  FEV_SEG_COMMIT_BOUND, order_id,
+										  100 + i);
+		}
+		FEV_ST_CHECK(fe2.nlegacy_seq > 0 && fork_event_check_order(&fe2));
+		FEV_ST_CHECK(!fork_event_index_usable(&fe2, 1));
+		for (uint32_t i = 0; i < fe2.nev; i++)
+			if (fe2.ev[i].admission_seq == 0)
+				fe2.ev[i].flags |= FEV_F_SNAPSHOT_DROPPED;
+		fork_event_compact_entry(&fe2);
+		FEV_ST_CHECK(fe2.nlegacy_seq == 0 && fork_event_check_order(&fe2));
+		FEV_ST_CHECK(fork_event_index_usable(&fe2, 1));
+		for (uint32_t i = 0; i < fe2.nev; i++)
+			FEV_ST_CHECK(fe2.ev[i].admission_seq != 0);
+		free(fe2.ev);
+		free(fe2.def_idx);
+		free(fe2.late_meta_idx);
+	}
+
 #undef FEV_ST_CHECK
 done:
 	free(seq_pool);
 	free(markers);
 	free(fe.ev);
 	free(fe.def_idx);
+	free(fe.late_meta_idx);
+	return rc;
+}
+
+/*
+ * ============================================================================
+ * Phase P1 differential tests (BRANCH_SNAPSHOT_SEQ_CAP.md S9.3).
+ *
+ * ref_page_visible() below is today's (pre-P1) page_visible() body, copied
+ * verbatim; fork_asof_hop_reference()/fork_inheritance_fenced_reference()
+ * above already are that same kind of frozen pre-index oracle for the fork
+ * fold, so they are reused rather than duplicated.  ref_fork_page_invalidated()
+ * is a verbatim copy of the pre-P1 fork_page_invalidated() body.
+ *
+ * ps_test_viewcap_differential() checks, over random histories:
+ *  (a) at PS_SEQ_UNBOUNDED (every production cap in P1), the new
+ *      page_select()/fork_asof_hop()/fork_inheritance_fenced()/
+ *      fork_page_invalidated() are bit-for-bit identical to these frozen
+ *      references -- the "no behaviour change" requirement;
+ *  (b) with finite random caps, page_select() agrees with a brute-force
+ *      admissibility check written directly from the design doc's S1.3
+ *      rule text (independent of page_select()'s own code), and
+ *      fork_asof_hop()'s slow path agrees with an independent brute-force
+ *      fold over the S3.2 hidden-event predicate, written directly from
+ *      the rule text rather than by calling fork_event_hidden().  Finite
+ *      caps are exercised only here: no production path constructs one in
+ *      P1.
+ * ============================================================================
+ */
+
+/* Verbatim copy of today's (pre-P1) page_visible() body. */
+static PageVer *
+ref_page_visible(PageEnt *e, uint64_t read_lsn, uint64_t read_seq)
+{
+	PageVer    *best = NULL;
+
+	for (int i = 0; i < e->nver; i++)
+	{
+		PageVer    *v = &e->vers[i];
+
+		if (v->lsn <= read_lsn &&
+			(v->lsn < read_lsn || read_seq == 0 || v->admission_seq == 0 ||
+			 v->admission_seq <= read_seq) &&
+			(!best || v->lsn > best->lsn ||
+			 (v->lsn == best->lsn &&
+			  v->admission_seq >= best->admission_seq)))
+			best = v;
+	}
+	return best;
+}
+
+/* Verbatim copy of today's (pre-P1) fork_page_invalidated() body. */
+static int
+ref_fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
+						  uint64_t cap, uint64_t seq_cap)
+{
+	if (e == NULL || page == NULL || e->last_def_lsn < page->lsn)
+		return 0;
+	for (int i = (int) e->ndef - 1; i >= 0; i--)
+	{
+		const ForkEvent *v = &e->ev[e->def_idx[i]];
+
+		if (v->lsn > cap ||
+			(seq_cap != 0 && v->lsn == cap && v->admission_seq != 0 &&
+			 v->admission_seq > seq_cap) ||
+			(v->kind != FEV_SET && v->kind != FEV_DEAD))
+			continue;
+		if (v->lsn != 0 && page->lsn != 0)
+		{
+			if (v->lsn < page->lsn)
+				break;
+			if (v->lsn == page->lsn &&
+				v->admission_seq <= page->admission_seq)
+				continue;
+		}
+		else if (v->admission_seq <= page->admission_seq)
+			continue;
+		if (v->kind == FEV_DEAD || block >= v->nblocks)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Brute-force page admissibility, written directly from S1.3's rule text,
+ * independent of page_select()'s own code:
+ *   admissible(v) <=> p <= L && (p < L || v.seq <= X)
+ *                   && (v.seq <= S || (p > B_k && v.seq == s_min(p)))
+ * then the admissible version with the greatest (lsn, seq).
+ */
+static PageVer *
+brute_page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
+{
+	PageVer    *best = NULL;
+
+	for (int i = 0; i < e->nver; i++)
+	{
+		PageVer    *v = &e->vers[i];
+		uint64_t	vseq = v->admission_seq;
+		bool		p_le_L = v->lsn <= c->lsn;
+		bool		strict_ok = v->lsn < c->lsn || vseq == 0 ||
+			c->strict_seq == PS_SEQ_UNBOUNDED || vseq <= c->strict_seq;
+		bool		seq_ok = vseq == 0 || c->seq == PS_SEQ_UNBOUNDED ||
+			vseq <= c->seq;
+
+		if (!seq_ok)
+		{
+			bool		eligible = !has_B || v->lsn > B;
+
+			if (eligible)
+			{
+				uint64_t	smin = UINT64_MAX;
+
+				for (int j = 0; j < e->nver; j++)
+					if (e->vers[j].lsn == v->lsn &&
+						e->vers[j].admission_seq < smin)
+						smin = e->vers[j].admission_seq;
+				seq_ok = (vseq == smin);
+			}
+		}
+		if (p_le_L && strict_ok && seq_ok &&
+			(!best || v->lsn > best->lsn ||
+			 (v->lsn == best->lsn && vseq >= best->admission_seq)))
+			best = v;
+	}
+	return best;
+}
+
+/*
+ * Brute-force fork-size fold, written directly from S1.3/S3.2's rule text
+ * (an event is hidden, and skipped, exactly when the H-set membership test
+ * below holds), independent of fork_event_hidden()/fork_asof_hop_slow()'s
+ * own code.  Only GROW/SET/DEAD (kind <= FEV_DEAD) events are ever folded,
+ * exactly as fork_event_cache_from() folds them.
+ */
+static int
+brute_fork_asof_hop(const ForkEnt *e, const ViewCap *c, uint64_t B, bool has_B,
+					uint32_t *nb_out)
+{
+	uint8_t		state = FORK_HOP_NONE;
+	uint32_t	nb = 0;
+
+	*nb_out = 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		const ForkEvent *v = &e->ev[i];
+		uint64_t	vseq = v->admission_seq;
+		bool		hidden;
+
+		if (v->kind > FEV_DEAD)
+			continue;
+		if (v->lsn > c->lsn)
+			break;
+		if (v->lsn == c->lsn && c->strict_seq != PS_SEQ_UNBOUNDED &&
+			vseq != 0 && vseq > c->strict_seq)
+			continue;			/* fails the boundary conjunct: not in scope */
+		if (vseq == 0 || c->seq == PS_SEQ_UNBOUNDED || vseq <= c->seq)
+			hidden = false;
+		else if (v->flags & FEV_F_UNSTAMPED)
+			hidden = true;
+		else if (has_B && v->lsn <= B)
+			hidden = true;
+		else if (v->flags & FEV_F_META)
+			hidden = !(v->flags & FEV_F_META_FIRST);
+		else
+			hidden = false;		/* PAGE-class GROW, lsn > B_k: escapes */
+		if (hidden)
+			continue;
+		if (v->kind == FEV_GROW)
+		{
+			if (v->nblocks > nb)
+				nb = v->nblocks;
+			state = (state == FORK_HOP_NONE || state == FORK_HOP_GROW) ?
+				FORK_HOP_GROW : FORK_HOP_DEF;
+		}
+		else if (v->kind == FEV_SET)
+		{
+			nb = v->nblocks;
+			state = FORK_HOP_DEF;
+		}
+		else if (v->kind == FEV_DEAD)
+		{
+			nb = 0;
+			state = FORK_HOP_DEAD;
+		}
+	}
+	*nb_out = nb;
+	return state;
+}
+
+/*
+ * Randomized differential test (design doc S9.3).  Returns 0 on success, or
+ * the 1-based index of the first failed check.
+ */
+int
+ps_test_viewcap_differential(uint64_t seed, uint32_t niter)
+{
+	uint64_t	rng = seed ? seed : 1;
+	int			checkno = 0;
+	int			rc = 0;
+	uint32_t	viewcap_test_unstamped_hidden_hits = 0;
+
+#define VC_CHECK(cond) \
+	do { \
+		checkno++; \
+		if (!(cond)) \
+		{ \
+			rc = checkno; \
+			goto done; \
+		} \
+	} while (0)
+
+	for (uint32_t iter = 0; iter < niter; iter++)
+	{
+		PageEnt		e;
+		PageVer		vers[16];
+		int			nver = 1 + (int) (fork_event_selftest_rand(&rng) % 16);
+
+		memset(&e, 0, sizeof(e));
+		e.vers = vers;
+		e.nver = nver;
+		for (int i = 0; i < nver; i++)
+		{
+			vers[i].lsn = fork_event_selftest_rand(&rng) % 12;
+			vers[i].admission_seq = (fork_event_selftest_rand(&rng) % 5 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 20;
+			vers[i].seg = -1;
+			vers[i].off = 0;
+			vers[i].shard = 0;
+		}
+
+		/* (a) infinity: must equal today's page_visible() exactly. */
+		{
+			uint64_t	read_lsn = fork_event_selftest_rand(&rng) % 14;
+			uint64_t	read_seq = (fork_event_selftest_rand(&rng) % 4 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 22;
+			ViewCap		c = {read_lsn, PS_SEQ_UNBOUNDED,
+		read_seq ? read_seq : PS_SEQ_UNBOUNDED, true};
+			PageVer    *got = page_select(&e, &c, 0, false);
+			PageVer    *want = ref_page_visible(&e, read_lsn, read_seq);
+			PageVer    *want2 = page_visible(&e, read_lsn, read_seq);
+
+			VC_CHECK((got == NULL) == (want == NULL));
+			VC_CHECK(got == want2);	/* page_visible() is page_select()'s wrapper */
+			if (got && want)
+				VC_CHECK(got->lsn == want->lsn &&
+						 got->admission_seq == want->admission_seq);
+		}
+
+		/* (b) finite caps: must equal the literal-rule brute force. */
+		{
+			uint64_t	L = fork_event_selftest_rand(&rng) % 14;
+			uint64_t	S = 1 + fork_event_selftest_rand(&rng) % 22;
+			uint64_t	X = (fork_event_selftest_rand(&rng) % 3 == 0) ?
+				PS_SEQ_UNBOUNDED : 1 + fork_event_selftest_rand(&rng) % 22;
+			bool		has_B = (fork_event_selftest_rand(&rng) % 2) != 0;
+			uint64_t	B = has_B ? fork_event_selftest_rand(&rng) % 10 : 0;
+			ViewCap		c;
+			PageVer    *got;
+			PageVer    *want;
+
+			c.lsn = L;
+			c.seq = S;
+			c.strict_seq = X;
+			c.legacy = false;
+			got = page_select(&e, &c, B, has_B);
+			want = brute_page_select(&e, &c, B, has_B);
+			VC_CHECK((got == NULL) == (want == NULL));
+			if (got && want)
+				VC_CHECK(got->lsn == want->lsn &&
+						 got->admission_seq == want->admission_seq);
+		}
+	}
+
+	for (uint32_t iter = 0; iter < niter; iter++)
+	{
+		/* A scratch timeline slot, reconfigured every iteration: fork_event_add()
+		 * maintains max_inherited_page_seq against e->timeline's *real* ancestry
+		 * (timeline_inherited_below(), exactly as production does through
+		 * TlWalk), so this test's own B/has_B must be the ancestry it actually
+		 * inserted the events under, not an independent draw made afterwards. */
+		const uint32_t viewcap_test_tl = MAX_TIMELINES - 1;
+		ForkEnt		fe;
+		uint32_t	nevents = 1 + (uint32_t) (fork_event_selftest_rand(&rng) % 12);
+		bool		has_B = (fork_event_selftest_rand(&rng) % 2) != 0;
+		uint64_t	B = has_B ? fork_event_selftest_rand(&rng) % 8 : 0;
+
+		timelines[viewcap_test_tl].defined = 1;
+		timelines[viewcap_test_tl].parent = has_B ? 0 : -1;
+		timelines[viewcap_test_tl].branch_lsn = B;
+
+		memset(&fe, 0, sizeof(fe));
+		fe.timeline = viewcap_test_tl;
+		for (uint32_t i = 0; i < nevents; i++)
+		{
+			uint64_t	lsn = fork_event_selftest_rand(&rng) % 10;
+			uint64_t	seq = (fork_event_selftest_rand(&rng) % 5 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 30;
+			uint32_t	roll = (uint32_t) (fork_event_selftest_rand(&rng) % 10);
+			uint8_t		kind = roll < 6 ? FEV_GROW : roll < 8 ? FEV_SET : FEV_DEAD;
+			uint32_t	nblocks = 1 + (uint32_t) (fork_event_selftest_rand(&rng) % 8);
+			bool		meta = kind == FEV_GROW &&
+				(fork_event_selftest_rand(&rng) % 2) == 0;
+
+			fork_event_add_unchecked(&fe, lsn, seq, nblocks, kind, meta);
+		}
+
+		/*
+		 * Mix in FEV_F_UNSTAMPED coverage (Codex round, 4102106012): no live
+		 * path sets this flag yet (the setter lands in P4 together with the
+		 * persisted flag, design doc S5), but fork_event_hidden()/
+		 * brute_fork_asof_hop() already implement its S1.6 rule ("no
+		 * first-arrival escape, ever", checked ahead of the META escape), so
+		 * flip it on a test-only random subset of the events just inserted,
+		 * including META ones (a META event can also be flagged UNSTAMPED;
+		 * the predicate's priority order is exactly what this exercises).
+		 * max_meta_seq is defined as the max seq over the "META/UNSTAMPED
+		 * events currently present" (see its field comment): bump it here
+		 * too, exactly what a real P4 setter would have to do, so
+		 * fork_asof_hop()'s fast-path gate stays correct for these
+		 * test-only events.
+		 */
+		for (uint32_t i = 0; i < fe.nev; i++)
+		{
+			if (fe.ev[i].kind > FEV_DEAD)
+				continue;		/* only GROW/SET/DEAD are ever folded */
+			if ((fork_event_selftest_rand(&rng) % 3) == 0)
+			{
+				fe.ev[i].flags |= FEV_F_UNSTAMPED;
+				if (fe.ev[i].admission_seq > fe.max_meta_seq)
+					fe.max_meta_seq = fe.ev[i].admission_seq;
+			}
+		}
+		VC_CHECK(fork_event_check_order(&fe));
+
+		/* (a) infinity: must equal the pre-index oracles exactly. */
+		{
+			uint64_t	cap = fork_event_selftest_rand(&rng) % 12;
+			uint64_t	seq_cap = (fork_event_selftest_rand(&rng) % 3 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 32;
+			ViewCap		c = viewcap_lsn_seq(cap, seq_cap);
+			uint32_t	nb_got = 0,
+						nb_want = 0;
+			int			s_got = fork_asof_hop(&fe, &c, 0, false, &nb_got);
+			int			s_want = fork_asof_hop_reference(&fe, cap, seq_cap,
+														  &nb_want);
+			uint32_t	block = (uint32_t) (fork_event_selftest_rand(&rng) % 10);
+			int			f_got = fork_inheritance_fenced(&fe, block, &c, 0, false);
+			int			f_want = fork_inheritance_fenced_reference(&fe, block,
+																	cap, seq_cap);
+
+			VC_CHECK(s_got == s_want && nb_got == nb_want);
+			VC_CHECK((f_got != 0) == (f_want != 0));
+		}
+
+		/* fork_page_invalidated(), at infinity, against its own pre-P1
+		 * verbatim copy. */
+		{
+			PageVer		pv;
+			uint64_t	cap = fork_event_selftest_rand(&rng) % 12;
+			uint64_t	seq_cap = (fork_event_selftest_rand(&rng) % 3 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 32;
+			uint32_t	block = (uint32_t) (fork_event_selftest_rand(&rng) % 10);
+			ViewCap		c = viewcap_lsn_seq(cap, seq_cap);
+			int			got;
+			int			want;
+
+			pv.lsn = fork_event_selftest_rand(&rng) % 12;
+			pv.admission_seq = (fork_event_selftest_rand(&rng) % 4 == 0) ?
+				0 : 1 + fork_event_selftest_rand(&rng) % 30;
+			pv.seg = -1;
+			pv.off = 0;
+			pv.shard = 0;
+			got = fork_page_invalidated(&fe, block, &pv, &c, 0, false);
+			want = ref_fork_page_invalidated(&fe, block, &pv, cap, seq_cap);
+			VC_CHECK((got != 0) == (want != 0));
+		}
+
+		/* (b) finite caps: fork_asof_hop()'s slow path against the
+		 * independent literal-rule brute force fold.  Reuses this
+		 * iteration's own B/has_B -- the ancestry the events above were
+		 * actually inserted under (see the comment at the top of this
+		 * loop) -- with a fresh random L/S/X. */
+		{
+			uint64_t	L = fork_event_selftest_rand(&rng) % 10;
+			uint64_t	S = 1 + fork_event_selftest_rand(&rng) % 34;
+			uint64_t	X = (fork_event_selftest_rand(&rng) % 3 == 0) ?
+				PS_SEQ_UNBOUNDED : 1 + fork_event_selftest_rand(&rng) % 34;
+			ViewCap		c;
+			uint32_t	nb_got = 0,
+						nb_want = 0;
+			int			s_got;
+			int			s_want;
+
+			c.lsn = L;
+			c.seq = S;
+			c.strict_seq = X;
+			c.legacy = false;
+			s_got = fork_asof_hop(&fe, &c, B, has_B, &nb_got);
+			s_want = brute_fork_asof_hop(&fe, &c, B, has_B, &nb_want);
+			VC_CHECK(s_got == s_want && nb_got == nb_want);
+			for (uint32_t i = 0; i < fe.nev; i++)
+				if ((fe.ev[i].flags & FEV_F_UNSTAMPED) &&
+					fe.ev[i].admission_seq > S && fe.ev[i].lsn <= L)
+					viewcap_test_unstamped_hidden_hits++;
+		}
+
+		free(fe.ev);
+		free(fe.def_idx);
+		free(fe.late_meta_idx);
+		timelines[viewcap_test_tl].defined = 0;
+	}
+
+#undef VC_CHECK
+done:
+	/* Confirms the FEV_F_UNSTAMPED coverage above is not vacuous: over the
+	 * default seed at niter=4000 this reliably hits four figures. */
+	/* Non-vacuity: the UNSTAMPED-hidden branch must actually be exercised.
+	 * A runtime check (not PS_ASSERT) so it holds in non-assert builds too. */
+	if (rc == 0 && niter >= 500 && viewcap_test_unstamped_hidden_hits == 0)
+		rc = -1;
 	return rc;
 }
 
@@ -6619,6 +8228,26 @@ uint64_t
 ps_test_fork_event_scan_steps(void)
 {
 	return fork_event_scan_steps;
+}
+
+/* Test-only: classification reconstructed for an exact admitted event. */
+int
+ps_test_fork_event_flags(uint32_t timeline, const PsKey *key, uint64_t seq)
+{
+	uint32_t shard = ps_shard_of(key);
+	ForkEnt *e;
+	int flags = -1;
+
+	ps_lock_shard_rd(shard);
+	e = fork_find(timeline, key);
+	for (uint32_t i = 0; e != NULL && i < e->nev; i++)
+		if (e->ev[i].admission_seq == seq)
+		{
+			flags = e->ev[i].flags & (FEV_F_META | FEV_F_UNSTAMPED);
+			break;
+		}
+	ps_unlock_shard(shard);
+	return flags;
 }
 
 /* Test-only: current event counts for one fork, under the shard read lock
@@ -6662,11 +8291,25 @@ ps_test_fork_event_count(uint32_t timeline, const PsKey *key,
 	return 1;
 }
 
+/*
+ * Returns 1 if growth was durably applied (persisted to fork-meta and
+ * inserted as a GROW event), 0 if the request was a no-op (the fork's size
+ * at (lsn, admission_seq) already covers to_nblocks, so nothing was
+ * persisted or inserted), or -1 on error (not durable: nothing applied).
+ *
+ * A no-op admits no mutation, so admission_seq is never made durable for
+ * it.  Callers that hand admission_seq back to a client as a mutation
+ * response MUST treat a 0 return as "burn the sequence, report none of it":
+ * reporting it anyway would let a client observe a sequence that a clean
+ * restart's allocator rollback (admission_seq_observe() during recovery)
+ * can later place below the ADMISSION_BARRIER -- see PS_OP_ZEROEXTEND below.
+ */
 static int
 fork_grow_with_seq(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
-				   uint64_t lsn, uint64_t admission_seq)
+				   uint64_t lsn, uint64_t admission_seq, bool unstamped)
 {
 	ForkEnt    *e = fork_get_or_create(timeline, key);
+	uint8_t kind = FEV_GROW | FEV_W_META | (unstamped ? FEV_W_UNSTAMPED : 0);
 
 	/*
 	 * Zeroextend has no page record from which recovery can reconstruct its
@@ -6674,12 +8317,13 @@ fork_grow_with_seq(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 	 */
 	if (lsn < e->last_def_lsn || lsn == 0)
 		lsn = e->last_def_lsn;
-	if (fork_size_asof_hop(e, lsn, admission_seq) < to_nblocks &&
-		fork_meta_persist(timeline, key, lsn, admission_seq, to_nblocks,
-						  FEV_GROW) != 0)
+	if (fork_size_asof_hop(e, lsn, admission_seq) >= to_nblocks)
+		return 0;			/* no-op: already at or above to_nblocks */
+	if (fork_meta_persist(timeline, key, lsn, admission_seq, to_nblocks,
+						  kind) != 0)
 		return -1;			/* not durable: do not apply in memory */
-	fork_event_add(e, lsn, admission_seq, to_nblocks, FEV_GROW);
-	return 0;
+	fork_event_add(e, lsn, admission_seq, to_nblocks, kind, true);
+	return 1;
 }
 
 int
@@ -6693,7 +8337,10 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 	admission_seq = admission_seq_alloc();
 	if (admission_seq == 0)
 		return -1;
-	return fork_grow_with_seq(timeline, key, to_nblocks, lsn, admission_seq);
+	/* Callers of fork_grow() only need success/failure, not the
+	 * applied-vs-no-op distinction; collapse both non-error outcomes to 0. */
+	return fork_grow_with_seq(timeline, key, to_nblocks, lsn, admission_seq, lsn == 0) < 0 ?
+		-1 : 0;
 }
 
 /* Apply growth whose durability is already represented by metadata/segment. */
@@ -6702,7 +8349,7 @@ fork_grow_apply(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 				uint64_t lsn, uint64_t admission_seq)
 {
 	fork_event_add(fork_get_or_create(timeline, key), lsn, admission_seq, to_nblocks,
-				   FEV_GROW);
+				   FEV_GROW, false);
 }
 
 static int
@@ -6825,7 +8472,7 @@ fork_restore_later_page_growth(uint32_t timeline, const PsKey *key,
 				}
 			if (!present)
 				fork_event_add(e, grows[i].lsn, grows[i].admission_seq,
-							   grows[i].nblocks, FEV_GROW);
+							   grows[i].nblocks, FEV_GROW, false);
 		}
 	}
 	fork_event_cache_defer--;
@@ -6850,7 +8497,7 @@ fork_grow_replay(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 				 uint64_t lsn, uint64_t admission_seq)
 {
 	fork_event_add(fork_get_or_create(timeline, key), lsn, admission_seq, to_nblocks,
-				   FEV_GROW);
+				   FEV_GROW, false);
 }
 
 /* --- timeline metadata + read-through --- */
@@ -6863,6 +8510,7 @@ timeline_define_incarnation(uint32_t id, int parent, uint64_t branch_lsn,
 		return;
 	timelines[id].parent = parent;
 	timelines[id].branch_lsn = branch_lsn;
+	timelines[id].branch_seq = PS_SEQ_UNBOUNDED;
 	timelines[id].parent_incarnation = parent_incarnation;
 	__atomic_store_n(&timelines[id].incarnation, incarnation, __ATOMIC_RELEASE);
 	__atomic_store_n(&timelines[id].state, PS_TIMELINE_LIVE, __ATOMIC_RELEASE);
@@ -7055,26 +8703,62 @@ timeline_recovery_allowed(uint32_t timeline)
 typedef struct TlWalk
 {
 	uint32_t	tl;				/* current ancestry level */
-	uint64_t	lsn;			/* read_lsn capped to this level's fork point */
+	uint64_t	lsn;			/* cap.lsn mirror, for LSN-only callers */
+	ViewCap		cap;			/* full composed cap at this level (S1.2) */
+	uint64_t	inherited_below;	/* B_k for this level (S1.5) */
+	bool		has_inherited_below;	/* false at the root: B_k = -infinity */
 } TlWalk;
+
+static inline void
+tl_walk_set_level(TlWalk *w, uint32_t tl)
+{
+	w->tl = tl;
+	w->lsn = w->cap.lsn;
+	w->inherited_below = timeline_inherited_below(tl, &w->has_inherited_below);
+}
+
+static inline TlWalk
+tl_walk_first_cap(uint32_t timeline, ViewCap cap)
+{
+	TlWalk		w;
+
+	w.cap = cap;
+	tl_walk_set_level(&w, timeline);
+	return w;
+}
 
 static inline TlWalk
 tl_walk_first(uint32_t timeline, uint64_t read_lsn)
 {
-	TlWalk		w = {timeline, read_lsn};
-
-	return w;
+	/* read_seq = 0: uncapped by X too, matching every pre-P1 LSN-only
+	 * walk's total absence of a seq concept.  Callers that need a real
+	 * request seq use tl_walk_first_cap(timeline, viewcap_from_request(...))
+	 * instead. */
+	return tl_walk_first_cap(timeline, viewcap_from_request(read_lsn, 0));
 }
 
-/* Advance to the parent, capping lsn at the branch point; 0 at the root. */
+/*
+ * Advance to the parent, composing the cap across the branch edge (S1.2)
+ * and recomputing this level's B_k; 0 at the root.  At edge_seq ==
+ * PS_SEQ_UNBOUNDED (timeline_branch_seq()'s only return value in P1),
+ * viewcap_compose() reduces lsn/strict_seq exactly as the pre-P1 body did
+ * ("if branch_lsn < w->lsn, cap lsn there"), so every existing LSN-only or
+ * (lsn, seq) walk is unaffected.
+ */
 static inline int
 tl_walk_next(TlWalk *w)
 {
+	uint64_t	edge_lsn;
+	uint64_t	edge_seq;
+	uint32_t	parent;
+
 	if (!timeline_has_parent(w->tl))
 		return 0;
-	if (timelines[w->tl].branch_lsn < w->lsn)
-		w->lsn = timelines[w->tl].branch_lsn;
-	w->tl = (uint32_t) timelines[w->tl].parent;
+	edge_lsn = timelines[w->tl].branch_lsn;
+	edge_seq = timeline_branch_seq(w->tl);
+	w->cap = viewcap_compose(w->cap, edge_lsn, edge_seq);
+	parent = (uint32_t) timelines[w->tl].parent;
+	tl_walk_set_level(w, parent);
 	return 1;
 }
 
@@ -7082,20 +8766,38 @@ tl_walk_next(TlWalk *w)
  * every ancestor position reached by its capped read, not merely at the
  * child's own frontier. */
 static int
-page_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn,
-						  uint64_t read_seq)
+page_frontier_ancestry_check(uint32_t reader_timeline, uint64_t read_lsn,
+							uint64_t read_seq, bool require_registered)
 {
-	TlWalk		w = tl_walk_first(reader_timeline, read_lsn);
+	TlWalk		w = tl_walk_first_cap(reader_timeline,
+									  viewcap_from_request(read_lsn, read_seq));
 
 	for (;;)
 	{
-		uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+		uint64_t	seq_cap = w.cap.strict_seq == PS_SEQ_UNBOUNDED ?
+			0 : w.cap.strict_seq;
 
-		if (!page_frontier_allows(w.tl, reader_timeline, w.lsn, seq_cap))
+		if ((require_registered && !page_view_registered(w.tl, &w.cap)) ||
+			!page_frontier_allows(w.tl, reader_timeline, w.lsn, seq_cap))
 			return 0;
 		if (!tl_walk_next(&w))
 			return 1;
 	}
+}
+
+static int
+page_frontier_ancestry_allows(uint32_t timeline, uint64_t lsn, uint64_t seq)
+{
+	return page_frontier_ancestry_check(timeline, lsn, seq, true);
+}
+
+/* SET/RESERVE establish the registration while admission and prune write
+ * locks exclude GC. They check retained history, not a registration that
+ * cannot exist until this operation publishes it. */
+static int
+page_frontier_ancestry_admits(uint32_t timeline, uint64_t lsn, uint64_t seq)
+{
+	return page_frontier_ancestry_check(timeline, lsn, seq, false);
 }
 
 /*
@@ -7115,10 +8817,11 @@ fork_asof_query_allowed(uint32_t reader_timeline, uint64_t read_lsn,
 
 	if (page_frontier_ancestry_allows(reader_timeline, read_lsn, read_seq))
 		return 1;
-	w = tl_walk_first(reader_timeline, read_lsn);
+	w = tl_walk_first_cap(reader_timeline, viewcap_from_request(read_lsn, read_seq));
 	for (;;)
 	{
-		if (!walidx_frontier_exception_active(w.tl, w.lsn))
+		if (!page_view_registered(w.tl, &w.cap) ||
+			!walidx_frontier_exception_active(w.tl, w.lsn))
 			return 0;
 		if (!tl_walk_next(&w))
 			return 1;
@@ -7313,7 +9016,8 @@ branch_frontiers_allow(int parent, uint64_t branch_lsn)
 		if (!timelines[t].defined ||
 			!wal_reclaim_frontier_ancestry_allows((uint32_t) t, cap) ||
 			walidx_frontier_publication_pending((uint32_t) t) ||
-			cap < page_frontier_current((uint32_t) t).lsn ||
+			(cap < page_frontier_current((uint32_t) t).lsn &&
+			 !page_frontier_structural_fence_active((uint32_t) parent, (uint32_t) t, cap)) ||
 			(cap < walidx_frontier_current((uint32_t) t) &&
 			 !walidx_frontier_exception_active((uint32_t) t, cap)))
 			return 0;
@@ -7332,54 +9036,245 @@ branch_exists_with_metadata(uint32_t tl, int parent, uint64_t branch_lsn)
 		timelines[tl].branch_lsn == branch_lsn;
 }
 
+#include "pagestore_artifact_caps.inc"
 #include "pagestore_artifact_lifecycle.inc"
+
+/*
+ * Phase P1 differential-test extension for artifact reads (Codex finding
+ * 4104937134, BRANCH_SNAPSHOT_SEQ_CAP.md S3.3): artifact_visible() must
+ * thread the walk's full ViewCap.seq (S) and per-level inherited-range
+ * boundary (B_k) through to its own admissibility check, rather than a
+ * downgraded (lsn, strict_seq) pair with B_k hardcoded to "root".  P1
+ * itself never constructs a finite S in production (S9.3: only P2/P3b/P5
+ * do), so -- exactly like ps_test_viewcap_differential()'s finite-cap half
+ * -- this test constructs one directly and checks artifact_visible()
+ * against brute_page_select() (the same literal-S1.3-rule oracle used
+ * there), restricted to the pre-first-BEGIN admission_seq domain
+ * ('first') artifact_visible()'s own fallback uses.
+ *
+ * The caller must already have, on an open store with the key's shard
+ * lock held for writing, written three plain (token == 0) versions of
+ * (tl, key, block) before ever calling ps_artifact_begin() on 'key' (so
+ * every one of them lands in artifact_visible()'s no-commit fallback
+ * domain), then issued exactly one ps_artifact_begin() (uncommitted,
+ * undropped) at an LSN above all three, in this order: an older write at
+ * lsn_rewrite, a same-LSN rewrite at lsn_rewrite with a larger
+ * admission_seq, and a third write at a fresh lsn_first > lsn_rewrite
+ * (its position holds only that one version).  See
+ * test_viewcap_artifact_property() in pagestore_artifact_lifecycle_test.c
+ * for the arrangement.
+ *
+ * Checks, at PS_SEQ_UNBOUNDED and at finite caps:
+ *  (a) uncapped: the newest version overall (lsn_first) is selected --
+ *      the "no behaviour change" half, matching every existing artifact
+ *      test's unrestricted expectation;
+ *  (b) S = the older lsn_rewrite write's admission_seq, L = lsn_rewrite:
+ *      the same-LSN rewrite is hidden (its escape fails: it is not the
+ *      first arrival at lsn_rewrite) and the honest pre-S write is
+ *      visible -- Bug B's protection, expressed for the artifact fallback
+ *      domain, and inexpressible through artifact_visible()'s pre-fix
+ *      (lsn, strict_seq)-only signature;
+ *  (c) S just below the lsn_first write's admission_seq, B_k = lsn_first
+ *      (has_B = true): that write's escape requires p > B_k, which now
+ *      fails, so it is hidden -- the pre-fix code hardcoded B = 0/
+ *      has_B = false here and would have shown it regardless;
+ *  (d) the same cap with has_B = false: the escape is available again and
+ *      that write is visible.
+ * Every check is also cross-checked against brute_page_select() itself,
+ * so a wrong expectation in this test cannot pass silently.
+ *
+ * Returns 0 on success, or the 1-based number of the first failed check.
+ */
+int
+ps_test_artifact_viewcap_property(uint32_t tl, const PsKey *key,
+								  uint32_t block, uint64_t lsn_rewrite,
+								  uint64_t lsn_first)
+{
+	PsKey		meta = artifact_meta_key(key);
+	PageEnt    *pages = page_find(tl, key, block);
+	uint64_t	first = artifact_legacy_seq(page_find(tl, &meta,
+													  PS_ARTIFACT_BEGIN_BLOCK));
+	PageVer		filtered[8];
+	PageEnt		tmp;
+	int			nfiltered = 0;
+	int			checkno = 0;
+	int			rc = 0;
+	ViewCap		cap;
+	PageVer    *got;
+	PageVer    *want;
+	int			state;
+
+#define AVC_CHECK(cond) \
+	do { \
+		checkno++; \
+		if (!(cond)) \
+		{ \
+			rc = checkno; \
+			goto done; \
+		} \
+	} while (0)
+
+	AVC_CHECK(pages != NULL && first != 0 && first != PS_SEQ_UNBOUNDED);
+	for (int i = 0; i < pages->nver && nfiltered < 8; i++)
+		if (pages->vers[i].admission_seq < first)
+			filtered[nfiltered++] = pages->vers[i];
+	AVC_CHECK(nfiltered == 3);
+	tmp.vers = filtered;
+	tmp.nver = nfiltered;
+
+	/*
+	 * This key never commits (the closing BEGIN is left open), so
+	 * artifact_visible() always takes its no-commit fallback and returns 0
+	 * ("legacy") regardless of whether it found a version: the answer is
+	 * *out itself, not the return code (see its doc comment).
+	 */
+
+	/* (a) uncapped: the newest overall (lsn_first) wins. */
+	cap = viewcap_from_request(UINT64_MAX, 0);
+	state = artifact_visible(tl, key, block, &cap, 0, false, &got, 1);
+	want = brute_page_select(&tmp, &cap, 0, false);
+	AVC_CHECK(state == 0);
+	AVC_CHECK((got == NULL) == (want == NULL));
+	AVC_CHECK(!want || (got->lsn == want->lsn &&
+						got->admission_seq == want->admission_seq));
+	AVC_CHECK(want && want->lsn == lsn_first);
+
+	/* (b) S caps out the same-LSN rewrite; the honest pre-S write at the
+	 * same position is visible (not the escape: it passes S directly). */
+	{
+		uint64_t	seq_lo = UINT64_MAX;
+
+		for (int i = 0; i < nfiltered; i++)
+			if (filtered[i].lsn == lsn_rewrite && filtered[i].admission_seq < seq_lo)
+				seq_lo = filtered[i].admission_seq;
+		AVC_CHECK(seq_lo != UINT64_MAX);
+		cap.lsn = lsn_rewrite;
+		cap.seq = seq_lo;
+		cap.strict_seq = PS_SEQ_UNBOUNDED;
+		cap.legacy = false;
+		state = artifact_visible(tl, key, block, &cap, 0, false, &got, 1);
+		want = brute_page_select(&tmp, &cap, 0, false);
+		AVC_CHECK(state == 0);
+		AVC_CHECK((got == NULL) == (want == NULL));
+		AVC_CHECK(!want || (got->lsn == want->lsn &&
+							got->admission_seq == want->admission_seq));
+		AVC_CHECK(want && want->lsn == lsn_rewrite &&
+				 want->admission_seq == seq_lo);
+	}
+
+	/* (c)/(d): S just below lsn_first's write; B_k = lsn_first disables its
+	 * escape (hidden), B_k = -infinity (has_B = false) allows it (visible). */
+	{
+		uint64_t	seq_first = 0;
+
+		for (int i = 0; i < nfiltered; i++)
+			if (filtered[i].lsn == lsn_first)
+				seq_first = filtered[i].admission_seq;
+		AVC_CHECK(seq_first != 0 && seq_first != PS_SEQ_UNBOUNDED);
+		cap.lsn = UINT64_MAX;
+		cap.seq = seq_first - 1;
+		cap.strict_seq = PS_SEQ_UNBOUNDED;
+		cap.legacy = false;
+
+		state = artifact_visible(tl, key, block, &cap, lsn_first, true, &got, 1);
+		want = brute_page_select(&tmp, &cap, lsn_first, true);
+		AVC_CHECK(state == 0);
+		AVC_CHECK((got == NULL) == (want == NULL));
+		AVC_CHECK(!want || (got->lsn == want->lsn &&
+							got->admission_seq == want->admission_seq));
+		AVC_CHECK(want && want->lsn != lsn_first);
+
+		state = artifact_visible(tl, key, block, &cap, 0, false, &got, 1);
+		want = brute_page_select(&tmp, &cap, 0, false);
+		AVC_CHECK(state == 0);
+		AVC_CHECK((got == NULL) == (want == NULL));
+		AVC_CHECK(!want || (got->lsn == want->lsn &&
+							got->admission_seq == want->admission_seq));
+		AVC_CHECK(want && want->lsn == lsn_first && want->admission_seq == seq_first);
+	}
+
+#undef AVC_CHECK
+done:
+	return rc;
+}
 
 /*
  * Resolve a read by walking the timeline ancestry: return the newest version of
  * (key, block) visible at read_lsn on 'timeline'; if the timeline never wrote
  * the page (or only after read_lsn), descend to the parent, capping read_lsn at
  * the branch LSN so the branch sees a frozen snapshot of the parent.  Returns
- * the chosen PageVer, or NULL if no ancestor has the page.
+ * 1 with the chosen PageVer, 0 for an unwritten page, or a negative
+ * status for unavailable history.  Byte-serving frontends must propagate errors.
  */
-PageVer *
-read_through(uint32_t timeline, const PsKey *key, uint32_t block,
-			 uint64_t read_lsn, uint64_t read_seq)
+int
+read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,
+			 uint64_t read_lsn, uint64_t read_seq, PageVer **out)
 {
 	TlWalk		w;
 
+	*out = NULL;
 	if (!core_process_valid())
-		return NULL;
-	w = tl_walk_first(timeline, read_lsn);
+		return -1;
+	w = tl_walk_first_cap(timeline, key->klass == PS_KLASS_CONTROL ?
+	artifact_control_cap(timeline, read_lsn, read_seq) : viewcap_from_request(read_lsn, read_seq));
 	do
 	{
 		ForkEnt    *fe = fork_find(w.tl, key);
-		uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
 		uint32_t	nb = 0;
-		int			fork_state = fe ? fork_asof_hop(fe, w.lsn, seq_cap, &nb) :
+		int			fork_state = fe ? fork_asof_hop(fe, &w.cap, w.inherited_below,
+											w.has_inherited_below, &nb) :
 			FORK_HOP_NONE;
 		PageEnt    *e = page_find(w.tl, key, block);
-		PageVer    *v = e ? page_visible(e, w.lsn, seq_cap) : NULL;
+		PageVer    *v = e ? page_select(e, &w.cap, w.inherited_below,
+										w.has_inherited_below) : NULL;
+		if ((key->klass == PS_KLASS_RELATION || (key->klass == PS_KLASS_CONTROL && read_seq != 0)) &&
+		!(key->klass == PS_KLASS_CONTROL ?
+		  control_view_registered(w.tl, &w.cap) : page_view_registered(w.tl, &w.cap)))
+			return -2;
 		if (artifact_data_key(key))
 		{
-			int state = artifact_visible(w.tl, key, block, w.lsn, seq_cap, &v, 1);
-			if (state < 0 || state == 2)
-				return NULL;
+			int state = artifact_visible(w.tl, key, block, &w.cap,
+										 w.inherited_below,
+										 w.has_inherited_below, &v, 1);
+			if (state < 0)
+				return -1;
+			if (state == 2)
+				return 0;
 		}
 
 		if (v)
 		{
-			if (!fork_page_invalidated(fe, block, v, w.lsn, seq_cap))
-				return v;
-			return NULL;
+			if (fork_page_invalidated(fe, block, v, &w.cap, w.inherited_below,
+									  w.has_inherited_below))
+				return 0;
+			/* LSN-0 bytes have no historical visibility proof.  This also
+			 * applies when a newest read becomes capped through ancestry. */
+			if (key->klass == PS_KLASS_RELATION && w.tl != timeline &&
+				v->lsn == 0)
+				return -1;
+			*out = v;
+			return 1;
 		}
 		if (fork_state == FORK_HOP_DEAD ||
 			(fork_state == FORK_HOP_DEF && block >= nb))
-			return NULL;
+			return 0;
 		if (fork_state == FORK_HOP_DEF &&
-			fork_inheritance_fenced(fe, block, w.lsn, seq_cap))
-			return NULL;
+			fork_inheritance_fenced(fe, block, &w.cap, w.inherited_below,
+									w.has_inherited_below))
+			return 0;
 	} while (tl_walk_next(&w));
-	return NULL;
+	return 0;
+}
+
+/* Index-only callers that do not serve bytes can treat unavailable as absent. */
+PageVer *
+read_through(uint32_t timeline, const PsKey *key, uint32_t block,
+			 uint64_t read_lsn, uint64_t read_seq)
+{
+	PageVer *v;
+
+	(void) read_through_checked(timeline, key, block, read_lsn, read_seq, &v);
+	return v;
 }
 
 /*
@@ -7398,7 +9293,8 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 					 uint64_t read_seq)
 {
 	uint32_t	maxnb = 0;
-	TlWalk		w = tl_walk_first(timeline, read_lsn);
+	TlWalk		w = tl_walk_first_cap(timeline,
+									  viewcap_from_request(read_lsn, read_seq));
 
 	do
 	{
@@ -7407,8 +9303,8 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 		if (e)
 		{
 			uint32_t	nb;
-			uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
-			int			r = fork_asof_hop(e, w.lsn, seq_cap, &nb);
+			int			r = fork_asof_hop(e, &w.cap, w.inherited_below,
+										  w.has_inherited_below, &nb);
 
 			if (r == FORK_HOP_DEAD)
 				return maxnb;
@@ -7458,7 +9354,8 @@ fork_block_death_through(uint32_t timeline, const PsKey *key, uint32_t block,
 						 uint64_t read_lsn, uint64_t read_seq,
 						 uint64_t *seq_out)
 {
-	TlWalk		w = tl_walk_first(timeline, read_lsn);
+	TlWalk		w = tl_walk_first_cap(timeline,
+									  viewcap_from_request(read_lsn, read_seq));
 
 	*seq_out = 0;
 	do
@@ -7467,15 +9364,26 @@ fork_block_death_through(uint32_t timeline, const PsKey *key, uint32_t block,
 
 		if (e != NULL)
 		{
-			uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+			bool		slow = w.cap.seq != PS_SEQ_UNBOUNDED &&
+				e->max_meta_seq > w.cap.seq;
+			uint64_t	seq_cap = w.cap.strict_seq == PS_SEQ_UNBOUNDED ?
+				0 : w.cap.strict_seq;
 
 			for (uint32_t i = e->nev; i > 0; i--)
 			{
-				const ForkEvent *v = &e->ev[i - 1];
+				uint32_t	idx = i - 1;
+				const ForkEvent *v = &e->ev[idx];
 
-				if (v->kind > FEV_DEAD || v->lsn == 0 || v->lsn > w.lsn ||
-					(v->lsn == w.lsn && seq_cap != 0 &&
-					 v->admission_seq != 0 && v->admission_seq > seq_cap))
+				if (v->kind > FEV_DEAD || v->lsn == 0 || v->lsn > w.lsn)
+					continue;
+				if (slow)
+				{
+					if (fork_event_hidden(e, idx, &w.cap, w.inherited_below,
+										  w.has_inherited_below))
+						continue;
+				}
+				else if (v->lsn == w.lsn && seq_cap != 0 &&
+						 v->admission_seq != 0 && v->admission_seq > seq_cap)
 					continue;
 				if (v->kind == FEV_DEAD ||
 					(v->kind == FEV_SET && v->nblocks <= block))
@@ -7494,7 +9402,8 @@ static int
 fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 					uint64_t read_seq)
 {
-	TlWalk		w = tl_walk_first(timeline, read_lsn);
+	TlWalk		w = tl_walk_first_cap(timeline,
+									  viewcap_from_request(read_lsn, read_seq));
 
 	do
 	{
@@ -7503,8 +9412,8 @@ fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 		if (e)
 		{
 			uint32_t	nb;
-			uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
-			int			r = fork_asof_hop(e, w.lsn, seq_cap, &nb);
+			int			r = fork_asof_hop(e, &w.cap, w.inherited_below,
+										  w.has_inherited_below, &nb);
 
 			if (r == FORK_HOP_DEAD)
 				return 0;
@@ -7661,7 +9570,7 @@ typedef struct TimelineRecV2
  * after a legacy-only log has been migrated. */
 #define TIMELINE_META_EVENT_CREATE 1U
 #define TIMELINE_META_EVENT_STATE  2U
-typedef struct TimelineRecEvent
+typedef struct TimelineRecEventV2
 {
 	uint32_t magic;
 	uint32_t rec_len;
@@ -7674,7 +9583,27 @@ typedef struct TimelineRecEvent
 	uint64_t parent_incarnation;
 	uint32_t crc;
 	uint32_t reserved;
-} TimelineRecEvent;
+} TimelineRecEventV2;
+
+/* Branch activation is durable so a format-only binary refuses this store. */
+#define TIMELINE_META_EVENT_CAP_ACTIVATION 3U
+typedef struct TimelineRecEventV3
+{
+	uint32_t magic;
+	uint32_t rec_len;
+	uint32_t kind;
+	uint32_t id;
+	int32_t parent;
+	uint32_t state;
+	uint64_t branch_lsn;
+	uint64_t incarnation;
+	uint64_t parent_incarnation;
+	uint64_t branch_seq;
+	uint32_t crc;
+	uint32_t reserved;
+} TimelineRecEventV3;
+
+_Static_assert(sizeof(TimelineRecEventV3) == 64, "timeline V3 wire size");
 
 /* Event records written before parent incarnation was part of the durable
  * timeline identity.  They remain readable as generation-one ancestry only;
@@ -7706,7 +9635,7 @@ timeline_rec_crc(TimelineRecV2 *rec)
 }
 
 static uint32_t
-timeline_event_crc(TimelineRecEvent *rec)
+timeline_event_crc(TimelineRecEventV2 *rec)
 {
 	uint32_t save = rec->crc;
 	uint32_t crc;
@@ -7715,6 +9644,41 @@ timeline_event_crc(TimelineRecEvent *rec)
 	crc = fnv(rec, sizeof(*rec));
 	rec->crc = save;
 	return crc;
+}
+
+static uint32_t
+timeline_event_v3_crc(TimelineRecEventV3 *rec)
+{
+	uint32_t save = rec->crc;
+	uint32_t crc;
+
+	rec->crc = 0;
+	crc = fnv(rec, sizeof(*rec));
+	rec->crc = save;
+	return crc;
+}
+
+/* Validate the original bytes before normalizing the legacy edge cap. */
+static int
+timeline_event_read(uint64_t off, uint32_t rec_len, TimelineRecEventV3 *rec)
+{
+	if (rec_len == sizeof(TimelineRecEventV2))
+	{
+		TimelineRecEventV2 old;
+		int n = ps_storage->meta_read(off, &old, sizeof(old));
+
+		if (n != (int) sizeof(old))
+			return n < 0 ? -1 : 0;
+		if (old.crc != timeline_event_crc(&old) || old.reserved != 0)
+			return -1;
+		memset(rec, 0, sizeof(*rec));
+		memcpy(rec, &old, offsetof(TimelineRecEventV2, crc));
+		rec->rec_len = sizeof(*rec);
+		rec->branch_seq = PS_SEQ_UNBOUNDED;
+		rec->crc = timeline_event_v3_crc(rec);
+		return sizeof(*rec);
+	}
+	return ps_storage->meta_read(off, rec, sizeof(*rec));
 }
 
 static uint32_t
@@ -7739,11 +9703,82 @@ timeline_meta_append(const void *data, uint32_t len)
 	return rc;
 }
 
+/* Durable epoch precedes the first finite edge. Previous binaries reject it,
+ * even if the following CREATE was torn or the finite branch was deleted. */
+static int
+timeline_activate_branch_caps(void)
+{
+	TimelineRecEventV3 rec;
+
+	if (branch_caps_active)
+		return 0;
+	memset(&rec, 0, sizeof(rec));
+	rec.magic = TIMELINE_META_V2_MAGIC;
+	rec.rec_len = sizeof(rec);
+	rec.kind = TIMELINE_META_EVENT_CAP_ACTIVATION;
+	rec.parent = -1;
+	rec.branch_seq = PS_SEQ_UNBOUNDED;
+	rec.crc = timeline_event_v3_crc(&rec);
+	if (timeline_meta_append(&rec, sizeof(rec)) != 0)
+		return -1;
+	branch_caps_active = 1;
+	return 0;
+}
+
+static int
+artifact_caps_recover(void)
+{
+	for (uint32_t shard = 0; shard < core_shards(); shard++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (PageEnt *e = g_shards[shard].page_idx[bucket]; e; e = e->next)
+				if (e->key.klass == PS_KLASS_ARTIFACT && e->block == PS_ARTIFACT_COMMIT_BLOCK)
+					for (int i = 0; i < e->nver; i++)
+					{
+						PsArtifactLifecycle record;
+						PsKey		data = e->key;
+
+						if (artifact_record(e->timeline, &e->key, e->block, &e->vers[i], &record, 0) != 0)
+							return -1;
+						if (record.state != PS_ARTIFACT_COMMITTED)
+							continue;
+						data.klass = data.forkNum;
+						data.forkNum = 0;
+						if (artifact_cap_note(e->timeline, &data, record.generation, record.begin_seq, e->vers[i].admission_seq) != 0)
+							return -1;
+					}
+	return 0;
+}
+
+static int
+timeline_activate_view_caps(void)
+{
+	for (unsigned kind = CAP_PIN; kind < CAP_COUNT; kind++)
+	{
+		TimelineRecEventV3 rec = {0};
+
+		if (cap_activation[kind])
+			continue;
+		rec.magic = TIMELINE_META_V2_MAGIC;
+		rec.rec_len = sizeof(rec);
+		rec.kind = TIMELINE_META_EVENT_CAP_ACTIVATION;
+		rec.id = kind;
+		rec.parent = -1;
+		rec.branch_seq = admission_seq_alloc();
+		if (!rec.branch_seq)
+			return -1;
+		rec.crc = timeline_event_v3_crc(&rec);
+		if (timeline_meta_append(&rec, sizeof(rec)) != 0)
+			return -1;
+		cap_activation[kind] = rec.branch_seq;
+	}
+	return 0;
+}
+
 static int
 timeline_persist_create(uint32_t id, int parent, uint64_t branch_lsn,
-						uint64_t incarnation, uint64_t parent_incarnation)
+						uint64_t incarnation, uint64_t parent_incarnation, uint64_t branch_seq)
 {
-	TimelineRecEvent rec;
+	TimelineRecEventV3 rec;
 
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = TIMELINE_META_V2_MAGIC;
@@ -7755,7 +9790,8 @@ timeline_persist_create(uint32_t id, int parent, uint64_t branch_lsn,
 	rec.branch_lsn = branch_lsn;
 	rec.incarnation = incarnation;
 	rec.parent_incarnation = parent_incarnation;
-	rec.crc = timeline_event_crc(&rec);
+	rec.branch_seq = branch_seq;
+	rec.crc = timeline_event_v3_crc(&rec);
 
 	return timeline_meta_append(&rec, sizeof(rec));
 }
@@ -7764,7 +9800,7 @@ static int
 timeline_persist_state(uint32_t id, PsTimelineState state,
 						   uint64_t incarnation)
 {
-	TimelineRecEvent rec;
+	TimelineRecEventV3 rec;
 
 	if (id >= MAX_TIMELINES || state < PS_TIMELINE_LIVE ||
 		state > PS_TIMELINE_DELETED || incarnation == 0)
@@ -7779,7 +9815,8 @@ timeline_persist_state(uint32_t id, PsTimelineState state,
 	rec.branch_lsn = timelines[id].branch_lsn;
 	rec.incarnation = incarnation;
 	rec.parent_incarnation = timelines[id].parent_incarnation;
-	rec.crc = timeline_event_crc(&rec);
+	rec.branch_seq = timeline_branch_seq(id);
+	rec.crc = timeline_event_v3_crc(&rec);
 
 	return timeline_meta_append(&rec, sizeof(rec));
 }
@@ -7802,8 +9839,9 @@ typedef struct ForkMetaRecV1
 
 #define FORK_META_V2_MAGIC 0x324d4b46 /* "FKM2": no record checksum (accepted) */
 #define FORK_META_V3_MAGIC 0x334d4b46 /* "FKM3": V2 layout, pad carries CRC-24 */
+#define FORK_META_V4_MAGIC 0x344d4b46 /* "FKM4": V3 layout, durable event flags */
 #define FORK_META_SNAPSHOT_PAYLOAD_MAGIC 0x31534d46 /* "FMS1" */
-#define FORK_META_SNAPSHOT_PAYLOAD_VERSION 1
+#define FORK_META_SNAPSHOT_PAYLOAD_VERSION 2
 #define FORK_META_SNAPSHOT_CHECKPOINT 0
 #define FORK_META_SNAPSHOT_TAIL 1
 
@@ -7866,7 +9904,9 @@ fork_meta_rec_seal(ForkMetaRecV2 *rec)
 {
 	uint32_t	crc;
 
-	rec->magic = FORK_META_V3_MAGIC;
+	rec->magic = FORK_META_V4_MAGIC;
+	if (FEV_KIND(rec->kind) == FEV_SET || FEV_KIND(rec->kind) == FEV_DEAD)
+		rec->kind |= FEV_W_META;
 	crc = fork_meta_rec_crc24(rec);
 	rec->pad[0] = (uint8_t) (crc >> 16);
 	rec->pad[1] = (uint8_t) (crc >> 8);
@@ -7876,7 +9916,8 @@ fork_meta_rec_seal(ForkMetaRecV2 *rec)
 static int
 fork_meta_magic_v2_family(uint32_t magic)
 {
-	return magic == FORK_META_V2_MAGIC || magic == FORK_META_V3_MAGIC;
+	return magic == FORK_META_V2_MAGIC || magic == FORK_META_V3_MAGIC ||
+		magic == FORK_META_V4_MAGIC;
 }
 
 /* Layout and checksum validity of a record read from the source log or a
@@ -7886,9 +9927,17 @@ fork_meta_rec_wire_valid(const ForkMetaRecV2 *rec)
 {
 	if (rec->rec_len != sizeof(*rec))
 		return 0;
+	if (rec->magic != FORK_META_V4_MAGIC && rec->kind != FEV_KIND(rec->kind))
+		return 0;
+	if (rec->magic == FORK_META_V4_MAGIC &&
+		(FEV_KIND(rec->kind) > FEV_SNAPSHOT_BASE ||
+		 (FEV_KIND(rec->kind) > FEV_DEAD && rec->kind != FEV_KIND(rec->kind)) ||
+		 ((rec->kind & FEV_W_UNSTAMPED) && FEV_KIND(rec->kind) == FEV_GROW &&
+		  !(rec->kind & FEV_W_META))))
+		return 0;
 	if (rec->magic == FORK_META_V2_MAGIC)
 		return rec->pad[0] == 0 && rec->pad[1] == 0 && rec->pad[2] == 0;
-	if (rec->magic == FORK_META_V3_MAGIC)
+	if (rec->magic == FORK_META_V3_MAGIC || rec->magic == FORK_META_V4_MAGIC)
 	{
 		uint32_t	crc = fork_meta_rec_crc24(rec);
 
@@ -7979,7 +10028,7 @@ fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 
 	if (fork_meta_poisoned_load())
 		return -1;
-	if (kind <= FEV_DEAD && !fork_meta_mutation_future(lsn, admission_seq))
+	if (FEV_KIND(kind) <= FEV_DEAD && !fork_meta_mutation_future(lsn, admission_seq))
 		return -1;
 
 	memset(&rec, 0, sizeof(rec));
@@ -8443,9 +10492,9 @@ fork_meta_snapshot_record_valid(const ForkMetaRecV2 *records, uint64_t index,
 	if (!fork_meta_rec_wire_valid(rec) ||
 		rec->timeline >= MAX_TIMELINES ||
 		rec->key.klass > PS_KLASS_ARTIFACT ||
-		(!ordered_marker && (rec->kind > FEV_DEAD || rec->order_id != 0)) ||
+		(!ordered_marker && (FEV_KIND(rec->kind) > FEV_DEAD || rec->order_id != 0)) ||
 		(ordered_marker && !fork_meta_ordered_marker_valid(rec, 1)) ||
-		(rec->kind == FEV_DEAD && rec->nblocks != 0))
+		(FEV_KIND(rec->kind) == FEV_DEAD && rec->nblocks != 0))
 	{
 		fprintf(stderr, "pagestore: invalid forkmeta snapshot record part=%u index=%llu kind=%u timeline=%u\n",
 				part, (unsigned long long) index, rec->kind, rec->timeline);
@@ -8572,7 +10621,8 @@ fork_meta_snapshot_load(const char *directory)
 			goto fail;
 		memcpy(&headers[part], data[part], sizeof(headers[part]));
 		if (headers[part].magic != FORK_META_SNAPSHOT_PAYLOAD_MAGIC ||
-			headers[part].version != FORK_META_SNAPSHOT_PAYLOAD_VERSION ||
+			(headers[part].version != 1 &&
+			 headers[part].version != FORK_META_SNAPSHOT_PAYLOAD_VERSION) ||
 			headers[part].header_bytes != sizeof(headers[part]) ||
 			headers[part].part != part ||
 			headers[part].record_bytes != sizeof(ForkMetaRecV2) ||
@@ -8633,9 +10683,11 @@ fork_meta_snapshot_load(const char *directory)
 					records[i].lsn, records[i].nblocks, records[i].kind,
 					records[i].order_id, records[i].admission_seq);
 			else
+				/* fork_event_add decodes V4 flags. Legacy V2/V3 SET/DEAD
+				 * are META and plain GROW is PAGE (design doc S4.2). */
 				fork_event_add(fork_get_or_create(records[i].timeline, &records[i].key),
 							   records[i].lsn, records[i].admission_seq,
-							   records[i].nblocks, records[i].kind);
+							   records[i].nblocks, records[i].kind, false);
 		}
 	}
 	fork_meta_snapshot_generation = snapshot.generation;
@@ -8682,7 +10734,7 @@ fork_meta_selected_suffix_valid(const ForkMetaRecV2 *rec)
 								fork_meta_snapshot_cutoff_lsn,
 								fork_meta_snapshot_cutoff_seq))
 		return 0;
-	switch (rec->kind)
+	switch (FEV_KIND(rec->kind))
 	{
 		case FEV_GROW:
 			return rec->order_id == 0 && rec->nblocks != 0;
@@ -8982,10 +11034,13 @@ load_fork_meta(void)
 				fork_get_or_create(rec.timeline, &rec.key),
 				rec.lsn, rec.nblocks, rec.kind, rec.order_id,
 				rec.admission_seq);
-		else if (rec.kind <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
+		else if (FEV_KIND(rec.kind) <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
 		{
+			/* Legacy record: same S4.2 mapping as the snapshot-payload path
+			 * above. */
 			fork_event_add(fork_get_or_create(rec.timeline, &rec.key),
-						   rec.lsn, rec.admission_seq, rec.nblocks, rec.kind);
+						   rec.lsn, rec.admission_seq, rec.nblocks, rec.kind,
+						   false);
 		}
 		else
 			fprintf(stderr, "pagestore: skipping invalid fork-meta record "
@@ -9598,8 +11653,8 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 				PsForkMetaEvent *events = NULL;
 				unsigned char *keep = NULL;
 				uint32_t *indices = NULL;
-				PsPruneFence *raw_fences = NULL;
-				PsForkMetaFence *fences = NULL;
+				PsHistoryFence *raw_fences = NULL;
+				PsForkMetaViewFence *fences = NULL;
 				uint32_t nitems = 0, nfences = 0;
 				int planned;
 				int deleting = filter_deleting &&
@@ -9608,7 +11663,22 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 				/* A deletion-filtered generation must not carry any lifecycle or
 				 * ordered record owned by an explicit DELETING timeline. */
 				if (deleting)
+				{
+					/* A fork can reach here with a stale snapshot_dropped == 1
+					 * from an EARLIER build that flagged it (as not-deleting)
+					 * and then failed after this point (fail_entry/prepare/
+					 * commit -> retry_done, so fork_event_compact_dropped_markers()
+					 * never ran on that flag): if this fork's timeline entered
+					 * DELETING before the NEXT successful build, that build
+					 * skips it right here and never re-flags it, so a stale 1
+					 * would survive into the compaction pass that follows this
+					 * build's own success and wrongly drop an inert marker
+					 * from a fork this generation is supposed to leave
+					 * untouched.  Clear it here instead. */
+					for (uint32_t i = 0; i < e->nev; i++)
+						e->ev[i].flags &= (uint8_t) ~FEV_F_SNAPSHOT_DROPPED;
 					continue;
+				}
 
 				for (uint32_t i = 0; i < e->nev; i++)
 					if (e->ev[i].kind <= FEV_DEAD)
@@ -9627,23 +11697,24 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						events[j].admission_seq = e->ev[i].admission_seq;
 						events[j].nblocks = e->ev[i].nblocks;
 						events[j].kind = e->ev[i].kind;
+						events[j].flags = e->ev[i].flags;
 						indices[j++] = i;
 					}
 				if (!preserve_survivors)
 				{
-					uint64_t   *wfences = NULL;
+					PsHistoryFence *wfences = NULL;
 					uint32_t	nwfences = 0;
 					uint32_t	out = 0;
 
 					if (page_prune_fences(e->timeline, &raw_fences,
 										  &nfences) != 0 ||
-						walidx_prune_fences(e->timeline, &wfences,
+						walidx_view_fences(e->timeline, &wfences,
 											&nwfences) != 0)
 					{
 						free(wfences);
 						goto fail_entry;
 					}
-					fences = malloc((size_t) (nfences + nwfences + 1) *
+					fences = malloc((size_t) (2 * nfences + 2 * nwfences + 1) *
 									sizeof(*fences));
 					if (fences == NULL)
 					{
@@ -9651,15 +11722,15 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						goto fail_entry;
 					}
 					for (uint32_t i = 0; i < nfences; i++)
-						if (raw_fences[i].lsn < cutoff.lsn ||
-							(raw_fences[i].lsn == cutoff.lsn &&
-							 raw_fences[i].admission_seq != 0 &&
-							 raw_fences[i].admission_seq <= cutoff.admission_seq))
-						{
-							fences[out].lsn = raw_fences[i].lsn;
-							fences[out].admission_seq = raw_fences[i].admission_seq;
-							out++;
-						}
+					{
+						PsHistoryFence f = raw_fences[i];
+						PsForkMetaViewFence v = {f.lsn, f.seq, f.admission_seq};
+						if (f.lsn < cutoff.lsn ||
+							(f.lsn == cutoff.lsn && f.admission_seq <= cutoff.admission_seq))
+							fences[out++] = v;
+						out += ps_forkmeta_derive_fences(&v, 1,
+							(PsForkMetaFence) {cutoff.lsn, cutoff.admission_seq}, &fences[out]);
+					}
 					/* Every WAL-index horizon (owner pins carrying the WAL
 					 * index, branch caps, and the shipper's progress) is a
 					 * fork-history horizon too: WAL-index compaction judges a
@@ -9669,17 +11740,16 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 					 * also a page fence would otherwise lose the death it was
 					 * planned against, or the regrowth after it, and be left
 					 * with neither an FPI nor a base. */
-					for (uint32_t i = 0; i <= nwfences; i++)
+					for (uint32_t i = 0; i < nwfences; i++)
 					{
-						uint64_t	lsn = i < nwfences ? wfences[i] :
-							walidx_progress_read(e->timeline);
-
-						if (lsn != 0 && lsn < cutoff.lsn)
-						{
-							fences[out].lsn = lsn;
-							fences[out].admission_seq = 0;
-							out++;
-						}
+						PsHistoryFence f = wfences[i];
+						PsForkMetaViewFence v = {f.lsn, f.seq, f.admission_seq};
+						if (f.lsn != 0 && (f.lsn < cutoff.lsn ||
+							(f.lsn == cutoff.lsn && f.admission_seq <= cutoff.admission_seq)))
+							fences[out++] = v;
+						if (f.lsn != 0)
+							out += ps_forkmeta_derive_fences(&v, 1,
+							 (PsForkMetaFence) {cutoff.lsn, cutoff.admission_seq}, &fences[out]);
 					}
 					free(wfences);
 					nfences = out;
@@ -9703,9 +11773,10 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 					}
 					fork_meta_required_fences(e, indices, nitems, walidx_pages,
 											  nwalidx_pages, required);
-					planned = ps_forkmeta_prune_plan_required(events, nitems,
+					planned = ps_forkmeta_prune_plan_capped(events, nitems,
 						(PsForkMetaFence) {cutoff.lsn, cutoff.admission_seq},
-						fences, nfences, required, planned_keep);
+						fences, nfences, timelines[e->timeline].branch_lsn,
+						timelines[e->timeline].parent >= 0, required, planned_keep);
 					free(required);
 					if (planned < 0)
 					{
@@ -9736,6 +11807,7 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						kind = event->marker_kind != 0 ? event->marker_kind :
 							event->kind;
 						order_id = event->marker_kind != 0 ? event->order_id : 0;
+						event->flags &= (uint8_t) ~FEV_F_SNAPSHOT_DROPPED;
 					}
 					else if (event->marker_kind != 0 &&
 						(future || fork_meta_snapshot_marker_page_retained(
@@ -9744,15 +11816,25 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 					{
 						kind = event->marker_kind;
 						order_id = event->order_id;
+						event->flags &= (uint8_t) ~FEV_F_SNAPSHOT_DROPPED;
 					}
 					else if (event->kind <= FEV_DEAD && keep[i])
 					{
 						kind = event->kind;
 						order_id = 0;
+						event->flags &= (uint8_t) ~FEV_F_SNAPSHOT_DROPPED;
 					}
 					else
+					{
+						/* Remove pruned PAGE GROWs and inert markers from
+						 * memory only after this generation commits. */
+						event->flags |= FEV_F_SNAPSHOT_DROPPED;
 						continue;
+					}
 
+					if (kind <= FEV_DEAD)
+						kind |= (event->flags & FEV_F_META ? FEV_W_META : 0) |
+							(event->flags & FEV_F_UNSTAMPED ? FEV_W_UNSTAMPED : 0);
 					if (fork_meta_vec_record(future ? tail : checkpoint,
 							e->timeline, &e->key, event->lsn,
 							event->admission_seq, order_id,
@@ -9823,6 +11905,111 @@ fail_entry:
 	if (source->len > UINT32_MAX)
 		return -1;
 	return 0;
+}
+
+/* Drop snapshot-pruned events only after a successful durable cutover.
+ * Once branch caps activate, META history follows the durable capped plan
+ * too. Rebuild every array index and prefix cache below. */
+static void
+fork_event_compact_entry(ForkEnt *e)
+{
+	uint32_t	w = 0;
+
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		if ((e->ev[i].flags & FEV_F_SNAPSHOT_DROPPED) &&
+			(branch_caps_active || cap_activation[CAP_PIN] || cap_activation[CAP_WALIDX] ||
+			 e->ev[i].kind > FEV_DEAD ||
+			 (e->ev[i].kind == FEV_GROW && !(e->ev[i].flags & FEV_F_META))))
+		{
+			if (e->ev[i].admission_seq == 0)
+				e->nlegacy_seq--;
+			continue;
+		}
+		if (w != i)
+			e->ev[w] = e->ev[i];
+		e->ev[w].flags &= (uint8_t) ~FEV_F_SNAPSHOT_DROPPED;
+		w++;
+	}
+	if (w == e->nev)
+		return;
+	e->nev = w;
+	e->ndef = 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+		if (e->ev[i].kind == FEV_SET || e->ev[i].kind == FEV_DEAD)
+			e->def_idx[e->ndef++] = i;
+	/* late_meta_idx stores array indexes too; META_FIRST itself travelled
+	 * with each surviving event above, so only the index list needs
+	 * rebuilding. The capped planner's closure preserves META_FIRST for
+	 * every retained position that a finite view can still escape into. */
+	if (branch_caps_active || cap_activation[CAP_PIN] || cap_activation[CAP_WALIDX])
+		fork_event_recompute_meta_first(e);
+	e->max_meta_seq = 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+		if ((e->ev[i].flags & (FEV_F_META | FEV_F_UNSTAMPED)) &&
+			e->ev[i].admission_seq > e->max_meta_seq)
+			e->max_meta_seq = e->ev[i].admission_seq;
+	e->nlate_meta = 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+		if ((e->ev[i].flags & FEV_F_META) && !(e->ev[i].flags & FEV_F_META_FIRST))
+		{
+			if (e->nlate_meta == e->late_meta_cap)
+			{
+				e->late_meta_cap = e->late_meta_cap ? e->late_meta_cap * 2 : 4;
+				e->late_meta_idx = realloc(e->late_meta_idx,
+					(size_t) e->late_meta_cap * sizeof(*e->late_meta_idx));
+			}
+			e->late_meta_idx[e->nlate_meta++] = i;
+		}
+	fork_event_cache_from(e, 0);
+	e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
+	e->max_inherited_page_seq = 0;
+	{
+		bool has_range;
+		uint64_t B = timeline_inherited_below(e->timeline, &has_range);
+
+		for (uint32_t i = 0; has_range && i < e->nev; i++)
+			if (e->ev[i].kind == FEV_GROW && !(e->ev[i].flags & FEV_F_META) &&
+				e->ev[i].lsn <= B && e->ev[i].admission_seq > e->max_inherited_page_seq)
+				e->max_inherited_page_seq = e->ev[i].admission_seq;
+	}
+	PS_ASSERT(fork_event_check_order(e));
+}
+
+/*
+ * Drop from every fork's in-memory history the inert markers the snapshot
+ * builder just dropped from the durable checkpoint/tail (fork_event_compact_entry()
+ * above).  Called only after fork_meta_snapshot_build() and the publish that
+ * follows it both succeed (fork_meta_snapshot_maintenance(), at rc = 1),
+ * under the same admission/shard/prune/map lock set that serialized the
+ * build, so nothing could have inserted a new event with a stale flag in
+ * between.  A fork visited under preserve_survivors is never flagged (that
+ * branch sets every event's flag to 0).  A fork skipped by the build's own
+ * "if (deleting) continue;" has every flag explicitly cleared right there
+ * before the skip, not merely left alone: without that clear, a fork could
+ * reach here with a stale 1 from an EARLIER build that flagged it (while
+ * not yet deleting) and then failed after stamping it (fail_entry/prepare/
+ * commit -> retry_done never runs this pass), followed by its timeline
+ * entering DELETING before the next successful build -- which would skip
+ * it and, without the explicit clear, leave that stale 1 for this pass to
+ * wrongly act on.  Either way, a deleting-or-preserve_survivors fork's
+ * surviving events always carry snapshot_dropped == 0 here, so this pass
+ * is a correctness no-op for it, exactly the "deleting forks and
+ * preserve_survivors generations untouched" requirement.  A failed build's
+ * flags never reach this pass at all (the caller does not run it on the
+ * retry/retry_done paths); the next SUCCESSFUL build overwrites every flag
+ * of every non-deleting fork it visits (and clears every deleting fork's)
+ * before this next runs, so a failed build's stale flags are always
+ * harmless by the time this pass reads them.  O(total events across every
+ * fork); once per cutover.
+ */
+static void
+fork_event_compact_dropped_markers(void)
+{
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (ForkEnt *e = g_shards[sh].fork_idx[bucket]; e; e = e->next)
+				fork_event_compact_entry(e);
 }
 
 static int
@@ -9990,6 +12177,27 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	int preserve_survivors;
 	int overflow_cutover;
 	int rc = 0;
+#ifdef PAGESTORE_ASSERT_CHECKING
+	/*
+	 * P2 plan-epoch validation (design doc S3.7(7), checklist item 5).  The
+	 * caller (the forkmeta-cutover branch of the maintenance loop) already
+	 * holds admission-wr *and* every shard's write lock across this entire
+	 * call, which excludes fork_event_add()/fork_event_add_seg_marker() on
+	 * every timeline, not just this one -- so no fork-event admission can
+	 * race this function at all, and the epoch sampled here can never
+	 * change before freeze_seq is taken below.  This assertion is the
+	 * epoch-comparison checklist asks for, placed "inside its existing
+	 * admission-wr section and before its switch"; it is a proof-carrying
+	 * no-op today (never trips) rather than new error-handling, because the
+	 * existing, coarser lock already makes it unconditionally true.
+	 */
+	uint64_t	plan_epoch_snapshot[MAX_TIMELINES];
+	uint32_t	plan_epoch_ei;
+
+	for (plan_epoch_ei = 0; plan_epoch_ei < MAX_TIMELINES; plan_epoch_ei++)
+		plan_epoch_snapshot[plan_epoch_ei] =
+			fork_event_plan_epoch_capture(plan_epoch_ei);
+#endif
 
 	if (fork_meta_pending_load(&fork_meta_snapshot_gc_pending))
 	{
@@ -10132,6 +12340,11 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	 * allocator through that selected position before freezing the snapshot. */
 	if (force_deleting)
 		admission_seq_observe(cutoff.admission_seq);
+#ifdef PAGESTORE_ASSERT_CHECKING
+	for (plan_epoch_ei = 0; plan_epoch_ei < MAX_TIMELINES; plan_epoch_ei++)
+		PS_ASSERT(fork_event_plan_epoch_validate(plan_epoch_ei,
+												 plan_epoch_snapshot[plan_epoch_ei]));
+#endif
 	freeze_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	if (freeze_seq <= 1)
 		goto retry;
@@ -10194,9 +12407,12 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	}
 	if (filter_deleting)
 		fork_meta_mark_deletion_cutover_done_locked();
-	/* Keep the in-memory chain conservative until the next restart.  All
-	 * acknowledged events remain available to readers; the durable checkpoint
-	 * is the source of truth for the next boot. */
+	/* The durable checkpoint just published is now the source of truth for
+	 * the next boot: drop the inert markers it no longer carries (flagged by
+	 * the build above) from every fork's in-memory history, so memory keeps
+	 * matching what that boot rebuilds instead of staying conservative until
+	 * a restart happens to come along. */
+	fork_event_compact_dropped_markers();
 	rc = 1;
 
 done:
@@ -10261,7 +12477,8 @@ load_timelines(void)
 			if (magic != TIMELINE_META_V2_MAGIC ||
 				(rec_len != sizeof(TimelineRecV2) &&
 				 rec_len != sizeof(TimelineRecEventV1) &&
-				 rec_len != sizeof(TimelineRecEvent)))
+				 rec_len != sizeof(TimelineRecEventV2) &&
+				 rec_len != sizeof(TimelineRecEventV3)))
 				return -1;
 			if (rec_len == sizeof(TimelineRecV2))
 			{
@@ -10370,8 +12587,8 @@ load_timelines(void)
 			}
 			else
 			{
-				TimelineRecEvent rec;
-				n = ps_storage->meta_read(off, &rec, sizeof(rec));
+				TimelineRecEventV3 rec;
+				n = timeline_event_read(off, rec_len, &rec);
 				if (n != (int) sizeof(rec))
 				{
 					if (n >= 0 && ps_storage->meta_truncate &&
@@ -10379,9 +12596,37 @@ load_timelines(void)
 						break;
 					return -1;
 				}
+				if (rec.kind == TIMELINE_META_EVENT_CAP_ACTIVATION)
+				{
+					if (rec.magic != TIMELINE_META_V2_MAGIC ||
+						rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
+						rec.crc != timeline_event_v3_crc(&rec) ||
+			rec.id >= CAP_COUNT || rec.parent != -1 || rec.state != 0 ||
+						rec.branch_lsn != 0 || rec.incarnation != 0 ||
+						rec.parent_incarnation != 0)
+			return -1;
+			if (rec.id == 0)
+			{
+			 if (branch_caps_active || rec.branch_seq != PS_SEQ_UNBOUNDED)
+			  return -1;
+			 branch_caps_active = 1;
+			}
+			else
+			{
+			 if (cap_activation[rec.id] || rec.branch_seq == 0 ||
+			  rec.branch_seq >= UINT64_MAX - 1)
+			  return -1;
+			 cap_activation[rec.id] = rec.branch_seq;
+			 admission_seq_observe(rec.branch_seq);
+			}
+					off += rec_len;
+					continue;
+				}
 				if (rec.magic != TIMELINE_META_V2_MAGIC ||
 					rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
-					rec.crc != timeline_event_crc(&rec) ||
+					rec.crc != timeline_event_v3_crc(&rec) ||
+					(rec.branch_seq != PS_SEQ_UNBOUNDED &&
+					 (!branch_caps_active || rec.branch_seq == 0)) ||
 					rec.id >= MAX_TIMELINES || rec.incarnation == 0 ||
 					rec.state < PS_TIMELINE_LIVE ||
 					rec.state > PS_TIMELINE_DELETED)
@@ -10422,6 +12667,9 @@ load_timelines(void)
 					}
 					else
 						return -1;
+					timelines[rec.id].branch_seq = rec.branch_seq;
+					if (rec.branch_seq != PS_SEQ_UNBOUNDED)
+						admission_seq_observe(rec.branch_seq);
 				}
 				else if (rec.kind == TIMELINE_META_EVENT_STATE)
 				{
@@ -10429,6 +12677,7 @@ load_timelines(void)
 
 					if (!timelines[rec.id].defined ||
 						timelines[rec.id].parent != rec.parent ||
+						timeline_branch_seq(rec.id) != rec.branch_seq ||
 						timelines[rec.id].branch_lsn != rec.branch_lsn ||
 						timelines[rec.id].parent_incarnation !=
 							rec.parent_incarnation ||
@@ -10449,7 +12698,7 @@ load_timelines(void)
 				}
 				else
 					return -1;
-				off += sizeof(rec);
+				off += rec_len;
 			}
 		}
 		return 0;
@@ -11479,8 +13728,10 @@ wal_recover_one(uint32_t tl)
 #define WALIDX_SNAPSHOT_PAYLOAD_VERSION_V1 1
 #define WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 2
 #define WALIDX_SNAPSHOT_PAYLOAD_BYTES_V1 64
-#define WALIDX_SNAPSHOT_PAYLOAD_VERSION 3
-#define WALIDX_SNAPSHOT_PAYLOAD_BYTES 72
+#define WALIDX_SNAPSHOT_PAYLOAD_VERSION_V3 3
+#define WALIDX_SNAPSHOT_PAYLOAD_BYTES_V3 72
+#define WALIDX_SNAPSHOT_PAYLOAD_VERSION 4
+#define WALIDX_SNAPSHOT_PAYLOAD_BYTES 80
 #define WALIDX_SNAPSHOT_DEFAULT_TRIGGER (1024u * 1024u)
 
 typedef struct WalIdxLogHdr
@@ -11533,9 +13784,15 @@ typedef struct WalIdxProgressRec
 	uint64_t	end_lsn;
 	uint64_t	shard_mask[2];
 	uint64_t	shard_offsets[PS_MAX_CHANNELS];
+	uint64_t	horizon_seq;
 } WalIdxProgressRec;
 
+#define WALIDX_PROGRESS_BYTES_V1 offsetof(WalIdxProgressRec, horizon_seq)
+_Static_assert(sizeof(WalIdxProgressRec) == WALIDX_PROGRESS_BYTES_V1 + 8,
+			   "progress v2 appends exactly one horizon sequence cap");
+
 static uint64_t walidx_progress[MAX_TIMELINES];
+static uint64_t walidx_horizon_seq[MAX_TIMELINES];
 static unsigned char walidx_progress_valid[MAX_TIMELINES];
 /* progress_valid also describes the provisional first WAL position before a
  * durable progress marker exists; reclaim policy must use this stricter bit. */
@@ -11715,6 +13972,7 @@ inspection_metrics_changed(void)
 static void
 inspection_timeline_cache_changed(void)
 {
+	__atomic_add_fetch(&page_view_timeline_epoch, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&inspection_timeline_cache_dirty, 1, __ATOMIC_RELEASE);
 	inspection_metrics_changed();
 }
@@ -12100,9 +14358,15 @@ walidx_progress_crc(WalIdxProgressRec *rec)
 	uint32_t	crc;
 
 	rec->crc = 0;
-	crc = fnv(rec, sizeof(*rec));
+	crc = fnv(rec, rec->rec_len);
 	rec->crc = save;
 	return crc;
+}
+
+void
+ps_test_admission_seq_observe(uint64_t seq)
+{
+	admission_seq_observe(seq);
 }
 
 static void
@@ -12433,13 +14697,25 @@ wal_reclaim_raw_dependency_floor(uint32_t timeline, uint64_t store_start,
  * grants_out/ngrants_out are optional: when given, the caller takes
  * ownership of the materializer-grant array that records which entries the
  * materializer exception added (needed only by the plan builder's own later
- * walidx_plan_recheck_standing at publish time, not by a one-off query). */
+ * walidx_plan_recheck_standing at publish time, not by a one-off query).
+ *
+ * Design doc S3.7(7) rev 3, S4 ("page prune keeps the base versions the
+ * WAL index depends on"): satisfied by construction, pre-existing and
+ * unchanged by P2.  The protected set here is built directly from
+ * page_prune_fences()'s own fence list (above), the identical fence set
+ * ps_page_prune_plan_capped() consumes for image retention (design doc
+ * S1.3 step 2: the newest admissible version at or below *every* fence it
+ * is given is kept).  So a horizon can only be "protected" -- and only
+ * then may walidx_plan_bases_build() rely on a stored image at or below it
+ * as a base -- when page-level retention is independently already
+ * committed to keeping a version there.  An unprotected horizon never
+ * trusts a stored image and falls back to the FPI-led chain instead. */
 static int
 walidx_protected_horizons_build(uint32_t tl, uint64_t **set_out,
 								uint32_t *n_out, WalIdxMatGrant **grants_out,
 								uint32_t *ngrants_out)
 {
-	PsPruneFence *fences = NULL;
+	PsHistoryFence *fences = NULL;
 	uint32_t	nfences = 0;
 	uint64_t   *protected_set;
 	uint32_t	nprotected = 0;
@@ -13023,7 +15299,7 @@ wal_segment_reclaim_one(void)
 			(pin_floor == 0 || retention_floor < pin_floor) && note_lsn != 0)
 		{
 			uint64_t	page_history_floor = 0;
-			PsPruneFence *cfences = NULL;
+			PsHistoryFence *cfences = NULL;
 			uint32_t	ncfences = 0;
 			int			note_rc;
 
@@ -13675,6 +15951,11 @@ timeline_reset_reuse_runtime(uint32_t timeline)
 	ps_pgcache_invalidate_timeline(timeline);
 	wal_runtime_purge(timeline);
 	memset(page_prune_due[timeline], 0, sizeof(page_prune_due[timeline]));
+	/* L2: the reused incarnation starts with a clean "deletion blocked"
+	 * dedup history -- otherwise a torn-tail stall logged for incarnation N
+	 * could suppress the first log line for the same stall recurring on
+	 * incarnation N+1 if the tuple happens to coincide. */
+	timeline_cleanup_blocked_last_valid[timeline] = 0;
 	__atomic_store_n(&timeline_used[timeline], 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_wal_cleanup_done[timeline], 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_page_cleanup_done[timeline], 0, __ATOMIC_RELEASE);
@@ -13762,12 +16043,15 @@ timeline_delete_page_cleanup_one(void)
 	 * with seg_read/seg_size/seg_write/sync alone; it needs no same-id
 	 * whole-segment replacement primitive.  seg_read/seg_size are already
 	 * required elsewhere in this path, so the one capability worth gating on
-	 * here is seg_write.  SPDK does implement it, but its seg_size always
-	 * reports the fixed g_segsize for every segment rather than how much of
-	 * it actually holds records, so pass 1's validation scan runs into the
-	 * unwritten tail padding and fails closed as malformed: SPDK timeline
-	 * deletion still cannot complete, for that structural reason, not a
-	 * missing capability (out of MVP scope, see D6 in MVP_STATUS.md).
+	 * here is seg_write.  SPDK does implement it, and its seg_size always
+	 * reporting the fixed g_segsize for every segment is no longer a
+	 * structural blocker by itself: pass 1 now treats the zero-padded tail
+	 * as end of log exactly where recover() does (invariant I4).  SPDK
+	 * timeline deletion is still not validated -- there is no SPDK lane
+	 * exercising this path, and SPDK's seg_write goes through the buffered
+	 * curbuf/iobuf path with unverified sync semantics for an in-place hole
+	 * write -- so it stays out of the MVP boundary (D6 in MVP_STATUS.md),
+	 * but the reason has changed from "cannot complete" to "unvalidated."
 	 */
 	if (ps_storage->seg_write == NULL)
 		return 0;
@@ -13787,6 +16071,10 @@ timeline_delete_page_cleanup_one(void)
 			ps_lock_shard_wr(sh);
 		ps_lock_map_wr();
 		had_entries = page_cleanup_has_index_entries_locked(tl);
+		/* L1: a stale failure from a *different* timeline's earlier scan
+		 * must never be attributed to this timeline below -- reset before
+		 * the call so cleanup_last_failure_valid only survives this scan. */
+		cleanup_last_failure_valid = 0;
 		rc = page_cleanup_scan_timeline_locked(tl);
 		if (rc == 0 && __atomic_load_n(&fork_meta_deletion_cutover_done[tl],
 											__ATOMIC_ACQUIRE))
@@ -13803,6 +16091,26 @@ timeline_delete_page_cleanup_one(void)
 		for (uint32_t sh = core_shards(); sh > 0; sh--)
 			ps_unlock_shard(sh - 1);
 		timeline_page_cleanup_cursor = (tl - 1) % (MAX_TIMELINES - 1);
+		if (rc < 0 && cleanup_last_failure_valid)
+		{
+			PsCleanupFailure f = cleanup_last_failure;
+
+			/* Once per distinct (timeline, shard, seg, off, magic, len):
+			 * a stalled deletion retries every maintenance turn, and this
+			 * diagnostic must not scale with turn count. */
+			if (!timeline_cleanup_blocked_last_valid[tl] ||
+				memcmp(&timeline_cleanup_blocked_last[tl], &f, sizeof(f)) != 0)
+			{
+				fprintf(stderr, "pagestore_daemon: timeline %u deletion blocked: "
+						"shard %u segment %d malformed record at offset %llu "
+						"(magic %#x len %u) inside the reachable region; "
+						"retrying each maintenance turn\n",
+						tl, f.shard, f.seg, (unsigned long long) f.off,
+						f.magic, f.len);
+				timeline_cleanup_blocked_last[tl] = f;
+				timeline_cleanup_blocked_last_valid[tl] = 1;
+			}
+		}
 		if (rc > 0)
 			return 1;
 		/* A malformed target segment must not prevent another deleting timeline
@@ -13832,9 +16140,9 @@ fork_meta_source_record_valid(const ForkMetaRecV2 *rec)
 		rec->kind <= FEV_SEG_COMMIT_BOUND;
 	if (ordered_marker)
 		return fork_meta_ordered_marker_valid(rec, 1);
-	if (rec->kind <= FEV_DEAD)
+	if (FEV_KIND(rec->kind) <= FEV_DEAD)
 		return rec->order_id == 0 &&
-			(rec->kind != FEV_DEAD || rec->nblocks == 0);
+			(FEV_KIND(rec->kind) != FEV_DEAD || rec->nblocks == 0);
 	if (rec->kind == FEV_MIGRATING || rec->kind == FEV_MIGRATED)
 	{
 		memset(&zero_key, 0, sizeof(zero_key));
@@ -14143,6 +16451,11 @@ timeline_delete_publish_one(void)
 			/* The deleted branch's cap no longer fences its ancestors' page
 			 * and control history; revisit their layers (map-wr is held). */
 			page_prune_mark_all_due_locked();
+			/* L2: DELETED is the durable proof this incarnation is fully
+			 * gone; a reuse of this slot must not have its own "deletion
+			 * blocked" diagnostic suppressed by a stale tuple left behind
+			 * by this incarnation's stall history. */
+			timeline_cleanup_blocked_last_valid[tl] = 0;
 			did = 1;
 		}
 		ps_unlock_map();
@@ -14317,7 +16630,7 @@ walidx_snapshot_encode_header(unsigned char out[WALIDX_SNAPSHOT_PAYLOAD_BYTES],
 							  uint32_t tl, uint32_t shard,
 							  uint64_t nrecords, uint64_t generation,
 							  uint64_t start_lsn, uint64_t end_lsn,
-							  uint64_t source_offset, uint64_t log_epoch)
+							  uint64_t source_offset, uint64_t log_epoch, uint64_t horizon_seq)
 {
 	uint32_t crc;
 
@@ -14334,6 +16647,7 @@ walidx_snapshot_encode_header(unsigned char out[WALIDX_SNAPSHOT_PAYLOAD_BYTES],
 	walidx_put_le64(out + 48, source_offset);
 	walidx_put_le64(out + 56, log_epoch);
 	walidx_put_le32(out + 68, (uint32_t) (nrecords >> 32));
+	walidx_put_le64(out + 72, horizon_seq);
 	crc = fnv(out, WALIDX_SNAPSHOT_PAYLOAD_BYTES);
 	walidx_put_le32(out + 64, crc);
 }
@@ -14364,6 +16678,9 @@ walidx_snapshot_decode_header(const unsigned char *header, uint64_t available,
 	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 &&
 			 bytes == WALIDX_SNAPSHOT_PAYLOAD_BYTES_V1)
 		crc_offset = 56;
+	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V3 &&
+			 bytes == WALIDX_SNAPSHOT_PAYLOAD_BYTES_V3)
+		crc_offset = 64;
 	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION &&
 			 bytes == WALIDX_SNAPSHOT_PAYLOAD_BYTES)
 		crc_offset = 64;
@@ -14383,15 +16700,19 @@ walidx_snapshot_decode_header(const unsigned char *header, uint64_t available,
 		walidx_get_le64(copy + 40) != end_lsn ||
 		(version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V1 &&
 		 walidx_get_le32(copy + 60) != 0) ||
+		(version == WALIDX_SNAPSHOT_PAYLOAD_VERSION &&
+		 (walidx_get_le64(copy + 72) == 0 ||
+	  (walidx_get_le64(copy + 72) != PS_SEQ_UNBOUNDED &&
+	   cap_effective_seq(CAP_WALIDX, walidx_get_le64(copy + 72)) == PS_SEQ_UNBOUNDED))) ||
 		fnv(copy, bytes) != stored_crc)
 		return -1;
 	*header_bytes = bytes;
-	*record_bytes = version == WALIDX_SNAPSHOT_PAYLOAD_VERSION ?
+	*record_bytes = version >= WALIDX_SNAPSHOT_PAYLOAD_VERSION_V3 ?
 		sizeof(WalIdxRec) : sizeof(WalIdxRecV1);
 	*nrecords = walidx_get_le32(copy + 20);
 	if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2)
 		*nrecords |= (uint64_t) walidx_get_le32(copy + 60) << 32;
-	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION)
+	else if (version >= WALIDX_SNAPSHOT_PAYLOAD_VERSION_V3)
 		*nrecords |= (uint64_t) walidx_get_le32(copy + 68) << 32;
 	*source_offset = walidx_get_le64(copy + 48);
 	*log_epoch = version >= WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 ?
@@ -14400,6 +16721,25 @@ walidx_snapshot_decode_header(const unsigned char *header, uint64_t available,
 		(*log_epoch != generation || *source_offset != 0))
 		return -1;
 	return 0;
+}
+
+/* Test the private wire codec with a valid CRC, including old V3 headers. */
+int
+ps_test_walidx_snapshot_horizon_header(uint32_t version, uint64_t seq)
+{
+	unsigned char header[WALIDX_SNAPSHOT_PAYLOAD_BYTES];
+	uint32_t header_bytes, record_bytes;
+	uint64_t nrecords, source_offset, log_epoch;
+	uint32_t bytes = version == 3 ? 72 : 80;
+
+	walidx_snapshot_encode_header(header, 0, 0, 0, 1, 0, 16384, 0, 1, PS_SEQ_UNBOUNDED);
+	walidx_put_le32(header + 4, version);
+	walidx_put_le32(header + 8, bytes);
+	walidx_put_le64(header + 72, seq);
+	walidx_put_le32(header + 64, 0);
+	walidx_put_le32(header + 64, fnv(header, bytes));
+	return walidx_snapshot_decode_header(header, bytes, 0, 0, 1, 0, 16384,
+		&header_bytes, &record_bytes, &nrecords, &source_offset, &log_epoch);
 }
 
 static int
@@ -14720,12 +17060,83 @@ fork_meta_required_fences(const ForkEnt *e, const uint32_t *indices,
  * Build the replacement-base table for one timeline.  Caller holds every
  * shard read lock, the WAL-index prune read fence, and map-rd.  Failure
  * leaves no table, which degrades to the FPI-only plan.
+ *
+ * Design doc S3.7(7) rev 3:
+ *   S1 -- every death and image below is computed per horizon's own
+ *         ViewCap (viewcap_lsn_seq(horizons[i], 0), fed straight into
+ *         fork_asof_hop() -- the same admissibility predicate the read
+ *         path uses, pagestore_admissible.h), not a raw LSN comparison, so
+ *         retention and reads can never disagree on what a horizon sees.
+ *   S3 -- fork size (nblocks) is consulted only to recognise a death (a
+ *         SET whose nblocks <= this block, or a DEAD event); it never by
+ *         itself drops a WAL-index record.  Grep confirms every nblocks
+ *         comparison below feeds `deaths[]`, never `keep[]`/`bases[]`
+ *         directly.
  */
+static int
+walidx_death_visible_to_fences(const ForkEnt *f, uint32_t idx,
+							   const PsHistoryFence *fences, uint32_t nfences)
+{
+	bool		has_B;
+	uint64_t	B = timeline_inherited_below(f->timeline, &has_B);
+
+	for (uint32_t i = 0; i < nfences; i++)
+	{
+		ViewCap		cap = {fences[i].lsn, fences[i].seq, fences[i].admission_seq, false};
+
+		if (f->ev[idx].lsn <= cap.lsn && cap.seq != PS_SEQ_UNBOUNDED &&
+			fork_event_hidden(f, idx, &cap, B, has_B))
+			return 0;
+	}
+	return 1;
+}
+
+static int
+walidx_absent_at_fences(const ForkEnt *f, uint32_t block, uint64_t horizon,
+						const PsHistoryFence *fences, uint32_t nfences)
+{
+	bool		has_B;
+	uint64_t	B = timeline_inherited_below(f->timeline, &has_B);
+
+	for (uint32_t i = 0; i < nfences; i++)
+	{
+		ViewCap		cap = {fences[i].lsn, fences[i].seq, fences[i].admission_seq, false};
+		uint32_t	nb = 0;
+		int			state;
+
+		if (cap.lsn != horizon || cap.seq == PS_SEQ_UNBOUNDED)
+			continue;
+		state = fork_asof_hop(f, &cap, B, has_B, &nb);
+		if (state != FORK_HOP_DEAD && (state != FORK_HOP_DEF || nb > block))
+			return 0;
+	}
+	return 1;
+}
+
+static int
+walidx_base_visible_to_fences(const PageEnt *page, const PageVer * version,
+							  const PsHistoryFence *fences, uint32_t nfences)
+{
+	bool		has_B;
+	uint64_t	B = timeline_inherited_below(page->timeline, &has_B);
+
+	for (uint32_t i = 0; i < nfences; i++)
+	{
+		PsAdmitCap	cap = {fences[i].lsn, fences[i].seq, fences[i].admission_seq};
+
+		if (version->lsn <= cap.lsn &&
+			!ps_version_admissible(version->lsn, version->admission_seq,
+								   page_select_is_smin(page, version), &cap, B, has_B))
+			return 0;
+	}
+	return 1;
+}
+
 static int
 walidx_plan_bases_build(uint32_t tl)
 {
 	uint64_t	floor = 0;
-	PsPruneFence *fences = NULL;
+	PsHistoryFence *fences = NULL;
 	uint32_t	nfences = 0;
 	uint64_t   *horizons = NULL;
 	uint32_t	nhorizons = 0;
@@ -14738,6 +17149,19 @@ walidx_plan_bases_build(uint32_t tl)
 										   &floor, 1, NULL, NULL, NULL, NULL) != 0 ||
 		page_prune_fences(tl, &fences, &nfences) != 0)
 		return -1;
+	{
+  PsHistoryFence *wfences = NULL;
+  uint32_t n = 0;
+  PsHistoryFence *grown;
+  if (walidx_view_fences(tl, &wfences, &n) != 0)
+  { free(fences); return -1; }
+  grown = realloc(fences, (size_t) (nfences + n) * sizeof(*fences));
+  if (!grown) { free(wfences); free(fences); return -1; }
+  fences = grown;
+  memcpy(fences + nfences, wfences, (size_t) n * sizeof(*fences));
+  nfences += n;
+  free(wfences);
+ }
 	/* The protected-horizon set (which LSNs a stored replacement base can
 	 * serve) is built once, shared with the WAL reclaimer's own
 	 * fruitless-evaluation lookup so the two can never diverge; fences here
@@ -14804,6 +17228,7 @@ walidx_plan_bases_build(uint32_t tl)
 				if (f != NULL)
 					for (uint32_t i = 0; i < f->nev; i++)
 						if (f->ev[i].lsn != 0 &&
+							walidx_death_visible_to_fences(f, i, fences, nfences) &&
 							(f->ev[i].kind == FEV_DEAD ||
 							 (f->ev[i].kind == FEV_SET &&
 							  f->ev[i].nblocks <= e->block)))
@@ -14812,11 +17237,22 @@ walidx_plan_bases_build(uint32_t tl)
 					for (uint32_t i = 0; i < nhorizons; i++)
 					{
 						uint32_t	nb = 0;
+						ViewCap hc = viewcap_lsn_seq(horizons[i], 0);
+			bool has_B;
+			uint64_t B = timeline_inherited_below(tl, &has_B);
+			for (uint32_t j = 0; j < nfences; j++)
+			 if (fences[j].lsn == hc.lsn)
+			 {
+			  if (fences[j].seq < hc.seq) hc.seq = fences[j].seq;
+			  if (fences[j].admission_seq < hc.strict_seq)
+			   hc.strict_seq = fences[j].admission_seq;
+			 }
 						int			state = horizons[i] == 0 ? FORK_HOP_NONE :
-						fork_asof_hop(f, horizons[i], 0, &nb);
+						fork_asof_hop(f, &hc, B, has_B, &nb);
 
-						if (state == FORK_HOP_DEAD ||
-							(state == FORK_HOP_DEF && nb <= e->block))
+						if ((state == FORK_HOP_DEAD ||
+							 (state == FORK_HOP_DEF && nb <= e->block)) &&
+							walidx_absent_at_fences(f, e->block, horizons[i], fences, nfences))
 							ndeaths++;
 					}
 				n = p != NULL && p->nver > 0 ? (uint32_t) p->nver : 0;
@@ -14845,9 +17281,9 @@ walidx_plan_bases_build(uint32_t tl)
 					qsort(chain, n, sizeof(*chain), prune_version_cmp);
 				if (n == 0 || floor == 0)
 					memset(keep, 1, n != 0 ? n : 1);
-				else if (ps_page_prune_plan(chain, n,
-											(PsPruneFence) {floor, UINT64_MAX},
-											fences, nfences, keep) < 0)
+				else if (history_prune_plan(chain, n, (PsPruneFence) {floor, UINT64_MAX},
+										fences, nfences, timelines[tl].branch_lsn,
+										timelines[tl].parent >= 0, keep) < 0)
 				{
 					free(chain);
 					free(keep);
@@ -14862,7 +17298,8 @@ walidx_plan_bases_build(uint32_t tl)
 					for (int j = 0; j < p->nver; j++)
 						if (p->vers[j].lsn == chain[i].lsn &&
 							p->vers[j].admission_seq == chain[i].admission_seq &&
-							walidx_base_version_durable(&p->vers[j]))
+							walidx_base_version_durable(&p->vers[j]) &&
+				walidx_base_visible_to_fences(p, &p->vers[j], fences, nfences))
 						{
 							bases[nbases++] = chain[i].lsn;
 							break;
@@ -14872,6 +17309,7 @@ walidx_plan_bases_build(uint32_t tl)
 				{
 					for (uint32_t i = 0; i < f->nev; i++)
 						if (f->ev[i].lsn != 0 &&
+							walidx_death_visible_to_fences(f, i, fences, nfences) &&
 							(f->ev[i].kind == FEV_DEAD ||
 							 (f->ev[i].kind == FEV_SET &&
 							  f->ev[i].nblocks <= e->block)))
@@ -14879,11 +17317,22 @@ walidx_plan_bases_build(uint32_t tl)
 					for (uint32_t i = 0; i < nhorizons; i++)
 					{
 						uint32_t	nb = 0;
+						ViewCap hc = viewcap_lsn_seq(horizons[i], 0);
+			bool has_B;
+			uint64_t B = timeline_inherited_below(tl, &has_B);
+			for (uint32_t j = 0; j < nfences; j++)
+			 if (fences[j].lsn == hc.lsn)
+			 {
+			  if (fences[j].seq < hc.seq) hc.seq = fences[j].seq;
+			  if (fences[j].admission_seq < hc.strict_seq)
+			   hc.strict_seq = fences[j].admission_seq;
+			 }
 						int			state = horizons[i] == 0 ? FORK_HOP_NONE :
-						fork_asof_hop(f, horizons[i], 0, &nb);
+						fork_asof_hop(f, &hc, B, has_B, &nb);
 
-						if (state == FORK_HOP_DEAD ||
-							(state == FORK_HOP_DEF && nb <= e->block))
+						if ((state == FORK_HOP_DEAD ||
+							 (state == FORK_HOP_DEF && nb <= e->block)) &&
+							walidx_absent_at_fences(f, e->block, horizons[i], fences, nfences))
 							deaths[ndeaths_out++] = horizons[i];
 					}
 				}
@@ -14996,6 +17445,7 @@ typedef struct WalIdxSnapshotProduceCtx
 	uint64_t source_offset;
 	uint64_t log_epoch;
 	uint64_t nrecords;
+ uint64_t horizon_seq;
 	int compact;
 	const uint64_t *horizons;
 	uint32_t nhorizons;
@@ -15016,7 +17466,7 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 
 	walidx_snapshot_encode_header(header, ctx->tl, ctx->shard, ctx->nrecords,
 							  ctx->generation, ctx->start_lsn, ctx->end_lsn,
-							  ctx->source_offset, ctx->log_epoch);
+							  ctx->source_offset, ctx->log_epoch, ctx->horizon_seq);
 	if (consume(consume_arg, header, sizeof(header)) != 0)
 		return -1;
 	/* One cursor per fixed hash bucket bounds serialization memory regardless
@@ -15182,7 +17632,7 @@ walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 		return -1;
 	*ctx = (WalIdxSnapshotProduceCtx) {
 		tl, shard, generation, start_lsn, end_lsn, source_offset, log_epoch,
-		nrecords, compact, horizons, nhorizons
+		nrecords, walidx_horizon_seq[tl] ? walidx_horizon_seq[tl] : PS_SEQ_UNBOUNDED, compact, horizons, nhorizons
 	};
 	*input = (PsWalIdxSnapshotInput) {
 		NULL,
@@ -15404,8 +17854,17 @@ walidx_snapshot_recover(uint32_t tl)
 								 &log_epoch) != 0 ||
 			nrecords > (UINT64_MAX - header_bytes) / record_bytes)
 			goto fail;
-		expected_len = header_bytes +
-			 nrecords * record_bytes;
+		{
+		uint64_t seq = header_bytes == WALIDX_SNAPSHOT_PAYLOAD_BYTES ?
+		 walidx_get_le64(header + 72) : PS_SEQ_UNBOUNDED;
+		if (shard && walidx_horizon_seq[tl] != seq)
+		 goto fail;
+		walidx_horizon_seq[tl] = seq;
+		if (seq != PS_SEQ_UNBOUNDED)
+		 admission_seq_observe(seq);
+	}
+	expected_len = header_bytes +
+		 nrecords * record_bytes;
 		if (expected_len != snapshot.shards[shard].len)
 			goto fail;
 		while (done < nrecords)
@@ -15529,6 +17988,15 @@ walidx_snapshot_publish_one(void)
 	int candidate = -1;
 	int retry = 0;
 	int rc = 0;
+	/* P2 plan-epoch observation (design doc S3.7(7)): sampled once the
+	 * candidate timeline is fixed and the plan starts depending on the
+	 * current fork-event state (walidx_plan_bases_build(), the
+	 * compaction plan and the per-shard payload all read it), re-checked
+	 * immediately before the generation switch below.  See the detailed
+	 * amendment at both call sites: this is currently an observation, not
+	 * a hard gate. */
+	uint64_t plan_epoch = 0;
+
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 		if (__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
@@ -15626,6 +18094,17 @@ walidx_snapshot_publish_one(void)
 		walidx_plan_bases_free();
 	for (uint32_t shard = ns; shard > 0; shard--)
 		ps_unlock_shard(shard - 1);
+	/*
+	 * Design doc S3.7(7) rev 3: sample the plan epoch once every shard
+	 * write lock this function's own read locks could conflict with is
+	 * released (every fork-event admission this counter tracks needs its
+	 * key's shard write lock, which was held rd above through
+	 * walidx_plan_bases_build()).  This is a pure soak-report observation
+	 * of "did anything land in the window from here to the switch below" --
+	 * it never gates: rev 3's monotonicity argument (S1-S4) is what makes
+	 * publication correct regardless of what lands in that window.
+	 */
+	plan_epoch = fork_event_plan_epoch_capture((uint32_t) candidate);
 	walidx_publish_wrlock();
 	walidx_plan_recheck_standing((uint32_t) candidate);
 	{
@@ -15773,9 +18252,25 @@ walidx_snapshot_publish_one(void)
 				goto publish_done;
 			}
 			walidx_prune_memory(tl, end_lsn, fences, nfences);
+			goto do_generation_switch;
 		}
-		else if (ps_walidx_snapshot_publish(directory, tl, generation,
-											start_lsn, end_lsn, inputs, ns) != 0)
+		/*
+		 * The non-compact path publishes and selects in one call
+		 * (ps_walidx_snapshot_publish() is exactly ps_walidx_snapshot_
+		 * prepare() + ps_walidx_snapshot_commit(), aborting on a failed
+		 * commit).  Design doc S3.7(7) rev 3: no *correctness* re-check is
+		 * needed here, or on the compact path above, no matter how long
+		 * prepare takes -- a fork-event/PAGE-GROW admission that lands
+		 * anywhere during this publish, at any LSN, cannot invalidate a
+		 * plan already built, because later admissions only add to what a
+		 * reader's view sees (S1-S4's monotonicity argument).  This
+		 * publish takes no admission lock.  (The informational epoch
+		 * counter is still sampled once both paths converge, at
+		 * do_generation_switch below, so it also counts admissions from
+		 * this I/O -- Codex 4114217403.)
+		 */
+		if (ps_walidx_snapshot_publish(directory, tl, generation,
+										start_lsn, end_lsn, inputs, ns) != 0)
 		{
 			int discard = ps_walidx_snapshot_discard_generation(directory, tl,
 															generation, ns);
@@ -15785,7 +18280,28 @@ walidx_snapshot_publish_one(void)
 				retry = 1;
 				goto publish_done;
 			}
+			/* discard == 1: this generation was already selected by an
+			 * earlier, previously-crashed attempt.  Fall through to
+			 * reconcile the in-memory pointer with that durable fact. */
 		}
+
+do_generation_switch:
+		/*
+		 * Codex 4114217403: the plan-epoch observation (design doc
+		 * S3.7(7) rev 3) moved here, the one point both the compact path
+		 * (ps_walidx_snapshot_prepare()/commit(), above) and the
+		 * non-compact path (ps_walidx_snapshot_publish(), just above)
+		 * reach only after successfully switching generations.  Sampled
+		 * before either path's own I/O (right after plan_epoch was
+		 * captured, near the top of this function), the check missed
+		 * every admission that landed during that I/O, undercounting the
+		 * plan-to-publish race it exists to measure.  It stays a pure
+		 * statistic: it neither gates this switch nor takes any new lock,
+		 * exactly as the comments on both paths above already explain.
+		 */
+		if (!fork_event_plan_epoch_validate(tl, plan_epoch))
+			__atomic_fetch_add(&walidx_publish_plan_epoch_aborts, 1,
+							   __ATOMIC_RELAXED);
 		pthread_mutex_lock(&walidx_meta_lock);
 		walidx_snapshot_generation[tl] = generation;
 		walidx_snapshot_start[tl] = start_lsn;
@@ -15966,8 +18482,9 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 				 hdr.rec_len == sizeof(WalIdxRecV1)))
 				rec_len = hdr.rec_len;
 			else if (shard == 0 && hdr.magic == WALIDX_PROGRESS_MAGIC &&
-					 hdr.rec_len == sizeof(WalIdxProgressRec))
-				rec_len = sizeof(WalIdxProgressRec);
+					 (hdr.rec_len == sizeof(WalIdxProgressRec) ||
+					  hdr.rec_len == WALIDX_PROGRESS_BYTES_V1))
+				rec_len = hdr.rec_len;
 			else
 				return -1;
 			if (used - pos < (int) rec_len)
@@ -16007,7 +18524,9 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 				WalIdxProgressRec rec;
 				uint64_t	first;
 
-				memcpy(&rec, buf + pos, sizeof(rec));
+				memset(&rec, 0, sizeof(rec));
+				rec.horizon_seq = PS_SEQ_UNBOUNDED;
+				memcpy(&rec, buf + pos, rec_len);
 				first = wal_log_start(tl);
 				if (!walidx_progress_valid[tl] && first != UINT64_MAX)
 				{
@@ -16031,7 +18550,9 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 						wal_segment_stores[tl].start_lsn)))
 					walidx_progress[tl] = rec.start_lsn;
 				if (rec.magic != WALIDX_PROGRESS_MAGIC ||
-					rec.rec_len != sizeof(rec) || rec.timeline != tl ||
+					rec.rec_len != rec_len || rec.timeline != tl ||
+					(rec.horizon_seq == 0 || (rec.horizon_seq != PS_SEQ_UNBOUNDED &&
+			 cap_effective_seq(CAP_WALIDX, rec.horizon_seq) == PS_SEQ_UNBOUNDED)) ||
 					rec.crc != walidx_progress_crc(&rec) ||
 					!walidx_progress_valid[tl] ||
 					rec.start_lsn != walidx_progress[tl] ||
@@ -16049,6 +18570,9 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 						walidx_shard_offsets_required[tl][i] =
 							rec.shard_offsets[i];
 				walidx_progress[tl] = rec.end_lsn;
+		walidx_horizon_seq[tl] = rec.horizon_seq;
+		if (rec.horizon_seq != PS_SEQ_UNBOUNDED)
+		 admission_seq_observe(rec.horizon_seq);
 				walidx_progress_valid[tl] = 1;
 				walidx_progress_durable[tl] = 1;
 			}
@@ -16079,7 +18603,7 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 }
 
 static int
-walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
+walidx_commit_locked(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 {
 	WalIdxProgressRec rec;
 	pthread_rwlock_t *wal_lock;
@@ -16124,6 +18648,7 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 		goto out;
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = WALIDX_PROGRESS_MAGIC;
+	rec.horizon_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_RELAXED) - 1;
 	rec.rec_len = sizeof(rec);
 	rec.crc = 0;
 	rec.timeline = tl;
@@ -16144,7 +18669,7 @@ out:
 		return -1;
 	}
 	if (ps_storage->walidx_append(tl, 0, walidx_log_epoch[tl][0],
-								&rec, sizeof(rec)) != 0)
+								  &rec, sizeof(rec)) != 0)
 	{
 		pthread_rwlock_unlock(wal_lock);
 		walidx_publish_wrunlock();
@@ -16171,10 +18696,16 @@ out:
 		if (rec.shard_offsets[shard] > walidx_shard_offsets_required[tl][shard])
 			walidx_shard_offsets_required[tl][shard] = rec.shard_offsets[shard];
 	walidx_progress[tl] = rec.end_lsn;
+	walidx_horizon_seq[tl] = rec.horizon_seq;
+	if (rec.horizon_seq != PS_SEQ_UNBOUNDED)
+		admission_seq_observe(rec.horizon_seq);
 	walidx_progress_valid[tl] = 1;
 	walidx_progress_durable[tl] = 1;
-	/* Durable progress is one of the terms wal_segment_reclaim_one takes the
-	 * minimum over; advancing it can move the candidate past the boundary. */
+
+	/*
+	 * Durable progress is one of the terms wal_segment_reclaim_one takes the
+	 * minimum over; advancing it can move the candidate past the boundary.
+	 */
 	wal_reclaim_proof_changed();
 	rc = 0;
 out_update:
@@ -16183,6 +18714,18 @@ out_update:
 	walidx_publish_wrunlock();
 	publish_wal_index_metrics();
 	return rc;
+}
+
+static int
+walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
+{
+ int rc;
+ for (uint32_t shard = 1; shard < core_shards(); shard++)
+  ps_lock_shard_rd(shard);
+ rc = walidx_commit_locked(tl, start_lsn, end_lsn);
+ for (uint32_t shard = core_shards(); shard-- > 1;)
+  ps_unlock_shard(shard);
+ return rc;
 }
 
 static uint64_t
@@ -16381,7 +18924,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	admission_seq;
 	int			clamped = 0;
 	int			ordered_record = 0;
-	int			segment_grows = 0;
+	int			extends_uncapped = 0;
 	int			zero_version = 0;
 	Shard	   *s;
 	ForkEnt    *fe;
@@ -16550,15 +19093,77 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		hdr.lsn = growth_floor;
 		zero_version = 1;
 	}
+	ordered_record = zero_version || clamped;
+	/*
+	 * An ordered write has no historical WAL position to preserve: its LSN
+	 * already represents the fork/branch floor, not the page's pd_lsn.  Once
+	 * forkmeta compaction passes that floor, place the new marker at the
+	 * selected cutoff instead.  The fresh admission sequence puts it strictly
+	 * in the source suffix (the caller holds admission-rd across this append).
+	 * This is the same operational ordering used by unstamped fork metadata
+	 * mutations.  It applies to growth as well as rewrites: persist the exact
+	 * position used for size/visibility so recovery cannot grow an old horizon.
+	 * WAL-less pages keep version zero and remain unavailable to capped reads;
+	 * clamped copies use the promoted position for both version and growth.
+	 * Ordinary WAL-versioned pages and explicit metadata LSNs are unchanged.
+	 */
+	if (ordered_record && fork_meta_snapshot_generation != 0 &&
+		hdr.lsn < fork_meta_snapshot_cutoff_lsn)
+		hdr.lsn = fork_meta_snapshot_cutoff_lsn;
+	if (ordered_record)
+	{
+		PsHistoryFence *fences = NULL;
+		uint32_t nfences = 0;
+		uint64_t newest;
+		int rc;
+
+		/* An operational write must be newer than every protected snapshot,
+		 * not just the compaction cutoff.  Reuse pruning's ancestry projection
+		 * for branch caps and PAGE_HISTORY pins.  A tuple-capped reader can
+		 * exclude our fresh admission at the same LSN; a bare-LSN branch or
+		 * legacy pin requires its successor.  Admission-rd excludes pin SET,
+		 * and the caller's shard-write lock excludes CREATE_BRANCH through
+		 * publication, so neither fence set can change after this sample. */
+		ps_lock_map_rd();
+		rc = page_prune_fences(timeline, &fences, &nfences);
+		/* A dropped pin/branch must not make a later ordered write sort
+		 * behind a version already admitted at that former horizon.  The
+		 * bound markers preserve this operational position across restart. */
+		newest = fork_newest_visible_lsn_through(timeline, key);
+		ps_unlock_map();
+		if (hdr.lsn < newest)
+			hdr.lsn = newest;
+		if (rc != 0)
+		{
+			*outcome = PS_APPEND_IO_FAILED;
+			return -1;
+		}
+		for (uint32_t i = 0; i < nfences; i++)
+		{
+			if (hdr.lsn < fences[i].lsn)
+				hdr.lsn = fences[i].lsn;
+			if (hdr.lsn == fences[i].lsn &&
+				admission_seq <= fences[i].admission_seq)
+			{
+				if (hdr.lsn == UINT64_MAX)
+				{
+					free(fences);
+					*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
+					return -1;
+				}
+				hdr.lsn++;
+			}
+		}
+		free(fences);
+	}
 	hdr_grow_lsn = hdr.lsn;
 	page_version = zero_version ? 0 : hdr.lsn;
-	ordered_record = zero_version || clamped;
-	segment_grows = (!fe ||
+	extends_uncapped = (!fe ||
 		fork_size_asof_hop(fe, hdr_grow_lsn, admission_seq) < block + 1);
 	/* An ordered body is acknowledged only together with its bound marker.
 	 * Reject an inadmissible tuple before either header or page bytes reach the
 	 * segment, even when this is a non-growth commit marker. */
-	if ((ordered_record || segment_grows) &&
+	if ((ordered_record || extends_uncapped) &&
 		!fork_meta_mutation_future(hdr_grow_lsn, admission_seq))
 	{
 		*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
@@ -16618,7 +19223,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 */
 	if (ordered_record &&
 		fork_meta_persist_segment(timeline, key, hdr_grow_lsn, block + 1,
-								  segment_grows ? FEV_SEG_GROW : FEV_SEG_COMMIT,
+								  FEV_SEG_GROW,
 								  order_id, admission_seq) != 0)
 	{
 		/* The complete body is not committed without its marker.  Retire this
@@ -16693,16 +19298,14 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * cutover would then publish a plain GROW that recovery can no longer
 	 * match.  Insert exactly what recovery itself rebuilds instead: add the
 	 * bound marker and activate it against this page record.  The marker
-	 * kind must mirror the one just persisted above (same segment_grows
-	 * expression).
+	 * kind mirrors the GROW marker persisted above for every ordered page.
 	 */
 	if (ordered_record)
 	{
 		ForkEnt    *ofe = fork_get_or_create(timeline, key);
 
 		fork_event_add_seg_marker(ofe, hdr_grow_lsn, block + 1,
-								  segment_grows ? FEV_SEG_GROW_BOUND :
-								  FEV_SEG_COMMIT_BOUND,
+								  FEV_SEG_GROW_BOUND,
 								  order_id, admission_seq);
 		(void) fork_event_activate_seg(ofe, hdr_grow_lsn, block + 1,
 									   order_id, admission_seq);
@@ -16725,6 +19328,115 @@ read_version(const PageVer *v, unsigned char *out)
 	if (ps_storage->seg_read(v->shard, v->seg, v->off, out, page_size) != 0)
 		return -1;
 	return 0;
+}
+
+/*
+ * Data verifications a map-lock holder could not record.
+ *
+ * layer_map_lookup_impl() looks pages up through private descriptor copies
+ * and writes a copy's data_verified back to the layer map under the map write
+ * lock.  A caller that already holds the map lock (the WAL floor computation,
+ * page-history floors) cannot take it, so without this every one of its
+ * lookups checksummed each layer's whole data section again.  Such a result
+ * is parked here, keyed by the identity of the local copy that was verified,
+ * and honoured by later lookups until a write-lock holder moves it into the
+ * map.  Only this function publishes entries, so a verification of some
+ * other physical copy (the remote object, before an eviction) never lands
+ * here.  Every site that removes or replaces a layer's local file, and every
+ * explicit (forced) verification, forgets the entry first, so a failed forced
+ * check is never overruled by an older parked success; close empties the set.
+ */
+#define LAYER_VERIFIED_PENDING_MAX	256
+
+typedef struct LayerVerifiedPending
+{
+	uint64_t	layer_id;
+	uint64_t	lsn_start;
+	uint64_t	lsn_end;
+	uint64_t	size;
+} LayerVerifiedPending;
+
+static pthread_mutex_t layer_verified_lock = PTHREAD_MUTEX_INITIALIZER;
+static LayerVerifiedPending layer_verified_pending[LAYER_VERIFIED_PENDING_MAX];
+static uint32_t layer_verified_npending;
+static uint32_t layer_verified_victim;
+
+static uint64_t
+layer_verified_size(const PsLayerDesc *d)
+{
+	return d->location_count > 0 ? d->locations[0].size : 0;
+}
+
+/* Is 'd' parked as verified?  With 'take', also remove it. */
+static int
+layer_verified_lookup(const PsLayerDesc *d, int take)
+{
+	int			found = 0;
+
+	pthread_mutex_lock(&layer_verified_lock);
+	for (uint32_t i = 0; i < layer_verified_npending; i++)
+	{
+		LayerVerifiedPending *p = &layer_verified_pending[i];
+
+		if (p->layer_id != d->layer_id)
+			continue;
+		found = p->lsn_start == d->lsn_start && p->lsn_end == d->lsn_end &&
+			p->size == layer_verified_size(d);
+		if (take || !found)
+			*p = layer_verified_pending[--layer_verified_npending];
+		break;
+	}
+	pthread_mutex_unlock(&layer_verified_lock);
+	return found;
+}
+
+static void
+layer_verified_park(const PsLayerDesc *d)
+{
+	pthread_mutex_lock(&layer_verified_lock);
+	for (uint32_t i = 0; i < layer_verified_npending; i++)
+		if (layer_verified_pending[i].layer_id == d->layer_id)
+		{
+			pthread_mutex_unlock(&layer_verified_lock);
+			return;
+		}
+	{
+		LayerVerifiedPending *p;
+
+		/* full: overwrite round-robin rather than stop parking for good */
+		if (layer_verified_npending < LAYER_VERIFIED_PENDING_MAX)
+			p = &layer_verified_pending[layer_verified_npending++];
+		else
+			p = &layer_verified_pending[layer_verified_victim++ %
+										LAYER_VERIFIED_PENDING_MAX];
+		p->layer_id = d->layer_id;
+		p->lsn_start = d->lsn_start;
+		p->lsn_end = d->lsn_end;
+		p->size = layer_verified_size(d);
+	}
+	pthread_mutex_unlock(&layer_verified_lock);
+}
+
+static void
+layer_verified_forget(uint64_t layer_id)
+{
+	pthread_mutex_lock(&layer_verified_lock);
+	for (uint32_t i = 0; i < layer_verified_npending; i++)
+		if (layer_verified_pending[i].layer_id == layer_id)
+		{
+			layer_verified_pending[i] =
+				layer_verified_pending[--layer_verified_npending];
+			break;
+		}
+	pthread_mutex_unlock(&layer_verified_lock);
+}
+
+static void
+layer_verified_reset(void)
+{
+	pthread_mutex_lock(&layer_verified_lock);
+	layer_verified_npending = 0;
+	pthread_mutex_unlock(&layer_verified_lock);
 }
 
 /*
@@ -16779,10 +19491,11 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	for (uint32_t i = 0; i < nlayers; i++)
 	{
-		const PsLayerDesc *d = &layers[i];
+		PsLayerDesc *d = &layers[i];
 		uint64_t	l,
 					a;
 		int			lookup;
+		bool		was_verified;
 
 		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline ||
 			!layer_matches_read_shard(d, shard) || d->deleting)
@@ -16790,9 +19503,16 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (expected_lsn != 0 &&
 			(expected_lsn < d->lsn_start || expected_lsn > d->lsn_end))
 			continue;
-		lookup = ps_image_layer_lookup(d, key, block, read_lsn, read_seq, tmp,
+		was_verified = d->data_verified;
+		if (!was_verified && layer_verified_lookup(d, 0))
+			d->data_verified = true;
+		lookup = ps_image_layer_lookup_exact(d, key, block, read_lsn, read_seq, tmp,
 									   page_size, &l, &a);
 
+		/* this caller cannot write the map: park what the lookup verified,
+		 * including a verification done while refilling the local cache */
+		if (map_locked && !was_verified && d->data_verified)
+			layer_verified_park(d);
 		if (lookup < 0)
 		{
 			error = 1;
@@ -16828,7 +19548,10 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 					if (map_locked)
 						break;
 					if (layers[i].data_verified)
+					{
 						ps_layer_map.layers[j].data_verified = true;
+						(void) layer_verified_lookup(&layers[i], 1);
+					}
 					if (tier_local_location(&ps_layer_map.layers[j]) == NULL &&
 						ps_layer_store->layer_exists_local != NULL &&
 						ps_layer_store->layer_exists_local(layers[i].layer_id) == 1)
@@ -16913,7 +19636,8 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (!core_process_valid())
 		return -1;
 	s = shard_for(key);
-	w = tl_walk_first(timeline, read_lsn);
+	w = tl_walk_first_cap(timeline, key->klass == PS_KLASS_CONTROL ?
+	artifact_control_cap(timeline, read_lsn, read_seq) : viewcap_from_request(read_lsn, read_seq));
 	/*
 	 * A durable compaction frontier makes older page history unavailable even
 	 * while a crash-recovery pass still has its source layers to clean up.
@@ -16937,7 +19661,16 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * before a remote layer read can block. */
 	ps_lock_map_rd();
 	do
+	{
+		if ((key->klass == PS_KLASS_RELATION || (key->klass == PS_KLASS_CONTROL && read_seq != 0)) &&
+		!(key->klass == PS_KLASS_CONTROL ?
+		  control_view_registered(w.tl, &w.cap) : page_view_registered(w.tl, &w.cap)))
+		{
+			ps_unlock_map();
+			return -2;
+		}
 		walk[levels++] = w;
+	}
 	while (levels < MAX_TIMELINES && tl_walk_next(&w));
 	ps_unlock_map();
 
@@ -16947,7 +19680,9 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 		{
 			uint32_t	tl = w.tl;
 			uint64_t	rl = w.lsn;
-			uint64_t	seq_cap = rl == read_lsn ? read_seq : 0;
+			uint64_t	seq_cap = w.cap.strict_seq == PS_SEQ_UNBOUNDED ?
+				0 : w.cap.strict_seq;
+			ViewCap		cur = w.cap;
 			ForkEnt    *fe;
 			uint32_t	nb = 0;
 			int			fork_state;
@@ -16969,13 +19704,17 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 					return -2;
 			}
 			fe = fork_find(tl, key);
-			fork_state = fe ? fork_asof_hop(fe, rl, seq_cap, &nb) :
+			fork_state = fe ? fork_asof_hop(fe, &cur, w.inherited_below,
+										  w.has_inherited_below, &nb) :
 				FORK_HOP_NONE;
 			e = page_find(tl, key, block);
-			pv = e ? page_visible(e, rl, seq_cap) : NULL;
+			pv = e ? page_select(e, &cur, w.inherited_below,
+								 w.has_inherited_below) : NULL;
 			if (artifact_data_key(key))
 			{
-				int state = artifact_visible(tl, key, block, rl, seq_cap, &pv, 0);
+				int state = artifact_visible(tl, key, block, &cur,
+											 w.inherited_below,
+											 w.has_inherited_below, &pv, 0);
 				if (state < 0)
 					return -1;
 				if (state == 2)
@@ -16987,6 +19726,9 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 			{
 				rl = pv->lsn;
 				seq_cap = pv->admission_seq;
+				cur.lsn = pv->lsn;
+				cur.strict_seq = pv->admission_seq ? pv->admission_seq :
+					PS_SEQ_UNBOUNDED;
 			}
 
 		if (pv)
@@ -16996,8 +19738,17 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 			int			served;
 			int			poisoned;
 
-			if (fork_page_invalidated(fe, block, pv, rl, seq_cap))
+			if (fork_page_invalidated(fe, block, pv, &cur, w.inherited_below,
+									  w.has_inherited_below))
 				return 0;
+
+			/* Frontends reject explicit capped reads of WAL-less bytes.  A
+			 * newest child read is capped here too, even though its original
+			 * request had no LSN/sequence cap.  Return an error distinct from
+			 * reclaimed history (-2), which READ_AT reports as absent.  Never
+			 * substitute absence or the parent's latest WAL-less contents. */
+			if (key->klass == PS_KLASS_RELATION && tl != timeline && pv->lsn == 0)
+				return -1;
 
 			/*
 			 * The materialized-page cache and the memtable are safe read sources
@@ -17021,7 +19772,7 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 				return 1;
 
 			if (s->memtable && !poisoned &&
-				ps_memtable_lookup(s->memtable, tl, key, block, rl, seq_cap,
+				ps_memtable_lookup(s->memtable, tl, key, block, pv->lsn, pv->admission_seq,
 								   &l, &a, out) &&
 				l == pv->lsn && a == pv->admission_seq)
 			{
@@ -17030,8 +19781,8 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 			}
 			else if (pv->seg < 0)
 			{
-				int		layer_result = layer_map_lookup(tl, key, block, rl,
-															seq_cap, pv->lsn, &l, &a, out);
+				int		layer_result = layer_map_lookup(tl, key, block, pv->lsn,
+												pv->admission_seq, pv->lsn, &l, &a, out);
 
 				if (layer_result < 0)
 					return -1;
@@ -17060,7 +19811,8 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 			(fork_state == FORK_HOP_DEF && block >= nb))
 			return 0;
 		if (fork_state == FORK_HOP_DEF &&
-			fork_inheritance_fenced(fe, block, rl, seq_cap))
+			fork_inheritance_fenced(fe, block, &cur, w.inherited_below,
+									w.has_inherited_below))
 			return 0;
 		}
 	}
@@ -17226,7 +19978,7 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 				{
 					uint64_t	layer_lsn;
 
-				if (layer_map_lookup(w.tl, &key, 1, v->lsn, 0, v->lsn,
+				if (layer_map_lookup(w.tl, &key, 1, v->lsn, v->admission_seq, v->lsn,
 									 &layer_lsn, NULL, tmp) != 1 ||
 						layer_lsn != v->lsn)
 					{
@@ -17313,7 +20065,7 @@ control_note_redo(uint32_t timeline, const PsKey *key, const PageVer *v,
 		uint64_t	layer_lsn;
 
 		if (layer_map_lookup_locked(timeline, key, PS_CONTROL_NOTE_BLOCK,
-									v->lsn, 0, v->lsn, &layer_lsn, NULL,
+									v->lsn, v->admission_seq, v->lsn, &layer_lsn, NULL,
 									tmp) != 1 ||
 			layer_lsn != v->lsn)
 			return -1;
@@ -17438,7 +20190,7 @@ wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
 			{
 				uint64_t layer_lsn;
 
-				if (layer_map_lookup(timeline, &key, 1, v->lsn, 0, v->lsn,
+				if (layer_map_lookup(timeline, &key, 1, v->lsn, v->admission_seq, v->lsn,
 								 &layer_lsn, NULL, tmp) != 1 ||
 					layer_lsn != v->lsn)
 					return -1;
@@ -17493,6 +20245,25 @@ retention_floor_add(uint64_t candidate, uint64_t *floor)
 /* Project one descendant LSN onto target's physical history.  Caller holds
  * map-rd.  Return 1 if target is an ancestor (including self), else 0. */
 static int
+retention_project_cap(uint32_t descendant, uint32_t target, ViewCap *cap)
+{
+	uint32_t	current = descendant;
+
+	for (uint32_t hops = 0; hops < MAX_TIMELINES; hops++)
+	{
+		if (current == target)
+			return 1;
+		if (current >= MAX_TIMELINES || !timelines[current].defined ||
+			!timeline_has_parent(current))
+			return 0;
+		*cap = viewcap_compose(*cap, timelines[current].branch_lsn,
+							   timeline_branch_seq(current));
+		current = (uint32_t) timelines[current].parent;
+	}
+	return 0;
+}
+
+static int
 retention_project_lsn(uint32_t descendant, uint32_t target, uint64_t *lsn)
 {
 	uint32_t	current = descendant;
@@ -17537,7 +20308,7 @@ prune_version_cmp(const void *va, const void *vb)
  */
 static int
 control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
-				   uint64_t floor, const PsPruneFence *fences,
+				   uint64_t floor, const PsHistoryFence *fences,
 				   uint32_t nfences, PsControlChainPlan *plan)
 {
 	PageEnt    *e = page_find(timeline, key, block);
@@ -17591,8 +20362,9 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	qsort(plan->chain, n, sizeof(*plan->chain), prune_version_cmp);
 	plan->nchain = n;
-	if (ps_page_prune_plan(plan->chain, n, (PsPruneFence) {floor, UINT64_MAX},
-						   fences, nfences, keep) < 0)
+	if (history_prune_plan(plan->chain, n, (PsPruneFence) {floor, UINT64_MAX},
+						  fences, nfences, timelines[timeline].branch_lsn,
+						  timelines[timeline].parent >= 0, keep) < 0)
 	{
 		free(plan->chain);
 		free(plan->kept);
@@ -17675,6 +20447,48 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 				plan->nkept++;
 			}
 		}
+		/* A branch restores the exact-redo twin, which may be older than
+		 * the image selected at L. Select that twin under the branch's S;
+		 * a post-S rewrite of the twin cannot replace it. */
+		for (uint32_t f = 0; notes != NULL && f < nfences; f++)
+		{
+			ViewCap cap = {fences[f].lsn, fences[f].seq, fences[f].admission_seq, false};
+			bool has_B;
+			uint64_t B = timeline_inherited_below(timeline, &has_B);
+			PageVer *note;
+			PageVer *twin;
+			uint64_t redo;
+			bool already = false;
+
+			if (cap.seq == PS_SEQ_UNBOUNDED)
+				continue;
+			note = page_select(notes, &cap, B, has_B);
+			if (note == NULL)
+				continue;
+			if (control_note_redo(timeline, key, note, tmp, &redo) != 0)
+			{
+				free(tmp);
+				free(plan->chain);
+				free(plan->kept);
+				free(plan->pending);
+				memset(plan, 0, sizeof(*plan));
+				return -1;
+			}
+			if (redo == 0 || redo > cap.lsn)
+				continue;
+			if (redo < cap.lsn)
+				cap.strict_seq = PS_SEQ_UNBOUNDED;
+			cap.lsn = redo;
+			twin = page_select(e, &cap, B, has_B);
+			if (twin == NULL || twin->lsn != redo || !walidx_base_version_durable(twin))
+				continue;
+			for (uint32_t j = 0; j < plan->nkept; j++)
+				if (plan->kept[j].lsn == twin->lsn &&
+					plan->kept[j].admission_seq == twin->admission_seq)
+					already = true;
+			if (!already)
+				plan->kept[plan->nkept++] = (PsPruneVersion) {twin->lsn, twin->admission_seq};
+		}
 		free(tmp);
 	}
 	plan->valid = 1;
@@ -17697,24 +20511,63 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
  */
 static int
 control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
-					uint32_t block, const PsPruneVersion *v)
+					uint32_t block, const PsPruneVersion *v,
+					const PsHistoryFence *fences, uint32_t nfences)
 {
 	int			lsn_retained = 0;
 
 	if (!plan->valid)
 		return 1;
+	/* A finite branch can retain several identities at the same LSN.
+	 * Without a positional consumer, duplicate checkpoint retries still
+	 * collapse to the newest authoritative image. Paired blocks also keep
+	 * the selected note/fence and its minimum-sequence closure. */
 	for (uint32_t i = 0; i < plan->nkept; i++)
 		if (plan->kept[i].lsn == v->lsn)
 		{
-			/* The image block, and every independently versioned block that
-			 * planned its own chain, keep exactly the planned tuple. */
-			if (block == PS_CONTROL_IMAGE_BLOCK || block >= PS_CONTROL_PAIRED_BLOCKS)
-				return plan->kept[i].admission_seq == v->admission_seq;
 			lsn_retained = 1;
-			break;
 		}
 	if (block == PS_CONTROL_IMAGE_BLOCK || block >= PS_CONTROL_PAIRED_BLOCKS)
-		return 0;
+	{
+		uint64_t newest = 0;
+		bool exact = false;
+		bool positional = false;
+		for (uint32_t i = 0; i < plan->nkept; i++)
+			if (plan->kept[i].lsn == v->lsn)
+			{
+				if (plan->kept[i].admission_seq > newest)
+					newest = plan->kept[i].admission_seq;
+				if (plan->kept[i].admission_seq == v->admission_seq)
+					exact = true;
+			}
+		for (uint32_t i = 0; i < nfences; i++)
+			if (fences[i].seq != PS_SEQ_UNBOUNDED && v->lsn <= fences[i].lsn)
+				positional = true;
+		return exact && (positional || newest == v->admission_seq);
+	}
+	if (lsn_retained && entry != NULL)
+	{
+		bool has_B;
+		uint64_t B = timeline_inherited_below(entry->timeline, &has_B);
+		for (uint32_t i = 0; i < nfences; i++)
+		{
+			ViewCap cap = {fences[i].lsn, fences[i].seq, fences[i].admission_seq, false};
+			PageVer *selected;
+			bool minimum = true;
+			if (cap.seq == PS_SEQ_UNBOUNDED || v->lsn > cap.lsn)
+				continue;
+			selected = page_select(entry, &cap, B, has_B);
+			if (selected && selected->lsn == v->lsn &&
+				selected->admission_seq == v->admission_seq)
+				return 1;
+			for (int j = 0; j < entry->nver; j++)
+				if (entry->vers[j].lsn == v->lsn &&
+					entry->vers[j].admission_seq < v->admission_seq)
+					minimum = false;
+			if (minimum && (!has_B || v->lsn > B))
+				return 1; /* position closure for paired note/fence blocks */
+		}
+	}
 	if (!lsn_retained)
 	{
 		int			in_flight = 0;
@@ -17755,36 +20608,45 @@ control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
 static int
 prune_version_needed(uint32_t timeline, const PsKey *key, uint32_t block,
 					 const PsPruneVersion *versions, uint32_t n, uint32_t idx,
-					 uint64_t floor, const PsPruneFence *fences,
+					 uint64_t floor, const PsHistoryFence *fences,
 					 uint32_t nfences)
 {
 	const ForkEnt *fe = fork_find(timeline, key);
+	bool has_B;
+	uint64_t B = timeline_inherited_below(timeline, &has_B);
 
 	if (fe == NULL || fe->ndef == 0)
 		return 1;
 	for (uint32_t h = 0; h <= nfences; h++)
 	{
-		PsPruneFence horizon = h == 0 ? (PsPruneFence) {floor, 0} : fences[h - 1];
-		int			visible = -1;
-		PageVer		pv;
+		PsHistoryFence f = h == 0 ?
+			(PsHistoryFence) {floor, PS_SEQ_UNBOUNDED, PS_SEQ_UNBOUNDED} : fences[h - 1];
+		ViewCap hc = {f.lsn, f.seq, f.admission_seq, f.seq == PS_SEQ_UNBOUNDED};
+		PsAdmitCap ac = {hc.lsn, hc.seq, hc.strict_seq};
+		int visible = -1;
+		PageVer pv;
+		uint64_t position = UINT64_MAX;
+		uint64_t minimum_seq = 0;
 
-		if (h != 0 && horizon.admission_seq == UINT64_MAX)
-			horizon.admission_seq = 0;
 		for (uint32_t i = 0; i < n; i++)
-			if (versions[i].lsn <= horizon.lsn &&
-				(versions[i].lsn < horizon.lsn || horizon.admission_seq == 0 ||
-				 versions[i].admission_seq == 0 ||
-				 versions[i].admission_seq <= horizon.admission_seq))
+		{
+			bool first;
+			if (i == 0 || versions[i].lsn != position)
+			{
+				position = versions[i].lsn;
+				minimum_seq = versions[i].admission_seq;
+			}
+			first = versions[i].admission_seq == minimum_seq;
+			if (ps_version_admissible(versions[i].lsn, versions[i].admission_seq,
+									  first, &ac, B, has_B))
 				visible = (int) i;
-			else if (versions[i].lsn > horizon.lsn)
-				break;
-		if (visible != (int) idx)
+		}
+		if (visible < 0 || versions[visible].lsn != versions[idx].lsn)
 			continue;
 		memset(&pv, 0, sizeof(pv));
-		pv.lsn = versions[idx].lsn;
-		pv.admission_seq = versions[idx].admission_seq;
-		if (!fork_page_invalidated(fe, block, &pv, horizon.lsn,
-								   horizon.admission_seq))
+		pv.lsn = versions[visible].lsn;
+		pv.admission_seq = versions[visible].admission_seq;
+		if (!fork_page_invalidated(fe, block, &pv, &hc, B, has_B))
 			return 1;
 	}
 	return 0;
@@ -17959,6 +20821,8 @@ artifact_fence_forget(uint32_t timeline)
 {
 	uint32_t	w = 0;
 
+	artifact_cap_retire(timeline, 0, true);
+
 	pthread_mutex_lock(&artifact_fence_lock);
 	if (nartifact_fences != UINT32_MAX)
 	{
@@ -18009,6 +20873,7 @@ artifact_fence_reset(void)
 	artifact_fences = NULL;
 	nartifact_fences = 0;
 	artifact_fence_cap = 0;
+	artifact_caps_clear();
 	pthread_mutex_unlock(&artifact_fence_lock);
 }
 
@@ -18045,15 +20910,16 @@ artifact_fence_snapshot(uint32_t timeline, uint64_t **lsns_out,
 	return 0;
 }
 
-/* Caller holds map-wr and the page-prune read fence. */
+/* Caller holds map-rd or map-wr.  Callers that act on the snapshot also
+ * fence pin mutations with admission-rd or the page-prune read fence. */
 static int
-page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
-				  uint32_t *nfences_out)
+page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
+				 uint32_t *nfences_out)
 {
 	PsRetentionPin *pins = NULL;
-	uint32_t npins = 0;
-	PsPruneFence *fences;
-	uint32_t nfences = 0;
+	uint32_t	npins = 0;
+	PsHistoryFence *fences;
+	uint32_t	nfences = 0;
 
 	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
 		return -1;
@@ -18066,28 +20932,31 @@ page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 	for (uint32_t i = 0; i < npins; i++)
 		if ((pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
 		{
-			uint64_t projected = pins[i].lsn;
+			ViewCap		cap = viewcap_from_request(pins[i].lsn, pins[i].admission_seq);
 
-			if (retention_project_lsn(pins[i].timeline, timeline, &projected))
+			if (retention_project_cap(pins[i].timeline, timeline, &cap))
 			{
-				fences[nfences].lsn = projected;
-				fences[nfences].admission_seq = projected == pins[i].lsn &&
-					pins[i].admission_seq != 0 ? pins[i].admission_seq : UINT64_MAX;
+				fences[nfences] = (PsHistoryFence)
+				{
+					cap.lsn, cap.strict_seq, cap.seq
+				};
 				nfences++;
 			}
 		}
 	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
 	{
-		uint64_t cap = UINT64_MAX;
+		ViewCap		cap = viewcap_from_request(UINT64_MAX, 0);
 		PsTimelineState state;
 
 		if (candidate != timeline && timelines[candidate].defined &&
 			ps_timeline_state(candidate, &state, NULL) &&
 			state != PS_TIMELINE_DELETED &&
-			retention_project_lsn(candidate, timeline, &cap))
+			retention_project_cap(candidate, timeline, &cap))
 		{
-			fences[nfences].lsn = cap;
-			fences[nfences].admission_seq = UINT64_MAX;
+			fences[nfences] = (PsHistoryFence)
+			{
+				cap.lsn, cap.strict_seq, cap.seq
+			};
 			nfences++;
 		}
 	}
@@ -18097,6 +20966,108 @@ page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 	return 0;
 }
 
+/* WAL-index views do not authorize relation reads, but their original first
+ * arrivals must survive so compaction cannot manufacture a replacement base. */
+static int
+page_storage_fences(uint32_t timeline, const PsHistoryFence *views,
+					uint32_t nviews, PsHistoryFence **fences_out, uint32_t *nfences_out)
+{
+	PsHistoryFence *fences,
+			   *wal_fences = NULL;
+	uint32_t	nfences = nviews,
+				nwal = 0;
+
+	if (walidx_view_fences(timeline, &wal_fences, &nwal) != 0)
+		return -1;
+	fences = malloc((size_t) (nviews + nwal) * sizeof(*fences));
+	if (!fences)
+	{
+		free(wal_fences);
+		return -1;
+	}
+	memcpy(fences, views, (size_t) nviews * sizeof(*fences));
+	for (uint32_t i = 0; i < nwal; i++)
+	{
+		uint32_t	j;
+
+		if (wal_fences[i].seq == PS_SEQ_UNBOUNDED)
+			continue;
+		for (j = 0; j < nfences; j++)
+			if (fences[j].lsn == wal_fences[i].lsn && fences[j].seq == wal_fences[i].seq &&
+				fences[j].admission_seq == wal_fences[i].admission_seq)
+				break;
+		if (j == nfences)
+			fences[nfences++] = wal_fences[i];
+	}
+	free(wal_fences);
+	*fences_out = fences;
+	*nfences_out = nfences;
+	return 0;
+}
+
+/* map lock held; positional caps must name a registered retained view. */
+static int
+page_view_registered(uint32_t timeline, const ViewCap *cap)
+{
+	/* Per worker bounded cache: mutation epochs invalidate both positive and
+	 * negative answers. The map lock fences timeline changes; admission/page
+	 * prune locks fence owner mutations for callers acting on this answer. */
+	static __thread struct {
+		uint32_t timeline;
+		ViewCap cap;
+		uint64_t timeline_epoch, retention_epoch;
+		int valid, found;
+	} cache[16];
+	static __thread unsigned victim;
+	PsHistoryFence *fences = NULL;
+	uint32_t nfences = 0;
+	uint64_t retention_epoch, timeline_epoch;
+	int found = 0;
+	unsigned slot;
+
+	/* Exact-LSN request caps retain their pre-P5 admission contract. */
+	if (cap->legacy)
+		return 1;
+	if (timeline_meta_poisoned_load() ||
+		ps_retention_epoch(&retention_epoch) != 0)
+		return 0;
+	timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	for (unsigned i = 0; i < 16; i++)
+		if (cache[i].valid && cache[i].timeline == timeline &&
+			cache[i].timeline_epoch == timeline_epoch &&
+			cache[i].retention_epoch == retention_epoch &&
+			cache[i].cap.lsn == cap->lsn &&
+			cache[i].cap.seq == cap->seq &&
+			cache[i].cap.strict_seq == cap->strict_seq)
+			return cache[i].found;
+	if (page_prune_fences(timeline, &fences, &nfences) != 0)
+		return 0;
+	for (uint32_t i = 0; i < nfences; i++)
+		if (fences[i].lsn == cap->lsn && fences[i].seq == cap->seq &&
+			fences[i].admission_seq == cap->strict_seq)
+		{
+			found = 1;
+			break;
+		}
+	free(fences);
+	/* Do not publish a snapshot raced by a registry mutation. */
+	{
+		uint64_t after;
+
+		if (ps_retention_epoch(&after) == 0 && after == retention_epoch)
+		{
+			slot = victim++ % 16;
+			cache[slot].timeline = timeline;
+			cache[slot].cap = *cap;
+			cache[slot].timeline_epoch = timeline_epoch;
+			cache[slot].retention_epoch = retention_epoch;
+			cache[slot].found = found;
+			cache[slot].valid = 1;
+		}
+	}
+	return found;
+}
+
 /*
  * Control-object versions are retained by the same operational floor as
  * relation pages, but their discrete fences are every retained WAL boundary:
@@ -18104,17 +21075,17 @@ page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
  * branch cap.  A reader or branch restores pg_control as-of its horizon, so
  * the newest control image and redo-floor note at or below each boundary must
  * survive, while versions above the operational floor stay eligible for later
- * owners.  Fences are LSN-only so the image and its same-version note always
- * receive the same keep decision.  Caller holds map-wr and the page-prune
+ * owners. Branch fences carry their positional cap; legacy control-owner
+ * pins stay LSN-only. Caller holds map-wr and the page-prune
  * read fence.
  */
 static int
-control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+control_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 					 uint32_t *nfences_out)
 {
 	PsRetentionPin *pins = NULL;
 	uint32_t npins = 0;
-	PsPruneFence *fences;
+	PsHistoryFence *fences;
 	uint32_t nfences = 0;
 
 	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
@@ -18129,27 +21100,27 @@ control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 		if ((pins[i].resources & (PS_RETENTION_RESOURCE_PAGE_HISTORY |
 								  PS_RETENTION_RESOURCE_WAL)) != 0)
 		{
-			uint64_t projected = pins[i].lsn;
+			ViewCap cap = viewcap_from_request(pins[i].lsn, pins[i].admission_seq);
+			if (cap.legacy)
+				cap.strict_seq = PS_SEQ_UNBOUNDED;
 
-			if (retention_project_lsn(pins[i].timeline, timeline, &projected))
+			if (retention_project_cap(pins[i].timeline, timeline, &cap))
 			{
-				fences[nfences].lsn = projected;
-				fences[nfences].admission_seq = UINT64_MAX;
+				fences[nfences] = (PsHistoryFence) {cap.lsn, cap.strict_seq, cap.seq};
 				nfences++;
 			}
 		}
 	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
 	{
-		uint64_t cap = UINT64_MAX;
+		ViewCap cap = viewcap_from_request(UINT64_MAX, 0);
 		PsTimelineState state;
 
 		if (candidate != timeline && timelines[candidate].defined &&
 			ps_timeline_state(candidate, &state, NULL) &&
 			state != PS_TIMELINE_DELETED &&
-			retention_project_lsn(candidate, timeline, &cap))
+			retention_project_cap(candidate, timeline, &cap))
 		{
-			fences[nfences].lsn = cap;
-			fences[nfences].admission_seq = UINT64_MAX;
+			fences[nfences] = (PsHistoryFence) {cap.lsn, cap.strict_seq, cap.seq};
 			nfences++;
 		}
 	}
@@ -18172,7 +21143,7 @@ control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 		}
 		if (nartifacts != 0)
 		{
-			PsPruneFence *grown = realloc(fences,
+			PsHistoryFence *grown = realloc(fences,
 										  (size_t) (npins + MAX_TIMELINES +
 													nartifacts) * sizeof(*fences));
 
@@ -18187,14 +21158,112 @@ control_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 			{
 				fences[nfences].lsn = artifacts[i];
 				fences[nfences].admission_seq = UINT64_MAX;
+				fences[nfences].seq = PS_SEQ_UNBOUNDED;
 				nfences++;
 			}
 		}
 		free(artifacts);
 	}
+	if (artifact_cap_fences(timeline, &fences, &nfences) != 0)
+	{
+		free(fences);
+		return -1;
+	}
 	*fences_out = fences;
 	*nfences_out = nfences;
 	return 0;
+}
+
+/* CONTROL is also retained by WAL-only owners and artifact producers. */
+static int
+control_view_registered(uint32_t timeline, const ViewCap *cap)
+{
+	PsHistoryFence *fences = NULL;
+	uint32_t	nfences = 0;
+	int			found = 0;
+
+	if (page_view_registered(timeline, cap) || artifact_cap_registered(timeline, cap))
+		return 1;
+	if (timeline_meta_poisoned_load() ||
+		control_prune_fences(timeline, &fences, &nfences) != 0)
+		return 0;
+	for (uint32_t i = 0; i < nfences; i++)
+		if (fences[i].lsn == cap->lsn && fences[i].seq == cap->seq &&
+			fences[i].admission_seq == cap->strict_seq)
+		{
+			found = 1;
+			break;
+		}
+	free(fences);
+	return found;
+}
+
+/* The two daemon-owned slots bound checkpoint retention without accumulating
+ * owner tombstones. Updating the older slot atomically keeps the previous
+ * checkpoint protected for readers handing off from it. */
+uint64_t
+ps_admission_barrier_register(uint32_t timeline, uint64_t lsn)
+{
+	PsRetentionPin slots[2] = {{0}}, pin = {0};
+	int			found[2],
+				allowed = 0;
+	unsigned	slot;
+	uint64_t	seq = 0;
+
+	if (timeline >= MAX_TIMELINES || admission_write_lock() != 0)
+		return 0;
+	pthread_rwlock_wrlock(&page_prune_lock);
+	pthread_rwlock_wrlock(&walidx_prune_lock);
+	for (unsigned i = 0; i < 2; i++)
+	{
+		found[i] = ps_retention_checkpoint_lookup(timeline, i + 1, &slots[i]);
+		if (found[i] < 0)
+			goto out;
+		found[i] = slots[i].resources != 0;
+	}
+	/* A failed CONTROL publication retries the same checkpoint.  Refresh
+	 * its existing slot before considering eviction, so retries cannot
+	 * consume the slot that still protects the prior distinct checkpoint. */
+	slot = found[0] && slots[0].lsn == lsn ? 0 :
+		found[1] && slots[1].lsn == lsn ? 1 :
+		found[0] != 1 ? 0 : found[1] != 1 ? 1 :
+		slots[0].admission_seq < slots[1].admission_seq ? 0 : 1;
+	if (slots[slot].generation == UINT32_MAX)
+		goto out;
+	seq = admission_seq_alloc();
+	if (!seq)
+		goto out;
+	ps_lock_map_rd();
+	allowed = timelines[timeline].defined &&
+		timelines[timeline].state == PS_TIMELINE_LIVE &&
+		page_frontier_ancestry_admits(timeline, lsn, seq) &&
+		wal_reclaim_frontier_ancestry_allows(timeline, lsn) &&
+		walidx_frontier_ancestry_allows(timeline, lsn) &&
+		!walidx_frontier_ancestry_pending(timeline);
+	ps_unlock_map();
+	if (!allowed)
+		goto fail;
+	pin.timeline = timeline;
+	pin.owner_kind = PS_RETENTION_OWNER_CHECKPOINT_FENCE;
+	pin.owner_id = slot + 1;
+	pin.generation = slots[slot].generation + 1;
+	pin.lsn = lsn;
+	pin.admission_seq = seq;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL |
+		PS_RETENTION_RESOURCE_WAL_INDEX;
+	if (ps_retention_reserve_and_set(&pin) != PS_RETENTION_OK)
+		goto fail;
+	page_prune_mark_all_due();
+	walidx_reclaim_fence_changed();
+	wal_reclaim_proof_changed();
+	goto out;
+fail:
+	seq = 0;
+out:
+	pthread_rwlock_unlock(&walidx_prune_lock);
+	pthread_rwlock_unlock(&page_prune_lock);
+	ps_admission_write_unlock();
+	return seq;
 }
 
 /* Caller holds map-rd and the WAL-index prune read fence. */
@@ -18237,6 +21306,60 @@ walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
 	free(pins);
 	*fences_out = fences;
 	*nfences_out = nfences;
+	return 0;
+}
+
+/* Full view projections for WAL-index owners and the durable progress sample.
+ * Caller holds the map lock and excludes owner/progress mutations. */
+static int
+walidx_view_fences(uint32_t timeline, PsHistoryFence **fences_out,
+				   uint32_t *nfences_out)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t	npins = 0,
+				n = 0;
+	PsHistoryFence *fences;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return -1;
+	fences = malloc((size_t) (npins + MAX_TIMELINES + 1) * sizeof(*fences));
+	if (!fences)
+	{
+		free(pins);
+		return -1;
+	}
+	for (uint32_t i = 0; i < npins; i++)
+		if (pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX)
+		{
+			ViewCap		cap = viewcap_from_request(pins[i].lsn, pins[i].admission_seq);
+
+			if (retention_project_cap(pins[i].timeline, timeline, &cap))
+				fences[n++] = (PsHistoryFence)
+			{
+				cap.lsn, cap.strict_seq, cap.seq
+			};
+		}
+	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
+	{
+		ViewCap		cap = viewcap_from_request(UINT64_MAX, 0);
+		PsTimelineState state;
+
+		if (candidate != timeline && timelines[candidate].defined &&
+			ps_timeline_state(candidate, &state, NULL) && state != PS_TIMELINE_DELETED &&
+			retention_project_cap(candidate, timeline, &cap))
+			fences[n++] = (PsHistoryFence)
+		{
+			cap.lsn, cap.strict_seq, cap.seq
+		};
+	}
+	fences[n++] = (PsHistoryFence)
+	{
+		walidx_progress_read(timeline), PS_SEQ_UNBOUNDED,
+			cap_effective_seq(CAP_WALIDX, walidx_horizon_seq[timeline])
+	};
+	free(pins);
+	*fences_out = fences;
+	*nfences_out = n;
 	return 0;
 }
 
@@ -18949,7 +22072,7 @@ replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
 				fork_meta_persist(timeline, key, l, admission_seq,
 							  block + 1, FEV_GROW) != 0)
 				fork_meta_migrate_failed = 1;
-			fork_event_add(fe, l, admission_seq, block + 1, FEV_GROW);
+			fork_event_add(fe, l, admission_seq, block + 1, FEV_GROW, false);
 		}
 	}
 	else if (!ordered && wal_less)
@@ -19465,7 +22588,8 @@ fail:
  * unstamped callers).
  */
 static uint64_t
-fork_op_lsn(uint32_t timeline, const PsKey *key, uint64_t req_lsn)
+fork_op_lsn(uint32_t timeline, const PsKey *key, uint64_t req_lsn,
+			uint64_t req_floor_lsn)
 {
 	uint64_t	newest;
 
@@ -19481,8 +22605,10 @@ fork_op_lsn(uint32_t timeline, const PsKey *key, uint64_t req_lsn)
 	 * rejected below the cutoff by fork_meta_mutation_future(). */
 	if (fork_meta_snapshot_generation != 0 &&
 		newest < fork_meta_snapshot_cutoff_lsn)
-		return fork_meta_snapshot_cutoff_lsn;
-	return newest == UINT64_MAX ? UINT64_MAX : newest + 1;
+		newest = fork_meta_snapshot_cutoff_lsn;
+	else if (newest != UINT64_MAX)
+		newest++;
+	return newest < req_floor_lsn ? req_floor_lsn : newest;
 }
 
 /* Caller holds map_lock for writing and the global admission write lock. */
@@ -19525,7 +22651,8 @@ timeline_has_active_owner(uint32_t timeline)
 	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
 		return 1;
 	for (uint32_t i = 0; i < npins; i++)
-		if (pins[i].timeline == timeline)
+		if (pins[i].timeline == timeline &&
+			pins[i].owner_kind != PS_RETENTION_OWNER_CHECKPOINT_FENCE)
 		{
 			found = 1;
 			break;
@@ -19534,12 +22661,36 @@ timeline_has_active_owner(uint32_t timeline)
 	return found;
 }
 
+/* Deleting is durable before these internal owners are retired. Recovery
+ * completes a retirement interrupted between the two log publications. */
+static int
+checkpoint_fences_retire(uint32_t timeline)
+{
+	int			changed = 0;
+
+	for (unsigned slot = 1; slot <= 2; slot++)
+	{
+		PsRetentionPin pin;
+		int			found = ps_retention_lookup(timeline, PS_RETENTION_OWNER_CHECKPOINT_FENCE, slot, &pin);
+
+		if (found < 0 || (found == 1 &&
+						  ps_retention_drop(timeline, pin.owner_kind, pin.owner_id, pin.generation) != 0))
+			return -1;
+		changed |= found == 1;
+	}
+	if (changed)
+		page_prune_mark_all_due_locked();
+	return 0;
+}
+
+/* On failure ch->result names the refusal (PsDeleteRefuseReason). */
 static int
 timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 {
 	uint32_t state;
 	uint64_t incarnation;
 
+	ch->result = PS_DELETE_REFUSE_INVALID;
 	if (timeline >= MAX_TIMELINES || !timelines[timeline].defined ||
 		timeline == 0)
 		return -1;
@@ -19548,20 +22699,32 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 																						__ATOMIC_ACQUIRE);
 	/* req_seq is the caller's fencing token.  An old retry may not turn a
 	 * different incarnation into an apparently idempotent success. */
-	if (ch->req_seq == 0 || ch->req_seq != incarnation ||
-		incarnation == 0 || state == PS_TIMELINE_DELETED)
+	if (ch->req_seq == 0 || incarnation == 0)
+		return -1;
+	ch->result = PS_DELETE_REFUSE_INCARNATION;
+	if (ch->req_seq != incarnation || state == PS_TIMELINE_DELETED)
 		return -1;
 	if (state == PS_TIMELINE_DELETING)
 	{
+		ch->result = PS_DELETE_REFUSE_STORAGE;
+		if (checkpoint_fences_retire(timeline) != 0)
+			return -1;
 		ch->result = state;
 		ch->req_seq = incarnation;
 		return 0;
 	}
-	if (state != PS_TIMELINE_LIVE || timeline_has_live_descendant(timeline) ||
-		timeline_has_active_owner(timeline))
+	ch->result = PS_DELETE_REFUSE_INVALID;
+	if (state != PS_TIMELINE_LIVE)
+		return -1;
+	ch->result = PS_DELETE_REFUSE_DESCENDANT;
+	if (timeline_has_live_descendant(timeline))
+		return -1;
+	ch->result = PS_DELETE_REFUSE_OWNER;
+	if (timeline_has_active_owner(timeline))
 		return -1;
 	/* The old-state side of the transition: nothing of the branch may have
 	 * changed while the request is not yet durable. */
+	ch->result = PS_DELETE_REFUSE_STORAGE;
 	if (ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_BEFORE_DELETING) != 0)
 		return -1;
 	if (timeline_persist_state(timeline, PS_TIMELINE_DELETING,
@@ -19582,6 +22745,8 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 	__atomic_store_n(&timelines[timeline].state, PS_TIMELINE_DELETING,
 									 __ATOMIC_RELEASE);
 	inspection_timeline_cache_changed();
+	if (checkpoint_fences_retire(timeline) != 0)
+		return -1;
 	ch->result = PS_TIMELINE_DELETING;
 	ch->req_seq = incarnation;
 	return 0;
@@ -19637,6 +22802,45 @@ timeline_op_allowed(uint32_t timeline, PsOpcode opcode,
 	return state == PS_TIMELINE_LIVE;
 }
 
+/*
+ * True if this request's client-supplied nblocks/datalen fits within one
+ * channel's fixed PS_IO_UNIT data[] buffer.  A client publishes a plain
+ * uint32_t for either field, and nothing on the wire otherwise bounds it, so
+ * every opcode that indexes ch->data by one of them -- on either byte-I/O
+ * path (READV/WRITEV, handled by the frontends) or this file's own
+ * WAL_APPEND/WAL_READ -- must be checked here before the buffer is touched:
+ * a too-large count walks PS_IO_UNIT bytes past data[] into a neighboring
+ * channel's shared memory, or off the end of the mapping.
+ *
+ * The other opcodes that carry a count need no check here:
+ *   - EXTEND/READ_AT move exactly one page at data[0]; page_size is bounded
+ *     to <= PS_IO_UNIT once at daemon startup, so a single page always fits.
+ *   - ZEROEXTEND never touches ch->data (it only advances a fork's size).
+ *   - WAL_INDEX_GET clamps its own output count to PS_IO_UNIT / sizeof(PsWalRec)
+ *     before writing to ch->data.
+ *   - WAL_INDEX_ADD_BATCH validates ch->datalen <= PS_IO_UNIT (and that
+ *     ch->nblocks * sizeof(PsWalIndexEntry) == ch->datalen) itself before
+ *     indexing ch->data, right where it is used.
+ * so their existing, opcode-local checks are left as the single source of
+ * truth for those instead of being duplicated/scattered here.
+ */
+int
+ps_request_payload_fits(const PsChannel *ch)
+{
+	switch ((PsOpcode) ch->opcode)
+	{
+		case PS_OP_WRITEV:
+		case PS_OP_READV:
+			return page_size > 0 && page_size <= PS_IO_UNIT &&
+				ch->nblocks > 0 && ch->nblocks <= PS_IO_UNIT / page_size;
+		case PS_OP_WAL_APPEND:
+		case PS_OP_WAL_READ:
+			return ch->datalen <= PS_IO_UNIT;
+		default:
+			return 1;
+	}
+}
+
 int
 ps_handle_meta(PsChannel *ch)
 {
@@ -19647,9 +22851,22 @@ ps_handle_meta(PsChannel *ch)
 		ch->status = PS_STATUS_ERROR;
 		return 1;
 	}
+	/* Refuse an out-of-range WAL_APPEND/WAL_READ datalen before anything
+	 * below reads or writes ch->data by it (see ps_request_payload_fits()). */
+	if (!ps_request_payload_fits(ch))
+	{
+		ch->status = PS_STATUS_ERROR;
+		return 1;
+	}
 	if (!timeline_op_allowed(tl, (PsOpcode) ch->opcode, ch->incarnation))
 	{
 		ch->status = PS_STATUS_ERROR;
+		/* The lifecycle queries are refused here only for poisoned timeline
+		 * metadata; their callers must not read that as "no such timeline". */
+		if (ch->opcode == PS_OP_TIMELINE_STATE)
+			ch->result = PS_TIMELINE_STATE_UNAVAILABLE;
+		else if (ch->opcode == PS_OP_BEGIN_DELETE)
+			ch->result = PS_DELETE_REFUSE_UNAVAILABLE;
 		return 1;
 	}
 
@@ -19658,10 +22875,15 @@ ps_handle_meta(PsChannel *ch)
 	 * not invalidate committed bytes behind the publication protocol. */
 	if (artifact_data_key(&ch->key) &&
 		(ch->opcode == PS_OP_UNLINK || ch->opcode == PS_OP_TRUNCATE ||
-		 ch->opcode == PS_OP_ZEROEXTEND || (ch->opcode == PS_OP_CREATE && !ch->is_redo)) &&
+		 ch->opcode == PS_OP_ZEROEXTEND || ch->opcode == PS_OP_CREATE) &&
 		artifact_has_protocol(tl, &ch->key))
 	{
-		ch->status = PS_STATUS_ERROR;
+		/* Redo's ensure-exists request must not publish a local empty fork
+		 * over an inherited COMMIT/DROP. BEGIN/COMMIT owns publication;
+		 * recording SET here would make pending replacement metadata
+		 * definitive before its completion record exists. */
+		if (ch->opcode != PS_OP_CREATE || !ch->is_redo)
+			ch->status = PS_STATUS_ERROR;
 		return 1;
 	}
 
@@ -19696,7 +22918,7 @@ ps_handle_meta(PsChannel *ch)
 						break;
 				}
 
-				lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
+				lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn, ch->req_floor_lsn);
 				/* XLogReadBufferExtended() asks smgr to ensure the relation fork
 				 * exists before applying every redo record.  That call has the
 				 * record's LSN but is not a relation-creation record: if the fork
@@ -19722,11 +22944,11 @@ ps_handle_meta(PsChannel *ch)
 				}
 				if (!fork_has_create_at(e, lsn))
 				{
-					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET) != 0)
+					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0)) != 0)
 						ch->status = PS_STATUS_ERROR;
 					else
 					{
-						fork_event_add(e, lsn, seq, 0, FEV_SET);
+						fork_event_add(e, lsn, seq, 0, FEV_SET | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0), true);
 						if (delayed)
 							fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 						ch->req_seq = seq;
@@ -19796,7 +23018,7 @@ ps_handle_meta(PsChannel *ch)
 			 */
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
-				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
+				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn, ch->req_floor_lsn);
 				uint64_t	seq = admission_seq_alloc();
 				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
 
@@ -19805,11 +23027,11 @@ ps_handle_meta(PsChannel *ch)
 					ch->status = PS_STATUS_ERROR;
 					break;
 				}
-				if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_DEAD) != 0)
+				if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_DEAD | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0)) != 0)
 					ch->status = PS_STATUS_ERROR;
 				else
 				{
-					fork_event_add(e, lsn, seq, 0, FEV_DEAD);
+					fork_event_add(e, lsn, seq, 0, FEV_DEAD | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0), true);
 					if (delayed)
 						fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 					ch->req_seq = seq;
@@ -19861,7 +23083,7 @@ ps_handle_meta(PsChannel *ch)
 			 */
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
-				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
+				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn, ch->req_floor_lsn);
 				uint64_t	seq = admission_seq_alloc();
 				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
 
@@ -19871,11 +23093,11 @@ ps_handle_meta(PsChannel *ch)
 					break;
 				}
 				if (fork_meta_persist(tl, &ch->key, lsn, seq, ch->nblocks,
-								  FEV_SET) != 0)
+								  FEV_SET | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0)) != 0)
 					ch->status = PS_STATUS_ERROR;
 				else
 				{
-					fork_event_add(e, lsn, seq, ch->nblocks, FEV_SET);
+					fork_event_add(e, lsn, seq, ch->nblocks, FEV_SET | (ch->req_lsn == 0 ? FEV_W_UNSTAMPED : 0), true);
 					if (delayed)
 						fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 					ch->req_seq = seq;
@@ -19889,21 +23111,36 @@ ps_handle_meta(PsChannel *ch)
 			 * The segment log has no record of it, so the GROW event must be
 			 * persisted -- but only when it actually raises the size at its
 			 * horizon, keeping the log as sparse as the in-memory dedup.
+			 *
+			 * A no-op grow (fork_grow_with_seq() returns 0: the fork's size
+			 * already covers 'to') persists and inserts nothing, so 'seq' is
+			 * never made durable.  It must not be reported as req_seq: a
+			 * client that observed it as a mutation sequence could later see
+			 * a clean-restart ADMISSION_BARRIER below it, since the
+			 * allocator itself rolls back to what recovery actually
+			 * observed.  Report req_seq = 0 instead; the burned seq value is
+			 * otherwise harmless (nothing references it).
 			 */
 			{
-				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
+				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn, ch->req_floor_lsn);
 				uint64_t	seq = admission_seq_alloc();
 				uint32_t	to = ch->blocknum + ch->nblocks;
+				int			grew;
 
 				/* Validate the caller's explicit tuple before fork_grow_with_seq()
 				 * can clamp its effective LSN to a newer definitive event. */
 				if (seq == 0 ||
 					(ch->req_lsn != 0 &&
-					 !fork_meta_mutation_future(ch->req_lsn, seq)) ||
-					fork_grow_with_seq(tl, &ch->key, to, lsn, seq) != 0)
+					 !fork_meta_mutation_future(ch->req_lsn, seq)))
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
+				grew = fork_grow_with_seq(tl, &ch->key, to, lsn, seq, ch->req_lsn == 0);
+				if (grew < 0)
 					ch->status = PS_STATUS_ERROR;
 				else
-					ch->req_seq = seq;
+					ch->req_seq = grew ? seq : 0;
 			}
 			break;
 
@@ -19917,6 +23154,10 @@ ps_handle_meta(PsChannel *ch)
 			{
 				uint64_t new_incarnation;
 				uint64_t parent_incarnation;
+				uint64_t branch_seq = PS_SEQ_UNBOUNDED;
+				bool proven = ch->is_redo == PS_BRANCH_R2_PROVEN;
+
+				ch->result = 0;
 
 				if (!branch_create_request_ok(ch->timeline,
 										(int) ch->parent_timeline, ch->req_lsn,
@@ -19938,12 +23179,31 @@ ps_handle_meta(PsChannel *ch)
 					__atomic_load_n(&timelines[ch->timeline].state,
 												__ATOMIC_ACQUIRE) == PS_TIMELINE_LIVE)
 				{
+					if (timeline_branch_seq(ch->timeline) != PS_SEQ_UNBOUNDED)
+					{
+						if (!proven)
+						{
+							ch->status = PS_STATUS_ERROR;
+							ch->result = PS_BRANCH_REFUSE_UNPROVEN_RETRY;
+							break;
+						}
+						ch->result = PS_BRANCH_RESULT_FINITE;
+					}
 					ch->incarnation = new_incarnation;
-					break; /* explicitly idempotent exact retry */
+					break; /* exact retry preserves the original S */
+				}
+				if (proven)
+				{
+					if (timeline_activate_branch_caps() != 0 ||
+						(branch_seq = admission_seq_alloc()) == 0)
+					{
+						ch->status = PS_STATUS_ERROR;
+						break;
+					}
 				}
 				if (timeline_persist_create(ch->timeline,
 										(int) ch->parent_timeline, ch->req_lsn,
-										new_incarnation, parent_incarnation) == 0)
+										new_incarnation, parent_incarnation, branch_seq) == 0)
 				{
 					if (__atomic_load_n(&timelines[ch->timeline].state,
 												__ATOMIC_ACQUIRE) == PS_TIMELINE_DELETED)
@@ -19952,6 +23212,9 @@ ps_handle_meta(PsChannel *ch)
 											(int) ch->parent_timeline, ch->req_lsn,
 											new_incarnation, parent_incarnation);
 					ch->incarnation = new_incarnation;
+					timelines[ch->timeline].branch_seq = branch_seq;
+					ch->result = PS_BRANCH_RESULT_NEW |
+						(branch_seq != PS_SEQ_UNBOUNDED ? PS_BRANCH_RESULT_FINITE : 0);
 				}
 				else
 					ch->status = PS_STATUS_ERROR;
@@ -19995,6 +23258,7 @@ ps_handle_meta(PsChannel *ch)
 				ch->parent_timeline = (uint32_t) timelines[tl].parent;
 				ch->req_lsn = timelines[tl].branch_lsn;
 				ch->req_seq = timelines[tl].parent_incarnation;
+				ch->req_floor_lsn = timeline_branch_seq(tl);
 			}
 			break;
 		case PS_OP_BEGIN_DELETE:
@@ -20007,7 +23271,13 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t incarnation;
 
 				if (!ps_timeline_state(tl, &state, &incarnation))
+				{
 					ch->status = PS_STATUS_ERROR;
+					/* an id beyond the table positively does not exist */
+					ch->result = timeline_meta_poisoned_load() ?
+						PS_TIMELINE_STATE_UNAVAILABLE :
+						PS_TIMELINE_STATE_UNDEFINED;
+				}
 				else
 				{
 					ch->result = state;
@@ -20135,7 +23405,8 @@ ps_handle_meta(PsChannel *ch)
 					(uint64_t) ch->pad1 << 32;
 				/* Generation zero exists only for replaying pre-v27 retention
 				 * records.  It is never valid on the current IPC boundary. */
-				if (ch->old_nblocks == 0 || tl >= MAX_TIMELINES)
+				if (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
+					ch->blocknum == PS_RETENTION_OWNER_CHECKPOINT_FENCE)
 					ret = PS_RETENTION_ERROR;
 				else
 				{
@@ -20159,7 +23430,7 @@ ps_handle_meta(PsChannel *ch)
 					/* Recheck LIVE under map_lock while admission write is held;
 					 * this serializes the owner update with BEGIN_DELETE. */
 					page_history_allowed = timeline_live &&
-						page_frontier_ancestry_allows(tl, pin.lsn,
+						page_frontier_ancestry_admits(tl, pin.lsn,
 							pin.admission_seq);
 					wal_allowed = timeline_live &&
 						wal_reclaim_frontier_ancestry_allows(tl, pin.lsn);
@@ -20191,7 +23462,9 @@ ps_handle_meta(PsChannel *ch)
 							((pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
 							 !wal_index_allowed) || wal_index_pending) ||
 							!timeline_live) ?
-						PS_RETENTION_ERROR : ps_retention_set(&pin);
+						PS_RETENTION_ERROR :
+			(cap_effective_seq(CAP_PIN, pin.admission_seq) == PS_SEQ_UNBOUNDED ?
+			 ps_retention_set(&pin) : ps_retention_handoff(&pin));
 					if (ret == PS_RETENTION_OK)
 					{
 						admission_seq_observe(pin.admission_seq);
@@ -20223,7 +23496,9 @@ ps_handle_meta(PsChannel *ch)
 					ps_admission_write_unlock();
 					}
 				}
-				if (ret == PS_RETENTION_STALE)
+				if (ret == PS_RETENTION_NOT_REGISTERED)
+			ch->result = (uint32_t) -ret;
+		if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
 				else if (ret != PS_RETENTION_OK)
 					ch->status = PS_STATUS_ERROR;
@@ -20251,7 +23526,8 @@ ps_handle_meta(PsChannel *ch)
 				pin.generation = ch->old_nblocks;
 				pin.owner_id = ch->req_seq;
 				pin.lsn = ch->req_lsn;
-				if (admission_write_lock() == 0)
+				if (ch->blocknum != PS_RETENTION_OWNER_CHECKPOINT_FENCE &&
+					admission_write_lock() == 0)
 				{
 				seq = admission_seq_alloc();
 				pin.admission_seq = seq;
@@ -20278,7 +23554,7 @@ ps_handle_meta(PsChannel *ch)
 					/* Recheck LIVE under map_lock after admission write, not merely
 					 * defined, so BEGIN_DELETE cannot race this owner publication. */
 					page_history_allowed = timeline_live &&
-						page_frontier_ancestry_allows(tl, pin.lsn,
+						page_frontier_ancestry_admits(tl, pin.lsn,
 							pin.admission_seq);
 					wal_allowed = timeline_live &&
 						wal_reclaim_frontier_ancestry_allows(tl, pin.lsn);
@@ -20290,9 +23566,13 @@ ps_handle_meta(PsChannel *ch)
 					wal_index_pending = wal_index_pending &&
 						((((old_found == 1 ? old_pin.resources : 0) |
 						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0);
+					/* A fresh WAL-index view also depends on retained
+					 * first-arrival page identities.  This validates
+					 * storage history without granting PAGE authority. */
 					if (timeline_live &&
 						(((pin.resources &
-						   PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0) ||
+						   (PS_RETENTION_RESOURCE_PAGE_HISTORY |
+							PS_RETENTION_RESOURCE_WAL_INDEX)) == 0) ||
 						 page_history_allowed) &&
 						(((pin.resources & PS_RETENTION_RESOURCE_WAL) == 0) ||
 						 wal_allowed) &&
@@ -20330,7 +23610,9 @@ ps_handle_meta(PsChannel *ch)
 				pthread_rwlock_unlock(&page_prune_lock);
 				ps_admission_write_unlock();
 				}
-				if (ret == PS_RETENTION_STALE)
+				if (ret == PS_RETENTION_NOT_REGISTERED)
+			ch->result = (uint32_t) -ret;
+		if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
 				else if (ret != PS_RETENTION_OK)
 					ch->status = PS_STATUS_ERROR;
@@ -20345,6 +23627,11 @@ ps_handle_meta(PsChannel *ch)
 				int			timeline_defined;
 				int			wal_index_pending;
 
+				if (ch->blocknum == PS_RETENTION_OWNER_CHECKPOINT_FENCE)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
 				pthread_rwlock_wrlock(&page_prune_lock);
 				pthread_rwlock_wrlock(&walidx_prune_lock);
 				old_found = ps_retention_lookup(tl, ch->blocknum,
@@ -20378,7 +23665,9 @@ ps_handle_meta(PsChannel *ch)
 				}
 				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);
-				if (ret == PS_RETENTION_STALE)
+				if (ret == PS_RETENTION_NOT_REGISTERED)
+			ch->result = (uint32_t) -ret;
+		if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
 				else if (ret != PS_RETENTION_OK)
 					ch->status = PS_STATUS_ERROR;
@@ -20613,6 +23902,7 @@ ps_core_close_impl(void)
 	ps_manifest_close();
 	/* Release local provider leases after all core users have stopped.  SPDK
 	 * storage is still closed by its daemon; it is not an idempotent provider. */
+	layer_verified_reset();		/* with the files it describes */
 	if (ps_layer_store != NULL && ps_layer_store->close != NULL)
 		ps_layer_store->close();
 	core_close_posix_storage();
@@ -20732,7 +24022,10 @@ verify_segment_layers_locked(uint32_t source_shard, uint32_t victim, int need_la
 		{
 			found = 1;
 			/* Always re-read and checksum now: a prior read's cached verification
-			 * may predate corruption that occurred before this unlink. */
+			 * may predate corruption that occurred before this unlink.  That
+			 * includes one parked by a map-lock holder: a failure here must
+			 * not be overruled by it on the next lookup. */
+			layer_verified_forget(d->layer_id);
 			if (ps_image_layer_verify_data(d, page_size) != 0)
 				return -1;
 		}
@@ -20866,6 +24159,8 @@ read_layer_block_refreshing(const PsLayerDesc *layer, uint64_t off,
 static int
 verify_image_layer_refreshing(const PsLayerDesc *layer)
 {
+	/* an explicit verification supersedes whatever was parked */
+	layer_verified_forget(layer->layer_id);
 	if (ps_image_layer_verify_data(layer, page_size) == 0)
 		return 0;
 	if (refresh_remote_only_layer(layer) != 0)
@@ -21074,6 +24369,7 @@ finish_evict(const PsLayerDesc *candidate)
 			/* A later cache refill installs different physical bytes; require
 			 * the image data checksum to be verified again before serving it. */
 			layer->data_verified = false;
+			layer_verified_forget(layer->layer_id);
 			layer->cache_resident = false;
 			layer->local_cleanup_pending = true;
 			found = 1;
@@ -21663,6 +24959,43 @@ ps_core_maintenance(void)
 }
 
 /*
+ * ps_core_open_impl() and ps_core_open() are one long sequence of "do this
+ * step or fail the whole open"; almost every step is its own condition
+ * ending in a bare "return -1".  Before this, a failure there was silent:
+ * whoever ran the daemon interactively saw nothing but a nonzero exit and no
+ * diagnostic naming which of the dozens of steps failed or why, and some
+ * steps' callees fail without setting errno at all, so even attaching a
+ * debugger after the fact could turn up a stale/unrelated errno.  Route
+ * every such failure through open_step_failed(name): it prints exactly one
+ * line naming the step and the (possibly defaulted) errno, then returns -1,
+ * so `return OPEN_STEP("step name");` is a drop-in replacement for a bare
+ * `return -1;` with no other change in control flow.
+ */
+static int
+open_step_failed(const char *step)
+{
+	int			saved_errno = errno;
+
+	/* Every ps_core_open_impl() failure return goes through here (see the
+	 * OPEN_STEP macro), including every one inside the single-threaded
+	 * recovery window that sets core_open_exclusive: unconditionally clear
+	 * it so a failed open never leaves I-ALLOC permanently exempted on this
+	 * thread. */
+	core_open_exclusive = 0;
+
+	/* A callee that fails without setting errno must not leave the daemon's
+	 * perror() (or this diagnostic, on a second failed step) reporting
+	 * whatever unrelated syscall last touched errno. */
+	if (saved_errno == 0)
+		saved_errno = EIO;
+	fprintf(stderr, "pagestore_core: open step %s failed: %s\n", step,
+			strerror(saved_errno));
+	errno = saved_errno;
+	return -1;
+}
+#define OPEN_STEP(name) open_step_failed(name)
+
+/*
  * Open the store and rebuild all in-memory state from it: define the root
  * timeline, load persisted branches, rebuild the page/fork indexes from the
  * image layers (falling back to a segment scan only for a store that has no
@@ -21676,16 +25009,18 @@ ps_core_open(const char *store_dir)
 	int rc;
 	int save_errno;
 	int storage_opened = 0;
+	uint32_t	i;
 
 	/* Lifecycle recovery and publication both copy a complete fixed record.
 	 * Validate before opening storage, including for callers without a CLI. */
 	if (page_size < sizeof(PsArtifactLifecycle))
 	{
 		errno = EINVAL;
-		return -1;
+		return OPEN_STEP("page_size validation");
 	}
+	errno = 0;
 	if (!core_process_valid())
-		return -1;
+		return OPEN_STEP("core_process_valid");
 	pthread_mutex_lock(&core_state_lock);
 	__atomic_store_n(&core_pid, getpid(), __ATOMIC_RELEASE);
 	__atomic_store_n(&artifact_io_failed, 0, __ATOMIC_RELEASE);
@@ -21698,7 +25033,26 @@ ps_core_open(const char *store_dir)
 		 * startup failure, including failures after manifest replay begins. */
 		save_errno = errno;
 		__atomic_store_n(&core_opened, 0, __ATOMIC_RELEASE);
+		/* ps_core_open_impl() allocates each shard's memtable, and
+		 * unconditionally the page cache, well before several later
+		 * validation/replay steps that can still fail -- a failure past that
+		 * point used to leak both (see lsan_suppressions.txt's prior
+		 * ps_memtable_create/ps_pgcache_init entries, now removed: this is
+		 * the fix, not a suppression).  Free rather than flush: the store
+		 * just failed to open, so its in-memory state may be incomplete or
+		 * inconsistent, and nothing has published a lease for a flush to be
+		 * durable under. */
+		for (i = 0; i < MAX_SHARDS; i++)
+		{
+			if (g_shards[i].memtable != NULL)
+			{
+				ps_memtable_destroy(g_shards[i].memtable);
+				g_shards[i].memtable = NULL;
+			}
+		}
+		ps_pgcache_free();
 		ps_manifest_close();
+		layer_verified_reset();
 		if (ps_layer_store != NULL && ps_layer_store->close != NULL)
 			ps_layer_store->close();
 		/* A fully initialized provider may use its ordinary close, including
@@ -21729,7 +25083,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		 strcmp(ps_storage->name, "posix") != 0))
 	{
 		errno = EINVAL;
-		return -1;
+		return OPEN_STEP("forkmeta reclaim requires the posix backend");
 	}
 
 	__atomic_store_n(&core_opened, 0, __ATOMIC_RELEASE);
@@ -21741,6 +25095,10 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	free_walidx_indexes();
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
 	__atomic_store_n(&next_admission_seq, 1, __ATOMIC_RELAXED);
+	/* The soak epochs are store-scoped too: a stale maximum from the previous
+	 * store would mask every admission of a lower-sequence new store. */
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		__atomic_store_n(&fork_event_admit_seq_by_tl[tl], 0, __ATOMIC_RELAXED);
 	/* A close/open cycle may switch to a store with different timelines.  Drop
 	 * every in-memory flat-WAL catalog before metadata replay selects which
 	 * timelines to recover; resetting only wal_end would leave stale offsets and
@@ -21766,10 +25124,13 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	memset(wal_covered_valid, 0, sizeof(wal_covered_valid));
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
+	branch_caps_active = 0;
+	memset(cap_activation, 0, sizeof(cap_activation));
 	memset(inspection_timeline_cache, 0,
 		   sizeof(inspection_timeline_cache));
 	inspection_timeline_cache_valid = 0;
 	inspection_timeline_cache_retention_usable = 0;
+	__atomic_add_fetch(&page_view_timeline_epoch, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&inspection_timeline_cache_dirty, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_meta_poisoned, 0, __ATOMIC_RELEASE);
 	memset(timeline_used, 0, sizeof(timeline_used));
@@ -21823,6 +25184,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	gc_remote_layer_cursor = 0;
 	memset(wal_segment_store_opened, 0, sizeof(wal_segment_store_opened));
 	memset(walidx_progress, 0, sizeof(walidx_progress));
+	memset(walidx_horizon_seq, 0, sizeof(walidx_horizon_seq));
 	memset(walidx_progress_valid, 0, sizeof(walidx_progress_valid));
 	memset(walidx_progress_durable, 0, sizeof(walidx_progress_durable));
 	memset(walidx_shards_seen, 0, sizeof(walidx_shards_seen));
@@ -21891,57 +25253,74 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	 * retain the original path and perform no POSIX path lookup. */
 	if (ps_storage->name != NULL && strcmp(ps_storage->name, "posix") == 0)
 	{
+		errno = 0;
 		if ((mkdir(store_dir, 0700) != 0 && errno != EEXIST) ||
 			realpath(store_dir, runtime_store_root) == NULL)
-			return -1;
+			return OPEN_STEP("create/canonicalize store root");
 		runtime_store_dir = runtime_store_root;
 	}
 	path_len = snprintf(next_wal_segment_root, sizeof(next_wal_segment_root), "%s",
 					runtime_store_dir);
 	if (path_len < 0 || (size_t) path_len >= sizeof(next_wal_segment_root))
-		return -1;
+	{
+		errno = ENAMETOOLONG;
+		return OPEN_STEP("wal segment root path");
+	}
 	path_len = snprintf(next_fork_meta_snapshot_dir,
 					sizeof(next_fork_meta_snapshot_dir),
 					"%s/forkmeta_snapshots", runtime_store_dir);
 	if (path_len < 0 ||
 		(size_t) path_len >= sizeof(next_fork_meta_snapshot_dir))
-		return -1;
+	{
+		errno = ENAMETOOLONG;
+		return OPEN_STEP("forkmeta snapshot dir path");
+	}
+	errno = 0;
 	if (ps_storage->open(runtime_store_dir, segment_size) != 0)
-		return -1;
+		return OPEN_STEP("storage open");
 	*storage_opened = 1;
 	memcpy(wal_segment_root, next_wal_segment_root,
 		   strlen(next_wal_segment_root) + 1);
 	memcpy(fork_meta_snapshot_dir, next_fork_meta_snapshot_dir,
 		   strlen(next_fork_meta_snapshot_dir) + 1);
 	ps_layer_store_set_page_size(page_size);
+	errno = 0;
 	if (ps_layer_store->open(runtime_store_dir) != 0)
-		return -1;
+		return OPEN_STEP("layer store open");
+	errno = 0;
 	if (ps_manifest_open(runtime_store_dir) != 0)
-		return -1;
+		return OPEN_STEP("manifest open");
+	errno = 0;
 	if (ps_manifest_replay(&ps_layer_map) != 0)
-		return -1;
+		return OPEN_STEP("manifest replay");
+	errno = 0;
 	if (validate_store_shard_count(runtime_store_dir,
 							   &publish_shard_count) != 0)
-		return -1;
+		return OPEN_STEP("validate store shard count");
+	errno = 0;
 	if (use_layers && ps_layer_store->validate_local_layers != NULL &&
 		ps_layer_store->validate_local_layers(&ps_layer_map) != 0)
-		return -1;
+		return OPEN_STEP("validate local layers");
+	errno = 0;
 	if (use_layers && mark_legacy_shard_zero_layers() != 0)
-		return -1;
+		return OPEN_STEP("mark legacy shard-zero layers");
 	/* The map is now a complete, shard-compatible replay result.  A tolerated
 	 * manifest tail repair is deliberately not authority for destructive orphan
 	 * cleanup; its durable quarantine marker suppresses this and all future
 	 * sweeps until an operator/repair workflow removes the ambiguity. */
 	if (use_layers && ps_layer_store->recover_local_layers != NULL)
 	{
-		int sweep_inhibited = ps_manifest_orphan_sweep_inhibited();
+		int sweep_inhibited;
 
+		errno = 0;
+		sweep_inhibited = ps_manifest_orphan_sweep_inhibited();
 		if (sweep_inhibited < 0)
-			return -1;
+			return OPEN_STEP("manifest orphan sweep inhibited check");
+		errno = 0;
 		if (ps_manifest_replay_had_manifest() &&
 			!ps_manifest_replay_repaired() && !sweep_inhibited &&
 			ps_layer_store->recover_local_layers(&ps_layer_map) != 0)
-			return -1;
+			return OPEN_STEP("recover local layers");
 	}
 	/* Leave deleting layers for asynchronous maintenance: recovery must not
 	 * block on an unavailable remote object that is already excluded from reads. */
@@ -21970,9 +25349,10 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 			/* Rebuild exact debt only when the PAGE controller needs it.  A
 			 * disabled open deliberately avoids historical segment metadata I/O
 			 * and exposes the diagnostic as unavailable. */
+			errno = 0;
 			if (page_reclaim_high_water_bytes != 0 &&
 				rebuild_page_gc_state(&g_shards[i]) != 0)
-				return -1;
+				return OPEN_STEP("rebuild page GC state");
 		}
 		g_shards[i].next_layer_id = 1;
 		pthread_rwlock_init(&shard_locks[i], NULL);
@@ -21996,7 +25376,10 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 			g_shards[i].memtable = ps_memtable_create(page_size,
 													  (uint32_t) flush_pages);
 			if (!g_shards[i].memtable)
-				return -1;
+			{
+				errno = ENOMEM;
+				return OPEN_STEP("create shard memtable");
+			}
 		}
 	/* the materialized-page cache helps both read paths (read_resolve and the
 	 * SPDK async path), so it is not gated on use_layers */
@@ -22006,38 +25389,49 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 
 	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
+	errno = 0;
 	if (load_timelines() != 0)
 	{
 		fprintf(stderr, "pagestore_core: refusing to open corrupt timelines metadata\n");
-		return -1;
+		return OPEN_STEP("load timelines");
 	}
 	/* Load durable branch definitions before immutable-only ids are marked used:
 	 * metadata replay must be allowed to reconstruct a legitimate branch, while
 	 * later CREATE_BRANCH requests must not reuse any discovered id. */
+	errno = 0;
 	if (wal_segment_discover_used() != 0)
-		return -1;
+		return OPEN_STEP("discover used WAL segments");
+	errno = 0;
 	if (ps_retention_open(runtime_store_dir) != 0)
-		return -1;
+		return OPEN_STEP("retention open");
+	for (uint32_t tl = 1; tl < MAX_TIMELINES; tl++)
+		if (timelines[tl].defined && timelines[tl].state != PS_TIMELINE_LIVE &&
+			checkpoint_fences_retire(tl) != 0)
+			return OPEN_STEP("retire deleting checkpoint owners");
+	errno = 0;
 	if (page_frontier_load(runtime_store_dir) != 0)
 	{
 		fprintf(stderr, "pagestore: refusing to open corrupt page reclamation frontiers\n");
-		return -1;
+		return OPEN_STEP("load page reclamation frontiers");
 	}
+	errno = 0;
 	if (walidx_frontier_load(runtime_store_dir) != 0)
 	{
 		fprintf(stderr, "pagestore: refusing to open corrupt WAL-index "
 				"reclamation frontiers\n");
-		return -1;
+		return OPEN_STEP("load WAL-index reclamation frontiers");
 	}
 	{
 		uint64_t	admission_highwater;
 		uint32_t	npins = 0;
 
+		errno = 0;
 		if (ps_retention_admission_highwater(&admission_highwater) != 0)
-			return -1;
+			return OPEN_STEP("read retention admission highwater");
 		admission_seq_observe(admission_highwater);
+		errno = 0;
 		if (ps_retention_count(&npins) != 0)
-			return -1;
+			return OPEN_STEP("count retention pins");
 		for (uint32_t i = 0; i < npins; i++)
 		{
 			PsRetentionPin pin;
@@ -22048,19 +25442,32 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 			{
 				fprintf(stderr, "pagestore: retention pin references an undefined timeline\n");
 				errno = EILSEQ;
-				return -1;
+				return OPEN_STEP("validate retention pin timeline");
 			}
 			if (pin.admission_seq != 0)
 				admission_seq_observe(pin.admission_seq);
 		}
 	}
+	/*
+	 * From here through the recover() loop below, this process is still
+	 * single-threaded (no worker or maintenance thread exists yet), so no
+	 * shard lock is meaningfully contended; I-ALLOC (ps_assert_shard_held_
+	 * for_key()) is exempted for this window instead of requiring recovery
+	 * to take shard-wr on every record it replays.  Cleared unconditionally
+	 * by open_step_failed() on any error return in this function, and
+	 * explicitly right after the recover() loop on the success path.
+	 */
+	core_open_exclusive = 1;
 	/* Reconcile the snapshot intent before loading either source epoch.  Only a
 	 * selected manifest transfers ownership away from the old source epoch. */
 	{
-		int manifest_exists = fork_meta_snapshot_manifest_exists(
+		int manifest_exists;
+
+		errno = 0;
+		manifest_exists = fork_meta_snapshot_manifest_exists(
 			fork_meta_snapshot_dir);
 		if (manifest_exists < 0)
-			return -1;
+			return OPEN_STEP("check forkmeta snapshot manifest existence");
 		if (manifest_exists)
 		{
 			PsForkmetaSnapshot selected = {.directory_fd = -1,
@@ -22068,8 +25475,10 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 			PsForkmetaSnapshotPrepared pending;
 			int have_pending;
 
+			errno = 0;
 			if (ps_forkmeta_snapshot_open(&selected, fork_meta_snapshot_dir) != 0)
-				return -1;
+				return OPEN_STEP("open selected forkmeta snapshot");
+			errno = 0;
 			have_pending = ps_forkmeta_snapshot_read_prepared(
 				fork_meta_snapshot_dir, &pending);
 			if (have_pending < 0 ||
@@ -22080,18 +25489,20 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 			{
 				fprintf(stderr, "pagestore: forkmeta prepared-intent reconcile failed\n");
 				ps_forkmeta_snapshot_close(&selected);
-				return -1;
+				return OPEN_STEP("reconcile forkmeta prepared intent");
 			}
 			ps_forkmeta_snapshot_close(&selected);
+			errno = 0;
 			if (fork_meta_snapshot_load(fork_meta_snapshot_dir) != 0)
 			{
 				fprintf(stderr, "pagestore: selected forkmeta snapshot is invalid\n");
-				return -1;
+				return OPEN_STEP("load selected forkmeta snapshot");
 			}
+			errno = 0;
 			if (fork_meta_snapshot_reconcile_source() != 0)
 			{
 				fprintf(stderr, "pagestore: forkmeta source epoch reconcile failed\n");
-				return -1;
+				return OPEN_STEP("reconcile forkmeta source epoch");
 			}
 			/* Startup has selected the authoritative generation.  Reclaim older
 			 * generations asynchronously; recovery must not leave them behind just
@@ -22103,14 +25514,17 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		else
 		{
 			PsForkmetaSnapshotPrepared prepared;
-			int have_prepared = ps_forkmeta_snapshot_read_prepared(
-				fork_meta_snapshot_dir, &prepared);
+			int			have_prepared;
 
+			errno = 0;
+			have_prepared = ps_forkmeta_snapshot_read_prepared(
+				fork_meta_snapshot_dir, &prepared);
 			if (have_prepared < 0)
-				return -1;
+				return OPEN_STEP("read forkmeta prepared intent");
+			errno = 0;
 			if (have_prepared == 1 &&
 				ps_forkmeta_snapshot_abort(&prepared) != 0)
-				return -1;
+				return OPEN_STEP("abort stale forkmeta prepared intent");
 			/* There is no selected manifest to make the normal observation arm
 			 * this path, but an interrupted first publication may have left valid
 			 * temporary parts.  Schedule bounded temp GC independently of
@@ -22136,23 +25550,30 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	 * scans and materializes only the segment suffix.  Without a watermark (an
 	 * old store or SPDK), recover() starts at segment zero.
 	 */
+	errno = 0;
 	if (load_fork_meta() != 0)
-		return -1;
+		return OPEN_STEP("load fork metadata");
 
 	for (uint32_t sh = 0; sh < ns; sh++)
 	{
+		errno = 0;
 		if (use_layers && recover_layer_prefix(sh) != 0)
-			return -1;
+			return OPEN_STEP("recover layer prefix");
+		errno = 0;
 		if (recover(sh) != 0)
-			return -1;
+			return OPEN_STEP("recover shard");
 	}
+	/* End of the single-threaded recovery window (see the comment above). */
+	core_open_exclusive = 0;
+	errno = 0;
 	if (artifact_validate_recovery() != 0)
-		return -1;
+		return OPEN_STEP("validate artifact recovery");
 	/* Retention mutations may have committed immediately before shutdown.
 	 * Conservatively revisit every nonempty layer set after recovery. */
 	page_prune_mark_all_due();
+	errno = 0;
 	if (use_layers && mark_legacy_shard_zero_layers() != 0)
-		return -1;
+		return OPEN_STEP("mark legacy shard-zero layers (post-recovery)");
 
 	/*
 	 * Seal the legacy migration before the daemon becomes writable.  Starting
@@ -22168,13 +25589,15 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		if (fork_meta_migrate_failed)
 		{
 			fprintf(stderr, "pagestore: fork-meta migration incomplete\n");
-			return -1;
+			errno = EILSEQ;
+			return OPEN_STEP("fork-meta migration");
 		}
 		memset(&zk, 0, sizeof(zk));
+		errno = 0;
 		if (fork_meta_persist(0, &zk, 0, 0, 0, FEV_MIGRATED) != 0)
 		{
 			fprintf(stderr, "pagestore: could not seal the fork-meta migration\n");
-			return -1;
+			return OPEN_STEP("seal fork-meta migration");
 		}
 		fork_meta_irreducible_prefix_bytes += sizeof(ForkMetaRecV2);
 	}
@@ -22193,36 +25616,47 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 				(timeline_state == PS_TIMELINE_DELETING ||
 				 timeline_state == PS_TIMELINE_DELETED))
 				continue;
+			errno = 0;
 			if (wal_recover_one(tl) != 0)
-				return -1;
+				return OPEN_STEP("recover timeline WAL");
+			errno = 0;
 			if (wal_segment_sync(tl) != 0)
 			{
 				fprintf(stderr, "pagestore: refusing invalid immutable WAL segments "
 						"for timeline %u\n", tl);
-				return -1;
+				return OPEN_STEP("sync immutable WAL segments");
 			}
 			walidx_progress_init(tl, wal_log_start(tl));
 			{
 				char directory[4096];
 
+				errno = 0;
 				if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0 ||
 					ps_walidx_snapshot_recover_prepared(directory, tl,
 										walidx_frontier_current(tl)) != 0)
-					return -1;
+					return OPEN_STEP("recover WAL-index prepared snapshot");
 			}
+			errno = 0;
 			if (walidx_snapshot_recover(tl) != 0)
-				return -1;
+				return OPEN_STEP("recover WAL-index snapshot");
 			for (uint32_t shard = 0; shard < core_shards(); shard++)
+			{
+				errno = 0;
 				if (walidx_recover_one(tl, shard) != 0)
-					return -1;
+					return OPEN_STEP("recover WAL-index shard");
+			}
 		}
 
+	errno = 0;
 	if (publish_shard_count &&
 		publish_store_shard_count(runtime_store_dir) != 0)
-		return -1;
+		return OPEN_STEP("publish store shard count");
+	errno = 0;
 	if (forkmeta_reclaim_high_water_bytes != 0 &&
 		fork_meta_reclaim_baseline_init() != 0)
-		return -1;
+		return OPEN_STEP("initialize forkmeta reclaim baseline");
+	if (artifact_caps_recover() != 0 || timeline_activate_view_caps() != 0)
+		return OPEN_STEP("activate finite view caps");
 	__atomic_store_n(&core_opened, 1, __ATOMIC_RELEASE);
 
 	return 0;
@@ -22236,8 +25670,9 @@ ps_core_format_identities(const PsFormatIdentity **out)
 		 PS_PAGE_FRONTIER_VERSION},
 		{"walidx_frontier", "walidx-prune.frontiers", PS_WALIDX_FRONTIER_MAGIC,
 		 PS_WALIDX_FRONTIER_VERSION},
-		{"timelines", "timelines record", TIMELINE_META_V2_MAGIC, 2},
-		{"forkmeta", "forkmeta record", FORK_META_V3_MAGIC, 3},
+		{"timelines", "timelines record", TIMELINE_META_V2_MAGIC, 3},
+		{"forkmeta", "forkmeta record", FORK_META_V4_MAGIC, 4},
+		{"forkmeta", "forkmeta record (accepted legacy)", FORK_META_V3_MAGIC, 3},
 		{"forkmeta", "forkmeta record (accepted legacy)", FORK_META_V2_MAGIC, 2},
 		{"forkmeta_snapshot", "forkmeta checkpoint/tail payload",
 		 FORK_META_SNAPSHOT_PAYLOAD_MAGIC, FORK_META_SNAPSHOT_PAYLOAD_VERSION},
@@ -22263,7 +25698,7 @@ ps_core_format_identities(const PsFormatIdentity **out)
 		{"wal_log", "wal_<tl> record", WAL_MAGIC, 0},
 		{"walidx_log", "walidx_<tl>_<shard> record", WALIDX_MAGIC, 0},
 		{"walidx_log", "walidx_<tl>_<shard> progress record",
-		 WALIDX_PROGRESS_MAGIC, 0},
+		 WALIDX_PROGRESS_MAGIC, 2},
 		/* Headerless persisted configuration: the schema number stands in
 		 * for a magic, which is why it reports zero. */
 		{"store_config", ".pagestore-nshards PSS2 checked shard count (legacy decimal accepted)", 0,

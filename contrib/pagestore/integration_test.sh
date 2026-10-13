@@ -33,6 +33,7 @@ fi
 BIN=$(dirname "$PGCTL")
 ROOT=$(dirname "$BIN")
 export LD_LIBRARY_PATH="$ROOT/lib:$ROOT/lib64"
+export DYLD_LIBRARY_PATH="$ROOT/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 # A loaded CI runner can take longer than pg_ctl's one-minute default to
 # reach a ready postmaster; a slow start is not a failed one.
 export PGCTLTIMEOUT=${PGCTLTIMEOUT:-180}
@@ -49,6 +50,39 @@ STORE=$(mktemp -d)/store
 SCRATCH=$(mktemp -d)/walredo	# private throwaway cluster for the wal-redo helper
 MAIN_SOCK=$(new_sockdir main)
 SHM=/psint_$$
+# The daemon's IPC segment as a filesystem path: Linux exposes POSIX shm under
+# /dev/shm; on macOS pagestore_shm.h backs it with a regular file instead.
+if [ "$(uname -s)" = Darwin ]; then
+	SHM_PATH="/tmp/pagestore-shm-$(id -u)/${SHM#/}"
+else
+	SHM_PATH="/dev/shm$SHM"
+fi
+remove_test_shm() {
+    # Reuse the harness's fd-relative cleanup and private-directory validation.
+    python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from pagestore_harness import remove_shm
+remove_shm(sys.argv[2])
+' "$SCRIPT_DIR/harness" "$SHM"
+}
+# GNU/BSD userland shims.
+if ! command -v md5sum >/dev/null 2>&1; then
+	md5sum() { if [ $# -eq 0 ]; then md5 -q; else md5 -q "$1"; fi; }
+fi
+if ! command -v sha256sum >/dev/null 2>&1; then
+	sha256sum() { shasum -a 256 "$@"; }
+fi
+file_size() { wc -c < "$1" | tr -d ' '; }
+sed_inplace() {
+	if sed --version >/dev/null 2>&1; then sed -i "$@"; else sed -i '' "$@"; fi
+}
+# Insert the branch-parent fields after the "timeline": 1 line of a manifest.
+add_branch_parent_fields() {  # $1=manifest $2=fork_lsn
+	awk -v lsn="$2" '{ print }
+		/"timeline": 1,/ { printf "  \"parent_timeline\": 0,\n  \"parent_incarnation\": 1,\n  \"fork_lsn\": \"%s\",\n", lsn }' \
+		"$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
 PORT=5432
 P="$BIN/psql -h $MAIN_SOCK -p $PORT -U postgres -tA"
 fail=0
@@ -68,7 +102,7 @@ assert() {  # $1=actual $2=expected $3=message
 # assertion (the reopen guard near the end, which must still print the
 # summary line on failure).
 daemon_shm_ready() {
-	local shm_path="/dev/shm$SHM"
+	local shm_path="$SHM_PATH"
 	local expected_magic=$((0x50414753))
 	local expected_version="$IPC_VERSION"
 	local expected_page_size=8192
@@ -84,7 +118,7 @@ daemon_shm_ready() {
 		fi
 		if [ -r "$shm_path" ]; then
 			read -r magic version page_size io_unit nchannels nshards < <(
-				od -An -tu4 -N24 -w24 "$shm_path" 2>/dev/null
+				od -An -tu4 -N24 "$shm_path" 2>/dev/null | tr -s ' \n' ' '
 			)
 			[ "$magic" = "$expected_magic" ] &&
 				[ "$version" = "$expected_version" ] &&
@@ -128,7 +162,8 @@ _dump_log() {  # $1=banner label $2=filename slug (for the stashed copy) $3=path
 # advancing-reader/bad-reader/unprepared-branch clusters this run created),
 # so a CI failure is diagnosable from the job output alone.  Also copies them
 # into $BUILD/pagestore-integration-logs for the workflow to upload as an
-# artifact.  Called only from the final fail-path, before the EXIT trap
+# artifact.  Also called on success when acceptance requests log export.
+# Called before the EXIT trap
 # removes the temporary directories.
 dump_failure_logs() {
 	FAILDUMP_DIR="$BUILD/pagestore-integration-logs"
@@ -161,14 +196,14 @@ cleanup() {
 		"${ADVANCINGDATA:+$(dirname "$ADVANCINGDATA")}" \
 		"${BADREADER:+$(dirname "$BADREADER")}" \
 		"${UNPREPARED:+$(dirname "$UNPREPARED")}" "$SOCKROOT"
-	rm -f "/dev/shm$SHM"
+	remove_test_shm || exit 1
 }
 trap cleanup EXIT
 
 mkdir -p "$TS"
 "$BIN/initdb" -D "$DATA" -U postgres -A trust >/dev/null 2>&1
 "$BIN/initdb" -D "$SCRATCH" -U postgres -A trust >/dev/null 2>&1
-rm -f "/dev/shm$SHM"
+remove_test_shm || exit 1
 "$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
 DPID=$!
 wait_daemon_ready
@@ -183,6 +218,7 @@ pagestore.slru_mirror = on
 pagestore.auto_wal_index = on
 pagestore.wal_index_max_lag_mb = 1
 io_method = sync
+max_prepared_transactions = 10
 wal_keep_size = 512MB	# appliers replay (C, L] from local pg_wal across restarts
 archive_mode = on
 archive_library = 'pagestore'
@@ -190,6 +226,45 @@ listen_addresses = ''
 unix_socket_directories = '$MAIN_SOCK'
 port = $PORT
 EOF
+# A frontend without the complete P5 protocol (currently SPDK) must be
+# refused at startup, before a writer can leave checkpoint mirrors queued.
+CAPBOOT=$(mktemp -d "$SOCKROOT/p5-capability.XXXXXX")
+cc -I"$SCRIPT_DIR" -x c -o "$CAPBOOT/layout" - <<'C'
+#include <stddef.h>
+#include <stdio.h>
+#include "pagestore_ipc.h"
+int main(void) {
+    printf("%zu %u\n", offsetof(PsShmHeader, frontend_capabilities),
+           PS_FRONTEND_CAP_ATOMIC_PINS);
+    return 0;
+}
+C
+read -r p5_cap_offset p5_cap_bit < <("$CAPBOOT/layout")
+p5_cap_before=$(python3 - "$SHM_PATH" "$p5_cap_offset" "$p5_cap_bit" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    caps, = struct.unpack('=I', f.read(4))
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', caps & ~int(sys.argv[3])))
+    print(caps)
+PYTHON
+)
+p5BootRejected=yes
+if "$BIN/pg_ctl" -D "$DATA" -l "$DATA/p5-capability.log" -w start >/dev/null 2>&1; then
+    p5BootRejected=no
+    "$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1
+fi
+# Always restore the header before the normal compute starts.
+python3 - "$SHM_PATH" "$p5_cap_offset" "$p5_cap_before" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', int(sys.argv[3])))
+PYTHON
+assert "$p5BootRejected" "yes" "compute startup refuses a daemon without atomic P5 capability"
+assert "$(grep -c 'daemon lacks atomic pin capability' "$DATA/p5-capability.log" || true)" \
+    "1" "startup reports the missing P5 capability explicitly"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 
 # --- 1. localsvc round-trip: a routed table's I/O goes to the daemon --------
@@ -301,7 +376,7 @@ seg=$(basename "$(ls "$DATA"/pg_wal/archive_status/*.done 2>/dev/null | head -1)
 out=$(mktemp)
 if [ -n "$seg" ] && "$BUILD/contrib/pagestore/pagestore_walrestore" \
 		--shm "$SHM" --timeline 0 --incarnation 1 --segsize 16777216 "$seg" "$out"; then
-	assert "$(stat -c %s "$out")" "16777216" "restored WAL segment $seg is a full standard segment"
+	assert "$(file_size "$out")" "16777216" "restored WAL segment $seg is a full standard segment"
 	# The payload's own identity gates the hand-off to recovery: the build's
 	# WAL page magic passes, a foreign one and a different segment size exit
 	# with a status above 125, which RestoreArchivedFile() treats as fatal
@@ -389,7 +464,7 @@ rm -f "$history_out"
 # exhaust the daemon's shared-memory mailboxes.
 missing_out=$(mktemp)
 walrestore_reuse_ok=1
-for _ in $(seq 1 160); do
+for ((iteration = 0; iteration < 160; iteration++)); do
 	rm -f "$missing_out"
 	"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" \
 		--timeline 0 --incarnation 1 --segsize 16777216 FFFFFFFFFFFFFFFFFFFFFFFF \
@@ -413,7 +488,7 @@ wait_walidx_visible() {
 	local rel=$1
 	local count=0
 
-	for i in $(seq 1 200); do
+	for ((i = 1; i <= 200; i++)); do
 		count=$($P -c "SELECT pagestore_walidx_count('$rel', 0, 0);")
 		[ "${count:-0}" -gt 0 ] && return 0
 		sleep 0.1
@@ -429,7 +504,7 @@ $P -c "SELECT pg_switch_wal();" >/dev/null
 widx=0
 # Earlier sections intentionally leave about 50 MB of shipped WAL ahead of
 # this table.  Batched index publication must consume that backlog promptly.
-for i in $(seq 1 200); do
+for ((i = 1; i <= 200; i++)); do
 	widx=$($P -c "SELECT pagestore_walidx_count('widx', 0, 0);")
 	[ "${widx:-0}" -gt 0 ] && break
 	sleep 0.1
@@ -448,7 +523,7 @@ $P -c "CREATE TABLE widx_resume(id int) TABLESPACE ts;
        INSERT INTO widx_resume SELECT generate_series(1,1000);
        SELECT pg_switch_wal();" >/dev/null
 widx_resume=0
-for i in $(seq 1 200); do
+for ((i = 1; i <= 200; i++)); do
 	widx_resume=$($P -c "SELECT pagestore_walidx_count('widx_resume', 0, 0);")
 	[ "${widx_resume:-0}" -gt 0 ] && break
 	sleep 0.1
@@ -579,7 +654,7 @@ assert "$sw_store" "t" "redo_page_asof replays base+deltas read from the store's
 # unlike a shared-daemon test where prior writes could push these into a layer.
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1          # detach the engine before restarting the daemon
 kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
-rm -f "/dev/shm$SHM"
+remove_test_shm || exit 1
 # Never flush: the crash-recovery rows must remain segment-log-only.
 "$DAEMON" --shm "$SHM" --store "$STORE" --flush-pages 100000000 \
 	>>"$DATA/daemon.log" 2>&1 &
@@ -591,7 +666,7 @@ $P -c "CREATE TABLE crash(id int, v text) TABLESPACE ts;
 crash_ck=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1          # detach before crashing the daemon
 kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null      # crash: no ps_core_close() -> memtable lost
-rm -f "/dev/shm$SHM"
+remove_test_shm || exit 1
 # Restart and rebuild the index from the segment log.
 "$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
 DPID=$!
@@ -724,7 +799,7 @@ boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
 # committed, so booting on the prepared pg_xact -- not the parent's copied one
 # -- is what makes row1 visible.
 SEEDOUT=$(mktemp -d)
-seeded_b=$($P -c "SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL',
+seeded_b=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL',
 	'3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, '1'::xid, '1'::xid, 0, 0);")
 assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"branch prepared via base snapshot + (C,L] replay ($seeded_b SLRU page(s))"
@@ -1088,7 +1163,7 @@ mxlocker=$!
 # wait until A actually holds the ROW lock -- its xid lands in the tuple's xmax -- rather
 # than a fixed sleep (or a relation-level RowShareLock that is taken before the tuple lock),
 # so a slow host can't let B lock and commit the row alone
-for _ in $(seq 1 100); do
+for ((iteration = 0; iteration < 100; iteration++)); do
 	[ "$($P -c "SELECT (xmax <> '0'::xid)::int FROM mx WHERE id=1;" 2>/dev/null)" = "1" ] && break
 	sleep 0.1
 done
@@ -1141,6 +1216,12 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_prepare_branch_from_control(text, int, int, pg_lsn, pg_lsn, pg_lsn) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch_from_control' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_prepare_branch_from_control(text, int, int, pg_lsn, pg_lsn, pg_lsn, bigint, bool) RETURNS bigint
+        AS 'pagestore','pagestore_prepare_branch_from_control' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_branch_window_open(OUT checkpoint_redo_lsn pg_lsn, OUT next_xid xid8, OUT prepared_count int) RETURNS record
+        AS 'pagestore','pagestore_branch_window_open' LANGUAGE C;
+       CREATE FUNCTION pagestore_prepare_branch_from_window(text, int, int, pg_lsn, pg_lsn, pg_lsn, bigint, xid8, int) RETURNS bigint
+        AS 'pagestore','pagestore_prepare_branch_from_window' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_install_prepared_branch_bootstrap(text, text, int, int, pg_lsn, pg_lsn, pg_lsn) RETURNS void
         AS 'pagestore','pagestore_install_prepared_branch_bootstrap' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_branch_manifest(text, int, int, pg_lsn) RETURNS bool
@@ -1215,7 +1296,7 @@ rm -rf "$BOOTSEED"
 # must leave a durable manifest next to the seeded SLRUs; that manifest is the handoff
 # artifact for the later pg_control/bootstrap step.
 PREPSEED=$(mktemp -d)
-prepSeeded=$($P -c "SELECT pagestore_prepare_branch('$PREPSEED', 2, 0, '$mxC', '$mxL',
+prepSeeded=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch('$PREPSEED', 2, 0, '$mxC', '$mxL',
 	'3'::xid, '$bootNext'::xid, '$ctsA'::xid, '$cts_next'::text::xid, '$mA'::xid, '$mxNext'::xid, $mOff, $((mOff + mxMembers)));")
 assert "$([ "${prepSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
 	"branch prepare seeded all bootstrap SLRUs and forked a store timeline ($prepSeeded page(s))"
@@ -1279,7 +1360,45 @@ rm -rf "$PREPSEED"
 # durably mirrored checkpoint redo.  Every bootstrap horizon must come from that
 # same control image; in particular, oldestMulti's member offset is reconstructed
 # from the base + WAL window instead of being guessed by the caller.
+# R2-s checks the real WAL record. An online checkpoint must fail before
+# preparing SLRUs or creating a timeline, including on a directory reuse.
 $P -c "CHECKPOINT;" >/dev/null
+windowOnline=$($P -c "SELECT * FROM pagestore_branch_window_open();" 2>&1 || true)
+case "$windowOnline" in
+    *"safe branch preparation requires a shutdown checkpoint"*) windowOnline=yes ;;
+    *) windowOnline=no ;;
+esac
+assert "$windowOnline" "yes" "transaction window refuses an online checkpoint"
+onlineRedo=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
+onlineFork=$($P -c "SELECT pg_current_wal_lsn();")
+ONLINESEED=$(mktemp -d)
+onlineRejected=$($P -v VERBOSITY=verbose -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
+	'$ONLINESEED', 3, 0, '$mxC', '$onlineRedo', '$onlineFork');" 2>&1 || true)
+case "$onlineRejected" in
+	*"55000: safe branch preparation requires a shutdown checkpoint"*) onlineRejected=yes ;;
+	*) onlineRejected=no ;;
+esac
+assert "$onlineRejected" "yes" "control-derived prepare rejects an online checkpoint with SQLSTATE 55000"
+assert "$(find "$ONLINESEED" -type f | wc -l | tr -d ' ')" "0" \
+	"online-checkpoint rejection creates no prepared artifacts"
+assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+	-c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_timeline_state(3);")" "t" \
+	"online-checkpoint rejection creates no store timeline"
+printf '%s\n' 'existing-bootstrap' > "$ONLINESEED/pagestore_branch.bootstrap"
+existingRejected=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
+	'$ONLINESEED', 3, 0, '$mxC', '$onlineRedo', '$onlineFork');" 2>&1 || true)
+case "$existingRejected" in
+	*"requires a shutdown checkpoint"*) existingRejected=yes ;;
+	*) existingRejected=no ;;
+esac
+assert "$existingRejected" "yes" "online checkpoint cannot bypass validation through directory reuse"
+assert "$(cat "$ONLINESEED/pagestore_branch.bootstrap")" "existing-bootstrap" \
+	"online-checkpoint rejection preserves existing readiness artifacts"
+rm -rf "$ONLINESEED"
+# Match the controller's clean fast-stop/restart sequence. The database state
+# is now IN_PRODUCTION, while its selected WAL record is still SHUTDOWN.
+"$BIN/pg_ctl" -D "$DATA" -m fast -w stop >/dev/null 2>&1
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 read -r autoL autoOldestXid autoNextXid autoOldestCts autoNextCts autoOldestMulti autoNextMulti autoNextMember <<< "$($P -c "
 	SELECT redo_lsn || ' ' || oldest_xid || ' ' || split_part(next_xid, ':', 2) || ' ' ||
 	       CASE WHEN current_setting('track_commit_timestamp')::bool
@@ -1293,15 +1412,114 @@ read -r autoL autoOldestXid autoNextXid autoOldestCts autoNextCts autoOldestMult
 	            ELSE '0' END || ' ' ||
 	       oldest_multi_xid || ' ' || next_multixact_id || ' ' || next_multi_offset
 	FROM pg_control_checkpoint();")"
+IFS='|' read -r autoWindowRedo autoWindowXid autoWindowPrepared <<< "$($P -c "SELECT * FROM pagestore_branch_window_open();")"
+assert "$autoWindowRedo" "$autoL" "transaction window selects the shutdown checkpoint redo"
+assert "$autoWindowPrepared" "0" "transaction window requires no prepared transactions"
+assert "$($P -c "SELECT '$autoWindowXid'::xid8 = pg_snapshot_xmax(pg_current_snapshot());")" "t" \
+    "transaction window preserves the full next XID without assigning one"
 if [ "$autoOldestMulti" = "$autoNextMulti" ]; then
 	autoOldestMember=$autoNextMember
 else
 	autoOldestMember=$($P -c "SELECT pagestore_multixact_offset_asof(
 		'$autoOldestMulti'::xid, '$mxC', '$autoL');")
 fi
-autoFork=$($P -c "SELECT pg_current_wal_lsn();")
+# Archive the checkpoint segment; the post-cut transaction below stays in
+# the next, unarchived segment. R2-x must still read it in store-WAL mode.
+$P -c "SELECT pg_switch_wal();" >/dev/null
+autoFork=$($P -c "SELECT lsn - (pg_walfile_name_offset(lsn)).file_offset
+    FROM (SELECT pg_current_wal_insert_lsn() AS lsn) p;")
+for ((iteration = 0; iteration < 100; iteration++)); do
+    [ "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+        -c "SELECT pagestore_shipped_wal_lsn() >= '$autoFork';" 2>/dev/null)" = "t" ] && break
+    sleep 0.1
+done
+# A direct-write test source has no materializer marker.  Opting into the
+# controller contract must refuse before any artifact or timeline is created.
+MISSINGMARKERSEED=$(mktemp -d)
+missingMarker=$($P -v VERBOSITY=verbose -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
+    '$MISSINGMARKERSEED', 6, 0, '$mxC', '$autoL', '$autoFork', 1, true);" 2>&1 || true)
+case "$missingMarker" in
+    *"55000: branch fork LSN exceeds the durable materialized horizon"*) missingMarker=yes ;;
+    *) missingMarker=no ;;
+esac
+assert "$missingMarker" "yes" "controller preparation rejects a missing materializer marker"
+assert "$(find "$MISSINGMARKERSEED" -type f | wc -l | tr -d ' ')" "0" \
+    "missing-marker rejection creates no prepared artifacts"
+assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_timeline_state(6);")" "t" \
+    "missing-marker rejection creates no store timeline"
+rm -rf "$MISSINGMARKERSEED"
+# Simulate an older daemon advertising no finite-branch capability. Read the
+# actual C layout instead of embedding a shared-memory offset in the test.
+CAPTEST=$(mktemp -d)
+cc -I"$SCRIPT_DIR" -x c -o "$CAPTEST/capability" - <<'C'
+#include <stddef.h>
+#include <stdio.h>
+#include "pagestore_ipc.h"
+int main(void) {
+    printf("%zu %u\n", offsetof(PsShmHeader, frontend_capabilities),
+           PS_FRONTEND_CAP_BRANCH_SEQ);
+    return 0;
+}
+C
+read -r cap_offset cap_bit < <("$CAPTEST/capability")
+mkdir "$CAPTEST/prepared"
+printf 'existing manifest\n' > "$CAPTEST/prepared/pagestore_branch.manifest"
+printf 'existing seed\n' > "$CAPTEST/prepared/seed"
+cap_before=$(python3 - "$SHM_PATH" "$cap_offset" "$cap_bit" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    caps, = struct.unpack('=I', f.read(4))
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', caps & ~int(sys.argv[3])))
+    print(caps)
+PYTHON
+)
+capRejected=$($P -c "SELECT pagestore_prepare_branch_from_window(
+    '$CAPTEST/prepared', 7, 0, '$mxC', '$autoL', '$autoFork', 1,
+    '$autoWindowXid', 0);" 2>&1 || true)
+# Restore the capability before assertions or any subsequent SQL.
+python3 - "$SHM_PATH" "$cap_offset" "$cap_before" <<'PYTHON'
+import struct, sys
+with open(sys.argv[1], 'r+b', buffering=0) as f:
+    f.seek(int(sys.argv[2]))
+    f.write(struct.pack('=I', int(sys.argv[3])))
+PYTHON
+case "$capRejected" in
+    *"daemon does not support safe branch sequence caps"*) capRejected=yes ;;
+    *) capRejected=no ;;
+esac
+assert "$capRejected" "yes" "checked preparation rejects a daemon without finite-branch capability"
+assert "$(cat "$CAPTEST/prepared/pagestore_branch.manifest")" "existing manifest"     "capability rejection preserves the existing prepared manifest"
+assert "$(cat "$CAPTEST/prepared/seed")" "existing seed"     "capability rejection preserves existing seeded bytes"
+assert "$(find "$CAPTEST/prepared" -type f | wc -l | tr -d ' ')" "2"     "capability rejection creates no prepared artifacts"
+rm -rf "$CAPTEST"
+WINDOWREJECT=$(mktemp -d)
+windowEpoch=$($P -c "SELECT pagestore_prepare_branch_from_window(
+    '$WINDOWREJECT', 7, 0, '$mxC', '$autoL', '$autoFork', 1,
+    (('$autoWindowXid'::text::numeric + 4294967296)::text)::xid8, 0);" 2>&1 || true)
+case "$windowEpoch" in
+    *"branch window snapshot does not match the selected checkpoint"*) windowEpoch=yes ;;
+    *) windowEpoch=no ;;
+esac
+assert "$windowEpoch" "yes" "transaction window compares the full XID epoch"
+$P -c "BEGIN; SELECT pg_current_xact_id(); ROLLBACK;" >/dev/null
+windowChanged=$($P -v VERBOSITY=verbose -c "SELECT pagestore_prepare_branch_from_window(
+    '$WINDOWREJECT', 7, 0, '$mxC', '$autoL', '$autoFork', 1, '$autoWindowXid', 0);" 2>&1 || true)
+case "$windowChanged" in
+    *"55000: restricted writer changed since the branch window was opened"*) windowChanged=yes ;;
+    *) windowChanged=no ;;
+esac
+assert "$windowChanged" "yes" "transaction window rejects an XID allocated by an aborted transaction"
+assert "$(find "$WINDOWREJECT" -type f | wc -l | tr -d ' ')" "0" \
+    "transaction-window rejection creates no prepared artifacts"
+assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -c "SELECT state IS NULL AND incarnation IS NULL FROM pagestore_timeline_state(7);")" "t" \
+    "transaction-window rejection creates no store timeline"
+rm -rf "$WINDOWREJECT"
 AUTOSEED=$(mktemp -d)
-autoSeeded=$($P -c "SELECT pagestore_prepare_branch_from_control(
+autoSeeded=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")
 assert "$([ "${autoSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
 	"control-derived prepare seeded all branch SLRUs ($autoSeeded page(s))"
@@ -1346,15 +1564,16 @@ assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::js
 	"$autoFork" "control-derived prepare forks at the separate materialized boundary"
 assert "$([ -s "$AUTOSEED/pagestore_branch.bootstrap" ] && echo present || echo absent)" \
 	"present" "control-derived prepare publishes the portable catalog bootstrap artifact"
+autoRecovery=$(python3 -c 'import struct,sys; e=struct.unpack("<3Q",open(sys.argv[1],"rb").read(24))[1];print(f"{e>>32:X}/{e&0xffffffff:08X}")' "$AUTOSEED/pagestore_branch.bootstrap")
 bootstrapMd5=$(md5sum "$AUTOSEED/pagestore_branch.bootstrap" | awk '{print $1}')
-autoRetry=$($P -c "SELECT pagestore_prepare_branch_from_control(
+autoRetry=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")
 assert "$autoRetry" "$autoSeeded" \
 	"control-derived prepare retry is idempotent"
 assert "$(md5sum "$AUTOSEED/pagestore_branch.bootstrap" | awk '{print $1}')" \
 	"$bootstrapMd5" "control-derived prepare retry reproduces the same bootstrap artifact"
 portableTsError=$($P -c "SELECT pagestore_install_prepared_branch_bootstrap(
-	'$AUTOSEED', '$AUTOSEED.target', 3, 0, '$autoL', '$autoFork', '$autoFork');" \
+	'$AUTOSEED', '$AUTOSEED.target', 3, 0, '$autoL', '$autoRecovery', '$autoFork');" \
 	2>&1 || true)
 case "$portableTsError" in
 	*"does not yet support user tablespaces"*) portableTsRejected=yes ;;
@@ -1367,7 +1586,7 @@ cp -a "$AUTOSEED/." "$CORRUPTBOOT/"
 printf '\001' | dd of="$CORRUPTBOOT/pagestore_branch.bootstrap" bs=1 seek=80 \
 	conv=notrunc status=none
 corruptBootstrap=$($P -c "SELECT pagestore_install_prepared_branch_bootstrap(
-	'$CORRUPTBOOT', '$CORRUPTBOOT.target', 3, 0, '$autoL', '$autoFork', '$autoFork');" \
+	'$CORRUPTBOOT', '$CORRUPTBOOT.target', 3, 0, '$autoL', '$autoRecovery', '$autoFork');" \
 	2>&1 || true)
 case "$corruptBootstrap" in
 	*"invalid checksum"*) corruptRejected=yes ;;
@@ -1379,7 +1598,7 @@ MIXEDBOOT=$(mktemp -d)
 cp -a "$AUTOSEED/." "$MIXEDBOOT/"
 printf '\n' >> "$MIXEDBOOT/pagestore_branch.manifest"
 mixedBootstrap=$($P -c "SELECT pagestore_install_prepared_branch_bootstrap(
-	'$MIXEDBOOT', '$MIXEDBOOT.target', 3, 0, '$autoL', '$autoFork', '$autoFork');" \
+	'$MIXEDBOOT', '$MIXEDBOOT.target', 3, 0, '$autoL', '$autoRecovery', '$autoFork');" \
 	2>&1 || true)
 case "$mixedBootstrap" in
 	*"does not match the prepared branch manifest"*) mixedRejected=yes ;;
@@ -1390,7 +1609,7 @@ assert "$mixedRejected" "yes" \
 rm -rf "$MIXEDBOOT"
 LEGACYREUSE=$(mktemp -d)
 cp -a "$AUTOSEED/." "$LEGACYREUSE/"
-legacyReuse=$($P -c "SELECT pagestore_prepare_branch(
+legacyReuse=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch(
 	'$LEGACYREUSE', 3, 0, '$mxC', '$autoFork',
 	'$autoOldestXid'::xid, '$autoNextXid'::xid,
 	'$autoOldestCts'::xid, '$autoNextCts'::xid,
@@ -1401,15 +1620,94 @@ assert "$legacyReuse" "$autoSeeded" \
 assert "$([ -e "$LEGACYREUSE/pagestore_branch.bootstrap" ] && echo present || echo absent)" \
 	"absent" "legacy expert prepare removes a stale portable bootstrap marker"
 rm -rf "$LEGACYREUSE"
-shortFork=$($P -c "SELECT pagestore_prepare_branch_from_control(
+shortFork=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED.short', 4, 0, '$mxC', '$autoL', '$autoL');" 2>/dev/null || echo ERROR)
 assert "$shortFork" "ERROR" \
 	"control-derived prepare rejects a fork that does not cover the checkpoint record"
-badAuto=$($P -c "SELECT pagestore_prepare_branch_from_control(
+badAuto=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED.bad', 4, 0, '$mxC', '$autoL'::pg_lsn + 1, '$autoFork');" 2>/dev/null || echo ERROR)
 assert "$badAuto" "ERROR" \
 	"control-derived prepare rejects a target without an exact checkpoint control state"
+# R2-x: a commit made after L can leave pre-S hint updates. It is unsafe
+# even when it has not yet been archived and the seeder uses store WAL.
+$P -c "CREATE TABLE r2_wal_probe (id int);" >/dev/null
+R2SEED=$(mktemp -d)
+mkdir "$R2SEED.existing" "$R2SEED.prepared" "$R2SEED.prepared-abort" "$R2SEED.abort"
+r2Commit=$($P -c "SET pagestore.redo_wal_from_store = on;
+    SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
+        '$R2SEED', 40, 0, '$mxC', '$autoL', '$autoFork');" 2>&1 || true)
+case "$r2Commit" in
+    *"transaction completion after the fork"*"cleanup=complete"*) r2Commit=yes ;;
+    *) r2Commit=no ;;
+esac
+assert "$r2Commit" "yes" "R2-x rejects an unarchived commit despite store-WAL seeding"
+assert "$([ ! -e "$R2SEED/pagestore_branch.bootstrap" ] && [ ! -e "$R2SEED/pagestore_branch.manifest" ] && echo yes || echo no)" \
+    "yes" "failed new branch proof removes readiness artifacts before deletion"
+assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -c "SELECT state IN ('deleting','deleted') FROM pagestore_timeline_state(40);")" \
+    "t" "failed new branch proof durably deletes its own timeline"
+# An exact retry must not delete a timeline this SQL call did not create.
+"$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_create_branch_with_incarnation(41, 0, 1, '$autoFork');" >/dev/null
+r2Existing=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
+    '$R2SEED.existing', 41, 0, '$mxC', '$autoL', '$autoFork');" 2>&1 || true)
+case "$r2Existing" in
+    *"transaction completion after the fork"*"cleanup=complete"*) r2Existing=yes ;;
+    *) r2Existing="no: $r2Existing" ;;
+esac
+assert "$r2Existing" "yes" "R2-x reports an unproven existing branch without claiming ownership"
+assert "$([ ! -e "$R2SEED.existing/pagestore_branch.bootstrap" ] && [ ! -e "$R2SEED.existing/pagestore_branch.manifest" ] && echo yes || echo no)" \
+    "yes" "failed retry removes readiness artifacts even though the timeline pre-existed"
+assert "$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -c "SELECT state = 'live' FROM pagestore_timeline_state(41);")" \
+    "t" "failed direct retry leaves the existing timeline live"
+# Prepared transactions can survive a shutdown checkpoint. Their completion
+# is dangerous even though COMMIT PREPARED does not allocate a new XID.
+$P -c "BEGIN; INSERT INTO r2_wal_probe VALUES (1); PREPARE TRANSACTION 'r2_commit';" >/dev/null
+r2Fork=$($P -c "SELECT pg_current_wal_insert_lsn();")
+$P -c "COMMIT PREPARED 'r2_commit';" >/dev/null
+r2Prepared=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
+    '$R2SEED.prepared', 42, 0, '$mxC', '$autoL', '$r2Fork');" 2>&1 || true)
+case "$r2Prepared" in
+    *"transaction completion after the fork"*"info 0x30"*) r2Prepared=yes ;;
+    *) r2Prepared="no: $r2Prepared" ;;
+esac
+assert "$r2Prepared" "yes" "R2-x rejects COMMIT PREPARED after the cut"
+$P -c "BEGIN; INSERT INTO r2_wal_probe VALUES (2); PREPARE TRANSACTION 'r2_abort';" >/dev/null
+r2Fork=$($P -c "SELECT pg_current_wal_insert_lsn();")
+$P -c "ROLLBACK PREPARED 'r2_abort';" >/dev/null
+r2PreparedAbort=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
+    '$R2SEED.prepared-abort', 43, 0, '$mxC', '$autoL', '$r2Fork');" 2>&1 || true)
+case "$r2PreparedAbort" in
+    *"transaction completion after the fork"*"info 0x40"*) r2PreparedAbort=yes ;;
+    *) r2PreparedAbort="no: $r2PreparedAbort" ;;
+esac
+assert "$r2PreparedAbort" "yes" "R2-x rejects ABORT PREPARED after the cut"
+r2Fork=$($P -c "SELECT pg_current_wal_insert_lsn();")
+$P -c "BEGIN; INSERT INTO r2_wal_probe VALUES (3); ROLLBACK;" >/dev/null
+r2Abort=$($P -q -c "SET pagestore.allow_unsafe_branch_cut = on; SELECT pagestore_prepare_branch_from_control(
+    '$R2SEED.abort', 44, 0, '$mxC', '$autoL', '$r2Fork');" 2>&1 || true)
+assert "$([ -s "$R2SEED.abort/pagestore_branch.bootstrap" ] && echo yes || echo no)" \
+    "yes" "R2-x permits an ordinary aborted transaction in the post-fork window ($r2Abort)"
+"$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 -tA \
+    -c "SELECT pagestore_delete_branch(41, 1); SELECT pagestore_delete_branch(44, 1);" >/dev/null
+rm -rf "$R2SEED" "$R2SEED.existing" "$R2SEED.prepared" "$R2SEED.prepared-abort" "$R2SEED.abort"
 rm -rf "$AUTOSEED"
+
+# Prepared transactions survive clean shutdown; window opening must inspect
+# them independently of the checkpoint's unchanged full next XID.
+$P -c "BEGIN; SELECT pg_current_xact_id(); PREPARE TRANSACTION 'window_open_prepared';" >/dev/null
+"$BIN/pg_ctl" -D "$DATA" -m fast -w stop >/dev/null 2>&1
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+windowPrepared=$($P -c "SELECT * FROM pagestore_branch_window_open();" 2>&1 || true)
+case "$windowPrepared" in
+    *"prepared transactions 1 (expected 0)"*) windowPrepared=yes ;;
+    *) windowPrepared=no ;;
+esac
+assert "$windowPrepared" "yes" "transaction window rejects a prepared transaction surviving shutdown"
+$P -c "ROLLBACK PREPARED 'window_open_prepared';" >/dev/null
+assert "$($P -c "SELECT prepared_count FROM pagestore_branch_window_open();")" "0" \
+    "transaction window opens after the surviving prepared transaction is resolved"
 
 # --- 26. pg_control mirror: control writes publish LSN-versioned store images ---
 # Every UpdateControlFile() queues the just-written image (versioned by the LSN
@@ -1558,6 +1856,95 @@ $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NOT NULL;")" "t" \
 	"watermark advances again once the debt is reset"
 
+# --- 28c. a superseded automatic reader snapshot is skipped, not refused ---
+# The reader snapshot worker publishes the automatic snapshot of every shipped
+# checkpoint asynchronously.  A newer checkpoint's note moves the page-history
+# cutoff, so compaction may reclaim past a job's redo before the job's
+# artifact BEGIN; no reader can pin that generation any more.  The worker
+# must skip it as superseded -- not provoke the artifact refusal the R5-2
+# assertion at the end of this script forbids (this was an intermittent CI
+# failure) -- and the newest checkpoint's job must still publish.  A test hook
+# holds the worker before its first BEGIN until the store's durable page
+# frontier for timeline 0 has passed the held redo.
+page_frontier_tl0() {
+	local f="$STORE/page-prune.frontiers" inc0 lsn0 seq0 inc1 lsn1 seq1
+	if [ ! -r "$f" ]; then
+		echo 0
+		return
+	fi
+	# PsPageFrontierState: magic, version, then {incarnation, lsn, seq} slots.
+	read -r inc0 lsn0 seq0 inc1 lsn1 seq1 < <(
+		od -An -tu8 -j8 -N48 "$f" 2>/dev/null | tr -s ' \n' ' '
+	)
+	if [ "${inc0:-}" = 1 ]; then
+		echo "${lsn0:-0}"
+	elif [ "${inc1:-}" = 1 ]; then
+		echo "${lsn1:-0}"
+	else
+		echo 0
+	fi
+}
+supersedeHold="$(dirname "$DATA")/reader-snapshot-hold"
+: > "$supersedeHold"
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+PAGESTORE_TEST_READER_SNAPSHOT_HOLD="$supersedeHold" \
+	"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+$P -c "CREATE FUNCTION ps_it_validate_auto_snapshot(pg_lsn) RETURNS bigint
+         AS 'pagestore','pagestore_validate_checkpoint_reader_snapshot' LANGUAGE C STRICT;" >/dev/null
+supersedeRefusedBefore=$(grep -c 'artifact .* refused' "$DATA/daemon.log" 2>/dev/null || true)
+$P -c "CHECKPOINT;" >/dev/null
+supersededR=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
+supersededRInt=$($P -c "SELECT ('$supersededR'::pg_lsn - '0/0'::pg_lsn)::bigint;")
+supersedeHeld=no
+for ((i = 0; i < 300; i++)); do
+	if grep -q "test hold of automatic reader snapshot at $supersededR\$" "$DATA/server.log"; then
+		supersedeHeld=yes
+		break
+	fi
+	sleep 0.1
+done
+assert "$supersedeHeld" "yes" "the reader snapshot worker is held before publishing the checkpoint's generation"
+supersedePassed=no
+for ((i = 0; i < 120; i++)); do
+	$P -q -c "BEGIN; INSERT INTO slru_live VALUES (100 + $i); COMMIT;" >/dev/null
+	$P -c "CHECKPOINT;" >/dev/null
+	if [ "$(page_frontier_tl0)" -gt "$supersededRInt" ]; then
+		supersedePassed=yes
+		break
+	fi
+	sleep 0.5
+done
+assert "$supersedePassed" "yes" "a newer checkpoint moves the durable page frontier past the held generation"
+supersedeNewestR=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
+rm -f "$supersedeHold"
+supersedeOutcome=none
+for ((i = 0; i < 600; i++)); do
+	if grep -q "automatic reader snapshot at $supersededR superseded" "$DATA/server.log"; then
+		supersedeOutcome=superseded
+		break
+	fi
+	if grep -q "automatic reader snapshot publication failed at $supersededR:" "$DATA/server.log"; then
+		supersedeOutcome=failed
+		break
+	fi
+	sleep 0.1
+done
+assert "$supersedeOutcome" "superseded" "the reclaimed generation is skipped as superseded"
+assert "$(grep -c 'artifact .* refused' "$DATA/daemon.log" 2>/dev/null || true)" "$supersedeRefusedBefore" \
+	"skipping the superseded generation provokes no artifact refusal"
+supersedeNewestPublished=no
+for ((i = 0; i < 600; i++)); do
+	if $P -c "SELECT ps_it_validate_auto_snapshot('$supersedeNewestR');" >/dev/null 2>&1; then
+		supersedeNewestPublished=yes
+		break
+	fi
+	sleep 0.1
+done
+assert "$supersedeNewestPublished" "yes" "the newest checkpoint's automatic snapshot still publishes"
+$P -c "DROP FUNCTION ps_it_validate_auto_snapshot(pg_lsn);" >/dev/null
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+
 # --- 29. SLRU live reads: transaction status served from the mirror ---
 # Restart the compute with pagestore.slru_live_reads on and the local
 # pg_xact segment hidden: startup's clog read and the status lookup for our
@@ -1608,6 +1995,12 @@ assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_
 # imported pages and the already-routed user-tablespace pages behind R's
 # admission fence.
 $P -c "CREATE DATABASE reader_aux;" >/dev/null
+# Automatic snapshot publication is asynchronous.  Retain the current WAL
+# position before enabling it: pinning only the later WAL insertion
+# point can reclaim an older checkpoint while its worker is still publishing.
+readerPinStart=$($P -c "SELECT pg_current_wal_lsn();")
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerPinStart');")" "0" \
+	"controller pins page history before automatic reader snapshot work"
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 "$BUILD/contrib/pagestore/pagestore_import" --shm "$SHM" --pgdata "$DATA" >/dev/null 2>&1
 cat >> "$DATA/postgresql.conf" <<EOF
@@ -1656,20 +2049,15 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
 READER_SUBXID_SQL=$(mktemp)
 {
 	printf 'BEGIN; INSERT INTO reader_running VALUES (1);\n'
-	for _ in $(seq 1 20000); do
+	for ((iteration = 0; iteration < 20000; iteration++)); do
 		printf 'SAVEPOINT s; INSERT INTO reader_subxid VALUES (1); RELEASE SAVEPOINT s;\n'
 	done
 	printf "PREPARE TRANSACTION 'reader_running_at_r';\n"
 } > "$READER_SUBXID_SQL"
 $P -f "$READER_SUBXID_SQL" >/dev/null
 rm -f "$READER_SUBXID_SQL"
-# The controller must establish authority before creating a horizon: otherwise
-# compaction is allowed to discard the SLRU/page base that prepare_reader will
-# consume after the checkpoint.  The fixed reader later takes over this exact
-# owner key and generation.
-readerPinStart=$($P -c "SELECT pg_current_wal_lsn();")
-assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerPinStart');")" "0" \
-	"controller pins page history before creating reader checkpoint R"
+# Keep the initial authority through the stopped copy below.  Background
+# workers may still be publishing checkpoints older than the selected R.
 # A restore point emits WAL without changing relation/catalog contents or the
 # reader-visible transaction state.  It makes the subsequent checkpoint redo
 # pointer strictly newer than the controller's initial pin even when both
@@ -1686,8 +2074,10 @@ read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerO
 	FROM pg_control_checkpoint();")"
 assert "$($P -c "SELECT pg_wal_lsn_diff('$readerR', '$readerPinStart') > 0;")" "t" \
 	"prepared reader checkpoint R is strictly newer than its initial pin"
+# Hand off before shutdown and restart can evict this checkpoint from the
+# daemon's newest-two automatic registrations. Its original S remains retained.
 assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0" \
-	"controller advances the prepared reader owner to exact checkpoint R"
+    "controller hands off the prepared reader checkpoint before stopping the writer"
 # This test has no concurrent catalog-changing workload across the checkpoint,
 # so its stopped copy is the control-plane catalog artifact for R.  The
 # prepared reader bundle replaces its SLRUs; pg_control is restored
@@ -1696,6 +2086,10 @@ assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0"
 READERDATA=$(mktemp -d)/reader
 cp -a "$DATA" "$READERDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+# The stop drained/terminated the old publication workers.  No queued
+# pre-R snapshot can now race this retention advance on the fresh writer.
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0" \
+	"controller retries its exact checkpoint hand-off after writer restart"
 $P -c "COMMIT PREPARED 'reader_running_at_r';" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT count(*) FROM reader_running;")" "1" \
@@ -1752,9 +2146,8 @@ assert "$([ "${readerSnapshotBlocks:-0}" -gt 1 ] && echo ok || echo no)" "ok" \
 # rewritten manifest cannot reuse another timeline's running-XID snapshot.
 BRANCHREADERPREP=$(mktemp -d)
 cp -a "$READERPREP/." "$BRANCHREADERPREP"
-sed -i 's/"timeline": 0/"timeline": 1/' "$BRANCHREADERPREP/pagestore_reader.manifest"
-sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"parent_incarnation\": 1,\\n  \"fork_lsn\": \"$bL\"," \
-	"$BRANCHREADERPREP/pagestore_reader.manifest"
+sed_inplace 's/"timeline": 0/"timeline": 1/' "$BRANCHREADERPREP/pagestore_reader.manifest"
+add_branch_parent_fields "$BRANCHREADERPREP/pagestore_reader.manifest" "$bL"
 # Retag the copied snapshot to timeline 1 and recompute its PostgreSQL CRC32C.
 # This produces a structurally valid branch-reader fixture, so the install must
 # reach (and be rejected by) the target branch-manifest identity check below.
@@ -2067,9 +2460,8 @@ BADREADER=
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
 BADREADER_SOCK=$(new_sockdir badreader)
-sed -i 's/"timeline": 0/"timeline": 1/' "$BADREADER/pagestore_reader.manifest"
-sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"parent_incarnation\": 1,\\n  \"fork_lsn\": \"$readerR\"," \
-	"$BADREADER/pagestore_reader.manifest"
+sed_inplace 's/"timeline": 0/"timeline": 1/' "$BADREADER/pagestore_reader.manifest"
+add_branch_parent_fields "$BADREADER/pagestore_reader.manifest" "$readerR"
 cat >> "$BADREADER/postgresql.conf" <<EOF
 pagestore.timeline = 1
 unix_socket_directories = '$BADREADER_SOCK'
@@ -2177,7 +2569,7 @@ assert "$($PR -c "NOTIFY pinned_chan;" 2>&1 | grep -c 'not allowed on a pinned r
 assert "$($PR -c "VACUUM reader_t;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses VACUUM"
 "$BIN/pg_ctl" -D "$READERDATA" -m fast -w stop >/dev/null
-sed -i 's/pagestore.advance_read_lsn = off/pagestore.advance_read_lsn = on/' \
+sed_inplace 's/pagestore.advance_read_lsn = off/pagestore.advance_read_lsn = on/' \
 	"$ADVANCINGDATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start >/dev/null
 readerAutoPublished=no
@@ -2235,7 +2627,7 @@ advancingRestore=$("$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$
 # that would collide on the data directory lock.
 advancingStart=$("$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start 2>&1) || {
 	advancingReady=0
-	for _ in $(seq 60); do
+	for ((iteration = 0; iteration < 60; iteration++)); do
 		if "$BIN/pg_ctl" -D "$ADVANCINGDATA" status >/dev/null 2>&1 &&
 			$PR -c "SELECT 1;" >/dev/null 2>&1; then
 			advancingReady=1
@@ -2311,11 +2703,45 @@ assert "$($P -c "SELECT pagestore_rel_nblocks_asof('asof_t', 0, '$asofR'::pg_lsn
 	"the pre-truncate horizon still sees the pre-truncate size (frozen view)"
 # WAL-less (unlogged) pages carry pd_lsn 0; their growth must order at the
 # create event's floor, not sort under it and leave the fork looking empty
+#
+# A newly created fork must not appear below its real-time lower bound.
+preUnloggedCreate=$($P -c "SELECT pg_current_wal_lsn();")
 $P -c "CREATE UNLOGGED TABLE unlogged_t(i int) TABLESPACE ts;" >/dev/null
+assert "$($P -c "SELECT pagestore_rel_exists_asof('unlogged_t', 0, '$preUnloggedCreate'::pg_lsn);")" "f" \
+	"a WAL-less create is absent at the pre-create horizon"
+# Use the same insert-pointer source as the client time-floor calculation.
+preInsertLsn=$($P -c "SELECT pg_current_wal_insert_lsn();")
+$P -c "CREATE UNLOGGED TABLE lsnfix_quiet_t(i int) TABLESPACE ts;" >/dev/null
+assert "$($P -c "SELECT pagestore_rel_exists_asof('lsnfix_quiet_t', 0, '$preInsertLsn'::pg_lsn);")" "f" \
+	"a WAL-less create remains absent at the idle-WAL pre-create horizon"
+preGrowInsert=$($P -c "SELECT pg_current_wal_insert_lsn();")
 $P -q -c "INSERT INTO unlogged_t SELECT generate_series(1, 100);" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_rel_nblocks_asof('unlogged_t', 0, pg_current_wal_lsn()) > 0;")" "t" \
-	"an unlogged table's WAL-less growth raises the store's newest size"
+    "an unlogged table's WAL-less growth raises the store's newest size"
+# CREATE can already have a real record identity from preceding catalog WAL.
+# ZEROEXTEND always has no record of its own; check its durable classification.
+growRel=$($P -c "SELECT pg_relation_filenode('unlogged_t');")
+unstampedGrow=$(python3 - "$STORE/forkmeta" "$growRel" "$preGrowInsert" <<'PYUNSTAMPED'
+import struct, sys
+record = struct.Struct('=8I3QIB3s')
+hi, lo = sys.argv[3].split('/')
+floor = (int(hi, 16) << 32) | int(lo, 16)
+found = False
+with open(sys.argv[1], 'rb') as f:
+    while data := f.read(record.size):
+        if len(data) != record.size:
+            break
+        r = record.unpack(data)
+        if (r[0] == 0x344d4b46 and r[1] == record.size and
+            r[2] == 0 and r[5] == int(sys.argv[2]) and r[6] == 0 and
+            r[12] & 0x3f == 0 and r[12] & 0x40):
+            found |= bool(r[12] & 0x80) and r[8] > floor and r[9] != 0
+print('yes' if found else 'no')
+PYUNSTAMPED
+)
+assert "$unstampedGrow" "yes" \
+    "ZEROEXTEND persists UNSTAMPED with a nonzero sequence and honest time floor"
 
 # A removed database emits durable artifact drops, while an old reader's
 # horizon still resolves byte-identical manifest and relmap generations.
@@ -2329,7 +2755,7 @@ assert "$?" "0" "database artifacts exist before DROP DATABASE"
 $P -v ON_ERROR_STOP=1 -c "DROP DATABASE reader_aux;" >/dev/null
 $P -v ON_ERROR_STOP=1 -c "CHECKPOINT;" >/dev/null
 artifact_dropped=0
-for _ in $(seq 1 60); do
+for ((iteration = 0; iteration < 60; iteration++)); do
 	if "$artifact_probe" --reader-artifacts "$SHM" "$artifact_db_oid" latest absent >/dev/null; then
 		artifact_dropped=1
 		break
@@ -2385,7 +2811,7 @@ assert "$(grep -c 'reason=storage failure' "$DATA/daemon.log" 2>/dev/null || tru
 [ -n "${BADREADER:-}" ] && "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 [ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null	# clean shutdown: ps_core_close() runs
-rm -f "/dev/shm$SHM"
+remove_test_shm || exit 1
 "$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
 DPID=$!
 if daemon_shm_ready; then
@@ -2421,6 +2847,9 @@ kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
 echo "----"
 if [ "$fail" = 0 ]; then
 	echo "integration test: PASS"
+	if [ "${PAGESTORE_INTEGRATION_EXPORT_LOGS:-0}" = 1 ]; then
+		dump_failure_logs
+	fi
 else
 	echo "integration test: FAIL"
 	dump_failure_logs

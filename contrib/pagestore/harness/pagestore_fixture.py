@@ -28,6 +28,8 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pagestore_harness as harness  # noqa: E402
+from pagestore_capture_source import (CaptureSourceError, add_capture_source_argument,
+                                      capture_source, validate_capture_source)  # noqa: E402
 
 DAEMON_ARGS = [
     "--page-size", "8192", "--nshards", "1", "--storage", "posix",
@@ -231,7 +233,7 @@ def forkmeta_record_offset(path: Path, rel: int, kind: int) -> int:
     for offset in range(0, len(data) - FORKMETA_RECORD_BYTES + 1,
                         FORKMETA_RECORD_BYTES):
         record = data[offset:offset + FORKMETA_RECORD_BYTES]
-        if struct.unpack_from("=I", record, 20)[0] == rel and record[60] == kind:
+        if struct.unpack_from("=I", record, 20)[0] == rel and (record[60] & 0x3f) == kind:
             return offset
     raise FixtureError(
         f"{path.name} carries no kind-{kind} record for relation {rel}"
@@ -617,7 +619,11 @@ def deterministic_tar(store: Path, output: Path) -> list[str]:
 def extract(fixture: Path, store: Path) -> None:
     store.mkdir(parents=True)
     with tarfile.open(fixture / STORE_TAR, "r:gz") as tar:
-        tar.extractall(store, filter="data")
+        try:
+            tar.extractall(store, filter="data")
+        except TypeError:
+            # Python < 3.12 (no "filter" keyword); the fixtures are trusted.
+            tar.extractall(store)
 
 
 class Daemon:
@@ -677,7 +683,8 @@ class Daemon:
 def run_client(client: Path, shm: str, mode: str, log: Path,
                payload_identity: dict[str, Any] | None = None,
                role: str = "current",
-               holes: bool = False) -> subprocess.CompletedProcess[str]:
+               holes: bool = False,
+               checkpoint_fence: bool = False) -> subprocess.CompletedProcess[str]:
     """Run the fixture workload; ``payload_identity`` (the capturing build's
     on capture, the fixture's own on check) tells it which WAL page magic
     and block size the shipped WAL carries, ``role`` which objects the
@@ -690,6 +697,7 @@ def run_client(client: Path, shm: str, mode: str, log: Path,
         env["PAGESTORE_FIXTURE_XLOG_MAGIC"] = str(int(payload_identity["xlog_page_magic"]))
         env["PAGESTORE_FIXTURE_XLOG_BLCKSZ"] = str(int(payload_identity["xlog_blcksz"]))
     env["PAGESTORE_FIXTURE_ROLE"] = role
+    env["PAGESTORE_FIXTURE_CHECKPOINT_FENCE"] = "1" if checkpoint_fence else "0"
     if holes:
         env["PAGESTORE_FIXTURE_DELETE_HOLES"] = "1"
     with log.open("a", encoding="utf-8") as output:
@@ -736,11 +744,15 @@ def wait_for_forkmeta_cutover(store: Path, timeout: float) -> None:
 
 def capture(args: argparse.Namespace) -> int:
     fixture = args.capture
-    # posix-timeline-delete-holes seeds an extra deleted-branch scenario in
-    # the extension phase (fixture_extend_holes() in
+    provenance = capture_source(args, fixture)
+    # posix-timeline-delete-holes (and its per-PostgreSQL-release variants,
+    # e.g. posix-timeline-delete-holes-pg18) seeds an extra deleted-branch
+    # scenario in the extension phase (fixture_extend_holes() in
     # pagestore_gc_crash_client.c), so its target records stay above the
-    # flush watermark in the archived store (invariant I3's D5 note).
-    holes = fixture.name == "posix-timeline-delete-holes"
+    # flush watermark in the archived store (invariant I3's D5 note).  Match
+    # by prefix so a release recapture under a suffixed directory name still
+    # gets the extra workload.
+    holes = fixture.name.startswith("posix-timeline-delete-holes")
     fixture.mkdir(parents=True, exist_ok=True)
     # the shipped WAL is stamped with the capturing build's page magic and
     # block size, so the fixture is one that build loads; without a build
@@ -796,6 +808,9 @@ def capture(args: argparse.Namespace) -> int:
             code = daemon.stop()
         if code != 0:
             raise FixtureError(f"daemon did not stop cleanly: status {code}")
+        if args.checkpoint_retention_tool is not None:
+            subprocess.run([str(args.checkpoint_retention_tool),
+                            "--seed-checkpoint-fence", str(store)], check=True)
         identities = format_identities(args.format_tool)
         check_segment_formats(store, identities)
         check_archived_identities(store, identities)
@@ -808,6 +823,8 @@ def capture(args: argparse.Namespace) -> int:
         "name": fixture.name,
         "role": "current",
         "workload": "fixture",
+        "checkpoint_fence": args.checkpoint_retention_tool is not None,
+        **({"capture_source": provenance} if provenance is not None else {}),
         "daemon_args": DAEMON_ARGS,
         "daemon_env": DAEMON_ENV,
         # the PostgreSQL identity of the payloads inside: a build with another
@@ -879,7 +896,7 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
                  metadata: dict[str, Any],
                  identities: list[dict[str, Any]] | None) -> None:
     store = root / "reopen"
-    holes = fixture.name == "posix-timeline-delete-holes"
+    holes = fixture.name.startswith("posix-timeline-delete-holes")
     extract(fixture, store)
     if identities is not None:
         check_segment_formats(store, identities)
@@ -896,7 +913,8 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
                 tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-4:]
                 raise FixtureError(f"fixture reopen {generation} refused: {status}; daemon: {tail!r}")
             result = run_client(args.client_binary, shm, "verify", root / "reopen-client.log",
-                                metadata.get("payload_identity"), metadata["role"], holes=holes)
+                                metadata.get("payload_identity"), metadata["role"], holes=holes,
+                                checkpoint_fence=metadata.get("checkpoint_fence", False))
             if result.returncode != 0:
                 tail = (root / "reopen-client.log").read_text(
                     encoding="utf-8", errors="replace").splitlines()[-3:]
@@ -913,7 +931,7 @@ def check_reopen(args: argparse.Namespace, root: Path, fixture: Path,
 def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict[str, Any],
                  metadata: dict[str, Any]) -> str:
     store = root / "mutations" / case["name"]
-    holes = fixture.name == "posix-timeline-delete-holes"
+    holes = fixture.name.startswith("posix-timeline-delete-holes")
     extract(fixture, store)
     case["apply"](first_match(store, case["pattern"]))
     log = root / "mutations" / f"{case['name']}.daemon.log"
@@ -928,7 +946,8 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
             return OPEN_REJECTED
         client_log = root / "mutations" / f"{case['name']}.client.log"
         result = run_client(args.client_binary, shm, "verify", client_log,
-                            metadata.get("payload_identity"), metadata["role"], holes=holes)
+                            metadata.get("payload_identity"), metadata["role"], holes=holes,
+                            checkpoint_fence=metadata.get("checkpoint_fence", False))
         # A mutation the store repairs (a torn append-only tail) resumes the
         # transition it interrupted asynchronously, so the oracle is retried
         # while that can still land; a rejection stays a rejection.
@@ -936,7 +955,8 @@ def run_mutation(args: argparse.Namespace, root: Path, fixture: Path, case: dict
         while result.returncode != 0 and time.monotonic() < deadline and daemon.alive():
             time.sleep(0.5)
             result = run_client(args.client_binary, shm, "verify", client_log,
-                                metadata.get("payload_identity"), metadata["role"], holes=holes)
+                                metadata.get("payload_identity"), metadata["role"], holes=holes,
+                                checkpoint_fence=metadata.get("checkpoint_fence", False))
         if not daemon.alive():
             code = daemon.process.returncode if daemon.process else None
             return f"{CRASHED} (daemon exited {code} under use)"
@@ -950,6 +970,8 @@ def fixture_metadata(fixture: Path) -> dict[str, Any]:
     parameters, and an older archive must still be read back under the ones it
     was captured with rather than under today's defaults."""
     metadata = json.loads((fixture / FIXTURE_JSON).read_text(encoding="utf-8"))
+    if "capture_source" in metadata:
+        validate_capture_source(metadata["capture_source"])
     if metadata.get("schema") != 1 or metadata.get("name") != fixture.name:
         raise FixtureError(f"{fixture / FIXTURE_JSON} does not describe {fixture.name}")
     daemon_args = metadata.get("daemon_args")
@@ -1018,7 +1040,7 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int | None:
                 continue
             try:
                 outcome = run_mutation(args, root, fixture, case, metadata)
-            except FixtureError as error:
+            except (FixtureError, CaptureSourceError) as error:
                 outcome = f"error: {error}"
             if outcome == case["expect"]:
                 print(f"ok   - {case['name']}: {outcome}")
@@ -1078,16 +1100,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-build-match", action="store_true",
                         help="fail, rather than warn, when no current fixture carries a payload "
                              "the checking build loads")
+    parser.add_argument("--checkpoint-retention-tool", type=Path,
+                        help="offline retention test tool to seed a daemon-owned "
+                             "checkpoint fence during capture")
     parser.add_argument("--only", nargs="*", help="run only these mutation cases")
     parser.add_argument("--keep-failures", type=Path, help="copy failed mutation stores here")
+    add_capture_source_argument(parser)
     args = parser.parse_args(argv)
+    if args.capture_source is not None and args.capture is None:
+        parser.error("--capture-source requires --capture")
     for name in ("daemon_binary", "client_binary", "inspect_binary", "format_tool",
-                 "postgres_payload_identity_tool", "postgres_payload_identity"):
+                 "postgres_payload_identity_tool", "postgres_payload_identity",
+                 "checkpoint_retention_tool"):
         if getattr(args, name) is not None:
             setattr(args, name, getattr(args, name).resolve())
     try:
         return capture(args) if args.capture else check(args)
-    except FixtureError as error:
+    except (FixtureError, CaptureSourceError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 

@@ -25,6 +25,9 @@ from pagestore_branch_fault import BranchFaultProbe
 
 EX_TEMPFAIL = 75
 EX_CONFIG = 78
+# pagestore_capture_slru_snapshot()'s report that its restartpoint was a no-op
+STALE_RESTARTPOINT = "restartpoint did not durably cover the paused WAL replay position"
+BASE_CAPTURE_ATTEMPTS = 5
 # the persisted layouts -- schema numbers, checksums, key sets -- are
 # pagestore_artifact_schema's, shared with the persisted-format fixture
 CONFIG_SCHEMA = artifact_schema.ARTIFACTS["branch_config"].schema
@@ -33,9 +36,9 @@ LEGACY_RECEIPT_SCHEMA = 1
 JOURNAL_OPERATION = "pagestore_branch_prepare"
 JOURNAL_STATES = {
     "started", "preflight_complete", "base_captured", "writer_stopped",
-    "writer_restricted", "checkpoint_selected", "checkpoint_archived",
+    "writer_restricted", "window_opened", "checkpoint_selected", "checkpoint_archived",
     "fork_captured", "branch_prepared", "prepared", "materializer_resumed",
-    "writer_restored", "complete",
+    "writer_restored", "complete", "r2_cleanup", "r2_failed",
 }
 JOURNAL_KEYS = set(artifact_schema.BRANCH_JOURNAL_KEYS)
 SAFE_POSTGRES_OPTION_PATH = re.compile(r"^[A-Za-z0-9_./-]+$")
@@ -59,13 +62,38 @@ def validate_authority_path(authority_dir: Path) -> os.stat_result:
         raise ConfigError(
             "retention_authority_dir must be owned by this user and mode 0700"
         )
-    component = authority_dir.parent
-    immediate = True
-    while True:
+    pending = [(authority_dir.parent, True)]
+    followed_links = 0
+    while pending:
+        component, immediate = pending.pop()
         component_stat = os.lstat(component)
+        if stat.S_ISLNK(component_stat.st_mode) and component_stat.st_uid == 0:
+            # Link ownership is insufficient: its source parent must also
+            # prevent replacement. Check both lexical and target ancestry,
+            # following one hop at a time so no intermediate link is hidden.
+            followed_links += 1
+            if followed_links > 8:
+                raise ConfigError(
+                    "retention_authority_dir ancestry follows too many symlinks"
+                )
+            target = Path(os.readlink(component))
+            if ".." in target.parts:
+                raise ConfigError(
+                    "retention_authority_dir ancestry symlink target must not contain '..'"
+                )
+            target = target if target.is_absolute() else component.parent / target
+            pending.append((target, immediate))
+            pending.append((component.parent, False))
+            continue
         if not stat.S_ISDIR(component_stat.st_mode):
             raise ConfigError(
                 "retention_authority_dir ancestry must contain only directories"
+            )
+        # A directory owner can replace its entries or chmod it regardless
+        # of group/world mode bits, even when the entry is root-owned.
+        if component_stat.st_uid not in {0, effective_uid}:
+            raise ConfigError(
+                "retention_authority_dir ancestry must be owned by root or this user"
             )
         writable = component_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         sticky = component_stat.st_mode & stat.S_ISVTX
@@ -79,10 +107,8 @@ def validate_authority_path(authority_dir: Path) -> os.stat_result:
             raise ConfigError(
                 "retention_authority_dir ancestry contains a replaceable writable directory"
             )
-        if component.parent == component:
-            break
-        component = component.parent
-        immediate = False
+        if component.parent != component:
+            pending.append((component.parent, False))
     return authority_stat
 
 
@@ -420,6 +446,7 @@ class BranchPreparer:
             "state": "started",
             "intent": "preflight",
             "base_lsn": None,
+            "window_snapshot": None,
             "checkpoint_redo_lsn": None,
             "checkpoint_end_lsn": None,
             "switch_lsn": None,
@@ -472,6 +499,18 @@ class BranchPreparer:
         ):
             if not isinstance(value[field], bool):
                 raise BranchPrepareError(f"branch journal {field} is invalid")
+        snapshot = value["window_snapshot"]
+        if snapshot is not None:
+            self.validate_window_snapshot(snapshot)
+        if value["state"] in {
+            "window_opened", "checkpoint_selected", "checkpoint_archived",
+            "fork_captured", "branch_prepared", "prepared",
+            "materializer_resumed", "writer_restored", "complete",
+        }:
+            self.validate_window_snapshot(snapshot)
+            redo = value.get("checkpoint_redo_lsn")
+            if redo is not None and parse_lsn(redo) != parse_lsn(snapshot["checkpoint_redo_lsn"]):
+                raise BranchPrepareError("branch journal checkpoint differs from its window snapshot")
         return value
 
     def write_journal(self, journal: dict[str, Any] | None = None) -> None:
@@ -807,7 +846,7 @@ class BranchPreparer:
             and self.journal is not None
             and self.journal["state"] in {
                 "fork_captured", "branch_prepared", "prepared",
-                "materializer_resumed", "writer_restored",
+                "materializer_resumed", "writer_restored", "r2_cleanup", "r2_failed",
             }
             and self.journal["restricted_writer_running"]
         ):
@@ -846,7 +885,10 @@ class BranchPreparer:
         )
         prepare_signature = self.extension_function(
             self.writer_extension_schema,
-            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)",
+            "pagestore_prepare_branch_from_window(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,xid8,integer)",
+        )
+        window_signature = self.extension_function(
+            self.writer_extension_schema, "pagestore_branch_window_open()"
         )
         checkpoint_signature = self.extension_function(
             self.writer_extension_schema, "pagestore_branch_checkpoint()"
@@ -878,6 +920,10 @@ class BranchPreparer:
                 " AND to_regprocedure("
                 + sql_literal(checkpoint_signature)
                 + ") IS NOT NULL"
+                " AND to_regprocedure(" + sql_literal(window_signature) + ") IS NOT NULL"
+                " AND to_regprocedure("
+                + sql_literal(self.extension_function(self.writer_extension_schema,
+                    "pagestore_branch_snapshot_is_safe(integer,bigint)")) + ") IS NOT NULL"
                 " AND NOT EXISTS (SELECT 1 FROM pg_tablespace"
                 " WHERE spcname NOT IN ('pg_default', 'pg_global'))"
             )
@@ -1065,8 +1111,35 @@ class BranchPreparer:
                 retention_set_attempted=False,
             )
 
+    def publish_base_checkpoint(self) -> None:
+        """Give the materializer a checkpoint record without a restartpoint.
+
+        pagestore_capture_slru_snapshot() makes the paused replay position
+        durable through a restartpoint, and PostgreSQL performs one only for
+        a replayed checkpoint record newer than the last restartpoint.  On a
+        writer that checkpoints normally the newest record usually has its
+        restartpoint already, so create the record instead of depending on
+        the operator to have left one.
+        """
+        self.writer_sql("CHECKPOINT")
+        self.wait_materializer(self.archive_checkpoint(private=False))
+
     def capture_and_pin_base(self) -> str:
-        base = self.pause_and_capture(keep_paused=True)
+        for attempt in range(BASE_CAPTURE_ATTEMPTS):
+            self.publish_base_checkpoint()
+            try:
+                base = self.pause_and_capture(keep_paused=True)
+                break
+            except BranchPrepareError as error:
+                # The materializer's own restartpoint can still take the new
+                # record between its replay and the pause.  The capture
+                # changed nothing; only another checkpoint record helps.
+                if (
+                    STALE_RESTARTPOINT not in str(error)
+                    or attempt == BASE_CAPTURE_ATTEMPTS - 1
+                ):
+                    raise
+                self.resume_materializer()
         try:
             self.install_branch_retention(base)
         except BaseException:
@@ -1148,6 +1221,46 @@ class BranchPreparer:
         if healthy != "t":
             raise BranchPrepareError("restricted writer failed its isolation health check")
 
+    def open_branch_window(self) -> dict[str, Any]:
+        output = last_output_line(self.writer_sql(
+            "SELECT * FROM " + self.extension_function(
+                self.writer_extension_schema, "pagestore_branch_window_open()"
+            ), private=True,
+        ))
+        fields = output.split("|")
+        if len(fields) != 3:
+            raise BranchPrepareError(f"unexpected branch window result: {output}")
+        try:
+            prepared = int(fields[2])
+        except ValueError as error:
+            raise BranchPrepareError(f"unexpected branch window result: {output}") from error
+        snapshot = {"checkpoint_redo_lsn": fields[0], "next_xid": fields[1],
+                    "prepared_count": prepared}
+        self.validate_window_snapshot(snapshot)
+        return snapshot
+
+    @staticmethod
+    def validate_window_snapshot(snapshot: Any) -> None:
+        if (not isinstance(snapshot, dict) or set(snapshot) != {
+                "checkpoint_redo_lsn", "next_xid", "prepared_count"}):
+            raise BranchPrepareError("branch transaction window snapshot is missing or invalid")
+        redo = snapshot["checkpoint_redo_lsn"]
+        xid = snapshot["next_xid"]
+        prepared = snapshot["prepared_count"]
+        if not isinstance(redo, str) or parse_lsn(redo) == 0:
+            raise BranchPrepareError("branch window checkpoint redo is invalid")
+        if (not isinstance(xid, str) or not xid.isascii() or not xid.isdecimal()
+                or not 3 <= int(xid) <= (1 << 64) - 1
+                or (int(xid) & 0xffffffff) < 3):
+            raise BranchPrepareError("branch window full next XID is invalid")
+        if not isinstance(prepared, int) or isinstance(prepared, bool) or prepared != 0:
+            raise BranchPrepareError("branch window must have no prepared transactions")
+
+    def branch_window_snapshot(self) -> dict[str, Any]:
+        snapshot = self.journal.get("window_snapshot") if self.journal else None
+        self.validate_window_snapshot(snapshot)
+        return snapshot
+
     def select_checkpoint(self) -> tuple[str, str]:
         # The fast stop that established writer ownership already completed a
         # shutdown checkpoint after draining every public client.  The server
@@ -1170,12 +1283,12 @@ class BranchPreparer:
             raise BranchPrepareError("checkpoint redo follows its flushed record end")
         return redo, end
 
-    def archive_checkpoint(self) -> str:
+    def archive_checkpoint(self, private: bool = True) -> str:
         output = last_output_line(
             self.writer_sql(
                 "SELECT switch_lsn, pg_walfile_name(switch_lsn - 1)"
                 " FROM (SELECT pg_switch_wal() AS switch_lsn) switched",
-                private=True,
+                private=private,
             )
         )
         fields = output.split("|")
@@ -1189,7 +1302,12 @@ class BranchPreparer:
             / "archive_status"
             / f"{wal_file}.done"
         )
-        self.wait_until(f"archive completion for {wal_file}", archive_done.is_file)
+        # a checkpoint on a running public writer may already have recycled it
+        wal_segment = self.config.writer_data_dir / "pg_wal" / wal_file
+        self.wait_until(
+            f"archive completion for {wal_file}",
+            lambda: archive_done.is_file() or not wal_segment.exists(),
+        )
         self.wait_until(
             f"durable pagestore WAL through {switch_lsn}",
             lambda: last_output_line(
@@ -1201,12 +1319,34 @@ class BranchPreparer:
                     + " >= "
                     + sql_literal(switch_lsn)
                     + "::pg_lsn",
-                    private=True,
+                    private=private,
                 )
             )
             == "t",
         )
         return switch_lsn
+
+    def wal_segment_size(self) -> int:
+        size = int(last_output_line(self.materializer_sql(
+            "SELECT pg_size_bytes(current_setting('wal_segment_size'))")))
+        if size <= 0 or size & (size - 1):
+            raise BranchPrepareError(f"unexpected WAL segment size {size}")
+        return size
+
+    @staticmethod
+    def segment_boundary_after(lsn: str, segment_size: int) -> str:
+        """The first WAL segment boundary at or after lsn."""
+        value = parse_lsn(lsn)
+        value = (value + segment_size - 1) // segment_size * segment_size
+        return f"{value >> 32:X}/{value & 0xFFFFFFFF:08X}"
+
+    def require_fork_on_segment_boundary(self, fork: str) -> None:
+        """A branch forked inside a WAL segment cannot restore that segment
+        (neither timeline holds a complete copy), so it can never boot."""
+        if parse_lsn(fork) % self.wal_segment_size() != 0:
+            raise BranchPrepareError(
+                f"materialized fork {fork} is not a WAL segment boundary; "
+                "a branch forked inside a segment cannot restore that segment")
 
     def wait_materializer(self, target: str) -> None:
         self.wait_until(
@@ -1222,6 +1362,9 @@ class BranchPreparer:
         )
 
     def prepare_branch(self, base: str, redo: str, fork: str) -> int:
+        snapshot = self.branch_window_snapshot()
+        if parse_lsn(redo) != parse_lsn(snapshot["checkpoint_redo_lsn"]):
+            raise BranchPrepareError("branch window checkpoint changed before preparation")
         reference = ""
         if self.verify_seed_against_materializer:
             # the comparison report is a NOTICE; a role or database that
@@ -1240,7 +1383,7 @@ class BranchPreparer:
                 "SELECT "
                 + self.extension_function(
                     self.writer_extension_schema,
-                    "pagestore_prepare_branch_from_control(",
+                    "pagestore_prepare_branch_from_window(",
                 )
                 + sql_literal(str(self.config.prepared_dir))
                 + f", {self.config.new_timeline}, {self.config.parent_timeline}, "
@@ -1251,7 +1394,8 @@ class BranchPreparer:
                 + sql_literal(fork)
                 + "::pg_lsn, "
                 + str(self.config.new_incarnation)
-                + ")",
+                + ", " + sql_literal(snapshot["next_xid"]) + "::xid8, "
+                + str(snapshot["prepared_count"]) + ")",
                 private=True,
             )
         )
@@ -1348,17 +1492,93 @@ class BranchPreparer:
             writer_owned=False, restricted_writer_running=False,
         )
 
+    def cleanup_failed_branch(self) -> None:
+        """Invalidate our unpublished directory before deleting our incarnation."""
+        if self.journal is None or self.journal["state"] != "r2_cleanup":
+            raise BranchPrepareError("R2 cleanup requires its durable journal state")
+        intent = self.journal.get("intent")
+        if intent not in {"remove_readiness", "manifest_removed", "timeline_deleting"}:
+            raise BranchPrepareError("R2 cleanup journal has an invalid intent")
+        if intent == "remove_readiness":
+            for name in ("pagestore_branch.bootstrap", "pagestore_branch.manifest"):
+                try:
+                    (self.config.prepared_dir / name).unlink()
+                except FileNotFoundError:
+                    pass
+            fd = os.open(self.config.prepared_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            self.journal_update("r2_cleanup", "manifest_removed")
+            self.fault("branch_prepare.r2_manifest_removed")
+        if self.journal.get("intent") == "manifest_removed":
+            delete = self.extension_function(self.writer_extension_schema,
+                                             "pagestore_delete_branch(")
+            state = self.extension_function(self.writer_extension_schema,
+                                            "pagestore_timeline_state(")
+            result = last_output_line(self.writer_sql(
+                "SELECT CASE WHEN incarnation IS NULL THEN 'absent' ELSE "
+                + delete + f"{self.config.new_timeline}, {self.config.new_incarnation}) END "
+                + "FROM " + state + f"{self.config.new_timeline})",
+                private=self.restricted_writer_running))
+            if result not in {"absent", "deleting", "deleted"}:
+                raise BranchPrepareError(f"unexpected R2 deletion result: {result}")
+            self.journal_update("r2_cleanup", "timeline_deleting")
+            self.fault("branch_prepare.r2_timeline_deleting")
+        self.journal_update("r2_failed", "restore_services")
+
+    def restore_failed_branch_services(self) -> None:
+        self.journal_update("r2_failed", "restore_services")
+        errors = self.restore_services()
+        if errors:
+            raise BranchPrepareError("R2 services restoration failed: " + "; ".join(errors))
+        self.journal_update("r2_failed", None, pause_owned=False, writer_owned=False,
+                            restricted_writer_running=False, retention_owned=False,
+                            retention_set_attempted=False, materializer_resumed=True,
+                            writer_restored=True)
+
     def recover_journal(self) -> dict[str, Any]:
         if self.journal is None:
             raise BranchPrepareError("branch journal is not loaded")
         state = self.journal["state"]
         if state == "complete":
+            self.validate_completed_materialization(self.journal["fork_lsn"])
             return dict(self.journal)
+        if state == "r2_failed" and self.journal.get("intent") is None:
+            raise BranchPrepareError("branch proof failed; rerun with a new incarnation and receipt path")
         self.discover_recovery_services()
         mode = self.observe_recovery_ownership()
+        if state == "r2_failed":
+            if self.journal.get("intent") != "restore_services":
+                raise BranchPrepareError("R2 failed journal has an invalid restoration intent")
+            self.restore_failed_branch_services()
+            raise BranchPrepareError("branch proof failed; rerun with a new incarnation and receipt path")
+        if state == "r2_cleanup" or (state == "fork_captured" and
+                                     self.journal.get("intent") == "prepare_branch"):
+            if state != "r2_cleanup":
+                self.journal_update("r2_cleanup", "remove_readiness")
+            self.cleanup_failed_branch()
+            self.restore_failed_branch_services()
+            raise BranchPrepareError("ambiguous branch preparation cleaned up; rerun with a new incarnation and receipt path")
+        # A journal an older controller left with a fork inside a WAL segment
+        # describes a branch that can never boot, whether or not its receipt
+        # was already published.  Refuse to seed, publish or complete it;
+        # restore the services as for any other unrecoverable journal.
+        fork_lsn = self.journal.get("fork_lsn")
+        if isinstance(fork_lsn, str):
+            parse_lsn(fork_lsn)
+            try:
+                self.require_fork_on_segment_boundary(fork_lsn)
+            except BranchPrepareError:
+                try:
+                    self.restore_ambiguous_services(mode)
+                finally:
+                    self.journal_update(self.journal["state"], "recovery_failed")
+                raise
         if state in {
             "started", "preflight_complete", "base_captured", "writer_stopped",
-            "writer_restricted", "checkpoint_selected", "checkpoint_archived",
+            "writer_restricted", "window_opened", "checkpoint_selected", "checkpoint_archived",
         }:
             try:
                 self.restore_ambiguous_services(mode)
@@ -1426,22 +1646,20 @@ class BranchPreparer:
                 archived_through_lsn=self.journal["switch_lsn"],
             )
             state = "branch_prepared"
-        if (entered_state in ("branch_prepared", "prepared")
-                and self.verify_seed_against_materializer):
-            # Prepared before verification was requested (or by a run whose
-            # verification we cannot see): the materializer is still paused
-            # at the fork LSN in these states, so re-seed under verification
-            # now -- the server reconstructs and compares every page again
-            # instead of reusing the manifest -- before carrying on.  A
-            # journal that entered at fork_captured was just seeded and
-            # verified above; seeding it again would only unlink and rebuild
-            # a manifest that already stands.
+        if entered_state in ("branch_prepared", "prepared"):
+            # An older controller may have published this state without the
+            # writer-side materializer proof.  Always repeat the checked API
+            # before publishing or restoring services, even without optional
+            # seed verification.  An unavailable upgraded signature fails
+            # closed here.  At fork_captured the same call just ran above.
             seeded = self.prepare_branch(
                 self.journal["base_lsn"],
                 self.journal["checkpoint_redo_lsn"],
                 self.journal["fork_lsn"],
             )
             self.journal_update(state, None, seeded_slru_pages=seeded)
+        if state in ("materializer_resumed", "writer_restored"):
+            self.validate_recovered_materialization(self.journal["fork_lsn"], mode)
         if state in ("materializer_resumed", "writer_restored") and self.verify_seed_against_materializer:
             raise BranchPrepareError(
                 f"branch journal state {state!r} has resumed the materializer past the fork "
@@ -1454,6 +1672,45 @@ class BranchPreparer:
             state = "prepared"
         self.success_restore(run_faults=False)
         return dict(self.journal or {})
+
+    def validate_completed_materialization(self, fork: str) -> None:
+        # A complete receipt can predate the checked prepare API.  Validate
+        # through the surviving writer without altering the receipt/services.
+        mode = self.observe_writer_mode()
+        if mode not in ("normal", "restricted"):
+            raise BranchPrepareError("branch materializer proof requires a reachable writer")
+        private = mode == "restricted"
+        self.writer_extension_schema = self.extension_schema(
+            lambda sql: self.writer_sql(sql, private=private), "writer"
+        )
+        self.validate_recovery_writer(private=private)
+        self.validate_recovered_materialization(fork, mode)
+
+    def validate_recovered_materialization(self, fork: str, mode: str) -> None:
+        # After services resume, only read the store-observed marker.  Reseeding
+        # would race the materializer and the normal writer's transactions.
+        parse_lsn(fork)
+        if mode not in ("restricted", "normal"):
+            raise BranchPrepareError("branch materializer proof requires a reachable writer")
+        signature = self.extension_function(
+            self.writer_extension_schema,
+            "pagestore_prepare_branch_from_window(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint,xid8,integer)",
+        )
+        result = last_output_line(self.writer_sql(
+            "SELECT to_regprocedure(" + sql_literal(signature) + ") IS NOT NULL"
+            " AND COALESCE((SELECT materialized_wal_lsn >= "
+            + sql_literal(fork) + "::pg_lsn FROM "
+            + self.extension_function(self.writer_extension_schema,
+                                      "pagestore_materializer_status()")
+            + "), false) AND "
+            + self.extension_function(self.writer_extension_schema, "pagestore_branch_snapshot_is_safe(")
+            + str(self.config.new_timeline) + ", " + str(self.config.new_incarnation) + ")",
+            private=mode == "restricted",
+        ))
+        if result != "t":
+            raise BranchPrepareError(
+                "recovered branch requires the checked API, a finite snapshot cap and a durable materializer marker covering its fork"
+            )
 
     def restore_services(self) -> list[str]:
         errors: list[str] = []
@@ -1485,6 +1742,13 @@ class BranchPreparer:
                         "the prepared branch is already complete and its materializer "
                         "resumed; its SLRUs cannot be verified against the materializer now"
                     )
+                # a receipt an older controller completed may describe a
+                # branch forked inside a WAL segment, which cannot boot
+                fork_lsn = existing.get("fork_lsn")
+                if not isinstance(fork_lsn, str):
+                    raise BranchPrepareError("completed branch receipt has no fork LSN")
+                self.require_fork_on_segment_boundary(fork_lsn)
+                self.validate_completed_materialization(fork_lsn)
                 return existing
             self.journal = existing
             self.restore_ownership_from_journal()
@@ -1520,8 +1784,13 @@ class BranchPreparer:
                 writer_owned=self.writer_owned,
                 restricted_writer_running=self.restricted_writer_running,
             )
-            self.journal_update("writer_restricted", "select_checkpoint")
+            self.journal_update("writer_restricted", "open_branch_window")
+            snapshot = self.open_branch_window()
+            self.journal_update("window_opened", None, window_snapshot=snapshot)
+            self.journal_update("window_opened", "select_checkpoint")
             redo, checkpoint_end = self.select_checkpoint()
+            if parse_lsn(redo) != parse_lsn(snapshot["checkpoint_redo_lsn"]):
+                raise BranchPrepareError("writer checkpoint changed since the branch window was opened")
             if parse_lsn(base) > parse_lsn(redo):
                 raise BranchPrepareError("proven SLRU base follows the selected checkpoint")
             self.journal_update(
@@ -1534,12 +1803,24 @@ class BranchPreparer:
                 raise BranchPrepareError("WAL switch did not cover the selected checkpoint")
             self.journal_update("checkpoint_archived", None, switch_lsn=switch_lsn)
             self.journal_update("checkpoint_archived", "wait_materializer")
-            self.wait_materializer(checkpoint_end)
+            # The branch inherits the parent's WAL up to the fork and owns it
+            # from there.  A fork inside a segment leaves that segment with
+            # no complete copy on either timeline, so the branch could never
+            # restore it and would fail to find its checkpoint.  The WAL
+            # switch above ends the parent's segment; the materializer's
+            # replay position after replaying the switch record is the next
+            # segment boundary, so wait for that, not just the checkpoint.
+            segment_size = self.wal_segment_size()
+            boundary = self.segment_boundary_after(switch_lsn, segment_size)
+            if parse_lsn(boundary) < parse_lsn(checkpoint_end):
+                raise BranchPrepareError("WAL switch did not end the checkpoint's segment")
+            self.wait_materializer(boundary)
             self.journal_update("checkpoint_archived", None)
             self.journal_update("checkpoint_archived", "capture_fork")
             fork = self.pause_and_capture(keep_paused=True)
             if parse_lsn(fork) < parse_lsn(checkpoint_end):
                 raise BranchPrepareError("materialized fork does not cover the checkpoint")
+            self.require_fork_on_segment_boundary(fork)
             self.journal_update(
                 "fork_captured", None, fork_lsn=fork, pause_owned=self.pause_owned,
                 archived_through_lsn=switch_lsn, materializer_resumed=False,
@@ -1564,11 +1845,23 @@ class BranchPreparer:
         except BaseException as error:
             failure = error
 
+        if failure is not None and self.journal is not None and (
+            self.journal["state"] == "fork_captured" and
+            self.journal.get("intent") == "prepare_branch"
+        ):
+            try:
+                self.journal_update("r2_cleanup", "remove_readiness")
+                self.cleanup_failed_branch()
+                self.restore_failed_branch_services()
+            except BaseException as cleanup_error:
+                failure = BranchPrepareError(f"{failure}; R2 cleanup failed: {cleanup_error}")
+
         preserve_prepare_fence = (
             self.journal is not None
-            and self.journal.get("intent") in {
-                "prepare_branch", "publish_prepared_receipt",
-            }
+            and (self.journal["state"] in {"r2_cleanup", "r2_failed"}
+                 or self.journal.get("intent") in {
+                     "prepare_branch", "publish_prepared_receipt",
+                 })
         )
         cleanup_errors = (
             []
@@ -1591,7 +1884,7 @@ class BranchPreparer:
                 "state"
             ) in {
                 "branch_prepared", "prepared", "materializer_resumed",
-                "writer_restored", "complete",
+                "writer_restored", "complete", "r2_failed",
             }
             if not cleanup_errors and not prepared_boundary and not preserve_prepare_fence:
                 try:
@@ -1601,7 +1894,10 @@ class BranchPreparer:
             if isinstance(failure, (KeyboardInterrupt, CancelledError)):
                 raise failure
             if preserve_prepare_fence:
-                detail += "; recovery journal retained and services remain fenced"
+                if self.journal["state"] == "r2_failed" and self.journal.get("intent") is None:
+                    detail += "; failed-operation journal retained; rerun with a new incarnation and receipt path"
+                else:
+                    detail += "; recovery journal retained and services remain fenced"
             raise BranchPrepareError(f"{failure}{detail}") from failure
         if cleanup_errors:
             raise BranchPrepareError("; ".join(cleanup_errors))

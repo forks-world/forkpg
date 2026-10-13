@@ -186,6 +186,116 @@ maintain(void)
 	}
 }
 
+/* A pending replacement must preserve an inherited or local DROP. */
+static void
+test_pending_after_drop(const char *store)
+{
+	PsKey saved = key;
+	uint64_t token;
+	PsChannel branch = {.opcode = PS_OP_CREATE_BRANCH, .timeline = 7,
+		.req_lsn = 1000300};
+
+	key.relNumber = 77;
+	token = begin(1000100);
+	check(write_page(1000100, token, 0, 0x71) == 0 &&
+		  commit(1000100, token, 1) == 0, "drop-pending: publish original");
+	check(drop(1000200) == 0, "drop-pending: drop original");
+	token = begin(1000300);
+	check(write_page(1000300, token, 8, 0x72) == 0,
+		  "drop-pending: stage replacement");
+	check(metadata_matches(0, 0, 0, 0, 0),
+		  "drop-pending: local pending replacement remains absent");
+	key.relNumber = 78;
+	token = begin(1000100);
+	check(write_page(1000100, token, 1, 0x74) == 0 &&
+		  commit(1000100, token, 1) == 0,
+		  "redo-ensure: publish sparse parent generation");
+	key.relNumber = 77;
+	meta(&branch);
+	check(metadata_matches(7, 0, 0, 0, 0) &&
+		  read_value(7, UINT64_MAX, 0, -1),
+		  "drop-pending: inherited pending replacement remains absent");
+	{
+		PsChannel create = {.opcode = PS_OP_CREATE, .timeline = 7,
+			.key = key, .req_lsn = 1000400, .is_redo = 1};
+		uint64_t child_token = 0;
+		unsigned char page[8192];
+
+		ps_lock_shard_wr(ps_shard_of(&key));
+		(void) ps_handle_meta(&create);
+		check(create.status == PS_STATUS_OK, "drop-pending: prepare child fork");
+		check(ps_artifact_begin(7, &key, 1000500, &child_token, NULL) == 0,
+			  "drop-pending: begin child replacement");
+		memset(page, 0x73, sizeof(page));
+		check(ps_artifact_write(7, &key, 8, page, 1000500, child_token,
+							NULL, NULL) == 0, "drop-pending: stage child replacement");
+		ps_unlock_shard(ps_shard_of(&key));
+		check(metadata_matches(7, 0, 0, 0, 0),
+			  "drop-pending: child preparation cannot publish an empty artifact");
+	}
+	key.relNumber = 78;
+	for (int redo = 1; redo <= 2; redo++)
+	{
+		PsChannel create = {.opcode = PS_OP_CREATE, .timeline = 7,
+			.key = key, .req_lsn = 1000400, .is_redo = redo};
+
+		ps_lock_shard_wr(ps_shard_of(&key));
+		(void) ps_handle_meta(&create);
+		ps_unlock_shard(ps_shard_of(&key));
+		check(create.status == PS_STATUS_OK &&
+			  metadata_matches(7, 0, 0, 1, 2) &&
+			  read_value(7, UINT64_MAX, 1, 0x74),
+			  "redo-ensure: preserve inherited completed metadata and bytes");
+	}
+	key.relNumber = 77;
+	maintain();
+	check(metadata_matches(0, 0, 0, 0, 0) &&
+		  metadata_matches(7, 0, 0, 0, 0),
+		  "drop-pending: compaction preserves absence");
+	ps_core_close();
+	check(ps_core_open(store) == 0, "drop-pending: reopen");
+	check(metadata_matches(0, 0, 0, 0, 0) &&
+		  metadata_matches(7, 0, 0, 0, 0),
+		  "drop-pending: abandoned replacement preserves absence");
+	key.relNumber = 78;
+	check(metadata_matches(7, 0, 0, 1, 2) &&
+		  read_value(7, UINT64_MAX, 1, 0x74),
+		  "redo-ensure: inherited completion survives compacted restart");
+	key = saved;
+}
+
+/* Parent adoption after the branch cut cannot suppress a child legacy CREATE. */
+static void
+test_protocol_after_branch(const char *store)
+{
+	PsKey saved = key;
+	PsChannel branch = {.opcode = PS_OP_CREATE_BRANCH, .timeline = 8,
+		.req_lsn = 1100100};
+	uint64_t token;
+
+	key.relNumber = 79;
+	meta(&branch);
+	token = begin(1100200);
+	check(write_page(1100200, token, 0, 0x79) == 0 &&
+		  commit(1100200, token, 1) == 0, "late-protocol: parent publication");
+	for (int redo = 1; redo <= 2; redo++)
+	{
+		PsChannel create = {.opcode = PS_OP_CREATE, .timeline = 8,
+			.key = key, .req_lsn = 1100300, .is_redo = redo};
+
+		ps_lock_shard_wr(ps_shard_of(&key));
+		(void) ps_handle_meta(&create);
+		ps_unlock_shard(ps_shard_of(&key));
+		check(create.status == PS_STATUS_OK && metadata_matches(8, 0, 0, 1, 0),
+			  "late-protocol: child CREATE records an empty legacy fork");
+	}
+	maintain();
+	ps_core_close();
+	check(ps_core_open(store) == 0 && metadata_matches(8, 0, 0, 1, 0),
+		  "late-protocol: child legacy fork survives compacted restart");
+	key = saved;
+}
+
 /*
  * R5-1/R5-2 regression: the reader-snapshot DATA object (object number
  * PS_READER_SNAPSHOT_DATA_OBJECT) used to be published under the same
@@ -305,6 +415,55 @@ test_reader_snapshot_owner_key_split(void)
 	rc = ps_artifact_commit(0, &automatic_key, 900400, token, 1, NULL);
 	ps_unlock_shard(ps_shard_of(&automatic_key));
 	check(rc == 0, "automatic generation at 900400 commits");
+}
+
+/*
+ * Codex finding 4104937134 (BRANCH_SNAPSHOT_SEQ_CAP.md S3.3): extends the P1
+ * differential test to artifact reads.  artifact_visible() used to discard
+ * the walk's composed ViewCap.seq and its per-level inherited-range
+ * boundary, rebuilding a (lsn, strict_seq)-only cap with B_k hardcoded to
+ * "root" -- harmless while every cap stays PS_SEQ_UNBOUNDED (P1's only
+ * production case, S9.3), but wrong once P2/P3b/P5 start constructing
+ * finite caps.  This builds a pre-first-BEGIN ("legacy fallback") history --
+ * an older write, a same-LSN rewrite with a larger admission_seq (the
+ * artifact analogue of Bug B), and a fresh-position first arrival -- on a
+ * key that has never gone through BEGIN/COMMIT, then closes it with one
+ * uncommitted BEGIN so artifact_visible()'s no-commit fallback resolves it,
+ * and hands it to ps_test_artifact_viewcap_property(), which checks
+ * artifact_visible() against brute_page_select() -- the same literal-S1.3-
+ * rule oracle ps_test_viewcap_differential() uses -- at PS_SEQ_UNBOUNDED and
+ * at finite caps.  The LSNs are chosen above every other LSN this file uses
+ * (highest elsewhere: 900400) so the page-reclaimed frontier this file's
+ * compaction has already advanced can never make these writes unfenced.
+ */
+static void
+test_viewcap_artifact_property(void)
+{
+	uint32_t	saved_rel = key.relNumber;
+	uint64_t	begin_token = 0;
+	PsArtifactRefuseReason reason = PS_ARTIFACT_REFUSE_NONE;
+
+	key.relNumber = 950;
+
+	check(write_page(950100, 0, 0, 0x70) == 0,
+		  "viewcap property: older write at the shared LSN");
+	check(write_page(950100, 0, 0, 0x71) == 0,
+		  "viewcap property: same-LSN rewrite");
+	check(write_page(950200, 0, 0, 0x72) == 0,
+		  "viewcap property: fresh-position write");
+
+	ps_lock_shard_wr(ps_shard_of(&key));
+	check(ps_artifact_begin(0, &key, 950300, &begin_token, &reason) == 0 &&
+		  begin_token != 0,
+		  "viewcap property: closing BEGIN activates the fallback domain");
+	ps_unlock_shard(ps_shard_of(&key));
+
+	ps_lock_shard_rd(ps_shard_of(&key));
+	check(ps_test_artifact_viewcap_property(0, &key, 0, 950100, 950200) == 0,
+		  "viewcap property: artifact_visible() matches brute_page_select() at every cap");
+	ps_unlock_shard(ps_shard_of(&key));
+
+	key.relNumber = saved_rel;
 }
 
 /*
@@ -617,7 +776,7 @@ main(int argc, char **argv)
 			  "T4: an unversioned write to a key under protocol is refused as LEGACY_BYPASS");
 	}
 	token = begin(200);
-	check(metadata_matches(0, 0, 0, 1, 2) && metadata_matches(0, 200, token, 1, 2),
+	check(metadata_matches(0, 0, 0, 1, 2) && metadata_matches(0, 200, 0, 1, 2),
 		  "same-LSN retry retains completed metadata");
 	check(write_page(200, token, 1, 0x25) != 0 && read_value(0, 200, 1, 0x23), "same-LSN retry rejects changes to completed bytes");
 	{
@@ -683,8 +842,11 @@ main(int argc, char **argv)
 	check(ps_test_artifact_fence_count(0) == 0, "retired data releases every artifact control-era fence");
 	token = begin(600);
 	check(write_page(600, token, 0, 0x66) == 0 && commit(600, token, 1) == 0 && read_value(0, 600, 0, 0x66), "recreate after drop");
+	test_pending_after_drop(store);
+	test_protocol_after_branch(store);
 	test_reader_snapshot_owner_key_split();
 	test_admission_refusal_does_not_poison();
+	test_viewcap_artifact_property();
 	test_io_failure_still_poisons(store);
 	ps_core_close();
 	for (int phase = 1; phase <= 2; phase++)

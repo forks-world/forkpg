@@ -73,15 +73,71 @@
 #include "access/commit_ts.h"
 /*
  * access/multixact_internal.h was split out of access/multixact.h upstream
- * in 19 (commit bb3b1c4f646); before that, the GetMultiXactInfo() prototype
- * and the MultiXactOffset type this file needs are exposed directly by
- * access/multixact.h.  On 19+, multixact_internal.h pulls in multixact.h
- * itself, so a single guarded include covers both.
+ * in 19 (commit bb3b1c4f646): the MultiXactOffset-page macros/functions
+ * this file's #else branch below reimplements moved there.  Before 19,
+ * access/multixact.h alone declares the MultiXactOffset type and the rest
+ * of the multixact API this file uses -- except GetMultiXactInfo() itself,
+ * which is not one of those symbols: it does not exist on 18 at all (added
+ * by a977e419ee6, "Refactor ReadMultiXactCounts() into GetMultiXactInfo()",
+ * 2025-08-19, well after the 18 branch), so including access/multixact.h
+ * does not expose it there.  On 19+, multixact_internal.h pulls in
+ * multixact.h itself, so a single guarded include still covers both
+ * majors' header needs; GetMultiXactInfo()'s own 18 gap is a separate
+ * problem, covered by the next paragraph.
+ *
+ * This guard alone does NOT make pagestore_slru.c (or the rest of
+ * contrib/pagestore) compile on 18: see
+ * PG_MAJOR_PORTABILITY.md "contrib/pagestore API-surface gaps" for the full,
+ * compile-verified list (ReplOriginId, XLogFindNextRecord's arity,
+ * xl_multixact_truncate's field names, CHECKPOINT_FAST, PageSetChecksum,
+ * and more, none of them guarded yet) and for GetMultiXactInfo() itself
+ * below, whose oldestMulti/oldestOffset are not exposed by any public API
+ * before 19 -- reading them on 18 needs a small core export, tracked there
+ * as a C4 item for the "PG 18 compatibility guards" follow-up PR (built
+ * from P2's core-patch work), not something contrib can add on its own.
  */
 #if PG_VERSION_NUM >= 190000
 #include "access/multixact_internal.h"
+#define ps_multixact_offset_page MultiXactIdToOffsetPage
+#define ps_multixact_member_page MXOffsetToMemberPage
 #else
 #include "access/multixact.h"
+
+/*
+ * MultiXactIdToOffsetPage()/MXOffsetToMemberPage() moved from static
+ * functions in access/transam/multixact.c to public inline functions in
+ * access/multixact_internal.h in the same 19 commit (bb3b1c4f646); the
+ * formula did not change, so this is a verbatim copy of 18's own
+ * multixact.c (MULTIXACT_OFFSETS_PER_PAGE through MULTIXACT_MEMBERS_PER_PAGE),
+ * not a guess -- it must be kept identical to upstream's should either
+ * change again.  Unlike GetMultiXactInfo() below, these are pure arithmetic
+ * over BLCKSZ/MultiXactOffset/TransactionId, so contrib can define them
+ * itself without a core export.  Keep the local names distinct from
+ * core: release-branch C4 patches can also export the original functions.
+ */
+#define MULTIXACT_OFFSETS_PER_PAGE (BLCKSZ / sizeof(MultiXactOffset))
+#define MXACT_MEMBER_BITS_PER_XACT			8
+#define MXACT_MEMBER_FLAGS_PER_BYTE			1
+#define MULTIXACT_FLAGBYTES_PER_GROUP		4
+#define MULTIXACT_MEMBERS_PER_MEMBERGROUP	\
+	(MULTIXACT_FLAGBYTES_PER_GROUP * MXACT_MEMBER_FLAGS_PER_BYTE)
+#define MULTIXACT_MEMBERGROUP_SIZE \
+	(sizeof(TransactionId) * MULTIXACT_MEMBERS_PER_MEMBERGROUP + MULTIXACT_FLAGBYTES_PER_GROUP)
+#define MULTIXACT_MEMBERGROUPS_PER_PAGE (BLCKSZ / MULTIXACT_MEMBERGROUP_SIZE)
+#define MULTIXACT_MEMBERS_PER_PAGE	\
+	(MULTIXACT_MEMBERGROUPS_PER_PAGE * MULTIXACT_MEMBERS_PER_MEMBERGROUP)
+
+static inline int64
+ps_multixact_offset_page(MultiXactId multi)
+{
+	return multi / MULTIXACT_OFFSETS_PER_PAGE;
+}
+
+static inline int64
+ps_multixact_member_page(MultiXactOffset offset)
+{
+	return offset / MULTIXACT_MEMBERS_PER_PAGE;
+}
 #endif
 #include "access/slru.h"
 
@@ -703,10 +759,10 @@ ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 			 * wrapped truncation's tombstone reconstructible by the reset
 			 * repair path instead of being skipped.
 			 */
-			*cutoff = MultiXactIdToOffsetPage(prev);
+			*cutoff = ps_multixact_offset_page(prev);
 		}
 		else
-			*cutoff = MXOffsetToMemberPage(oldestOffset);
+			*cutoff = ps_multixact_member_page(oldestOffset);
 		return true;
 	}
 	return false;
@@ -3454,6 +3510,16 @@ ps_slru_now_lsn(void)
 			p = GetXLogReplayRecPtr(NULL);
 		if (XLogRecPtrIsInvalid(p))
 			p = GetRedoRecPtr();
+		/*
+		 * Clean startup skips PerformWalRecovery(), which initializes the
+		 * replay pointers. PG18 can flush TrimCLOG()/TrimMultiXact() here
+		 * before the shared redo pointer is available too. The shutdown
+		 * checkpoint has already been read, and its end bounds these
+		 * recovered bytes; use that real WAL position before the bootstrap
+		 * sentinel, which cannot be appended behind a retained frontier.
+		 */
+		if (XLogRecPtrIsInvalid(p))
+			p = GetCheckPointRecordEnd();
 		if (XLogRecPtrIsInvalid(p))
 			p = (XLogRecPtr) 1;
 		return p;

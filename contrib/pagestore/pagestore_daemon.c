@@ -372,21 +372,28 @@ shm_publish_ready(PsShmHeader *hdr)
  * block; printed only when meaningful (a WRITE refusal).
  */
 static void
-log_artifact_refusal(const char *op, uint32_t tl, const PsKey *key,
-					 uint32_t block, uint64_t lsn, PsArtifactRefuseReason reason)
+log_artifact_refusal(const char *op, const PsChannel *ch, uint32_t tl,
+					 const PsKey *key, uint32_t block, uint64_t lsn,
+					 PsArtifactRefuseReason reason)
 {
 	uint64_t	last_page_lsn = 0,
 				last_commit_lsn = 0;
 	char		block_buf[32] = "";
+	/* An automatic generation refused as unfenced was superseded by a newer
+	 * checkpoint (PS_ARTIFACT_REQ_SUPERSEDABLE); keep the line, but do not
+	 * report an expected outcome as a refused operation. */
+	const char *outcome =
+		ch->parent_timeline == PS_ARTIFACT_REQ_SUPERSEDABLE &&
+		reason == PS_ARTIFACT_REFUSE_UNFENCED ? "superseded" : "refused";
 
 	ps_artifact_diag(tl, key, &last_page_lsn, &last_commit_lsn);
 	if (block != UINT32_MAX)
 		snprintf(block_buf, sizeof(block_buf), " block=%u", block);
 	fprintf(stderr,
-		"pagestore_daemon: artifact %s refused: reason=%s timeline=%u "
+		"pagestore_daemon: artifact %s %s: reason=%s timeline=%u "
 		"key=(klass=%u,spc=%u,db=%u,rel=%u,fork=%d)%s lsn=%llu "
 		"last_page_lsn=%llu last_commit=%llu\n",
-		op, pagestore_artifact_refuse_reason_name(reason), tl,
+		op, outcome, pagestore_artifact_refuse_reason_name(reason), tl,
 		key->klass, key->spcOid, key->dbOid, key->relNumber, key->forkNum,
 		block_buf,
 		(unsigned long long) lsn,
@@ -405,6 +412,15 @@ handle_request(PsChannel *ch)
 
 	ch->status = PS_STATUS_OK;
 	ch->result = 0;
+	/* Refuse an out-of-range WRITEV/READV nblocks before the loops below walk
+	 * ch->data by it -- see ps_request_payload_fits() in pagestore_core.c.
+	 * Must run before anything else touches ch->data, including ps_handle_meta()
+	 * below (which applies the same check to WAL_APPEND/WAL_READ). */
+	if (!ps_request_payload_fits(ch))
+	{
+		ch->status = PS_STATUS_ERROR;
+		return;
+	}
 	if (ch->key.klass == PS_KLASS_ARTIFACT ||
 		((ch->key.klass == PS_KLASS_SLRU || ch->key.klass == PS_KLASS_READER_SNAPSHOT) &&
 		 ch->opcode == PS_OP_WRITEV && ch->nblocks != 1))
@@ -429,11 +445,14 @@ handle_request(PsChannel *ch)
 			{
 				PsArtifactRefuseReason reason = PS_ARTIFACT_REFUSE_NONE;
 
-				if (ps_artifact_begin(tl, &ch->key, ch->req_lsn, &ch->req_seq, &reason) != 0)
+				if (ch->is_redo != PS_ARTIFACT_BEGIN_CAPPED_READ)
+					reason = PS_ARTIFACT_REFUSE_INVALID;
+				if (reason != PS_ARTIFACT_REFUSE_NONE ||
+					ps_artifact_begin(tl, &ch->key, ch->req_lsn, &ch->req_seq, &reason) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					ch->result = (uint32_t) reason;
-					log_artifact_refusal("BEGIN", tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
+					log_artifact_refusal("BEGIN", ch, tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
 				}
 			}
 			break;
@@ -445,7 +464,7 @@ handle_request(PsChannel *ch)
 				{
 					ch->status = PS_STATUS_ERROR;
 					ch->result = (uint32_t) reason;
-					log_artifact_refusal("COMMIT", tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
+					log_artifact_refusal("COMMIT", ch, tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
 				}
 			}
 			break;
@@ -457,7 +476,7 @@ handle_request(PsChannel *ch)
 				{
 					ch->status = PS_STATUS_ERROR;
 					ch->result = (uint32_t) reason;
-					log_artifact_refusal("DROP", tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
+					log_artifact_refusal("DROP", ch, tl, &ch->key, UINT32_MAX, ch->req_lsn, reason);
 				}
 			}
 			break;
@@ -475,7 +494,7 @@ handle_request(PsChannel *ch)
 					if (artifact_klass)
 					{
 						ch->result = (uint32_t) reason;
-						log_artifact_refusal("WRITE", tl, &ch->key, ch->blocknum,
+						log_artifact_refusal("WRITE", ch, tl, &ch->key, ch->blocknum,
 											 ch->req_lsn, reason);
 					}
 				}
@@ -498,7 +517,7 @@ handle_request(PsChannel *ch)
 						if (artifact_klass)
 						{
 							ch->result = (uint32_t) reason;
-							log_artifact_refusal("WRITE", tl, &ch->key, ch->blocknum + i,
+							log_artifact_refusal("WRITE", ch, tl, &ch->key, ch->blocknum + i,
 												 ch->req_lsn, reason);
 						}
 						break;
@@ -883,6 +902,18 @@ relation_request_lsn(const PsChannel *ch)
 		uint32_t	npages = op == PS_OP_EXTEND ? 1 : ch->nblocks;
 		uint64_t	lowest = UINT64_MAX;
 
+		/*
+		 * This runs ahead of handle_request()'s ps_request_payload_fits()
+		 * check, from run_request()'s admission-fence loop: an out-of-range
+		 * WRITEV nblocks must not walk ch->data by it here either.  Answer
+		 * UINT64_MAX (no fence-relevant LSN found) without touching the
+		 * buffer; the request is then admitted and promptly refused by
+		 * handle_request()'s own check.  EXTEND's npages is always 1 and
+		 * needs no such guard (see ps_request_payload_fits()).
+		 */
+		if (op == PS_OP_WRITEV && !ps_request_payload_fits(ch))
+			return UINT64_MAX;
+
 		for (uint32_t i = 0; i < npages; i++)
 		{
 			uint32_t	hi,
@@ -981,13 +1012,16 @@ run_request(uint32_t channel, PsChannel *ch)
 
 	if (op == PS_OP_ADMISSION_BARRIER)
 	{
-		/* The barrier is an ordinary complete request: lifecycle-rd is held
-		 * while its inner admission-wr establishes the sequence.  BEGIN_DELETE
-		 * is the sole lifecycle-wr exception. */
+		/*
+		 * The barrier is an ordinary complete request: lifecycle-rd is held
+		 * while its inner admission-wr establishes the sequence.
+		 * BEGIN_DELETE is the sole lifecycle-wr exception.
+		 */
 		ps_lifecycle_read_lock();
 		ch->status = PS_STATUS_OK;
 		ch->result = 0;
-		ch->req_seq = ps_admission_barrier();
+		ch->req_seq = ch->is_redo == PS_BARRIER_REGISTER ?
+			ps_admission_barrier_register(ch->timeline, ch->req_lsn) : 0;
 		if (ch->req_seq == 0)
 			ch->status = PS_STATUS_ERROR;
 		ps_store_release(&ch->state, PS_STATE_DONE);
@@ -1427,17 +1461,50 @@ main(int argc, char **argv)
 		perror("shm_open");
 		return 1;
 	}
-	/* Acquire byte zero before byte one.  Byte zero gates the destructive
+	/*
+	 * Acquire byte zero before byte one.  Byte zero gates the destructive
 	 * initialization and is retained until READY; byte one is the daemon
-	 * process-lifetime lease. */
-	if (set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) != 0)
+	 * process-lifetime lease.
+	 *
+	 * Clients now briefly take a *shared* lock on byte zero while checking
+	 * whether the segment is ready (ps_shm_hold_init_shared(), see
+	 * pagestore_shm.h) -- an orchestrator polling health across a daemon
+	 * restart can legitimately hold it for the length of one health probe.
+	 * An exclusive F_WRLCK acquisition here would then collide with that
+	 * transient shared hold and fail immediately, so retry byte zero with a
+	 * bounded wait (~10ms steps, ~10s total) before giving up.  Byte one
+	 * (the lease) is still refused immediately: another *daemon* already
+	 * holding it is a real ownership conflict, not a transient inspector,
+	 * and waiting out a live daemon's whole lifetime would make no sense.
+	 */
 	{
-		if (errno == EACCES || errno == EAGAIN)
-			fprintf(stderr, "pagestore_daemon: shm initialization is busy\n");
-		else
-			perror("pagestore_daemon: fcntl client initialization lock");
-		close(fd);
-		return 1;
+		int			attempt;
+		int			acquired = 0;
+
+		for (attempt = 0; attempt < 1000; attempt++)
+		{
+			if (set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) == 0)
+			{
+				acquired = 1;
+				break;
+			}
+			if (errno != EACCES && errno != EAGAIN)
+				break;
+			{
+				struct timespec ts = {0, 10000000};	/* 10ms */
+
+				nanosleep(&ts, NULL);
+			}
+		}
+		if (!acquired)
+		{
+			if (errno == EACCES || errno == EAGAIN)
+				fprintf(stderr, "pagestore_daemon: shm initialization is busy\n");
+			else
+				perror("pagestore_daemon: fcntl client initialization lock");
+			close(fd);
+			return 1;
+		}
 	}
 	client_lock_held = 1;
 	if (set_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE, F_WRLCK) != 0)
@@ -1500,7 +1567,8 @@ main(int argc, char **argv)
 	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
-	hdr->frontend_capabilities = PS_FRONTEND_CAP_RELATION_INSPECTION;
+	hdr->frontend_capabilities = PS_FRONTEND_CAP_RELATION_INSPECTION |
+		PS_FRONTEND_CAP_BRANCH_SEQ | PS_FRONTEND_CAP_ATOMIC_PINS;
 	hdr->daemon_instance = new_daemon_instance();
 	daemon_hdr = hdr;
 	ps_core_set_metrics_header(hdr);

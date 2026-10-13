@@ -72,9 +72,20 @@ typedef struct TestTimelineEvent
 	uint64_t branch_lsn;
 	uint64_t incarnation;
 	uint64_t parent_incarnation;
+	uint64_t branch_seq;
 	uint32_t crc;
 	uint32_t reserved;
 } TestTimelineEvent;
+
+/* The last pre-cap lifecycle shape remains readable in mixed logs. */
+typedef struct TestTimelineEventV2
+{
+	uint32_t magic, rec_len, kind, id;
+	int32_t parent;
+	uint32_t state;
+	uint64_t branch_lsn, incarnation, parent_incarnation;
+	uint32_t crc, reserved;
+} TestTimelineEventV2;
 
 typedef struct TestTimelineEventV1
 {
@@ -320,7 +331,7 @@ fork_meta_source_contains(const TestForkMetaRecV2 *wanted)
 			return 0;
 		if (nread != (int) sizeof(magic))
 			return -1;
-		if (magic != TEST_FORK_META_V2_MAGIC && magic != TEST_FORK_META_V3_MAGIC)
+		if (magic != TEST_FORK_META_V2_MAGIC && magic != TEST_FORK_META_V3_MAGIC && magic != 0x344d4b46U)
 			return -1;
 		{
 			TestForkMetaRecV2 rec;
@@ -389,6 +400,59 @@ close_store(void)
 	ps_core_close();
 	if (ps_storage->close != NULL)
 		ps_storage->close();
+}
+
+static int
+count_occurrences(const char *haystack, const char *needle)
+{
+	int			count = 0;
+	const char *p = haystack;
+
+	while (haystack != NULL && (p = strstr(p, needle)) != NULL)
+	{
+		count++;
+		p += strlen(needle);
+	}
+	return count;
+}
+
+/*
+ * Like pagestore_forkmeta_cutover_test.c's open_capture_stderr(), but wraps a
+ * run of ps_core_maintenance() turns instead of one ps_core_open() call: for
+ * asserting how many times a once-per-tuple diagnostic actually logs across
+ * many retries of a stalled operation.
+ */
+static int
+capture_stderr_maintenance(int turns, char *out, size_t out_cap)
+{
+	char		logpath[] = "/tmp/pstimelinemaintlogXXXXXX";
+	int			logfd = mkstemp(logpath);
+	int			saved_stderr;
+	ssize_t		n;
+
+	out[0] = 0;
+	if (logfd < 0)
+		return 0;
+	saved_stderr = dup(STDERR_FILENO);
+	if (saved_stderr < 0)
+	{
+		close(logfd);
+		unlink(logpath);
+		return 0;
+	}
+	fflush(stderr);
+	dup2(logfd, STDERR_FILENO);
+	for (int i = 0; i < turns; i++)
+		(void) ps_core_maintenance();
+	fflush(stderr);
+	dup2(saved_stderr, STDERR_FILENO);
+	close(saved_stderr);
+	if (lseek(logfd, 0, SEEK_SET) == 0 &&
+		(n = read(logfd, out, out_cap - 1)) > 0)
+		out[n] = 0;
+	close(logfd);
+	unlink(logpath);
+	return 1;
 }
 
 static int
@@ -2067,7 +2131,7 @@ strip_ordered_markers(const char *store, uint32_t timeline)
 			break;
 		if (n != (ssize_t) sizeof(rec) ||
 			(rec.magic != TEST_FORK_META_V2_MAGIC &&
-			 rec.magic != TEST_FORK_META_V3_MAGIC) ||
+			 rec.magic != TEST_FORK_META_V3_MAGIC && rec.magic != 0x344d4b46U) ||
 			rec.rec_len != sizeof(rec))
 		{
 			(void) close(fd);
@@ -2896,6 +2960,70 @@ test_deleting_timeline_wal_cleanup(void)
 	remove_tree(store);
 }
 
+/*
+ * Design doc S3.7(7) rev 3 (amendment, superseding the rev 1/rev 2
+ * plan-epoch/lsn-range gates previously tested here): no gate remains on
+ * the WAL-index snapshot publish switch.  A fork-event/PAGE-GROW admission
+ * at or below the plan's horizon H, landing at any point up to and
+ * including the generation switch, never blocks or invalidates
+ * publication -- see the design doc's monotonicity argument (S1-S4) and
+ * the dedicated property test in pagestore_walidx_prune_test.c, which is
+ * the merge-blocking correctness proof for this.  This test only confirms
+ * the baseline liveness case in-process: with no concurrent admission,
+ * publication succeeds on its first try and the (now purely informational)
+ * plan-epoch-mismatch counter never fires.
+ */
+static void
+test_walidx_publish_no_race_publishes_once(void)
+{
+	char		store[] = "/tmp/pagestore-walidx-plan-epoch-norace-XXXXXX";
+	PsChannel	channel;
+	uint32_t	timeline = 503;
+	uint64_t	aborts_before;
+
+	check(mkdtemp(store) != NULL, "create walidx plan-epoch no-race store");
+	configure_timeline_core();
+	check(ps_core_open(store) == 0 && create_branch(timeline, 0, 100),
+		  "open store for the walidx no-race control case");
+	walidx_snapshot_trigger_option_bytes = 1;
+
+	check(append_wal(timeline, 100,
+					 (const unsigned char[4]) {0x11, 0x22, 0x33, 0x44}, 4),
+		  "append real WAL bytes so wal_log_start() is defined");
+	memset(&channel, 0, sizeof(channel));
+	channel.timeline = timeline;
+	channel.opcode = PS_OP_WAL_INDEX_ADD;
+	channel.blocknum = 1;
+	channel.req_lsn = 100;
+	channel.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+		  "append a WAL-index tail entry to make the control timeline due");
+	check(ps_backpressure_configure_all(0, 0, 0, 0, 1, 0) == 0,
+		  "configure a minimal walidx reclaim high-water mark");
+	ps_backpressure_refresh();
+	check(ps_test_walidx_force_due(timeline) != 0,
+		  "tail-only debt marks the control timeline force-eligible");
+
+	/* No concurrent admission ever races the plan, so
+	 * walidx_snapshot_publish_one() must never observe a plan-epoch
+	 * mismatch -- every attempted publication succeeds on its first try. */
+	aborts_before = ps_test_walidx_plan_epoch_aborts();
+	for (int i = 0; i < 16; i++)
+	{
+		ps_backpressure_refresh();
+		(void) ps_core_maintenance();
+	}
+	check(ps_test_walidx_plan_epoch_aborts() == aborts_before,
+		  "no plan-epoch mismatch statistic ever fires without a racing "
+		  "admission");
+
+	check(ps_backpressure_configure_all(0, 0, 0, 0, 0, 0) == 0,
+		  "clear the reclaim high-water mark before the next test");
+	walidx_snapshot_trigger_option_bytes = 0;
+	close_store();
+	remove_tree(store);
+}
+
 static void
 test_v2_and_mixed_lifecycle(void)
 {
@@ -3165,13 +3293,27 @@ test_deleting_timeline_page_cleanup(void)
 	remove_tree(store);
 }
 
+/*
+ * The contract guard, not a fail-before: a malformed record *inside* the
+ * reachable region (invariant I4) must still fail pass 1 closed, exactly as
+ * before L6 -- only bytes recover() never replayed (a torn/zero tail) get
+ * the new end-of-log treatment.  Corrupts the sibling's own magic word in
+ * place, below the append cursor, so pass 1 must reach and reject it rather
+ * than stop early.  Also covers L2: the "deletion blocked" diagnostic must
+ * log exactly once across many retried maintenance turns, not once per
+ * turn.
+ */
 static void
 test_deleting_timeline_page_cleanup_fail_closed(void)
 {
 	char store[] = "/tmp/pagestore-timeline-page-malformed-XXXXXX";
 	unsigned char page[8192];
-	uint32_t bad = 0xdeadbeefU;
+	uint32_t bad_magic = 0xdeadbeefU;
+	uint32_t magic_check = 0;
+	char captured[4096];
+	int64_t off1;
 	int64_t valid_size;
+	int64_t after;
 
 	configure_timeline_core();
 	segment_size = 1024 * 1024;
@@ -3179,25 +3321,244 @@ test_deleting_timeline_page_cleanup_fail_closed(void)
 	check(mkdtemp(store) != NULL, "create malformed page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100) &&
+			write_timeline_layer(1, 0, 100) == 0,
+		  "write the target record before the sibling");
+	off1 = ps_storage->seg_size(0, 0);
+	check(off1 > 0 && write_timeline_layer(10, 1, 200) == 0,
+		  "write the sibling record whose magic will be corrupted");
+	valid_size = ps_storage->seg_size(0, 0);
+	check(valid_size > off1 &&
+			ps_storage->seg_write(0, 0, (uint64_t) off1, &bad_magic,
+								 sizeof(bad_magic)) == 0 &&
+			ps_storage->sync() == 0 && begin_delete(1, 1, NULL),
+		  "corrupt the sibling's magic in place, inside the reachable "
+		  "region (below the cursor), after BEGIN_DELETE target");
+	check(capture_stderr_maintenance(16, captured, sizeof(captured)),
+		  "capture stderr across 16 maintenance turns");
+	after = ps_storage->seg_size(0, 0);
+	check(after == valid_size,
+		  "malformed segment cleanup stays fail-closed and retryable "
+		  "(segment size unchanged)");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 1,
+		  "failed cleanup retains the target until repair");
+	check(count_segment_holes(0, 0, off1) == 0,
+		  "the validate-only pass 1 rejection writes zero holes: pass 2 "
+		  "never runs on a malformed segment (checked up to the corrupted "
+		  "record, whose own magic count_segment_holes cannot parse)");
+	check(ps_storage->seg_read(0, 0, (uint64_t) off1, &magic_check,
+							   sizeof(magic_check)) == 0 &&
+			magic_check == bad_magic,
+		  "the corrupted magic itself is left exactly as this test left it");
+	check(count_occurrences(captured, "deletion blocked") == 1,
+		  "the once-per-tuple diagnostic logs exactly once across 16 "
+		  "retried maintenance turns, not once per turn");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * L1 regression (review-driven, probe_c): cleanup_last_failure_valid is a
+ * single process-global static, set only on an actual parse failure.
+ * Before L1 it was never cleared before the next timeline's scan, so a
+ * later stalled deletion whose own page_cleanup_tombstone_segment() failure
+ * sets no tuple at all (the oversized-segment early return below never
+ * reaches fail_malformed) printed the previous store's stale tuple -- a
+ * different timeline, shard, segment and offset -- as if it were this
+ * deletion's own cause.
+ */
+static void
+test_deleting_timeline_page_cleanup_stale_failure_not_reattributed(void)
+{
+	char storeA[] = "/tmp/pagestore-timeline-stale-failA-XXXXXX";
+	char storeB[] = "/tmp/pagestore-timeline-stale-failB-XXXXXX";
+	uint32_t bad_magic = 0xdeadbeefU;
+	unsigned char sparse_tail = 0;
+	char captured[4096];
+	int64_t off1;
+
+	/* Store A: a genuine malformed-record failure for timeline 901, which
+	 * fills cleanup_last_failure with timeline 901's own (shard, seg, off,
+	 * magic, len) tuple and logs it once.  Timeline IDs here are picked
+	 * unused elsewhere in this suite: timeline_cleanup_blocked_last[] is a
+	 * process-wide array that is never reset except on DELETED/reuse (L2),
+	 * so an earlier test's still-DELETING timeline with a coincidentally
+	 * identical tuple would otherwise dedup-suppress this test's own first
+	 * occurrence -- a test-suite ordering artifact, not the bug under test. */
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 100;
+	check(mkdtemp(storeA) != NULL, "create store A");
+	check(ps_core_open(storeA) == 0 && create_branch(901, 0, 100) &&
+			create_branch(910, 0, 100) &&
+			write_timeline_layer(901, 0, 100) == 0,
+		  "A: write the target record");
+	off1 = ps_storage->seg_size(0, 0);
+	check(off1 > 0 && write_timeline_layer(910, 1, 200) == 0,
+		  "A: write the sibling record to corrupt");
+	check(ps_storage->seg_write(0, 0, (uint64_t) off1, &bad_magic,
+								sizeof(bad_magic)) == 0 &&
+			ps_storage->sync() == 0 && begin_delete(901, 1, NULL),
+		  "A: corrupt the sibling's magic in place and begin deletion");
+	check(capture_stderr_maintenance(4, captured, sizeof(captured)),
+		  "A: capture stderr across 4 maintenance turns");
+	check(count_occurrences(captured, "deletion blocked") == 1,
+		  "A: the malformed-record diagnostic fires for timeline 901");
+	close_store();
+	remove_tree(storeA);
+
+	/* Store B: a fresh, unrelated store whose only DELETING timeline fails
+	 * for a reason that sets no tuple at all (an oversized segment).  Before
+	 * L1, cleanup_last_failure_valid was still whatever store A's scan left
+	 * it as, so this used to reprint store A's stale timeline-901 tuple
+	 * under timeline 902. */
+	configure_timeline_core();
+	segment_size = 32768;
+	flush_pages = 100;
+	check(mkdtemp(storeB) != NULL, "create store B");
+	check(ps_core_open(storeB) == 0 && create_branch(902, 0, 100) &&
+			write_timeline_layer(902, 0, 100) == 0,
+		  "B: write the target record");
+	check(ps_storage->seg_write(0, 0, segment_size, &sparse_tail,
+								sizeof(sparse_tail)) == 0 &&
+			ps_storage->sync() == 0 && begin_delete(902, 1, NULL),
+		  "B: extend the segment beyond segment_size and begin deletion");
+	check(capture_stderr_maintenance(4, captured, sizeof(captured)),
+		  "B: capture stderr across 4 maintenance turns");
+	check(count_occurrences(captured, "deletion blocked") == 0,
+		  "B: an oversized-segment failure sets no tuple, and store A's "
+		  "stale tuple must not be reprinted under timeline 902 (L1)");
+	close_store();
+	remove_tree(storeB);
+}
+
+/*
+ * L2 regression (review-driven, probe_d): timeline_cleanup_blocked_last[]
+ * dedups the "deletion blocked" diagnostic by (timeline, shard, seg, off,
+ * magic, len), once per distinct tuple.  Before L2, that per-timeline dedup
+ * entry was never reset on DELETED or on slot reuse: if a reused
+ * incarnation's own deletion later blocks on the exact same tuple its prior
+ * incarnation already logged, the diagnostic stays silent even though this
+ * is a brand new stall the operator has never been told about.
+ */
+static void
+test_deleting_timeline_page_cleanup_blocked_diagnostic_resets_on_reuse(void)
+{
+	char store[] = "/tmp/pagestore-timeline-blocked-reset-XXXXXX";
+	uint32_t bad_magic = 0xdeadbeefU;
+	uint32_t good_magic = 0;
+	char captured[8192];
+	int64_t off1;
+	PsTimelineState state;
+	uint64_t inc;
+
+	/* Timeline 903 is unused elsewhere in this suite (see the comment above
+	 * the previous test for why that matters to the dedup array). */
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 100;
+	check(mkdtemp(store) != NULL, "create blocked-diagnostic-reset store");
+	check(ps_core_open(store) == 0 && create_branch(903, 0, 100) &&
+			create_branch(913, 0, 100) &&
+			write_timeline_layer(903, 0, 100) == 0,
+		  "write the target record (incarnation 1)");
+	off1 = ps_storage->seg_size(0, 0);
+	check(write_timeline_layer(913, 1, 200) == 0 &&
+			ps_storage->seg_read(0, 0, (uint64_t) off1, &good_magic,
+								 sizeof(good_magic)) == 0,
+		  "write the sibling record and snapshot its live magic");
+	check(ps_storage->seg_write(0, 0, (uint64_t) off1, &bad_magic,
+								sizeof(bad_magic)) == 0 &&
+			ps_storage->sync() == 0 && begin_delete(903, 1, NULL),
+		  "corrupt the sibling's magic and begin deleting incarnation 1");
+	check(capture_stderr_maintenance(4, captured, sizeof(captured)),
+		  "capture stderr across 4 maintenance turns (incarnation 1)");
+	check(count_occurrences(captured, "deletion blocked") == 1,
+		  "incarnation 1's blocked deletion logs once");
+
+	/* Repair the corruption, let incarnation 1's deletion finish, and reuse
+	 * the slot as incarnation 2. */
+	check(ps_storage->seg_write(0, 0, (uint64_t) off1, &good_magic,
+								sizeof(good_magic)) == 0 &&
+			ps_storage->sync() == 0,
+		  "repair the corrupted magic");
+	for (int i = 0; i < 32; i++)
+		(void) ps_core_maintenance();
+	check(state_of(903, &state, &inc) && state == PS_TIMELINE_DELETED,
+		  "incarnation 1 reaches DELETED after repair");
+	check(create_branch_fenced(903, 0, 100, 2, 1),
+		  "reuse timeline 903's slot as incarnation 2");
+	check(state_of(903, &state, &inc) && state == PS_TIMELINE_LIVE &&
+			inc == 2,
+		  "incarnation 2 is LIVE");
+	check(write_timeline_layer(903, 3, 300) == 0, "incarnation 2 writes");
+
+	/* Corrupt the exact same (shard, seg, off) with the exact same magic
+	 * again, and delete incarnation 2: the dedup tuple is identical to the
+	 * one incarnation 1 already logged, so before L2 this stayed silent. */
+	check(ps_storage->seg_write(0, 0, (uint64_t) off1, &bad_magic,
+								sizeof(bad_magic)) == 0 &&
+			ps_storage->sync() == 0 && begin_delete(903, 2, NULL),
+		  "corrupt the same tuple again and begin deleting incarnation 2");
+	check(capture_stderr_maintenance(8, captured, sizeof(captured)),
+		  "capture stderr across 8 maintenance turns (incarnation 2)");
+	check(state_of(903, &state, &inc) && state == PS_TIMELINE_DELETING,
+		  "incarnation 2's deletion is blocked (DELETING)");
+	check(count_occurrences(captured, "deletion blocked") >= 1,
+		  "incarnation 2's blocked deletion logs at least once even though "
+		  "the tuple exactly matches incarnation 1's (L2)");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * L6 fail-before family, phase 2: flips the pre-fix expectation of the test
+ * above's original shape.  4 bytes of unknown-magic garbage installed
+ * exactly *at* the append cursor (never inside the reachable region) must
+ * not block the deletion at all -- it is beyond invariant I4's boundary R,
+ * bytes recover() never replayed and a later append is free to overwrite.
+ */
+static void
+test_deleting_timeline_page_cleanup_garbage_beyond_cursor_is_ignored(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-beyond-cursor-XXXXXX";
+	unsigned char page[8192];
+	uint32_t bad = 0xdeadbeefU;
+	int64_t valid_size;
+	int64_t after;
+	PsTimelineState state;
+
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 100;
+	check(mkdtemp(store) != NULL, "create beyond-cursor page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
 			write_timeline_layer(1, 0, 100) == 0 &&
 			write_timeline_layer(10, 1, 200) == 0,
-		  "write target and sibling before malformed tail");
+		  "write target and sibling before the garbage word");
 	valid_size = ps_storage->seg_size(0, 0);
 	check(valid_size > 0 &&
 			ps_storage->seg_write(0, 0, (uint64_t) valid_size, &bad,
 								 sizeof(bad)) == 0 && ps_storage->sync() == 0 &&
 			begin_delete(1, 1, NULL),
-		  "install a truncated record tail after BEGIN_DELETE target");
+		  "install 4 bytes of unknown-magic garbage exactly at the cursor, "
+		  "after BEGIN_DELETE target");
 	for (int i = 0; i < 16; i++)
 		(void) ps_core_maintenance();
-	check(ps_storage->seg_size(0, 0) == valid_size + (int64_t) sizeof(bad),
-		  "malformed segment cleanup stays fail-closed and retryable");
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "garbage beyond the cursor no longer stalls the deletion (L6)");
+	after = ps_storage->seg_size(0, 0);
+	check(after == valid_size + (int64_t) sizeof(bad),
+		  "the 4 bytes of garbage beyond the cursor are untouched");
+	check(count_segment_holes(0, 0, valid_size) == 1,
+		  "exactly the target record below the cursor becomes a hole");
 	memset(page, 0, sizeof(page));
-	check(read_test_page(1, 0, page) == 1,
-		  "failed cleanup retains the target until repair");
-	check(count_segment_holes(0, 0, valid_size) == 0,
-		  "the validate-only pass 1 rejection writes zero holes: pass 2 "
-		  "never runs on a malformed segment");
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+		  "sibling still served with garbage past the cursor");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0,
+		  "target gone with garbage past the cursor");
 	close_store();
 	remove_tree(store);
 }
@@ -3566,13 +3927,571 @@ test_deleting_timeline_page_cleanup_retired_short_segment(void)
 	remove_tree(store);
 }
 
+/*
+ * L6 fail-before: garbage after a torn tail, past the recovered append
+ * cursor, must not stall a timeline deletion forever (invariant I4, the
+ * reachable region).  A complete-looking SEG_ADMISSION header is appended
+ * after a clean close, followed by only 100 of its claimed page_size body
+ * bytes -- a torn record recover() already treats as end of log (it sets
+ * cur_off to the valid boundary and never replays past it), which pre-L6
+ * pass 1 failed closed on forever instead of also stopping there.
+ */
+static void
+test_deleting_timeline_page_cleanup_torn_tail(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-torn-tail-XXXXXX";
+	unsigned char page[8192];
+	unsigned char tail_before[256];
+	unsigned char tail_after[256];
+	PsTimelineState state;
+	TestSegRecHdr hdr;
+	uint64_t admission_seq = 77;
+	unsigned char body[100];
+	char seg_path[1400];
+	size_t torn_len;
+	int fd;
+	int64_t valid;
+	int64_t after;
+
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 1;
+	check(mkdtemp(store) != NULL, "create torn-tail page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(1, 0, 100) == 0 &&
+			write_timeline_layer(10, 1, 200) == 0 &&
+			write_timeline_layer(1, 2, 300) == 0,
+		  "write target, sibling, target (each flushed)");
+	valid = ps_storage->seg_size(0, 0);
+	check(valid > 0, "torn-tail segment has bytes before the torn record");
+	close_store();
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = TEST_SEG_ADMISSION_MAGIC;
+	hdr.timeline = 10;
+	hdr.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	hdr.block = 7;
+	hdr.lsn = 900;
+	hdr.len = page_size;
+	memset(body, 0xEE, sizeof(body));
+	torn_len = sizeof(hdr) + sizeof(admission_seq) + sizeof(body);
+	check(fixture_path(seg_path, sizeof(seg_path), store, "seg_00000000"),
+		  "build torn-tail segment path");
+	fd = open(seg_path, O_WRONLY | O_APPEND);
+	check(fd >= 0 &&
+			write(fd, &hdr, sizeof(hdr)) == (ssize_t) sizeof(hdr) &&
+			write(fd, &admission_seq, sizeof(admission_seq)) ==
+				(ssize_t) sizeof(admission_seq) &&
+			write(fd, body, sizeof(body)) == (ssize_t) sizeof(body) &&
+			fsync(fd) == 0 && close(fd) == 0,
+		  "install a complete-looking header with a torn body past the "
+		  "valid boundary");
+	fd = open(seg_path, O_RDONLY);
+	check(fd >= 0 &&
+			pread(fd, tail_before, torn_len, (off_t) valid) ==
+				(ssize_t) torn_len && close(fd) == 0,
+		  "snapshot the torn tail bytes before deletion");
+
+	check(ps_core_open(store) == 0,
+		  "reopen with the torn tail; recovery stops at it");
+	check(begin_delete(1, 1, NULL), "begin torn-tail target deletion");
+	for (int i = 0; i < 48; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "torn-tail garbage past the cursor does not stall the deletion");
+	after = ps_storage->seg_size(0, 0);
+	check(after == valid + (int64_t) torn_len,
+		  "torn-tail segment keeps its size, garbage untouched");
+	check(count_segment_holes(0, 0, valid) == 2,
+		  "exactly the two target records below the valid boundary become "
+		  "holes");
+	fd = open(seg_path, O_RDONLY);
+	check(fd >= 0 &&
+			pread(fd, tail_after, torn_len, (off_t) valid) ==
+				(ssize_t) torn_len && close(fd) == 0 &&
+			memcmp(tail_before, tail_after, torn_len) == 0,
+		  "no hole write ever lands on the torn tail bytes");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+		  "sibling still served after torn-tail cleanup");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0, "target block 0 gone");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 2, page) == 0, "target block 2 gone");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * L6 fail-before, sealed-segment shape: the torn tail lands in a segment
+ * that later rolls over to the next one, so it is no longer the *current*
+ * segment by the time cleanup runs and no cursor applies to it at all --
+ * the reachable-region boundary must come entirely from the same
+ * end-of-log parse recover() already trusts (I4), not just the cur_off
+ * clamp test (a) exercises.
+ */
+static void
+test_deleting_timeline_page_cleanup_sealed_torn_tail(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-sealed-torn-XXXXXX";
+	unsigned char page[8192];
+	PsTimelineState state;
+	TestSegRecHdr hdr;
+	uint64_t admission_seq = 55;
+	unsigned char body[100];
+	char seg_path[1400];
+	size_t torn_len;
+	int fd;
+	int64_t before_torn;
+	int64_t after_torn;
+	int64_t seg0_final;
+
+	configure_timeline_core();
+	segment_size = 20000;
+	flush_pages = 1;
+	check(mkdtemp(store) != NULL, "create sealed-torn-tail page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(1, 0, 100) == 0 &&
+			write_timeline_layer(10, 1, 200) == 0,
+		  "write target and sibling filling most of segment 0");
+	before_torn = ps_storage->seg_size(0, 0);
+	check(before_torn > 0 && before_torn < (int64_t) segment_size,
+		  "segment 0 has room left before the torn record");
+	close_store();
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = TEST_SEG_ADMISSION_MAGIC;
+	hdr.timeline = 10;
+	hdr.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	hdr.block = 9;
+	hdr.lsn = 900;
+	hdr.len = page_size;
+	memset(body, 0xEE, sizeof(body));
+	torn_len = sizeof(hdr) + sizeof(admission_seq) + sizeof(body);
+	check(fixture_path(seg_path, sizeof(seg_path), store, "seg_00000000"),
+		  "build sealed-segment path");
+	fd = open(seg_path, O_WRONLY | O_APPEND);
+	check(fd >= 0 &&
+			write(fd, &hdr, sizeof(hdr)) == (ssize_t) sizeof(hdr) &&
+			write(fd, &admission_seq, sizeof(admission_seq)) ==
+				(ssize_t) sizeof(admission_seq) &&
+			write(fd, body, sizeof(body)) == (ssize_t) sizeof(body) &&
+			fsync(fd) == 0 && close(fd) == 0,
+		  "append a torn record to segment 0 before it rolls over");
+	after_torn = before_torn + (int64_t) torn_len;
+
+	check(ps_core_open(store) == 0,
+		  "reopen with the torn tail; recovery's cursor stays at "
+		  "before_torn");
+	/* One more sibling page no longer fits segment 0 (before_torn + its own
+	 * record size > segment_size), so append_page_impl() rolls to segment 1
+	 * -- sealing segment 0 with the torn record physically past its own
+	 * (now-frozen) cursor. */
+	check(write_timeline_layer(10, 2, 300) == 0 &&
+			ps_storage->seg_size(0, 0) == after_torn &&
+			ps_storage->seg_size(0, 1) > 0,
+		  "the next sibling write rolls to segment 1, sealing segment 0");
+	check(begin_delete(1, 1, NULL), "begin sealed-segment target deletion");
+	for (int i = 0; i < 48; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "a sealed segment's torn tail does not stall the deletion");
+	seg0_final = ps_storage->seg_size(0, 0);
+	check(seg0_final == after_torn,
+		  "sealed segment 0 keeps its size, torn tail untouched");
+	check(count_segment_holes(0, 0, before_torn) == 1,
+		  "sealed segment 0 gets exactly the target's hole");
+	check(count_segment_holes(0, 1, ps_storage->seg_size(0, 1)) == 0,
+		  "segment 1 is untouched by cleanup of segment 0's target record");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+		  "sealed-segment sibling still served after cleanup");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 2, page) == 1 && page[100] == 0x5A,
+		  "rolled-over sibling in segment 1 still served after cleanup");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0,
+		  "target gone after sealed-segment cleanup");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * L6 fail-before, retired shape (use_layers=0): the same missing-marker
+ * retirement as test_deleting_timeline_page_cleanup_retired_short_segment()
+ * (recovery sets cur_off == segment_size even though the file is
+ * physically short), plus a torn record appended after close.  A retired
+ * segment's cur_off carries no boundary information about the segment
+ * itself (I4: "there is no cur_off bound for a retired/sealed segment"), so
+ * this exercises the reachable-region parser with no cursor clamp helping
+ * it at all -- unlike test (a), where the clamp alone would already be
+ * enough.
+ */
+static void
+test_deleting_timeline_page_cleanup_retired_torn_tail(void)
+{
+	char store[] = "/tmp/pagestore-timeline-retired-torn-XXXXXX";
+	unsigned char page[8192];
+	PsTimelineState state;
+	TestSegRecHdr hdr;
+	uint64_t admission_seq = 33;
+	unsigned char body[100];
+	char seg_path[1400];
+	size_t torn_len;
+	int fd;
+	int64_t before;
+	int64_t after;
+
+	configure_timeline_core();
+	segment_size = 32768;
+	flush_pages = 100;
+	use_layers = 0; /* keep the recovery case on the physical segment path */
+	check(mkdtemp(store) != NULL, "create retired-torn page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(10, 1, 50) == 0 &&
+			write_timeline_layer(1, 0, 100) == 0,
+		  "write sibling and target into one short segment");
+	before = ps_storage->seg_size(0, 0);
+	check(before > 0 && before < (int64_t) segment_size &&
+			count_segment_holes(0, 0, before) == 0 &&
+			begin_delete(1, 1, NULL) && ps_storage->sync() == 0,
+		  "begin deletion before simulating a missing ordered marker and "
+		  "the torn tail, no holes yet");
+	close_store();
+	check(strip_ordered_markers(store, 10) == 0,
+		  "remove only the live sibling ordered forkmeta marker");
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = TEST_SEG_ADMISSION_MAGIC;
+	hdr.timeline = 10;
+	hdr.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	hdr.block = 9;
+	hdr.lsn = 900;
+	hdr.len = page_size;
+	memset(body, 0xEE, sizeof(body));
+	torn_len = sizeof(hdr) + sizeof(admission_seq) + sizeof(body);
+	check(fixture_path(seg_path, sizeof(seg_path), store, "seg_00000000"),
+		  "build retired-segment path");
+	fd = open(seg_path, O_WRONLY | O_APPEND);
+	check(fd >= 0 &&
+			write(fd, &hdr, sizeof(hdr)) == (ssize_t) sizeof(hdr) &&
+			write(fd, &admission_seq, sizeof(admission_seq)) ==
+				(ssize_t) sizeof(admission_seq) &&
+			write(fd, body, sizeof(body)) == (ssize_t) sizeof(body) &&
+			fsync(fd) == 0 && close(fd) == 0,
+		  "append a torn record after the retired segment's valid bytes");
+
+	check(ps_core_open(store) == 0,
+		  "restart accepts a short retired segment with a torn tail");
+	for (int i = 0; i < 32; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "a retired segment's torn tail does not stall the deletion");
+	after = ps_storage->seg_size(0, 0);
+	check(after == before + (int64_t) torn_len,
+		  "retired segment keeps its size, torn tail untouched");
+	check(count_segment_holes(0, 0, before) == 1,
+		  "retired-segment cleanup leaves exactly the target's hole");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0,
+		  "target gone after retired-segment cleanup");
+
+	/* The sentinel must survive: a subsequent live write still rolls to
+	 * segment 1 instead of appending after the (still physically present)
+	 * torn tail. */
+	check(write_timeline_layer(10, 2, 300) == 0 &&
+			ps_storage->seg_size(0, 0) == after &&
+			ps_storage->seg_size(0, 1) > 0,
+		  "next write still rolls past the retired compacted segment");
+	close_store();
+	check(ps_core_open(store) == 0,
+		  "restart after retired-segment cleanup and rolled append");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 2, page) == 1 && page[100] == 0x5A,
+		  "rolled append survives retired-segment recovery");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * L6 fail-before, SPDK shape on POSIX: an unwritten tail reads back as
+ * zeros (storage_spdk.c's every-segment-reports-g_segsize behavior).  Magic
+ * 0 was already recover()'s end-of-log rule (I4); pre-L6 pass 1 treated it
+ * as an unrecognized magic and failed closed forever instead.
+ */
+static void
+test_deleting_timeline_page_cleanup_zero_tail(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-zero-tail-XXXXXX";
+	unsigned char page[8192];
+	unsigned char zeros[4096];
+	unsigned char tail_before[4096];
+	unsigned char tail_after[4096];
+	PsTimelineState state;
+	char seg_path[1400];
+	int fd;
+	int64_t valid;
+	int64_t after;
+
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 1;
+	check(mkdtemp(store) != NULL, "create zero-tail page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(1, 0, 100) == 0 &&
+			write_timeline_layer(10, 1, 200) == 0,
+		  "write target and sibling before the zero-padded tail");
+	valid = ps_storage->seg_size(0, 0);
+	check(valid > 0, "zero-tail segment has bytes");
+	close_store();
+
+	memset(zeros, 0, sizeof(zeros));
+	check(fixture_path(seg_path, sizeof(seg_path), store, "seg_00000000"),
+		  "build zero-tail segment path");
+	check(append_bytes(seg_path, zeros, sizeof(zeros)) == 0,
+		  "append an SPDK-shaped zero-padded tail");
+	fd = open(seg_path, O_RDONLY);
+	check(fd >= 0 &&
+			pread(fd, tail_before, sizeof(tail_before), (off_t) valid) ==
+				(ssize_t) sizeof(tail_before) && close(fd) == 0,
+		  "snapshot the zero tail before deletion");
+
+	check(ps_core_open(store) == 0,
+		  "reopen with the zero tail; recovery stops at magic 0");
+	check(begin_delete(1, 1, NULL), "begin zero-tail target deletion");
+	for (int i = 0; i < 48; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "a zero-padded tail does not stall the deletion");
+	after = ps_storage->seg_size(0, 0);
+	check(after == valid + (int64_t) sizeof(zeros),
+		  "zero-tail segment keeps its size");
+	check(count_segment_holes(0, 0, valid) == 1,
+		  "exactly the target record below the zeros becomes a hole");
+	fd = open(seg_path, O_RDONLY);
+	check(fd >= 0 &&
+			pread(fd, tail_after, sizeof(tail_after), (off_t) valid) ==
+				(ssize_t) sizeof(tail_after) && close(fd) == 0 &&
+			memcmp(tail_before, tail_after, sizeof(tail_after)) == 0,
+		  "the zero tail itself is never written");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+		  "sibling still served after zero-tail cleanup");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0,
+		  "target gone after zero-tail cleanup");
+	close_store();
+	remove_tree(store);
+}
+
+/*
+ * M1 regression (review-driven, probe_b): recover() does not start the
+ * watermark segment's scan at 0 -- it starts at flush_watermark.seg_off,
+ * since segments are not synced before ps_manifest_set_flush_watermark()
+ * durably records that cursor.  Before M1, pass 1 treated any end-of-log
+ * shape as the unconditional end of the reachable region, including one
+ * found *below* the watermark (a header sector lost to a crash while the
+ * pages after it and the watermark itself both survived).  That let a
+ * deletion report success while a live, recover()-replayable target record
+ * at/after the watermark was still untouched; a later reuse of the same
+ * timeline slot then silently resurrected the deleted incarnation's data
+ * on the next real restart.  This forks so the restart half genuinely
+ * re-derives state from the persisted manifest/watermark in a fresh
+ * process image -- a same-process close_store() would flush the
+ * deliberately-unflushed block-2 write this setup depends on and move the
+ * watermark past the bug entirely, per ps_core_close()'s "flush the
+ * memtable, commit its coverage watermark" contract.
+ */
+static void
+test_deleting_timeline_page_cleanup_below_watermark_no_resurrection(void)
+{
+	char store[] = "/tmp/pagestore-timeline-below-wm-XXXXXX";
+	unsigned char page[8192];
+	PsTimelineState state;
+	uint64_t inc;
+	pid_t pid;
+	int status;
+
+	check(mkdtemp(store) != NULL,
+		  "create below-watermark torn-tail regression store");
+
+	pid = fork();
+	if (pid == 0)
+	{
+		unsigned char zeros[4096];
+		int64_t off_sib;
+		PsTimelineState cstate;
+		uint64_t cinc;
+
+		configure_timeline_core();
+		segment_size = 1024 * 1024;
+		flush_pages = 2;
+		if (ps_core_open(store) != 0 || !create_branch(1, 0, 100) ||
+			!create_branch(10, 0, 100))
+			_exit(1);
+		if (write_timeline_layer(1, 0, 100) != 0)	/* target: memtable (1 of 2) */
+			_exit(2);
+		off_sib = ps_storage->seg_size(0, 0);
+		if (write_timeline_layer(10, 1, 200) != 0)	/* sibling: flush advances W */
+			_exit(3);
+		if (write_timeline_layer(1, 2, 300) != 0)	/* target: below the next flush */
+			_exit(4);
+		/* Power-loss shape: the sibling's header sector is lost (reads as
+		 * zeros) while the target's second record and the flush watermark
+		 * (set when the sibling's write flushed) both survived. */
+		memset(zeros, 0, sizeof(zeros));
+		if (ps_storage->seg_write(0, 0, (uint64_t) off_sib, zeros,
+								  sizeof(zeros)) != 0 ||
+			ps_storage->sync() != 0)
+			_exit(5);
+		if (!begin_delete(1, 1, NULL))
+			_exit(6);
+		for (int i = 0; i < 64; i++)
+			(void) ps_core_maintenance();
+		if (!state_of(1, &cstate, NULL) || cstate != PS_TIMELINE_DELETED)
+			_exit(7);
+		/* Slot reuse: incarnation 2 of the same timeline. */
+		if (!create_branch_fenced(1, 0, 100, 2, 1))
+			_exit(8);
+		if (!state_of(1, &cstate, &cinc) || cstate != PS_TIMELINE_LIVE ||
+			cinc != 2)
+			_exit(9);
+		/* Crash-shaped exit: no clean close, no final memtable flush -- a
+		 * clean close would flush the still-unflushed block-2 write and
+		 * move the watermark past this setup entirely (see the comment
+		 * above the function). */
+		_exit(0);
+	}
+	check(pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+			WEXITSTATUS(status) == 0,
+		  "child sets up the below-watermark torn tail, deletes the "
+		  "target, and reuses the timeline slot");
+
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 1;
+	check(ps_core_open(store) == 0,
+		  "restart re-derives state from the persisted watermark");
+	check(state_of(1, &state, &inc) && state == PS_TIMELINE_LIVE && inc == 2,
+		  "reused timeline is incarnation 2, LIVE, after restart");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 2, page) == 0,
+		  "reused incarnation must not resurrect the deleted incarnation's "
+		  "block 2 after a real restart");
+	check(write_timeline_layer(1, 5, 500) == 0,
+		  "reused incarnation extends the same relation with block 5");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 2, page) == 0,
+		  "old incarnation's block 2 still must not resurface once the "
+		  "reused incarnation has written further pages");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_timeline_seqcap_format(void)
+{
+	char store[] = "/tmp/pagestore-timeline-seqcap-XXXXXX";
+	char path[512];
+	TestTimelineEventV2 old;
+	TestTimelineEvent current, mutation;
+	PsTimelineState state;
+	uint64_t incarnation;
+	struct stat st;
+	int fd;
+
+	configure_timeline_core();
+	check(mkdtemp(store) != NULL, "create seqcap format store");
+	(void) snprintf(path, sizeof(path), "%s/timelines", store);
+	memset(&old, 0, sizeof(old));
+	old.magic = TEST_TIMELINE_MAGIC;
+	old.rec_len = sizeof(old);
+	old.kind = 1;
+	old.id = 1;
+	old.parent = 0;
+	old.state = PS_TIMELINE_LIVE;
+	old.branch_lsn = 100;
+	old.incarnation = old.parent_incarnation = 1;
+	old.crc = fnv(&old, sizeof(old));
+	check(write_bytes(path, &old, sizeof(old)) == 0 && ps_core_open(store) == 0,
+		  "load pre-cap 56-byte lifecycle record");
+	check(create_branch(2, 1, 110), "append cap-format child to legacy log");
+	close_store();
+	fd = open(path, O_RDONLY);
+	check(fd >= 0 && pread(fd, &current, sizeof(current), sizeof(old) + 3 * sizeof(current)) ==
+		  (ssize_t) sizeof(current), "read 64-byte cap-format create");
+	if (fd >= 0)
+		(void) close(fd);
+	check(current.rec_len == 64 && current.branch_seq == UINT64_MAX &&
+		  current.id == 2 && current.parent_incarnation == 1,
+		  "new creates persist an unbounded edge cap");
+	check(ps_core_open(store) == 0 && begin_delete(2, 1, NULL),
+		  "mixed lifecycle log supports deletion");
+	for (int i = 0; i < 16; i++)
+		(void) ps_core_maintenance();
+	check(state_of(2, &state, &incarnation) && state == PS_TIMELINE_DELETED &&
+		  create_branch_fenced(2, 1, 120, 2, 1),
+		  "cap-format timeline can be reused after deletion");
+	close_store();
+	check(ps_core_open(store) == 0 && state_of(2, &state, &incarnation) &&
+		  state == PS_TIMELINE_LIVE && incarnation == 2,
+		  "mixed cap-format states and reused create survive restart");
+	close_store();
+
+	/* Valid checksums must not let unsupported semantics through, and a
+	 * rejected complete record must never be repaired as a torn tail. */
+	for (int i = 0; i < 5; i++)
+	{
+		mutation = current;
+		if (i == 0)
+			mutation.branch_seq = 0;
+		else if (i == 1)
+			mutation.branch_seq = UINT64_MAX - 1;
+		else if (i == 2)
+			mutation.kind = 3; /* CAP_ACTIVATION */
+		else if (i == 3)
+			mutation.reserved = 1;
+		mutation.crc = 0;
+		mutation.crc = fnv(&mutation, sizeof(mutation));
+		if (i == 4)
+			mutation.crc ^= 1;
+		check(write_bytes(path, &old, sizeof(old)) == 0 &&
+			  append_bytes(path, &mutation, sizeof(mutation)) == 0 &&
+			  expect_open_failure(store),
+			  "unsupported cap, activation, reserved field or CRC fails closed");
+		check(stat(path, &st) == 0 && st.st_size ==
+			  (off_t) (sizeof(old) + sizeof(mutation)),
+			  "failed cap-format replay preserves complete log bytes");
+	}
+	for (int len = 1; len < (int) sizeof(current); len++)
+	{
+		check(write_bytes(path, &old, sizeof(old)) == 0 &&
+			  append_bytes(path, &current, len) == 0 && ps_core_open(store) == 0,
+			  "every incomplete cap-format tail preserves the legacy prefix");
+		close_store();
+		check(stat(path, &st) == 0 && st.st_size == (off_t) (sizeof(old) + 3 * sizeof(current)),
+			  "incomplete cap-format tail is truncated at its record boundary");
+	}
+	/* Old complete records must be checked before conversion to V3. */
+	old.crc ^= 1;
+	check(write_bytes(path, &old, sizeof(old)) == 0 && expect_open_failure(store),
+		  "legacy lifecycle CRC remains mandatory during cap normalization");
+	remove_tree(store);
+}
+
 int
 main(void)
 {
+	test_timeline_seqcap_format();
 	test_old_event_replay_derives_reused_parent_incarnation();
 	test_legacy_migration_and_parser_fail_closed();
 	test_delete_discards_unflushed_memtable();
 	test_deleting_timeline_wal_cleanup();
+	test_walidx_publish_no_race_publishes_once();
 	test_deletion_requires_durable_forkmeta();
 	test_deletion_state_append_failure();
 	test_timeline_incarnation_reuse();
@@ -3581,9 +4500,17 @@ main(void)
 	test_deleting_timeline_page_cleanup_backpressure_debt();
 	test_deleting_timeline_page_cleanup_pending_remove();
 	test_deleting_timeline_page_cleanup_fail_closed();
+	test_deleting_timeline_page_cleanup_stale_failure_not_reattributed();
+	test_deleting_timeline_page_cleanup_blocked_diagnostic_resets_on_reuse();
 	test_deleting_timeline_page_cleanup_oversized();
 	test_deleting_timeline_page_cleanup_prefix_hole();
 	test_deleting_timeline_page_cleanup_retired_short_segment();
+	test_deleting_timeline_page_cleanup_torn_tail();
+	test_deleting_timeline_page_cleanup_sealed_torn_tail();
+	test_deleting_timeline_page_cleanup_retired_torn_tail();
+	test_deleting_timeline_page_cleanup_zero_tail();
+	test_deleting_timeline_page_cleanup_below_watermark_no_resurrection();
+	test_deleting_timeline_page_cleanup_garbage_beyond_cursor_is_ignored();
 	test_v2_and_mixed_lifecycle();
 	test_relation_inspection_forkmeta_poison();
 	test_relation_inspection_rejects_non_live_timeline();

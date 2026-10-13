@@ -24,7 +24,7 @@
 #define MATRIX_KEYS 24
 #define TEST_FORK_META_V2_MAGIC UINT32_C(0x324d4b46)
 #define TEST_FORK_META_V3_MAGIC UINT32_C(0x334d4b46)
-#define TEST_FORK_META_MAGIC_OK(m) ((m) == TEST_FORK_META_V2_MAGIC || (m) == TEST_FORK_META_V3_MAGIC)
+#define TEST_FORK_META_MAGIC_OK(m) ((m) == TEST_FORK_META_V2_MAGIC || ((m) == TEST_FORK_META_V3_MAGIC || (m) == 0x344d4b46U))
 #define TEST_MAX_TIMELINES 1024
 #define TEST_FEV_SNAPSHOT_BASE 10
 #define TEST_FEV_GROW 0
@@ -768,7 +768,7 @@ source_epoch_matches_selected(const char *store, const char *snapshots,
 		 * and fork_meta_ordered_marker_valid() in pagestore_core.c.  In
 		 * particular, only bound ordered markers are accepted in a selected
 		 * suffix; ordinary records may not carry an order id. */
-		switch (rec.kind)
+		switch (rec.kind & 0x3f)
 		{
 			case TEST_FEV_GROW:
 				if (rec.order_id != 0 || rec.nblocks == 0)
@@ -982,7 +982,7 @@ count_event_in_part(int fd, const PsKey *key, uint8_t kind, uint64_t lsn,
 		if (pread(fd, &rec, sizeof(rec), offset) != (ssize_t) sizeof(rec) ||
 			!TEST_FORK_META_MAGIC_OK(rec.magic) || rec.rec_len != sizeof(rec))
 			return -1;
-		if (rec.kind == kind && rec.lsn == lsn &&
+		if ((rec.kind & 0x3f) == kind && rec.lsn == lsn &&
 			memcmp(&rec.key, key, sizeof(*key)) == 0)
 		{
 			if (rec.nblocks != nblocks)
@@ -1050,7 +1050,7 @@ count_acked_event(const char *store, const char *snapshots, const PsKey *key,
 		if (pread(fd, &rec, sizeof(rec), offset) != (ssize_t) sizeof(rec) ||
 			!TEST_FORK_META_MAGIC_OK(rec.magic) || rec.rec_len != sizeof(rec))
 			goto done;
-		if (rec.kind == kind && rec.lsn == lsn &&
+		if ((rec.kind & 0x3f) == kind && rec.lsn == lsn &&
 			memcmp(&rec.key, key, sizeof(*key)) == 0)
 		{
 			if (rec.nblocks != nblocks)
@@ -1345,7 +1345,7 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 			int counted;
 
 			check(ack->key_index == MATRIX_KEYS, "acknowledged event names the appender's key");
-			if (ack->kind == TEST_FEV_GROW)
+			if ((ack->kind & 0x3f) == TEST_FEV_GROW)
 			{
 				if (meta_request(PS_OP_NBLOCKS, &own, 0, 0, &reply) &&
 					reply.result == ack->nblocks)
@@ -1367,7 +1367,7 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 				dprintf(STDERR_FILENO, "ack record count case=%d kind=%u counted=%d records=%llu\n",
 						(int) which, ack->kind, counted, (unsigned long long) records);
 			check(counted && records == 1,
-				  ack->kind == TEST_FEV_GROW ?
+				  (ack->kind & 0x3f) == TEST_FEV_GROW ?
 				  "acknowledged growth is recorded exactly once in what recovery composes" :
 				  "acknowledged create is recorded exactly once in what recovery composes");
 		}

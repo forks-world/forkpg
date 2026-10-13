@@ -68,6 +68,19 @@ on_signal(int sig)
 	stop_requested = 1;
 }
 
+static int
+set_shm_lock(int fd, off_t byte, short type)
+{
+	struct flock lock;
+
+	memset(&lock, 0, sizeof(lock));
+	lock.l_type = type;
+	lock.l_whence = SEEK_SET;
+	lock.l_start = byte;
+	lock.l_len = 1;
+	return fcntl(fd, F_SETLK, &lock);
+}
+
 static void
 shm_mark_starting(PsShmHeader *hdr)
 {
@@ -239,7 +252,7 @@ inspection_completion_required(PsOpcode opcode)
  * writes) normally finish and publish DONE here; inspection-affecting metadata
  * callers pass defer_done so run_request() can publish after the post-lock
  * inspection hook.  Read ops submit their page reads and return, leaving DONE
- * to read_done().  Index pointers from read_through() are dereferenced
+ * to read_done().  Index pointers from read_through_checked() are dereferenced
  * (seg/off taken) synchronously here, never held across the async wait, so a
  * concurrent write reallocating a version array cannot dangle them.
  */
@@ -250,6 +263,19 @@ begin(uint32_t i, PsChannel *ch, int defer_done)
 
 	ch->status = PS_STATUS_OK;
 	ch->result = 0;
+	/* Refuse an out-of-range WRITEV/READV nblocks before either loop below
+	 * (here or in read_done()/read completions) walks ch->data by it -- see
+	 * ps_request_payload_fits() in pagestore_core.c.  Must run before
+	 * anything else touches ch->data, including ps_handle_meta() below
+	 * (which applies the same check to WAL_APPEND/WAL_READ).  READV also
+	 * keeps its own MAX_BLOCKS check further down: that bounds a distinct
+	 * fixed array (ReqState.blk[]), unrelated to PS_IO_UNIT. */
+	if (!ps_request_payload_fits(ch))
+	{
+		ch->status = PS_STATUS_ERROR;
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		return;
+	}
 	if ((ch->opcode == PS_OP_EXTEND || ch->opcode == PS_OP_WRITEV ||
 		 ch->opcode == PS_OP_READV || ch->opcode == PS_OP_READ_AT) &&
 		!ps_timeline_request_allowed(tl, ch->incarnation))
@@ -310,12 +336,18 @@ begin(uint32_t i, PsChannel *ch, int defer_done)
 					uint32_t	blk = ch->blocknum + b;
 					/* req_lsn nonzero = a pinned reader's horizon cap;
 					 * 0 keeps the newest (writer) semantics */
-					PageVer    *v = read_through(tl, &ch->key, blk,
+					PageVer    *v;
+					int			result = read_through_checked(tl, &ch->key, blk,
 											 ch->req_lsn ? ch->req_lsn
 											 : UINT64_MAX,
-											 ch->req_seq);
+											 ch->req_seq, &v);
 					BlkCtx	   *bc;
 
+					if (result < 0)
+					{
+						ch->status = PS_STATUS_ERROR;
+						break;
+					}
 					if (!v)
 					{
 						memset(dst, 0, page_size);	/* unwritten -> zeros */
@@ -350,11 +382,18 @@ begin(uint32_t i, PsChannel *ch, int defer_done)
 		case PS_OP_READ_AT:
 			{
 				uint64_t	read_lsn = ch->req_lsn;
-				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
-										 read_lsn, ch->req_seq);
+				PageVer    *v;
+				int			result = read_through_checked(tl, &ch->key, ch->blocknum,
+										 read_lsn, ch->req_seq, &v);
 				ReqState   *rs = &reqstate[i];
 				BlkCtx	   *bc;
 
+				if (result < 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					ps_store_release(&ch->state, PS_STATE_DONE);
+					return;
+				}
 				if (!v)
 				{
 					memset(ch->data, 0, page_size);		/* not found: result 0 */
@@ -416,6 +455,18 @@ relation_request_lsn(const PsChannel *ch)
 		uint32_t	npages = op == PS_OP_EXTEND ? 1 : ch->nblocks;
 		uint64_t	lowest = UINT64_MAX;
 
+		/*
+		 * This runs ahead of begin()'s ps_request_payload_fits() check, from
+		 * run_request()'s admission-fence gate: an out-of-range WRITEV
+		 * nblocks must not walk ch->data by it here either.  Answer
+		 * UINT64_MAX (no fence-relevant LSN found) without touching the
+		 * buffer; the request is then admitted and promptly refused by
+		 * begin()'s own check.  EXTEND's npages is always 1 and needs no
+		 * such guard (see ps_request_payload_fits()).
+		 */
+		if (op == PS_OP_WRITEV && !ps_request_payload_fits(ch))
+			return UINT64_MAX;
+
 		for (uint32_t i = 0; i < npages; i++)
 		{
 			uint32_t	hi,
@@ -453,6 +504,34 @@ active_fence_epoch(void)
 		return 0;
 	}
 	return epoch;
+}
+
+/*
+ * Which shard's lock (if any single one) guards this request.  Mirrors the
+ * POSIX frontend's derivation in run_request_admitted() (pagestore_daemon.c):
+ * most ops are keyed by ch->key, but the shipped-WAL byte ops (WAL_APPEND/
+ * WAL_SIZE/WAL_READ) touch a per-timeline log rather than per-key page state
+ * and are not reliably keyed by the caller, so they serialize on shard 0; the
+ * floor queries scan the fixed control object, so their shard is derived from
+ * a synthetic control key rather than trusting ch->key to be pre-filled.
+ */
+static uint32_t
+request_shard(const PsChannel *ch)
+{
+	PsOpcode	op = (PsOpcode) ch->opcode;
+
+	if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ ||
+		op == PS_OP_WAL_INDEX_PROGRESS)
+		return 0;
+	if (op == PS_OP_WAL_RETAIN_FLOOR || op == PS_OP_RETENTION_FLOOR)
+	{
+		PsKey		ctlkey;
+
+		memset(&ctlkey, 0, sizeof(ctlkey));
+		ctlkey.klass = PS_KLASS_CONTROL;
+		return ps_shard_of(&ctlkey);
+	}
+	return ps_shard_of(&ch->key);
 }
 
 static int
@@ -517,7 +596,8 @@ run_request(uint32_t i, PsChannel *ch)
 		pthread_rwlock_wrlock(&core_rwlock);
 		ch->status = PS_STATUS_OK;
 		ch->result = 0;
-		ch->req_seq = ps_admission_barrier();
+		ch->req_seq = ch->is_redo == PS_BARRIER_REGISTER ?
+			ps_admission_barrier_register(ch->timeline, ch->req_lsn) : 0;
 		if (ch->req_seq == 0)
 			ch->status = PS_STATUS_ERROR;
 		ps_store_release(&ch->state, PS_STATE_DONE);
@@ -543,19 +623,75 @@ run_request(uint32_t i, PsChannel *ch)
 		pthread_rwlock_rdlock(&core_rwlock);
 	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
 		op == PS_OP_REQUIRE_BRANCH)
+	{
+		/*
+		 * CREATE_BRANCH/CHECK_BRANCH/REQUIRE_BRANCH mutate only timelines[]
+		 * under map_wr, not any shard's page/fork state -- unlike the POSIX
+		 * frontend's CREATE_BRANCH, which additionally takes every shard's
+		 * write lock to purge per-shard incarnation-local indexes/caches
+		 * when *reusing* a deleted timeline's incarnation.  That reuse path
+		 * (timeline_reset_reuse_runtime(), driven by an incarnation > 1
+		 * request) is already refused above, before this point, for both
+		 * ops in this SPDK frontend, so it can never run here and no shard
+		 * lock is needed.
+		 */
 		ps_lock_map_wr();
-	/* WAL-index inserts complete synchronously in ps_handle_meta().  Match the
-	 * POSIX frontend's shard exclusion so snapshot/prune maintenance and a
-	 * future retained-base publisher cannot race the batch admission or its
-	 * in-memory insertion.  Do not extend this lock across async page I/O. */
-	if (op == PS_OP_WAL_INDEX_ADD || op == PS_OP_WAL_INDEX_ADD_BATCH)
-		ps_lock_shard_wr(ps_shard_of(&ch->key));
-	begin(i, ch, inspection_completion_required(op));
-	if (op == PS_OP_WAL_INDEX_ADD || op == PS_OP_WAL_INDEX_ADD_BATCH)
-		ps_unlock_shard(ps_shard_of(&ch->key));
-	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
-		op == PS_OP_REQUIRE_BRANCH)
+		begin(i, ch, inspection_completion_required(op));
 		ps_unlock_map();
+	}
+	else if (op == PS_OP_IMMEDSYNC)
+	{
+		/*
+		 * storage_spdk's sync() flushes every shard's in-memory curbuf --
+		 * state a concurrent shard write or maintenance() prune/flush
+		 * mutates -- so no single shard's write lock excludes that the way
+		 * it does for every other write op below.  Match the POSIX
+		 * frontend's SPDK-storage branch (pagestore_daemon.c,
+		 * ps_storage->sync_needs_write_lock) and take every shard's write
+		 * lock, ascending: the shard lock order already used throughout
+		 * this file (see maintenance_worker()/core's own multi-shard ops).
+		 */
+		uint32_t	s;
+
+		for (s = 0; s < ps_nshards; s++)
+			ps_lock_shard_wr(s);
+		begin(i, ch, inspection_completion_required(op));
+		for (s = ps_nshards; s-- > 0;)
+			ps_unlock_shard(s);
+	}
+	else
+	{
+		/*
+		 * Every other op that reaches ps_handle_meta()/append_page() through
+		 * begin() touches this shard's state (page/fork version chains,
+		 * WAL-index entries, or the append cursor s->cur_off) with no
+		 * locking of its own -- append_page_impl() documents holding this
+		 * lock as its caller's responsibility, and walidx_add()/
+		 * walidx_add_batch_locked() (WAL_INDEX_ADD[_BATCH]) rely on it the
+		 * same way.  maintenance_worker() below takes each shard's write
+		 * lock for prune/flush without going through core_rwlock, so
+		 * without this lock it can run concurrently with an insert on the
+		 * same shard and race its version chain and cur_off.  Reads walk
+		 * that same chain in read_through_checked() with no locking of
+		 * their own either, so they need the same exclusion while
+		 * resolving it (page_find()/page_visible(), and dereferencing a
+		 * version's seg/off -- see begin()'s header comment).  Match the
+		 * POSIX frontend's shard exclusion (pagestore_daemon.c's
+		 * request_is_write branch) with shard-wr for writes, shard-rd for
+		 * reads.  Dropped at the same point core_rwlock is below, before
+		 * any asynchronous device I/O begin() may have queued: identical
+		 * scope to what core_rwlock already had, so this adds no new
+		 * across-the-async-wait exposure.
+		 */
+		uint32_t	shard = request_shard(ch);
+
+		if (is_write)
+			ps_lock_shard_wr(shard);
+		else
+			ps_lock_shard_rd(shard);
+		begin(i, ch, inspection_completion_required(op));
+		ps_unlock_shard(shard);
+	}
 	if (is_write)
 		ps_admission_read_unlock();
 	pthread_rwlock_unlock(&core_rwlock);
@@ -770,6 +906,56 @@ main(int argc, char **argv)
 		perror("shm_open");
 		return 1;
 	}
+	/*
+	 * Same ownership protocol as the POSIX daemon: byte zero is held through
+	 * initialization until READY, byte one for the process lifetime.  Clients
+	 * treat a READY header as live only under that lease, so fd stays open
+	 * (closing it would drop both locks).
+	 *
+	 * Clients now briefly take a *shared* lock on byte zero while checking
+	 * readiness (ps_shm_hold_init_shared(), see pagestore_shm.h), so retry
+	 * byte zero with a bounded wait (~10ms steps, ~10s total) instead of
+	 * failing on the first collision with such a transient hold.  Byte one
+	 * (the lease) is still refused immediately: another daemon already
+	 * holding it is a real conflict.
+	 */
+	{
+		int			attempt;
+		int			acquired = 0;
+
+		for (attempt = 0; attempt < 1000; attempt++)
+		{
+			if (set_shm_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) == 0)
+			{
+				acquired = 1;
+				break;
+			}
+			if (errno != EACCES && errno != EAGAIN)
+				break;
+			{
+				struct timespec ts = {0, 10000000};	/* 10ms */
+
+				nanosleep(&ts, NULL);
+			}
+		}
+		if (!acquired)
+		{
+			if (errno == EACCES || errno == EAGAIN)
+				fprintf(stderr, "pagestore_daemon_spdk: another process owns the shm lease\n");
+			else
+				perror("pagestore_daemon_spdk: fcntl shm lease");
+			return 1;
+		}
+	}
+	if (set_shm_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE, F_WRLCK) != 0)
+	{
+		if (errno == EACCES || errno == EAGAIN)
+			fprintf(stderr, "pagestore_daemon_spdk: another process owns the shm lease\n");
+		else
+			perror("pagestore_daemon_spdk: fcntl shm lease");
+		(void) set_shm_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK);
+		return 1;
+	}
 	if (ftruncate(fd, PS_SHM_SIZE) != 0)
 	{
 		perror("ftruncate shm");
@@ -781,7 +967,6 @@ main(int argc, char **argv)
 		perror("mmap");
 		return 1;
 	}
-	close(fd);
 	hdr = (PsShmHeader *) shm;
 	daemon_hdr = hdr;
 	/* Invalidate a previous daemon's header before store recovery begins. */
@@ -802,6 +987,9 @@ main(int argc, char **argv)
 	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
+	/* Do not advertise ATOMIC_PINS: artifact BEGIN/COMMIT and token-aware
+	 * writes are not implemented by this frontend. P5 computes reject it
+	 * at attachment, before any checkpoint or artifact publication. */
 	ps_core_set_metrics_header(hdr);
 
 	memset(&sa, 0, sizeof(sa));
@@ -852,6 +1040,8 @@ main(int argc, char **argv)
 		if (started == hdr->nshards && maintenance_started && !stop_requested &&
 			shm_publish_ready(hdr))
 		{
+			if (set_shm_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_UNLCK) != 0)
+				perror("pagestore_daemon_spdk: fcntl initialization lock release");
 			fprintf(stderr, "pagestore_daemon_spdk: shm=%s store=%s storage=%s "
 					"page_size=%u io_unit=%u channels=%u nshards=%u ready\n",
 					shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,

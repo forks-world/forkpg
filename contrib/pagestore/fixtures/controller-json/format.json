@@ -23,10 +23,11 @@
     "family": "controller",
     "artifact": "pagestore_branch.prepare.json (JSON, schema member, crc32)",
     "magic": "0x00000000",
-    "version": 2,
+    "version": 3,
     "legacy": [],
     "refused": [
-      1
+      1,
+      2
     ],
     "checksum": true
   },

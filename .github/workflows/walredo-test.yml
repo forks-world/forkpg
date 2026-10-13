@@ -1,0 +1,126 @@
+# CI for the PostgreSQL-side pagestore integration: the wal-redo helper AND the
+# smgr-shim PG module (contrib/pagestore/pagestore.so).
+#
+# Unlike the freestanding pagestore daemon CI (the "pagestore" workflow), this
+# DOES build PostgreSQL. It exists to catch two things the daemon job can't:
+#   - the wal-redo helper (src/backend/postmaster/walredo.c), backend code linked
+#     into the postgres binary; and
+#   - the PG module (pagestore.c), the f_smgr/smgr_register smgr shim, which only
+#     compiles against the core export and was previously never built in CI.
+# It does a full build+install (so pagestore.so is built), asserts the module is
+# present, then runs the wal-redo protocol + redo end-to-end tests.
+name: walredo
+
+on:
+  push:
+    branches:
+      - master
+      - pagestore
+      - 'branchdb_*'
+    paths:
+      - 'src/backend/postmaster/walredo.c'
+      - 'src/include/postmaster/walredo.h'
+      - 'src/backend/main/main.c'
+      - 'src/include/postmaster/postmaster.h'
+      - 'src/backend/tcop/postgres.c'
+      - 'src/include/tcop/tcopprot.h'
+      - 'src/backend/access/transam/xlogutils.c'
+      - 'src/backend/access/heap/visibilitymap.c'
+      - 'src/include/storage/smgr.h'
+      - 'src/backend/storage/ipc/procarray.c'
+      - 'src/include/storage/procarray.h'
+      - 'src/backend/access/transam/xlog.c'
+      - 'src/backend/access/transam/xlogrecovery.c'
+      - 'src/include/access/xlogrecovery.h'
+      - 'src/include/access/xlog.h'
+      - 'src/backend/access/transam/slru.c'
+      - 'src/include/access/slru.h'
+      - 'contrib/pagestore/pagestore.c'
+      - 'contrib/pagestore/pagestore_slru.c'
+      - 'contrib/pagestore/walredo_client.c'
+      - 'contrib/pagestore/walredo_client.h'
+      - 'contrib/pagestore/backend_localsvc.c'
+      - 'contrib/pagestore/pagestore_backend.h'
+      - 'contrib/pagestore/pagestore_ipc.h'
+      - 'contrib/pagestore/meson.build'
+      - '.github/scripts/walredo_smoke.py'
+      - '.github/scripts/walredo_redo_test.py'
+      - '.github/scripts/test_walredo_records.py'
+      - '.github/workflows/walredo-test.yml'
+  pull_request:
+    paths:
+      - 'src/backend/postmaster/walredo.c'
+      - 'src/include/postmaster/walredo.h'
+      - 'src/backend/main/main.c'
+      - 'src/include/postmaster/postmaster.h'
+      - 'src/backend/tcop/postgres.c'
+      - 'src/include/tcop/tcopprot.h'
+      - 'src/backend/access/transam/xlogutils.c'
+      - 'src/backend/access/heap/visibilitymap.c'
+      - 'src/include/storage/smgr.h'
+      - 'src/backend/storage/ipc/procarray.c'
+      - 'src/include/storage/procarray.h'
+      - 'src/backend/access/transam/xlog.c'
+      - 'src/backend/access/transam/xlogrecovery.c'
+      - 'src/include/access/xlogrecovery.h'
+      - 'src/include/access/xlog.h'
+      - 'src/backend/access/transam/slru.c'
+      - 'src/include/access/slru.h'
+      - 'contrib/pagestore/pagestore.c'
+      - 'contrib/pagestore/pagestore_slru.c'
+      - 'contrib/pagestore/walredo_client.c'
+      - 'contrib/pagestore/walredo_client.h'
+      - 'contrib/pagestore/backend_localsvc.c'
+      - 'contrib/pagestore/pagestore_backend.h'
+      - 'contrib/pagestore/pagestore_ipc.h'
+      - 'contrib/pagestore/meson.build'
+      - '.github/scripts/walredo_smoke.py'
+      - '.github/scripts/walredo_redo_test.py'
+      - '.github/scripts/test_walredo_records.py'
+      - '.github/workflows/walredo-test.yml'
+  workflow_dispatch:
+
+# Do not let obsolete full PostgreSQL builds from push+pull_request events
+# saturate the hosted-runner quota while a stacked PageStore PR is rebased.
+concurrency:
+  group: walredo-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    name: build postgres + PG module + wal-redo tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check WAL record framing regressions
+        run: python3 .github/scripts/test_walredo_records.py
+
+      - name: Install build dependencies
+        run: |
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name '*microsoft*' -o -name '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build bison flex pkg-config \
+            libreadline-dev zlib1g-dev libicu-dev
+
+      - name: Configure, build and install (incl. the pagestore PG module)
+        run: |
+          meson setup build -Dcassert=true -Dprefix="$PWD/inst"
+          ninja -C build install
+
+      - name: Assert the pagestore smgr-shim module built
+        run: |
+          find inst -name pagestore.so | grep -q . \
+            && echo "pagestore.so present" \
+            || { echo "ERROR: pagestore.so was not built/installed"; exit 1; }
+
+      - name: initdb a throwaway scratch cluster
+        run: inst/bin/initdb -D scratch --no-locale -U postgres
+
+      - name: wal-redo protocol smoke test
+        run: python3 .github/scripts/walredo_smoke.py inst/bin/postgres scratch
+
+      - name: wal-redo redo end-to-end test
+        run: python3 .github/scripts/walredo_redo_test.py inst/bin scratch 5499

@@ -354,7 +354,7 @@ snapshot_lifecycle_records(const char *store)
 				found = -1;
 				break;
 			}
-			if (rec.timeline == 0 && rec.kind <= 2 &&
+			if (rec.timeline == 0 && (rec.kind & 0x3f) <= 2 &&
 				memcmp(&rec.key, &rel_key, sizeof(rel_key)) == 0)
 			{
 				found++;
@@ -468,9 +468,11 @@ test_truncate_churn_is_bounded(void)
 			check(read_tag_at(b, lsn, &tag) == 0,
 				  "regrown block has no content at the cutoff");
 	}
+	/* The tail now carries all four PAGE GROWs as well as the previous
+	 * META budget. They remain necessary until that tail reaches cutoff. */
 	check(records_after_six > 0 && records_after_twelve > 0 &&
 		  records_after_twelve <= records_after_six &&
-		  records_after_twelve <= 6,
+		  records_after_twelve <= 6 + 4,
 		  "retained lifecycle records do not grow with truncate churn");
 	check(bytes_after_six > 0 && bytes_after_twelve <= bytes_after_six + 1024,
 		  "forkmeta snapshot bytes stay flat across truncate churn");

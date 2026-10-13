@@ -18,6 +18,11 @@ extern void ps_retention_close(void);
 #define PS_RETENTION_OK		0
 #define PS_RETENTION_ERROR	(-1)
 #define PS_RETENTION_STALE	(-2)
+#define PS_RETENTION_NOT_REGISTERED (-3)
+extern int ps_retention_handoff(const PsRetentionPin *pin);
+/* Internal slots include tombstones, preserving generations across reuse. */
+extern int ps_retention_checkpoint_lookup(uint32_t timeline, uint64_t slot,
+	PsRetentionPin *pin_out);
 
 extern int ps_retention_set(const PsRetentionPin *pin);
 extern int ps_retention_reserve_and_set(const PsRetentionPin *pin);
@@ -25,6 +30,7 @@ extern int ps_retention_reserve_admission_seq(uint64_t admission_seq);
 extern int ps_retention_admission_highwater(uint64_t *admission_seq_out);
 extern int ps_retention_drop(uint32_t timeline, uint32_t owner_kind,
 								 uint64_t owner_id, uint32_t generation);
+extern int ps_retention_epoch(uint64_t *epoch_out);
 extern int ps_retention_count(uint32_t *count_out);
 extern int ps_retention_get(uint32_t index, PsRetentionPin *pin_out,
 								 uint32_t *count_out);

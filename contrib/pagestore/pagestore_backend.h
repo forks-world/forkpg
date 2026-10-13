@@ -191,10 +191,15 @@ extern void pagestore_localsvc_require_branch_timeout(uint32 new_tl,
 														 uint64 target_incarnation,
 														 uint64 parent_incarnation,
 														 int timeout_ms);
-extern void pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
+extern bool pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 												 uint64 branch_lsn,
 												 uint64 target_incarnation,
 												 uint64 parent_incarnation);
+extern void pagestore_localsvc_require_branch_seq(void);
+extern bool pagestore_localsvc_create_branch_proven(uint32 new_tl, uint32 parent_tl,
+												   uint64 branch_lsn, uint64 target_incarnation,
+												   uint64 parent_incarnation);
+extern bool pagestore_localsvc_branch_is_finite(uint32 timeline, uint64 incarnation);
 extern void pagestore_localsvc_detach(void);
 extern void pagestore_localsvc_wal_append(uint64 start_lsn, const void *data,
 										  uint32 len);
@@ -224,8 +229,15 @@ extern bool pagestore_localsvc_timeline_info(uint32 timeline,
 	uint64 *parent_incarnation, int timeout_ms);
 extern uint8 pagestore_localsvc_begin_delete(uint32 timeline,
 	uint64 expected_incarnation);
+extern uint8 pagestore_localsvc_begin_delete_reason(uint32 timeline,
+													uint64 expected_incarnation,
+													uint32 *reason);
 extern bool pagestore_localsvc_timeline_state(uint32 timeline,
 	uint32 *state, uint64 *incarnation);
+extern bool pagestore_localsvc_timeline_state_known(uint32 timeline,
+													uint32 *state,
+													uint64 *incarnation,
+													bool *undefined);
 extern int	pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn,
 										uint32 len, void *out);
 extern uint32 pagestore_localsvc_timeline(void);
@@ -317,11 +329,12 @@ extern void pagestore_localsvc_store_sync_timeout(int timeout_ms);
 extern bool pagestore_localsvc_admission_fence_begin(uint64 redo_lsn,
 													  uint64 *token);
 extern bool pagestore_localsvc_admission_fence_active(uint64 token);
-extern uint64 pagestore_localsvc_admission_barrier_timeout(int timeout_ms);
+extern uint64 pagestore_localsvc_admission_barrier_timeout(uint64 lsn, int timeout_ms);
 extern void pagestore_localsvc_admission_fence_end(uint64 token);
 extern BlockNumber pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
 																 const PageStoreRelKey *key,
 																 int timeout_ms);
+extern bool pagestore_localsvc_artifact_supersedable(bool on);
 extern uint64 pagestore_localsvc_artifact_begin(uint32 klass, const PageStoreRelKey *key,
 	uint64 version, int timeout_ms);
 extern void pagestore_localsvc_artifact_commit(uint32 klass, const PageStoreRelKey *key,
@@ -350,6 +363,9 @@ extern void pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key
 extern bool pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 										   BlockNumber block, uint64 version,
 										   void *page, uint64 *resolved);
+extern bool pagestore_localsvc_obj_read_capped_timeout(uint32 klass,
+	const PageStoreRelKey *key, BlockNumber block, uint64 version, uint64 seq,
+	void *page, uint64 *resolved, int timeout_ms);
 extern bool pagestore_localsvc_obj_read_at_timeout(uint32 klass,
 												   const PageStoreRelKey *key,
 												   BlockNumber block,
