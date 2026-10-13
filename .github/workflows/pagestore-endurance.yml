@@ -67,6 +67,11 @@ jobs:
       - name: Prepare temporary install tree
         run: meson test -C build --suite setup
 
+      - name: Verify postmaster cleanup including a forced pg_ctl timeout
+        run: |
+          PAGESTORE_CLEANUP_TEST_BUILD="$(pwd)/build" \
+            python3 contrib/pagestore/endurance/test_postmaster_cleanup.py
+
       - name: Run the endurance driver
         env:
           SEED: ${{ inputs.seed || '1' }}

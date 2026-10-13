@@ -14,6 +14,7 @@ import json
 import os
 import random
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -180,6 +181,55 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+class PostmasterHandle:
+    """Keep the kernel process identity, including across numeric PID reuse."""
+
+    def __init__(self, fd: int):
+        self.fd = fd
+
+    @classmethod
+    def open(cls, pid: int, datadir: Path, postgres: Path) -> "PostmasterHandle":
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise Failure("cleanup_identity", "endurance requires Linux pidfd support (Python 3.9+)")
+        fd = os.pidfd_open(pid)
+        try:
+            # A stale PID file is not ownership evidence. Pin first, then check
+            # the executable and -D argument while that pinned process is live.
+            proc = Path(f"/proc/{pid}")
+            argv = (proc / "cmdline").read_bytes().split(b"\0")
+            directory = os.fsencode(str(datadir.resolve()))
+            owns_directory = any(argv[i] == b"-D" and argv[i + 1] == directory
+                                 for i in range(len(argv) - 1))
+            if not (proc / "exe").samefile(postgres) or not owns_directory:
+                raise Failure("cleanup_identity", f"PID {pid} is not this compute's postmaster")
+            if select.select([fd], [], [], 0)[0]:
+                raise ProcessLookupError(f"postmaster {pid} exited while its identity was checked")
+            return cls(fd)
+        except FileNotFoundError as error:
+            exited = bool(select.select([fd], [], [], 0)[0])
+            os.close(fd)
+            if exited:
+                raise ProcessLookupError(f"postmaster {pid} exited") from error
+            raise Failure("cleanup_identity", f"cannot verify live PID {pid}: {error}") from error
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def exited(self) -> bool:
+        return bool(select.select([self.fd], [], [], 0)[0])
+
+    def kill(self) -> None:
+        try:
+            signal.pidfd_send_signal(self.fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass                                # the pinned process already exited
+        if not select.select([self.fd], [], [], 60)[0]:
+            raise Failure("cleanup_timeout", "the pinned postmaster did not exit after SIGKILL")
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+
 class Pg:
     """One PostgreSQL compute owned by the driver."""
 
@@ -191,6 +241,7 @@ class Pg:
         self.log = run.root / f"{name}.log"
         self.expected_up = False
         self.log_scanned = 0
+        self.postmaster: PostmasterHandle | None = None
 
     def ctl(self, *args: str, env: dict[str, str] | None = None, timeout: int = 300) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -198,8 +249,16 @@ class Pg:
             env=env or self.run.env, capture_output=True, text=True, timeout=timeout)
 
     def start(self) -> None:
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise Failure("cleanup_identity", "endurance requires Linux pidfd support (Python 3.9+)")
+        if self.postmaster is not None:
+            if not self.postmaster.exited():
+                raise Failure("start_failed", f"{self.name} still has a live postmaster")
+            self.postmaster.close()
+            self.postmaster = None
         r = self.ctl("-l", str(self.log), "-w", "-t", "300", "start")
         if r.returncode == 0:
+            self.pin_postmaster()
             self.expected_up = True
             return
         raise Failure("start_failed", f"{self.name} did not start: {r.stdout[-400:]} {r.stderr[-400:]}")
@@ -207,29 +266,51 @@ class Pg:
     def stop(self, mode: str = "fast", check: bool = True) -> None:
         self.expected_up = False
         r = self.ctl("-m", mode, "-w", "-t", "300", "stop")
+        # halt uses stop(check=False), retaining the handle for escalation;
+        # ordinary stops release it, including permanently retired branches.
+        if check and self.postmaster is not None and self.postmaster.exited():
+            self.postmaster.close()
+            self.postmaster = None
         if check and r.returncode != 0:
             raise Failure("stop_failed", f"{self.name} ({mode}): {r.stdout[-300:]} {r.stderr[-300:]}")
 
-    def halt(self) -> None:
-        """Stop immediately whatever state the compute is in; SIGKILL the
-        postmaster's process group if pg_ctl cannot, and wait for it."""
+    def pin_postmaster(self) -> None:
         pid = self.pid()
-        try:
-            self.stop("immediate", check=False)
-        except subprocess.TimeoutExpired:
-            pass
-        if not pid_alive(pid):
-            return
-        try:
-            os.killpg(pid, signal.SIGKILL)        # pg_ctl starts the postmaster in its own session
-        except OSError:
+        if pid is None or pid <= 0:
+            raise Failure("cleanup_identity", f"{self.name} has no valid postmaster PID")
+        self.postmaster = PostmasterHandle.open(pid, self.datadir, self.run.bin / "postgres")
+
+    def halt(self) -> None:
+        """Immediate shutdown, escalating only through a pinned process handle.
+
+        PostgreSQL children observe postmaster death; never signal a numeric
+        process group that could have been reused after pg_ctl timed out.
+        """
+        if self.postmaster is None:
+            # Also handle a partially successful pg_ctl start. Validate its
+            # executable/data directory before adopting a process from the PID file.
+            if self.pid() is None:
+                return
             try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
+                self.pin_postmaster()
+            except ProcessLookupError:
+                return
+        try:
+            # Do not call pg_ctl against a stale PID file after this generation
+            # exited: even its numeric PID may now refer to an unrelated process.
+            if self.postmaster.exited():
+                return
+            try:
+                self.stop("immediate", check=False)
+            except subprocess.TimeoutExpired:
                 pass
-        deadline = time.time() + 60
-        while pid_alive(pid) and time.time() < deadline:
-            time.sleep(0.1)
+            if not self.postmaster.exited():
+                self.postmaster.kill()
+        finally:
+            self.expected_up = False
+            if self.postmaster.exited():
+                self.postmaster.close()
+                self.postmaster = None
 
     def pid(self) -> int | None:
         try:
@@ -1037,11 +1118,15 @@ recovery_target_action = 'promote'
 
     def teardown(self, preserve_state: bool, interrupted: bool = False) -> None:
         self.stop_sampling()
+        cleanup_errors: list[str] = []
         for pg in self.computes():
-            pg.halt()
+            try:
+                pg.halt()
+            except Exception as error:
+                cleanup_errors.append(f"{pg.name}: {error}")
         if self.daemon and self.daemon.poll() is None:
             # after a finding, SIGKILL keeps the store exactly as it failed
-            self.daemon.send_signal(signal.SIGKILL if preserve_state or interrupted else signal.SIGTERM)
+            self.daemon.send_signal(signal.SIGKILL if preserve_state or interrupted or cleanup_errors else signal.SIGTERM)
             try:
                 self.daemon.wait(timeout=600)
             except subprocess.TimeoutExpired:
@@ -1051,6 +1136,8 @@ recovery_target_action = 'promote'
         except OSError:
             pass
         self.events.close()
+        if cleanup_errors:
+            raise Failure("cleanup_failed", "; ".join(cleanup_errors))
 
     # ---- main loop -------------------------------------------------------
 
@@ -1145,7 +1232,13 @@ def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
             failure = run.async_failure         # a finding the main thread had not picked up yet
         # a signal during cleanup is remembered, not raised half-way through it
         with deferred_signals() as signalled:
-            run.teardown(preserve_state=failure is not None, interrupted=interrupted or bool(signalled))
+            try:
+                run.teardown(preserve_state=failure is not None, interrupted=interrupted or bool(signalled))
+            except Failure as cleanup_failure:
+                if failure is None:
+                    failure = cleanup_failure
+                else:
+                    failure.detail += f"; {cleanup_failure}"
             interrupted = interrupted or bool(signalled)
             if interrupted and failure is None:
                 shutil.rmtree(root, ignore_errors=True)

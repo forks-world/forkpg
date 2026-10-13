@@ -14,6 +14,13 @@ contrib/pagestore/endurance/pagestore_endurance.py --build build \
     --root /path/on/a/real/filesystem --forever --duration 3600
 ```
 
+The driver requires Linux pidfd support and Python 3.9 or newer. Each started
+postmaster is pinned by a kernel process handle after checking its executable
+and data directory. If immediate `pg_ctl` shutdown fails or times out, cleanup
+sends SIGKILL through that handle; PostgreSQL backends observe postmaster death.
+An exited generation is never signalled through its old PID or process group.
+A partially started compute is adopted only after the same ownership checks.
+
 Put `--root` on a real filesystem.  On tmpfs every fsync is free and the run
 says nothing about the store's durability ordering.
 
