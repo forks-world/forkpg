@@ -152,3 +152,15 @@ do not guess), add the `#if PG_VERSION_NUM` guard on `pagestore`, update
 this table, and re-run a real compile against `REL_18_6` (ideally with
 `branchdb_18-rc`, so the compile reaches these sites instead of failing
 earlier on a missing core hook).
+
+### Promotion evidence for the core series
+
+Before marking a major candidate/released, the authoritative pagestore manifest
+must record `core_series`: keys C1-C7 each map to `{"commit": "<full approved port SHA>",
+"sources": ["<full landed pagestore source SHA>", ...]}`. These pins identify
+the reviewed per-major squash/conflict resolution; raw patch equality across
+majors is not required. Verification requires actual PostgreSQL core/build
+changes, requires source citations in the port/cherry-pick commit message,
+checks source ancestry on pagestore, and compares each release series
+commit to its approved pin. Update these pins with the base/source fields after
+a deliberate minor rebase. Planned entries need no such release evidence.

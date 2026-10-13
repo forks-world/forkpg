@@ -41,20 +41,31 @@ class ProvenanceTests(unittest.TestCase):
         path.write_text("source tree\n")
         self.git("add", "contrib")
         self.git("commit", "-q", "-m", "pagestore source")
+        self.source_commits = {}
+        for label in range(1, 8):
+            path = self.repo / f"src/core{label}"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(f"core {label}\n")
+            self.git("add", str(path.relative_to(self.repo)))
+            self.git("commit", "-q", "-m", f"development core {label}")
+            self.source_commits[f"C{label}"] = self.git("rev-parse", "HEAD")
         self.source = self.git("rev-parse", "HEAD")
         self.git("checkout", "-q", "-b", "branchdb_18", self.base)
         self.git("checkout", self.source, "--", "contrib/pagestore")
         self.git("commit", "-q", "-m", "release tree copy")
-        for label in range(1, 8):
-            (self.repo / f"core{label}").write_text(f"core {label}\n")
-            self.git("add", f"core{label}")
-            self.git("commit", "-q", "-m", f"core {label}\n\nBranchdb-Series: C{label}")
+        self.core_series = {}
+        for label, source in self.source_commits.items():
+            self.git("cherry-pick", "-x", source)
+            self.git("commit", "-q", "--amend", "-m",
+                     f"ported {label}\n\nBranchdb-Series: {label}\n(cherry picked from commit {source})")
+            self.core_series[label] = {"commit": self.git("rev-parse", "HEAD"), "sources": [source]}
         self.candidate = self.git("rev-parse", "HEAD")
         self.origin = root / "origin.git"
         subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(self.origin)], check=True)
         self.git("remote", "add", "origin", str(self.origin))
         self.data = {"supported": [{"major": 18, "branch": "branchdb_18", "status": "candidate",
-                                   "base_tag": "REL_18_6", "contrib_sha": self.source}]}
+                                   "base_tag": "REL_18_6", "contrib_sha": self.source,
+                                   "core_series": self.core_series}]}
 
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.repo, text=True,
@@ -151,7 +162,7 @@ class ProvenanceTests(unittest.TestCase):
         local["supported"][0].update(status="planned", base_tag=None, contrib_sha=None)
         path.write_text(json.dumps(local))
         self.assertEqual(manifest_reader.load_authoritative(
-            candidate_sha=self.candidate, repo=self.repo, upstream=str(self.upstream)), data)
+            candidate_sha=self.candidate, repo=self.repo, upstream=str(self.upstream))["supported"], data["supported"])
         # Moving the branch must not change what the frozen tag validates.
         path.write_text(json.dumps(data))
         self.git("checkout", "-q", "branchdb_18")
@@ -185,6 +196,53 @@ class ProvenanceTests(unittest.TestCase):
             self.assertEqual(manifest_reader._print_field(18, "contrib_sha"), 0)
             check.assert_not_called()
         self.assertEqual(output.getvalue().strip(), self.source)
+
+    def test_candidate_requires_release_lineage(self):
+        self.git("checkout", "-q", "-b", "unrelated")
+        (self.repo / "unrelated").write_text("allowed ancillary commit\n")
+        self.git("add", "unrelated")
+        self.git("commit", "-q", "-m", "ci: unrelated candidate")
+        candidate = self.git("rev-parse", "HEAD")
+        with self.assertRaises(ReleaseBranchesError):
+            manifest_reader.check_release_provenance(self.data, repo=self.repo,
+                upstream=str(self.upstream), candidate_sha=candidate)
+        # The same commit is valid PR evidence, but not a frozen release tag.
+        manifest_reader.check_release_provenance(self.data, repo=self.repo,
+            upstream=str(self.upstream), candidate_sha=candidate, require_lineage=False)
+
+    def test_empty_core_and_unlanded_core_source_are_rejected(self):
+        self.git("reset", "--hard", self.candidate + "~1")
+        self.git("commit", "-q", "--allow-empty", "-m", "empty\n\nBranchdb-Series: C7")
+        self.data["supported"][0]["core_series"]["C7"]["commit"] = self.git("rev-parse", "HEAD")
+        self.git("push", "--force", "origin", "branchdb_18")
+        with self.assertRaisesRegex(ReleaseBranchesError, "no PostgreSQL core/build"):
+            self.check()
+        self.git("reset", "--hard", self.candidate)
+        self.git("push", "--force", "origin", "branchdb_18")
+        self.data["supported"][0]["core_series"]["C7"]["commit"] = self.candidate
+        self.data["supported"][0]["core_series"]["C7"]["sources"] = ["0" * 40]
+        with self.assertRaises(ReleaseBranchesError):
+            self.check()
+
+    def test_contrib_only_core_label_is_rejected(self):
+        self.git("reset", "--hard", self.candidate + "~1")
+        (self.repo / "contrib/pagestore/example").write_text("not a core patch\n")
+        self.git("add", "contrib/pagestore/example")
+        self.git("commit", "-q", "-m", "contrib only\n\nBranchdb-Series: C7")
+        self.data["supported"][0]["core_series"]["C7"]["commit"] = self.git("rev-parse", "HEAD")
+        self.git("push", "--force", "origin", "branchdb_18")
+        with self.assertRaisesRegex(ReleaseBranchesError, "no PostgreSQL core/build"):
+            self.check()
+
+    def test_checked_branch_revision_is_returned(self):
+        revisions = manifest_reader.check_release_provenance(self.data, repo=self.repo,
+            upstream=str(self.upstream))
+        self.assertEqual(revisions, {"branchdb_18": self.candidate})
+        (self.repo / "extra").write_text("new ancillary commit\n")
+        self.git("add", "extra")
+        self.git("commit", "-q", "-m", "ci: later branch")
+        self.git("push", "origin", "branchdb_18")
+        self.assertEqual(revisions["branchdb_18"], self.candidate)
 
     def test_planned_entries_need_no_repository(self):
         self.data["supported"][0].update(status="planned", base_tag=None, contrib_sha=None)

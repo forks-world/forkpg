@@ -23,7 +23,7 @@ Consumers:
   subprocess, so the shell script stays dependency-free) to look up a
   major's recorded ``contrib_sha``.
 * The nightly/release-acceptance workflows (V4 plan, P4) read
-  ``candidate_branches()`` to fan their soak matrix out over every branch
+  ``candidate_revisions()`` to use verified commit snapshots for every branch
   that currently has release evidence riding on it, instead of a hardcoded
   YAML list.
 
@@ -124,6 +124,17 @@ def load(path: Path | None = None, *, verify_provenance: bool = True) -> dict[st
             if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
                 raise ReleaseBranchesError(
                     f"{path}: {entry['status']} major {major} requires a full contrib_sha commit ID")
+            series = entry.get("core_series")
+            if not isinstance(series, dict) or set(series) != {f"C{n}" for n in range(1, 8)}:
+                raise ReleaseBranchesError(f"{path}: promoted major {major} requires approved core_series C1-C7")
+            for label, record in series.items():
+                if (not isinstance(record, dict) or
+                    not isinstance(record.get("commit"), str) or
+                    not re.fullmatch(r"[0-9a-fA-F]{40}", record["commit"]) or
+                    not isinstance(record.get("sources"), list) or not record["sources"] or
+                    any(not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha)
+                        for sha in record["sources"])):
+                    raise ReleaseBranchesError(f"{path}: invalid approved {label} commit/source records")
     for entry in unsupported:
         _check_common(path, entry, seen_majors)
         if not isinstance(entry.get("reason"), str) or not entry["reason"]:
@@ -132,7 +143,7 @@ def load(path: Path | None = None, *, verify_provenance: bool = True) -> dict[st
             )
 
     if verify_provenance:
-        check_release_provenance(data)
+        data["_verified_revisions"] = check_release_provenance(data)
     return data
 
 
@@ -146,7 +157,8 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def load_authoritative(*, candidate_sha: str | None = None, repo: Path | None = None,
-                       upstream: str = "https://github.com/postgres/postgres.git") -> dict[str, Any]:
+                       upstream: str = "https://github.com/postgres/postgres.git",
+                       require_lineage: bool = True) -> dict[str, Any]:
     repo = repo or DEFAULT_PATH.parents[2]
     ref = "refs/pagestore-release-check/manifest"
     _git(repo, "fetch", "--no-tags", "origin", f"+refs/heads/pagestore:{ref}")
@@ -155,13 +167,14 @@ def load_authoritative(*, candidate_sha: str | None = None, repo: Path | None = 
         path = Path(tmp) / "release-branches.json"
         path.write_text(manifest, encoding="utf-8")
         data = load(path, verify_provenance=False)
-    check_release_provenance(data, repo=repo, upstream=upstream, candidate_sha=candidate_sha)
+    data["_verified_revisions"] = check_release_provenance(data, repo=repo, upstream=upstream, candidate_sha=candidate_sha, require_lineage=require_lineage)
     return data
 
 
 def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
                              upstream: str = "https://github.com/postgres/postgres.git",
-                             candidate_sha: str | None = None) -> None:
+                             candidate_sha: str | None = None,
+                             require_lineage: bool = True) -> dict[str, str]:
     """Confirm promoted entries against freshly fetched authoritative Git refs.
 
     Fetches update only dedicated verification refs, never local branches/tags.
@@ -181,7 +194,7 @@ def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
         if not entries:
             raise ReleaseBranchesError(f"candidate PG{major} has no promoted authoritative manifest entry")
     if not entries:
-        return
+        return {}
     repo = repo or DEFAULT_PATH.parents[2]
 
     def git(*args: str) -> str:
@@ -193,17 +206,23 @@ def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
     # history before making a promotion decision.
     if git("rev-parse", "--is-shallow-repository") == "true":
         git("fetch", "--unshallow", "--no-tags", "origin", f"+refs/heads/pagestore:{main_ref}")
+    main_ref = git("rev-parse", f"{main_ref}^{{commit}}")
+    revisions: dict[str, str] = {}
     for entry in entries:
         major, branch, tag, source = (entry[k] for k in ("major", "branch", "base_tag", "contrib_sha"))
         prefix = f"refs/pagestore-release-check/{major}"
         tag_ref, stable_ref, branch_ref = (prefix + suffix for suffix in ("/tag", "/stable", "/branch"))
         git("fetch", "--no-tags", upstream, f"+refs/tags/{tag}:{tag_ref}",
             f"+refs/heads/REL_{major}_STABLE:{stable_ref}")
-        if candidate_sha is None:
-            git("fetch", "--no-tags", "origin", f"+refs/heads/{branch}:{branch_ref}")
-        else:
+        git("fetch", "--no-tags", "origin", f"+refs/heads/{branch}:{branch_ref}")
+        release_head = git("rev-parse", f"{branch_ref}^{{commit}}")
+        branch_ref = release_head
+        stable_ref = git("rev-parse", f"{stable_ref}^{{commit}}")
+        if candidate_sha is not None:
+            git("rev-parse", "--verify", f"{candidate_sha}^{{commit}}")
+            if require_lineage:
+                git("merge-base", "--is-ancestor", candidate_sha, release_head)
             branch_ref = candidate_sha
-            git("rev-parse", "--verify", f"{branch_ref}^{{commit}}")
         base = git("rev-parse", f"{tag_ref}^{{commit}}")
         if git("merge-base", branch_ref, stable_ref) != base:
             raise ReleaseBranchesError(f"{branch}: recorded base_tag {tag} differs from its upstream merge base")
@@ -217,7 +236,24 @@ def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
             if declarations:
                 if len(declarations) != 1 or not re.fullmatch(r"Branchdb-Series: C[1-7]", declarations[0]):
                     raise ReleaseBranchesError(f"{branch}: invalid core-series declarations on {commit}")
-                labels.append(declarations[0].split()[-1])
+                label = declarations[0].split()[-1]
+                approved = entry["core_series"][label]
+                if commit.lower() != approved["commit"].lower():
+                    raise ReleaseBranchesError(f"{branch}: {label} differs from approved core commit")
+                core_paths = git("diff-tree", "--no-commit-id", "--name-only", "-r", commit,
+                                 "--", "src", "contrib/meson.build", "contrib/Makefile")
+                if not core_paths:
+                    raise ReleaseBranchesError(f"{branch}: {label} has no PostgreSQL core/build changes")
+                for origin_sha in approved["sources"]:
+                    citations = re.findall(r"(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])", message.lower())
+                    if not any(origin_sha.lower().startswith(citation) for citation in citations):
+                        raise ReleaseBranchesError(f"{branch}: {label} does not cite approved source {origin_sha}")
+                    git("rev-parse", "--verify", f"{origin_sha}^{{commit}}")
+                    git("merge-base", "--is-ancestor", origin_sha, main_ref)
+                    if not git("diff-tree", "--no-commit-id", "--name-only", "-r", origin_sha,
+                               "--", "src", "contrib/meson.build", "contrib/Makefile"):
+                        raise ReleaseBranchesError(f"{branch}: {label} source has no core/build changes")
+                labels.append(label)
                 continue
             paths = git("diff-tree", "--no-commit-id", "--name-only", "-r", commit,
                         "--", ".", ":!contrib/pagestore")
@@ -233,6 +269,13 @@ def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
             raise ReleaseBranchesError(f"{branch}: source contrib/pagestore is not a tree")
         if git("rev-parse", f"{branch_ref}:contrib/pagestore") != source_tree:
             raise ReleaseBranchesError(f"{branch}: contrib tree differs from recorded contrib_sha {source}")
+        revisions[branch] = git("rev-parse", f"{branch_ref}^{{commit}}")
+    return revisions
+
+
+def candidate_revisions() -> dict[str, str]:
+    """Exact SHA snapshots verified from the authoritative manifest."""
+    return load_authoritative()["_verified_revisions"]
 
 
 def supported_majors(data: dict[str, Any] | None = None) -> list[int]:
@@ -271,7 +314,9 @@ def _test_release_evidence(data: dict[str, Any]) -> None:
             promoted = copy.deepcopy(data)
             entry = promoted["supported"][0]
             major = entry["major"]
-            entry.update(status=status, base_tag=f"REL_{major}_1", contrib_sha="a" * 40)
+            entry.update(status=status, base_tag=f"REL_{major}_1", contrib_sha="a" * 40,
+                         core_series={f"C{n}": {"commit": "b" * 40, "sources": ["a" * 40]}
+                                      for n in range(1, 8)})
             path.write_text(json.dumps(promoted), encoding="utf-8")
             assert entry["branch"] in candidate_branches(load(path, verify_provenance=False))
             for field, bad_values in (
@@ -341,9 +386,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="the field to print (requires --major), e.g. contrib_sha, base_tag")
     parser.add_argument("--authoritative-manifest", action="store_true",
                         help="validate the manifest freshly fetched from origin/pagestore")
+    parser.add_argument("--release-pr-sha", help="validate an unmerged release PR commit against authoritative metadata")
     parser.add_argument("--candidate-sha", help="validate this frozen candidate commit instead of a branch head")
     args = parser.parse_args(argv)
-    if args.candidate_sha and not args.authoritative_manifest:
+    if args.candidate_sha and args.release_pr_sha:
+        parser.error("choose candidate-sha or release-pr-sha")
+    if (args.candidate_sha or args.release_pr_sha) and not args.authoritative_manifest:
         parser.error("--candidate-sha requires --authoritative-manifest")
     if args.authoritative_manifest and (args.major is not None or args.field is not None):
         parser.error("authoritative validation cannot be combined with field lookup")
@@ -353,7 +401,8 @@ def main(argv: list[str] | None = None) -> int:
         return _print_field(args.major, args.field)
     try:
         if args.authoritative_manifest:
-            load_authoritative(candidate_sha=args.candidate_sha)
+            load_authoritative(candidate_sha=args.candidate_sha or args.release_pr_sha,
+                               require_lineage=args.release_pr_sha is None)
             print("ok   - authoritative release manifest and Git provenance verified")
             return 0
         return _self_test()
