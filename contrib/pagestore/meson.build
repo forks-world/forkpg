@@ -802,7 +802,8 @@ test('pagestore_release_branches',
   pagestore_harness_python,
   args: [files('harness/pagestore_release_branches.py')],
   suite: ['pagestore'],
-  timeout: 30,
+  # Promoted metadata verifies several upstream/origin refs over the network.
+  timeout: 600,
 )
 if host_system != 'windows'
   test('pagestore_materializer_supervisor',

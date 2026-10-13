@@ -397,6 +397,22 @@ class ProvenanceTests(unittest.TestCase):
         self.assertNotIn("STUB RAN", result.stdout + result.stderr)
         self.assertIn("not a mechanical sync", result.stderr)
 
+    def test_pinned_core_series_must_be_in_history_order(self):
+        self.git("checkout", "-q", "-b", "unordered", self.base)
+        self.git("checkout", self.source, "--", "contrib/pagestore")
+        self.git("commit", "-q", "-m", f"contrib/pagestore: sync to pagestore@{self.source}")
+        pins = {}
+        for label in ("C7", "C1", "C2", "C3", "C4", "C5", "C6"):
+            source = self.source_commits[label]
+            self.git("cherry-pick", "-x", source)
+            self.git("commit", "-q", "--amend", "-m",
+                     f"ported {label}\n\nBranchdb-Series: {label}\n(cherry picked from commit {source})")
+            pins[label] = {"commit": self.git("rev-parse", "HEAD"), "sources": [source]}
+        self.data["supported"][0]["core_series"] = pins
+        self.git("push", "--force", "origin", "HEAD:branchdb_18")
+        with self.assertRaisesRegex(ReleaseBranchesError, "in history order"):
+            self.check()
+
     def test_planned_entries_need_no_repository(self):
         self.data["supported"][0].update(status="planned", base_tag=None, contrib_sha=None)
         check_release_provenance(self.data, repo=self.repo / "nonexistent")

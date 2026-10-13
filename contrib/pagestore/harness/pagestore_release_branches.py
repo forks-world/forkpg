@@ -293,7 +293,7 @@ def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
         if git("rev-list", "--count", "--merges", release_range) != "0":
             raise ReleaseBranchesError(f"{branch}: release contains merge commits above base")
         labels: list[str] = []
-        for commit in git("rev-list", release_range).splitlines():
+        for commit in git("rev-list", "--reverse", release_range).splitlines():
             message = git("show", "-s", "--format=%B", commit)
             declarations = [line for line in message.splitlines() if line.startswith("Branchdb-Series:")]
             if declarations:
@@ -339,8 +339,8 @@ def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
                     raise ReleaseBranchesError(f"{branch}: mechanical sync {commit} differs from cited source")
             elif not subject.startswith(("ci:", "docs:", "fixtures:")):
                 raise ReleaseBranchesError(f"{branch}: unallowed release commit {commit}: {subject}")
-        if sorted(labels) != [f"C{n}" for n in range(1, 8)]:
-            raise ReleaseBranchesError(f"{branch}: release must contain exactly one C1-C7 commit each")
+        if labels != [f"C{n}" for n in range(1, 8)]:
+            raise ReleaseBranchesError(f"{branch}: release must contain exactly one C1-C7 commit each in history order")
         git("rev-parse", "--verify", f"{source}^{{commit}}")
         git("merge-base", "--is-ancestor", source, main_ref)
         source_tree = git("rev-parse", f"{source}:contrib/pagestore")
