@@ -173,7 +173,7 @@ def load_authoritative(*, candidate_sha: str | None = None, repo: Path | None = 
 
 def staged_release_entry(entry: dict[str, Any], candidate: str, repo: Path,
                          upstream: str) -> dict[str, Any]:
-    """Check a planned sync for PR review without claiming release promotion.
+    """Check a proposed release sync/update without claiming promotion.
 
     Provenance comes from the mechanical sync and cited core sources. Reviewed
     port pins are recorded on pagestore only after this release PR lands.
@@ -263,10 +263,12 @@ def check_release_provenance(data: dict[str, Any], *, repo: Path | None = None,
     main_ref = git("rev-parse", f"{main_ref}^{{commit}}")
     revisions: dict[str, str] = {}
     for entry in entries:
-        if entry["status"] == "planned":
-            if candidate_sha is None or require_lineage:
-                raise ReleaseBranchesError("planned entries cannot qualify release candidates")
+        if candidate_sha is not None and not require_lineage:
+            # Proposed first syncs and later minor/source updates both precede
+            # their post-landing metadata update; they are review evidence only.
             entry = staged_release_entry(entry, candidate_sha, repo, upstream)
+        elif entry["status"] == "planned":
+            raise ReleaseBranchesError("planned entries cannot qualify release candidates")
         major, branch, tag, source = (entry[k] for k in ("major", "branch", "base_tag", "contrib_sha"))
         prefix = f"refs/pagestore-release-check/{major}"
         tag_ref, stable_ref, branch_ref = (prefix + suffix for suffix in ("/tag", "/stable", "/branch"))

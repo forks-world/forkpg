@@ -172,3 +172,10 @@ landed source SHA, and its core ports cite landed core sources. This staged
 validation does not promote the manifest or qualify candidate acceptance. After
 the PR lands, record its approved pins and promote metadata on pagestore.
 Unsupported reference majors skip PR release evidence, never candidate acceptance.
+
+PR review evidence also covers proposed minor/source updates to already-promoted
+branches. It checks the proposed commit's real upstream tag, mechanical sync
+and landed core sources without requiring post-landing metadata to exist first.
+Frozen candidate acceptance and weekly release qualification still require the
+approved authoritative base/source/core pins; metadata transitions never become
+qualified merely because the unmerged PR is structurally reviewable.

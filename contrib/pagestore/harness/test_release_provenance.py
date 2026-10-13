@@ -302,6 +302,18 @@ class ProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseBranchesError, "sources have no core/build"):
             self.check()
 
+    def test_promoted_minor_update_is_reviewable_before_metadata_update(self):
+        previous = copy.deepcopy(self.data)
+        self.git("rebase", "--onto", "REL_18_7", self.base, "branchdb_18")
+        candidate = self.git("rev-parse", "HEAD")
+        self.assertEqual(manifest_reader.check_release_provenance(self.data, repo=self.repo,
+            upstream=str(self.upstream), candidate_sha=candidate, require_lineage=False),
+            {"branchdb_18": candidate})
+        self.assertEqual(self.data, previous)
+        with self.assertRaises(ReleaseBranchesError):
+            manifest_reader.check_release_provenance(self.data, repo=self.repo,
+                upstream=str(self.upstream), candidate_sha=candidate)
+
     def test_planned_entries_need_no_repository(self):
         self.data["supported"][0].update(status="planned", base_tag=None, contrib_sha=None)
         check_release_provenance(self.data, repo=self.repo / "nonexistent")
