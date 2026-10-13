@@ -64,6 +64,15 @@ class CleanupTests(unittest.TestCase):
         self.handle.close.assert_called_once()
         self.assertIsNone(self.pg.postmaster)
 
+    def test_successful_pg_ctl_stop_waits_for_late_process_exit(self):
+        self.handle.exited.return_value = False
+        self.pg.ctl = Mock(return_value=SimpleNamespace(returncode=0))
+        endurance.Pg.stop(self.pg)
+        self.handle.wait_exit.assert_called_once()
+        self.handle.wait_children.assert_called_once()
+        self.handle.close.assert_called_once()
+        self.assertIsNone(self.pg.postmaster)
+
     def test_start_refuses_to_replace_live_generation(self):
         self.handle.exited.return_value = False
         self.pg.ctl = Mock()
@@ -162,7 +171,27 @@ class TeardownTests(unittest.TestCase):
                 self.assertIn('identity refused', result['detail'])
                 self.assertTrue((Path(temp) / 'history.jsonl').exists())
 
-    def test_identity_refusal_still_cleans_other_computes_and_daemon(self):
+    def test_successful_cleanup_retry_allows_shared_resource_teardown(self):
+        run = object.__new__(endurance.Run)
+        compute = Mock()
+        compute.name = 'retry'
+        compute.halt.side_effect = [endurance.Failure('cleanup_timeout', 'slow child'), None]
+        run.computes = Mock(return_value=[compute])
+        run.stop_sampling = Mock()
+        run.daemon = Mock()
+        run.daemon.poll.return_value = None
+        run.shm = '/test-retry'
+        run.events = Mock()
+        with patch.object(endurance, 'unlink_shm') as unlink:
+            with self.assertRaisesRegex(endurance.Failure, 'cleanup_failed'):
+                run.teardown(preserve_state=False)
+        self.assertEqual(compute.halt.call_count, 2)
+        run.daemon.send_signal.assert_called_once_with(signal.SIGKILL)
+        run.daemon.wait.assert_called_once()
+        unlink.assert_called_once_with(run.shm)
+        run.events.close.assert_called_once()
+
+    def test_identity_refusal_cleans_other_computes_but_preserves_shared_resources(self):
         run = object.__new__(endurance.Run)
         first, second = Mock(), Mock()
         first.name = 'first'
@@ -177,9 +206,10 @@ class TeardownTests(unittest.TestCase):
             with self.assertRaisesRegex(endurance.Failure, 'cleanup_failed'):
                 run.teardown(preserve_state=False)
         second.halt.assert_called_once()
-        run.daemon.send_signal.assert_called_once_with(signal.SIGKILL)
-        run.daemon.wait.assert_called_once()
-        unlink.assert_called_once_with(run.shm)
+        first.halt.assert_has_calls([unittest.mock.call(), unittest.mock.call()])
+        run.daemon.send_signal.assert_not_called()
+        run.daemon.wait.assert_not_called()
+        unlink.assert_not_called()
         run.events.close.assert_called_once()
 
 
@@ -231,6 +261,15 @@ class RealHandleTests(unittest.TestCase):
             os.close(child_fd)
             if pg.postmaster is not None:
                 pg.postmaster.close()
+
+    def test_kernel_without_procfs_children_uses_parentage_fallback(self):
+        read_text = Path.read_text
+        def missing_children(path, *args, **kwargs):
+            if path.name == 'children':
+                raise FileNotFoundError('CONFIG_CHECKPOINT_RESTORE disabled')
+            return read_text(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', new=missing_children):
+            self.test_halt_waits_for_a_child_with_delayed_parent_death_exit()
 
     def test_handle_kills_only_owned_process(self):
         handle = endurance.PostmasterHandle.open(self.process.pid, self.datadir, Path(sys.executable))

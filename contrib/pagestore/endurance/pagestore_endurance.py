@@ -228,7 +228,18 @@ class PostmasterHandle:
         except FileNotFoundError:
             if self.exited():
                 return
-            raise
+            # The children file depends on CONFIG_CHECKPOINT_RESTORE; pidfds
+            # and ordinary procfs parentage work without that kernel option.
+            pids = []
+            for proc in Path("/proc").iterdir():
+                if not proc.name.isdecimal():
+                    continue
+                try:
+                    stat = (proc / "stat").read_text().rsplit(") ", 1)[1].split()
+                    if int(stat[1]) == self.pid:
+                        pids.append(proc.name)
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    continue
         for value in pids:
             pid = int(value)
             child = next((child for child in self.children.values()
@@ -267,13 +278,16 @@ class PostmasterHandle:
                 raise Failure("cleanup_timeout", "an owned postmaster child did not exit")
             child.wait_children(deadline)
 
+    def wait_exit(self) -> None:
+        if not select.select([self.fd], [], [], 60)[0]:
+            raise Failure("cleanup_timeout", "the pinned postmaster did not exit")
+
     def kill(self) -> None:
         try:
             signal.pidfd_send_signal(self.fd, signal.SIGKILL)
         except ProcessLookupError:
             pass                                # the pinned process already exited
-        if not select.select([self.fd], [], [], 60)[0]:
-            raise Failure("cleanup_timeout", "the pinned postmaster did not exit after SIGKILL")
+        self.wait_exit()
 
     def close(self) -> None:
         for child in self.children.values():
@@ -323,7 +337,8 @@ class Pg:
         r = self.ctl("-m", mode, "-w", "-t", "300", "stop")
         # halt uses stop(check=False), retaining the handle for escalation;
         # ordinary stops release it, including permanently retired branches.
-        if check and self.postmaster is not None and self.postmaster.exited():
+        if check and self.postmaster is not None and (r.returncode == 0 or self.postmaster.exited()):
+            self.postmaster.wait_exit()
             self.postmaster.wait_children()
             self.postmaster.close()
             self.postmaster = None
@@ -1193,11 +1208,23 @@ recovery_target_action = 'promote'
     def teardown(self, preserve_state: bool, interrupted: bool = False) -> None:
         self.stop_sampling()
         cleanup_errors: list[str] = []
+        pending: list[Pg] = []
         for pg in self.computes():
             try:
                 pg.halt()
             except Exception as error:
                 cleanup_errors.append(f"{pg.name}: {error}")
+                pending.append(pg)
+        still_live: list[str] = []
+        for pg in pending:
+            try:
+                pg.halt()                       # one bounded retry using retained handles
+            except Exception as error:
+                still_live.append(f"{pg.name}: {error}")
+        if still_live:
+            self.events.close()
+            raise Failure("cleanup_failed", "; ".join(still_live) +
+                          "; daemon and shared memory preserved for incomplete compute cleanup")
         if self.daemon and self.daemon.poll() is None:
             # after a finding, SIGKILL keeps the store exactly as it failed
             self.daemon.send_signal(signal.SIGKILL if preserve_state or interrupted or cleanup_errors else signal.SIGTERM)
