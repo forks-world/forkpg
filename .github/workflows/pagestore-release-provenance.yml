@@ -32,12 +32,15 @@ jobs:
         run: |
           git fetch --no-tags origin +refs/heads/pagestore:refs/pagestore-release-check/workflow-policy
           python3 - >> "$GITHUB_OUTPUT" <<'PY'
-          import json, os, re, subprocess
+          import json, os, re, subprocess, sys
           branch = os.environ["TARGET_BRANCH"]
           match = re.fullmatch(r"branchdb_([0-9]+)(?:-rc)?", branch)
           if match is None:
               raise SystemExit("invalid release branch name: " + branch)
           major = int(match.group(1))
+          print(f"major={major}")
+          revision = subprocess.check_output(["git", "rev-parse", "refs/pagestore-release-check/workflow-policy"], text=True).strip()
+          print(f"revision={revision}")
           data = json.loads(subprocess.check_output([
               "git", "show", "refs/pagestore-release-check/workflow-policy:contrib/pagestore/release-branches.json"
           ], text=True))
@@ -47,17 +50,29 @@ jobs:
               print("supported=true")
           elif major in unsupported and major not in supported:
               print("supported=false")
-              print(f"skip - PG{major} is an unsupported reference branch", file=__import__('sys').stderr)
+              print(f"skip - PG{major} is an unsupported reference branch", file=sys.stderr)
           else:
               raise SystemExit("major missing or duplicated in authoritative support policy")
           PY
-      - name: Check provenance regressions
+      - name: Extract authoritative validation code
         if: steps.policy.outputs.supported == 'true'
-        run: python3 contrib/pagestore/harness/test_release_provenance.py
+        env:
+          TRUSTED_REVISION: ${{ steps.policy.outputs.revision }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pagestore-trusted-checker"
+          for file in pagestore_release_branches.py test_release_provenance.py; do
+            git show "$TRUSTED_REVISION:contrib/pagestore/harness/$file" \
+              > "$RUNNER_TEMP/pagestore-trusted-checker/$file"
+          done
+      - name: Check authoritative provenance regressions
+        if: steps.policy.outputs.supported == 'true'
+        run: python3 "$RUNNER_TEMP/pagestore-trusted-checker/test_release_provenance.py"
       - name: Validate checked-out release commit
         if: steps.policy.outputs.supported == 'true'
         env:
           RELEASE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_MAJOR: ${{ steps.policy.outputs.major }}
         run: |
-          python3 contrib/pagestore/harness/pagestore_release_branches.py \
-            --authoritative-manifest --release-pr-sha "$RELEASE_SHA"
+          python3 "$RUNNER_TEMP/pagestore-trusted-checker/pagestore_release_branches.py" \
+            --repository "$GITHUB_WORKSPACE" --authoritative-manifest \
+            --release-pr-sha "$RELEASE_SHA" --expected-major "$EXPECTED_MAJOR"

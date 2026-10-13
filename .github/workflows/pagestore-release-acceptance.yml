@@ -142,9 +142,17 @@ jobs:
         env:
           CANDIDATE_SHA: ${{ needs.resolve.outputs.sha }}
         run: |
-          python3 contrib/pagestore/harness/test_release_provenance.py
-          python3 contrib/pagestore/harness/pagestore_release_branches.py \
-            --authoritative-manifest --candidate-sha "$CANDIDATE_SHA"
+          git fetch --no-tags origin +refs/heads/pagestore:refs/pagestore-release-check/acceptance-checker
+          trusted_revision=$(git rev-parse refs/pagestore-release-check/acceptance-checker)
+          mkdir -p "$RUNNER_TEMP/pagestore-trusted-checker"
+          for file in pagestore_release_branches.py test_release_provenance.py; do
+            git show "$trusted_revision:contrib/pagestore/harness/$file" \
+              > "$RUNNER_TEMP/pagestore-trusted-checker/$file"
+          done
+          python3 "$RUNNER_TEMP/pagestore-trusted-checker/test_release_provenance.py"
+          python3 "$RUNNER_TEMP/pagestore-trusted-checker/pagestore_release_branches.py" \
+            --repository "$GITHUB_WORKSPACE" --authoritative-manifest \
+            --candidate-sha "$CANDIDATE_SHA"
 
       - name: Run standalone test suite
         working-directory: contrib/pagestore

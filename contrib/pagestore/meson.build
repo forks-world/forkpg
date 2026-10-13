@@ -796,7 +796,7 @@ test('pagestore_release_provenance',
   pagestore_harness_python,
   args: [files('harness/test_release_provenance.py')],
   suite: ['pagestore'],
-  timeout: 60,
+  timeout: 300,
 )
 test('pagestore_release_branches',
   pagestore_harness_python,

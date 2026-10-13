@@ -96,9 +96,15 @@ class ProvenanceTests(unittest.TestCase):
             self.check()
 
     def test_stale_source_tree_is_rejected(self):
-        (self.repo / "contrib/pagestore/example").write_text("changed release tree\n")
+        self.git("checkout", "-q", "pagestore")
+        (self.repo / "contrib/pagestore/example").write_text("new source tree\n")
         self.git("add", "contrib")
-        self.git("commit", "-q", "-m", "ci: changed release")
+        self.git("commit", "-q", "-m", "new source capture")
+        newer = self.git("rev-parse", "HEAD")
+        self.git("push", "origin", "pagestore")
+        self.git("checkout", "-q", "branchdb_18")
+        self.git("checkout", newer, "--", "contrib/pagestore")
+        self.git("commit", "-q", "-m", f"contrib/pagestore: sync to pagestore@{newer}")
         self.git("push", "origin", "branchdb_18")
         with self.assertRaisesRegex(ReleaseBranchesError, "contrib tree differs"):
             self.check()
@@ -231,7 +237,7 @@ class ProvenanceTests(unittest.TestCase):
         self.git("commit", "-q", "-m", "contrib only\n\nBranchdb-Series: C7")
         self.data["supported"][0]["core_series"]["C7"]["commit"] = self.git("rev-parse", "HEAD")
         self.git("push", "--force", "origin", "branchdb_18")
-        with self.assertRaisesRegex(ReleaseBranchesError, "no PostgreSQL core/build"):
+        with self.assertRaisesRegex(ReleaseBranchesError, "changes contrib/pagestore"):
             self.check()
 
     def test_checked_branch_revision_is_returned(self):
@@ -313,6 +319,83 @@ class ProvenanceTests(unittest.TestCase):
         with self.assertRaises(ReleaseBranchesError):
             manifest_reader.check_release_provenance(self.data, repo=self.repo,
                 upstream=str(self.upstream), candidate_sha=candidate)
+
+    def test_wrong_target_major_is_rejected(self):
+        with self.assertRaisesRegex(ReleaseBranchesError, "does not match target PG17"):
+            manifest_reader.check_release_provenance(self.data, repo=self.repo,
+                upstream=str(self.upstream), candidate_sha=self.candidate,
+                require_lineage=False, expected_major=17)
+
+    def test_direct_contrib_edit_then_restore_is_rejected(self):
+        path = self.repo / "contrib/pagestore/example"
+        path.write_text("direct edit\n")
+        self.git("add", "contrib")
+        self.git("commit", "-q", "-m", "direct contrib edit")
+        path.write_text("source tree\n")
+        self.git("add", "contrib")
+        self.git("commit", "-q", "-m", "restore source tree")
+        self.git("push", "origin", "branchdb_18")
+        with self.assertRaisesRegex(ReleaseBranchesError, "not a mechanical sync"):
+            self.check()
+
+    def test_falsely_claimed_mechanical_sync_is_rejected(self):
+        path = self.repo / "contrib/pagestore/example"
+        path.write_text("wrong claimed source\n")
+        self.git("add", "contrib")
+        self.git("commit", "-q", "-m", f"contrib/pagestore: sync to pagestore@{self.source}")
+        path.write_text("source tree\n")
+        self.git("add", "contrib")
+        self.git("commit", "-q", "-m", f"contrib/pagestore: sync to pagestore@{self.source}")
+        self.git("push", "origin", "branchdb_18")
+        with self.assertRaisesRegex(ReleaseBranchesError, "differs from cited source"):
+            self.check()
+
+    def test_authoritative_checker_ignores_proposed_helper_stub(self):
+        # Keep the production authority URL in the checker while mapping it
+        # to this test's isolated authoritative Git repository.
+        self.git("config", f"url.{self.upstream.as_uri()}.insteadOf",
+                 "https://github.com/postgres/postgres.git")
+        self.git("checkout", "-q", "pagestore")
+        harness = self.repo / "contrib/pagestore/harness"
+        harness.mkdir()
+        source = Path(manifest_reader.__file__).read_text()
+        (harness / "pagestore_release_branches.py").write_text(source)
+        (harness / "test_release_provenance.py").write_text(Path(__file__).read_text())
+        (self.repo / "contrib/pagestore/release-branches.json").write_text(json.dumps(self.data))
+        self.git("add", "contrib")
+        self.git("commit", "-q", "-m", "authoritative checker and policy")
+        self.git("push", "origin", "pagestore")
+        trusted_revision = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "branchdb_18")
+        harness.mkdir(exist_ok=True)
+        (harness / "pagestore_release_branches.py").write_text("print('STUB RAN')\n")
+        self.git("add", "contrib")
+        self.git("commit", "-q", "-m", "stub the validator")
+        candidate = self.git("rev-parse", "HEAD")
+        # Execute the actual workflow extraction and validation programs.
+        import os
+        import textwrap
+        workflow = Path(__file__).resolve().parents[3] / ".github/workflows/pagestore-release-provenance.yml"
+        if not workflow.exists():
+            # When the trusted regression file itself runs from an extracted
+            # cache, test the same git-show/bootstrap contract directly.
+            extract = 'mkdir -p "$RUNNER_TEMP/pagestore-trusted-checker"\ngit show "$TRUSTED_REVISION:contrib/pagestore/harness/pagestore_release_branches.py" > "$RUNNER_TEMP/pagestore-trusted-checker/pagestore_release_branches.py"'
+            validate = 'python3 "$RUNNER_TEMP/pagestore-trusted-checker/pagestore_release_branches.py" --repository "$GITHUB_WORKSPACE" --authoritative-manifest --release-pr-sha "$RELEASE_SHA" --expected-major "$EXPECTED_MAJOR"'
+        else:
+            def program(name):
+                section = workflow.read_text().split(f"      - name: {name}\n", 1)[1]
+                section = section.split("\n      - name:", 1)[0]
+                return textwrap.dedent(section.split("        run: |\n", 1)[1])
+            extract = program("Extract authoritative validation code")
+            validate = program("Validate checked-out release commit")
+        env = {**os.environ, "RUNNER_TEMP": self.temp.name, "TRUSTED_REVISION": trusted_revision,
+               "GITHUB_WORKSPACE": str(self.repo), "RELEASE_SHA": candidate, "EXPECTED_MAJOR": "18"}
+        subprocess.run(["bash", "-e", "-c", extract], cwd=self.repo, env=env, check=True, timeout=30)
+        result = subprocess.run(["bash", "-e", "-c", validate], cwd=self.repo, env=env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("STUB RAN", result.stdout + result.stderr)
+        self.assertIn("not a mechanical sync", result.stderr)
 
     def test_planned_entries_need_no_repository(self):
         self.data["supported"][0].update(status="planned", base_tag=None, contrib_sha=None)

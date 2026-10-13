@@ -179,3 +179,12 @@ and landed core sources without requiring post-landing metadata to exist first.
 Frozen candidate acceptance and weekly release qualification still require the
 approved authoritative base/source/core pins; metadata transitions never become
 qualified merely because the unmerged PR is structurally reviewable.
+
+The release workflow binds PR validation to the target branch's major, then
+extracts validator/regression code from the freshly fetched authoritative
+pagestore revision into a temporary directory. Candidate acceptance uses the
+same trusted bootstrap. Proposed release code cannot replace its own checker.
+Every commit changing contrib/pagestore must be a pure mechanical sync with a
+full landed source SHA and an identical tree at that commit, not just at HEAD.
+Legacy prototype history with direct contrib edits requires a clean release
+cut before qualification; a later tree restore does not attest earlier edits.
