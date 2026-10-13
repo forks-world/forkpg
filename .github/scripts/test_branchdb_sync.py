@@ -19,6 +19,12 @@ class BranchSyncSafety(unittest.TestCase):
         self.git("config", "tag.gpgSign", "false")
         self.git("config", "core.hooksPath", "/dev/null")
         self.git("commit", "-q", "--allow-empty", "-m", "base")
+        self.no_contrib = self.git("rev-parse", "HEAD")
+        path = self.repo / "contrib/pagestore/example"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("baseline\n")
+        self.git("add", "contrib/pagestore")
+        self.git("commit", "-q", "-m", "base with pagestore")
         self.base = self.git("rev-parse", "HEAD")
         for tag in ("REL_18_6", "REL_17_6"):
             self.git("tag", tag)
@@ -99,6 +105,14 @@ class BranchSyncSafety(unittest.TestCase):
         result = self.assert_refused_without_rewrite("verify", "branchdb_18-rc", "HEAD")
         self.assertIn("not an ancestor of origin/pagestore", result.stderr)
 
+    def test_verify_rejects_source_and_release_without_pagestore(self):
+        self.git("update-ref", "refs/remotes/origin/pagestore", "branchdb_19")
+        self.git("checkout", "-q", "branchdb_18-rc")
+        self.git("rm", "-r", "contrib/pagestore")
+        self.git("commit", "-q", "-m", "ci: remove contrib for negative test")
+        result = self.assert_refused_without_rewrite("verify", "branchdb_18-rc", self.no_contrib)
+        self.assertIn("no contrib/pagestore tree", result.stderr)
+
     def test_verify_accepts_landed_source(self):
         self.git("tag", "-d", "REL_17_6")  # keep the PG18 base tag unambiguous
         self.git("update-ref", "refs/remotes/origin/pagestore", "branchdb_19")
@@ -119,12 +133,12 @@ class BranchSyncSafety(unittest.TestCase):
 
     def test_sync_rejects_source_without_contrib_before_mutating(self):
         path = self.repo / "contrib/pagestore/example"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("preserve me\n")
         self.git("add", "contrib/pagestore")
         self.git("commit", "-q", "-m", "source tree")
         self.git("update-ref", "refs/remotes/origin/pagestore", "HEAD")
-        result = self.assert_refused_without_rewrite("sync-contrib", "branchdb_19", self.base)
+        result = self.assert_refused_without_rewrite("sync-contrib", "branchdb_19", self.no_contrib)
         self.assertIn("no contrib/pagestore tree", result.stderr)
         self.assertEqual(path.read_text(), "preserve me\n")
         self.assertEqual(self.git("status", "--porcelain"), "")
@@ -190,7 +204,7 @@ class BranchSyncSafety(unittest.TestCase):
     def test_sync_records_immutable_oid_when_alias_moves(self):
         self.git("tag", "-d", "REL_17_6")
         path = self.repo / "contrib/pagestore/example"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("first capture\n")
         self.git("add", "contrib/pagestore")
         self.git("commit", "-q", "-m", "source capture")

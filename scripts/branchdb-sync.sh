@@ -498,6 +498,9 @@ cmd_verify() {
     die "'$sha' is not an ancestor of origin/pagestore; verify requires a landed pagestore source"
   fi
 
+  [[ "$(git cat-file -t "$sha:contrib/pagestore" 2>/dev/null || true)" == "tree" ]] ||
+    die "verified source '$sha' has no contrib/pagestore tree"
+
   local upref
   upref=$(upstream_ref "$v") || die "no upstream ref for PG $v"
   local base

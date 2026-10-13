@@ -81,7 +81,7 @@ jobs:
           # matrix jobs used to resolve it
           SOAK_REF: >-
             ${{ github.event.inputs.ref
-                || (github.ref_name == github.event.repository.default_branch
+                || (github.event_name == 'schedule'
                     && 'pagestore' || github.ref_name) }}
           GH_TOKEN: ${{ github.token }}
         run: |
