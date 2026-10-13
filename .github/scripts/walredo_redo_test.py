@@ -54,6 +54,28 @@ def start(extra_opts=""):
     time.sleep(2)
 
 
+def read_record(read_at, rec_start, rec_end):
+    """Read logical record bytes, removing WAL continuation page headers."""
+    total_len = struct.unpack("<I", read_at(rec_start, 4))[0]
+    assert total_len >= 24, "invalid record length"
+    cursor, remaining = rec_start, total_len
+    chunks = []
+    while remaining:
+        if cursor != rec_start and cursor % 8192 == 0:
+            header = read_at(cursor, 24)
+            _, info, _, pageaddr, rem_len = struct.unpack("<HHIQI4x", header)
+            assert info & 1 and pageaddr == cursor and rem_len == remaining, "invalid WAL continuation"
+            cursor += 40 if info & 2 else 24
+        size = min(remaining, 8192 - cursor % 8192)
+        chunk = read_at(cursor, size)
+        assert len(chunk) == size, "truncated WAL record"
+        chunks.append(chunk)
+        remaining -= size
+        cursor += size
+        assert cursor <= rec_end, "record exceeds WAL end"
+    return b"".join(chunks)
+
+
 def extract_record(start_lsn, end_lsn, desc_match):
     """Return (rec_start, rec_end, bytes) for the first matching no-FPI record."""
     dump = subprocess.run([f"{BINDIR}/pg_waldump", "-p", f"{PGDATA}/pg_wal",
@@ -68,17 +90,17 @@ def extract_record(start_lsn, end_lsn, desc_match):
             break
     assert rec_start is not None, "no matching no-FPI record found"
     rec_end = min([x for x in all_lsns if x > rec_start] + [end_lsn])
-    off = rec_start % SEGSIZE
-    seg = "%08X%08X%08X" % (1, rec_start >> 32, (rec_start % (1 << 32)) // SEGSIZE)
-    with open(f"{PGDATA}/pg_wal/{seg}", "rb") as wal_file:
-        wal = wal_file.read()
-    total_len = struct.unpack_from("<I", wal, off)[0]
-    assert total_len >= 24 and rec_start + total_len <= rec_end, "invalid record length"
-    assert (off % 8192) + total_len <= 8192, "record spans a WAL page; rerun"
-    # The next record starts at MAXALIGN(total_len); padding is not part of
-    # the framed record, although rec_end remains the aligned WAL position.
-    data = wal[off:off + total_len]
-    assert len(data) == total_len, "truncated WAL record"
+    def read_at(lsn, size):
+        seg = "%08X%08X%08X" % (1, lsn >> 32, (lsn % (1 << 32)) // SEGSIZE)
+        with open(f"{PGDATA}/pg_wal/{seg}", "rb") as wal_file:
+            wal_file.seek(lsn % SEGSIZE)
+            data = wal_file.read(size)
+        assert len(data) == size, "truncated WAL data"
+        return data
+
+    # The next record's aligned LSN includes padding/page headers; the frame
+    # contains exactly xl_tot_len bytes after continuation headers are removed.
+    data = read_record(read_at, rec_start, rec_end)
     return rec_start, rec_end, data
 
 

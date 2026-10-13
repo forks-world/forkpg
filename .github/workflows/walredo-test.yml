@@ -45,6 +45,7 @@ on:
       - 'contrib/pagestore/meson.build'
       - '.github/scripts/walredo_smoke.py'
       - '.github/scripts/walredo_redo_test.py'
+      - '.github/scripts/test_walredo_records.py'
       - '.github/workflows/walredo-test.yml'
   pull_request:
     paths:
@@ -75,6 +76,7 @@ on:
       - 'contrib/pagestore/meson.build'
       - '.github/scripts/walredo_smoke.py'
       - '.github/scripts/walredo_redo_test.py'
+      - '.github/scripts/test_walredo_records.py'
       - '.github/workflows/walredo-test.yml'
   workflow_dispatch:
 
@@ -90,6 +92,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check WAL record framing regressions
+        run: python3 .github/scripts/test_walredo_records.py
 
       - name: Install build dependencies
         run: |

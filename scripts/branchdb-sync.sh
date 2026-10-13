@@ -507,7 +507,7 @@ cmd_verify() {
 
   local base_tag
   if base_tag=$(git describe --tags --exact-match "$base" 2>/dev/null) && \
-      [[ "$base_tag" =~ ^REL_${v}_ ]]; then
+      [[ "$base_tag" =~ ^REL_${v}_([0-9]+|BETA[1-9][0-9]*|RC[1-9][0-9]*)$ ]]; then
     echo "ok   - base $base_tag is an upstream REL_${v}_* tag"
   elif [[ -n "${base_tag:-}" ]]; then
     echo "FAIL - base ${base:0:12} is tagged '$base_tag', which is not a REL_${v}_* tag (wrong major, or a non-release tag such as a pagestore-candidate-* tag reused as a base)"
