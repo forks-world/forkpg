@@ -14,6 +14,7 @@ import json
 import os
 import random
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -180,6 +181,121 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+class PostmasterHandle:
+    """Keep the kernel process identity, including across numeric PID reuse."""
+
+    def __init__(self, fd: int, pid: int):
+        self.fd = fd
+        self.pid = pid
+        self.children: dict[int, PostmasterHandle] = {}
+
+    @classmethod
+    def open(cls, pid: int, datadir: Path, postgres: Path) -> "PostmasterHandle":
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise Failure("cleanup_identity", "endurance requires Linux pidfd support (Python 3.9+)")
+        fd = os.pidfd_open(pid)
+        try:
+            # A stale PID file is not ownership evidence. Pin first, then check
+            # the executable and -D argument while that pinned process is live.
+            proc = Path(f"/proc/{pid}")
+            argv = (proc / "cmdline").read_bytes().split(b"\0")
+            directory = os.fsencode(str(datadir.resolve()))
+            owns_directory = any(argv[i] == b"-D" and argv[i + 1] == directory
+                                 for i in range(len(argv) - 1))
+            if not (proc / "exe").samefile(postgres) or not owns_directory:
+                raise Failure("cleanup_identity", f"PID {pid} is not this compute's postmaster")
+            if select.select([fd], [], [], 0)[0]:
+                raise ProcessLookupError(f"postmaster {pid} exited while its identity was checked")
+            return cls(fd, pid)
+        except FileNotFoundError as error:
+            exited = bool(select.select([fd], [], [], 0)[0])
+            os.close(fd)
+            if exited:
+                raise ProcessLookupError(f"postmaster {pid} exited") from error
+            raise Failure("cleanup_identity", f"cannot verify live PID {pid}: {error}") from error
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def exited(self) -> bool:
+        return bool(select.select([self.fd], [], [], 0)[0])
+
+    def pin_children(self) -> None:
+        if self.exited():
+            return
+        try:
+            pids = Path(f"/proc/{self.pid}/task/{self.pid}/children").read_text().split()
+        except FileNotFoundError:
+            if self.exited():
+                return
+            # The children file depends on CONFIG_CHECKPOINT_RESTORE; pidfds
+            # and ordinary procfs parentage work without that kernel option.
+            pids = []
+            for proc in Path("/proc").iterdir():
+                if not proc.name.isdecimal():
+                    continue
+                try:
+                    stat = (proc / "stat").read_text().rsplit(") ", 1)[1].split()
+                    if int(stat[1]) == self.pid:
+                        pids.append(proc.name)
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    continue
+        for value in pids:
+            pid = int(value)
+            child = next((child for child in self.children.values()
+                          if child.pid == pid and not child.exited()), None)
+            if child is not None:
+                child.pin_children()
+                continue
+            try:
+                fd = os.pidfd_open(pid)
+            except ProcessLookupError:
+                continue
+            adopted = False
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+                # Pin before checking parentage; reject a recycled PID, and
+                # never infer ownership merely from a numeric process group.
+                if int(stat[1]) != self.pid or self.exited() or select.select([fd], [], [], 0)[0]:
+                    continue
+                child = PostmasterHandle(fd, pid)
+                self.children[fd] = child
+                adopted = True
+                child.pin_children()
+            except FileNotFoundError:
+                if not select.select([fd], [], [], 0)[0]:
+                    raise
+            finally:
+                if not adopted:
+                    os.close(fd)
+
+    def wait_children(self, deadline: float | None = None) -> None:
+        if deadline is None:
+            deadline = time.monotonic() + 60
+        for child in self.children.values():
+            remaining = max(0, deadline - time.monotonic())
+            if not select.select([child.fd], [], [], remaining)[0]:
+                raise Failure("cleanup_timeout", "an owned postmaster child did not exit")
+            child.wait_children(deadline)
+
+    def wait_exit(self) -> None:
+        if not select.select([self.fd], [], [], 60)[0]:
+            raise Failure("cleanup_timeout", "the pinned postmaster did not exit")
+
+    def kill(self) -> None:
+        try:
+            signal.pidfd_send_signal(self.fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass                                # the pinned process already exited
+        self.wait_exit()
+
+    def close(self) -> None:
+        for child in self.children.values():
+            child.close()
+        self.children.clear()
+        os.close(self.fd)
+
+
 class Pg:
     """One PostgreSQL compute owned by the driver."""
 
@@ -191,6 +307,7 @@ class Pg:
         self.log = run.root / f"{name}.log"
         self.expected_up = False
         self.log_scanned = 0
+        self.postmaster: PostmasterHandle | None = None
 
     def ctl(self, *args: str, env: dict[str, str] | None = None, timeout: int = 300) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -198,38 +315,90 @@ class Pg:
             env=env or self.run.env, capture_output=True, text=True, timeout=timeout)
 
     def start(self) -> None:
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise Failure("cleanup_identity", "endurance requires Linux pidfd support (Python 3.9+)")
+        if self.postmaster is not None:
+            if not self.postmaster.exited():
+                raise Failure("start_failed", f"{self.name} still has a live postmaster")
+            self.postmaster.wait_children()
+            self.postmaster.close()
+            self.postmaster = None
         r = self.ctl("-l", str(self.log), "-w", "-t", "300", "start")
         if r.returncode == 0:
+            self.pin_postmaster()
             self.expected_up = True
             return
         raise Failure("start_failed", f"{self.name} did not start: {r.stdout[-400:]} {r.stderr[-400:]}")
 
     def stop(self, mode: str = "fast", check: bool = True) -> None:
         self.expected_up = False
+        if check and self.postmaster is not None:
+            self.postmaster.pin_children()
         r = self.ctl("-m", mode, "-w", "-t", "300", "stop")
+        # halt uses stop(check=False), retaining the handle for escalation;
+        # ordinary stops release it, including permanently retired branches.
+        if check and self.postmaster is not None and (r.returncode == 0 or self.postmaster.exited()):
+            self.postmaster.wait_exit()
+            self.postmaster.wait_children()
+            self.postmaster.close()
+            self.postmaster = None
         if check and r.returncode != 0:
             raise Failure("stop_failed", f"{self.name} ({mode}): {r.stdout[-300:]} {r.stderr[-300:]}")
 
-    def halt(self) -> None:
-        """Stop immediately whatever state the compute is in; SIGKILL the
-        postmaster's process group if pg_ctl cannot, and wait for it."""
+    def pin_postmaster(self) -> None:
         pid = self.pid()
-        try:
-            self.stop("immediate", check=False)
-        except subprocess.TimeoutExpired:
-            pass
-        if not pid_alive(pid):
-            return
-        try:
-            os.killpg(pid, signal.SIGKILL)        # pg_ctl starts the postmaster in its own session
-        except OSError:
+        if pid is None or pid <= 0:
+            raise Failure("cleanup_identity", f"{self.name} has no valid postmaster PID")
+        self.postmaster = PostmasterHandle.open(pid, self.datadir, self.run.bin / "postgres")
+
+    def refresh_postmaster(self) -> None:
+        """Re-acquire ownership after an external controller's writer restart."""
+        if self.postmaster is not None:
+            if not self.postmaster.exited():
+                return
+            self.postmaster.wait_children()
+            self.postmaster.close()
+            self.postmaster = None
+        self.pin_postmaster()
+
+    def halt(self) -> None:
+        """Immediate shutdown, escalating only through a pinned process handle.
+
+        PostgreSQL children observe postmaster death; never signal a numeric
+        process group that could have been reused after pg_ctl timed out.
+        """
+        if self.postmaster is None:
+            # Also handle a partially successful pg_ctl start. Validate its
+            # executable/data directory before adopting a process from the PID file.
+            if self.pid() is None:
+                return
             try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
+                self.pin_postmaster()
+            except ProcessLookupError:
+                return
+        cleanup_complete = False
+        try:
+            # Do not call pg_ctl against a stale PID file after this generation
+            # exited: even its numeric PID may now refer to an unrelated process.
+            if self.postmaster.exited():
+                self.postmaster.wait_children()
+                cleanup_complete = True
+                return
+            self.postmaster.pin_children()
+            try:
+                self.stop("immediate", check=False)
+            except subprocess.TimeoutExpired:
                 pass
-        deadline = time.time() + 60
-        while pid_alive(pid) and time.time() < deadline:
-            time.sleep(0.1)
+            if not self.postmaster.exited():
+                self.postmaster.pin_children()
+                self.postmaster.kill()
+            self.postmaster.wait_children()
+            cleanup_complete = True
+        finally:
+            self.expected_up = False
+            if cleanup_complete:
+                self.postmaster.close()
+                self.postmaster = None
 
     def pid(self) -> int | None:
         try:
@@ -842,6 +1011,7 @@ DO $$ DECLARE r record; BEGIN
                     raise
                 self.event("branch_prepare_retry", timeline=tl, attempt=attempt + 1)
             finally:
+                self.writer.refresh_postmaster()
                 self.writer.expected_up = True
         if receipt.get("state") != "complete":
             raise Failure("branch_prepare", f"receipt state {receipt.get('state')}")
@@ -1037,11 +1207,27 @@ recovery_target_action = 'promote'
 
     def teardown(self, preserve_state: bool, interrupted: bool = False) -> None:
         self.stop_sampling()
+        cleanup_errors: list[str] = []
+        pending: list[Pg] = []
         for pg in self.computes():
-            pg.halt()
+            try:
+                pg.halt()
+            except Exception as error:
+                cleanup_errors.append(f"{pg.name}: {error}")
+                pending.append(pg)
+        still_live: list[str] = []
+        for pg in pending:
+            try:
+                pg.halt()                       # one bounded retry using retained handles
+            except Exception as error:
+                still_live.append(f"{pg.name}: {error}")
+        if still_live:
+            self.events.close()
+            raise Failure("cleanup_failed", "; ".join(still_live) +
+                          "; daemon and shared memory preserved for incomplete compute cleanup")
         if self.daemon and self.daemon.poll() is None:
             # after a finding, SIGKILL keeps the store exactly as it failed
-            self.daemon.send_signal(signal.SIGKILL if preserve_state or interrupted else signal.SIGTERM)
+            self.daemon.send_signal(signal.SIGKILL if preserve_state or interrupted or cleanup_errors else signal.SIGTERM)
             try:
                 self.daemon.wait(timeout=600)
             except subprocess.TimeoutExpired:
@@ -1051,6 +1237,8 @@ recovery_target_action = 'promote'
         except OSError:
             pass
         self.events.close()
+        if cleanup_errors:
+            raise Failure("cleanup_failed", "; ".join(cleanup_errors))
 
     # ---- main loop -------------------------------------------------------
 
@@ -1145,7 +1333,13 @@ def one_run(args: argparse.Namespace, seed: int, root: Path) -> bool:
             failure = run.async_failure         # a finding the main thread had not picked up yet
         # a signal during cleanup is remembered, not raised half-way through it
         with deferred_signals() as signalled:
-            run.teardown(preserve_state=failure is not None, interrupted=interrupted or bool(signalled))
+            try:
+                run.teardown(preserve_state=failure is not None, interrupted=interrupted or bool(signalled))
+            except Failure as cleanup_failure:
+                if failure is None:
+                    failure = cleanup_failure
+                else:
+                    failure.detail += f"; {cleanup_failure}"
             interrupted = interrupted or bool(signalled)
             if interrupted and failure is None:
                 shutil.rmtree(root, ignore_errors=True)

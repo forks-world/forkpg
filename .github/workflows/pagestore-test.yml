@@ -224,6 +224,7 @@ jobs:
         run: |
           python3 harness/tests/test_capture_source.py
           python3 harness/tests/test_pgdata_identity.py
+          python3 endurance/test_postmaster_cleanup.py
 
       - name: Check data-directory artifact identities against the fixture
         working-directory: contrib/pagestore

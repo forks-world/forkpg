@@ -774,6 +774,12 @@ test('pagestore_pgcache',
 # the regular pagestore suite so scenario/capability changes fail before the
 # slower PostgreSQL integration coverage runs.
 pagestore_harness_python = find_program('python3')
+test('pagestore_endurance_cleanup',
+  pagestore_harness_python,
+  args: [files('endurance/test_postmaster_cleanup.py')],
+  suite: ['pagestore'],
+  timeout: 60,
+)
 test('pagestore_store_owner_recovery',
   pagestore_harness_python,
   args: [files('harness/tests/test_store_owner_recovery.py'),
