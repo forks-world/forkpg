@@ -48,7 +48,11 @@ either capture command. The file must contain exactly these fields:
 Use the source/core SHAs and assertion setting of the build that produced
 the payloads. Regenerating an existing provenance-bearing fixture without
 this input fails before replacing its archive; old SHAs are never silently
-reused. Both fixture checkers validate the recorded provenance fields.
+reused. Both fixture checkers validate the recorded provenance fields. A current
+fixture that matches the checking build must also have capture provenance
+to pass `--require-build-match`. Foreign-major and legacy fixtures do not
+provide current-build release evidence; non-strict historical checks remain
+available without provenance.
 
 ## What it runs
 

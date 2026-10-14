@@ -45,3 +45,11 @@ def capture_source(args: argparse.Namespace, fixture: Path) -> dict[str, Any] | 
     except (OSError, json.JSONDecodeError) as error:
         raise CaptureSourceError(f"cannot read capture provenance: {error}") from error
     return None
+
+
+def require_release_capture(metadata: dict[str, Any]) -> None:
+    """A matching current fixture needs capture evidence for release gates."""
+    if "capture_source" not in metadata:
+        raise CaptureSourceError("a matching current fixture needs capture_source for "
+                                 "--require-build-match; recapture with --capture-source")
+    validate_capture_source(metadata["capture_source"])

@@ -50,7 +50,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pagestore_harness as harness  # noqa: E402
 from pagestore_capture_source import (CaptureSourceError, add_capture_source_argument,
-                                      capture_source, validate_capture_source)  # noqa: E402
+                                      capture_source, validate_capture_source,
+                                      require_release_capture)  # noqa: E402
 from pagestore_fixture import Daemon, build_payload_identity  # noqa: E402
 
 FIXTURE_JSON = "fixture.json"
@@ -559,6 +560,8 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int | None:
               "confirm the checking build loads it; recapture with "
               "--postgres-payload-identity[-tool]")
         return 1
+    if args.require_build_match and role == "current":
+        require_release_capture(metadata)
     expected = json.loads((fixture / FORMAT_JSON).read_text(encoding="utf-8"))
     current = format_identities(args.format_tool)
     if role == "current":
