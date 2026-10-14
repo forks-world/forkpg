@@ -2,22 +2,71 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HARNESS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARNESS))
 from pagestore_capture_source import CaptureSourceError, capture_source, validate_capture_source
+import pagestore_fixture as store
+import pagestore_pgdata_fixture as pgdata
 
 SOURCE = {"pagestore_sha": "a" * 40, "postgres_core_sha": "b" * 40,
           "postgres_major": 18, "cassert": True}
 
 
 class CaptureSourceTests(unittest.TestCase):
+    def test_strict_matching_fixture_requires_provenance_in_both_checkers(self):
+        for module in [store, pgdata]:
+            for strict in [False, True]:
+                with self.subTest(module=module.__name__, strict=strict), tempfile.TemporaryDirectory() as temp:
+                    fixture = Path(temp)
+                    (fixture / 'format.json').write_text('[]')
+                    identity = dict(pg_control_version=1902, xlog_page_magic=53536)
+                    metadata = dict(role='current', pg_identity=identity)
+                    args = argparse.Namespace(require_build_match=strict, format_tool=Path('/unused'),
+                                              build=None, only=['no-such-mutation'],
+                                              postgres_payload_identity=Path('/supplied'),
+                                              postgres_payload_identity_tool=None)
+                    with patch.object(module, 'fixture_metadata', return_value=metadata), \
+                         patch.object(module, 'format_identities', return_value=[]), \
+                         patch.object(pgdata, 'build_payload_identity', return_value=identity), \
+                         patch.object(store, 'check_reopen'), contextlib.redirect_stdout(io.StringIO()):
+                        if strict:
+                            with self.assertRaisesRegex(CaptureSourceError, 'needs capture_source'):
+                                module.check_one(args, fixture)
+                        else:
+                            self.assertEqual(module.check_one(args, fixture), 0)
+                        metadata['capture_source'] = dict(SOURCE, postgres_major=19)
+                        self.assertEqual(module.check_one(args, fixture), 0)
+
+    def test_strict_foreign_and_legacy_fixtures_do_not_require_capture_evidence(self):
+        for module in [store, pgdata]:
+            for role in ['legacy', 'current']:
+                with self.subTest(module=module.__name__, role=role), tempfile.TemporaryDirectory() as temp:
+                    fixture = Path(temp)
+                    (fixture / 'format.json').write_text('[{"old": true}]')
+                    metadata = dict(role=role, pg_identity=dict(pg_control_version=1800, xlog_page_magic=53528))
+                    args = argparse.Namespace(require_build_match=True, format_tool=Path('/unused'), build=None,
+                                              postgres_payload_identity=Path('/supplied'),
+                                              postgres_payload_identity_tool=None)
+                    with patch.object(module, 'fixture_metadata', return_value=metadata), \
+                         patch.object(module, 'format_identities', return_value=[]), \
+                         patch.object(pgdata, 'build_payload_identity', return_value=dict(
+                             pg_control_version=1902, xlog_page_magic=53536)), \
+                         patch.object(store, 'check_reopen', side_effect=(
+                             store.ForeignPayload('foreign major') if role=='current' else None)), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                        result = module.check_one(args, fixture)
+                        self.assertEqual(result, None if role=='current' or module is pgdata else 0)
+
     def test_validation(self):
         self.assertEqual(validate_capture_source(SOURCE), SOURCE)
         invalid = [{}, dict(SOURCE, unexpected=1), dict(SOURCE, pagestore_sha="abc"),

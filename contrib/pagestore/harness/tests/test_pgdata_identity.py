@@ -39,7 +39,9 @@ class IdentityTests(unittest.TestCase):
                                       postgres_payload_identity_tool=None)
 
     def check(self, recorded, build=IDENTITY, present=True, strict=True):
-        metadata = {"role": "current"}
+        metadata = {"role": "current", "capture_source": {
+            "pagestore_sha": "a" * 40, "postgres_core_sha": "b" * 40,
+            "postgres_major": 19, "cassert": True}}
         if present:
             metadata['pg_identity'] = recorded
         self.args.require_build_match = strict

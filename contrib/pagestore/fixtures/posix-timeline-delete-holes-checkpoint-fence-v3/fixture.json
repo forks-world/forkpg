@@ -4,6 +4,12 @@
   "role": "current",
   "workload": "fixture",
   "checkpoint_fence": true,
+  "capture_source": {
+    "pagestore_sha": "8ad5294e9e0f6d63a1d8ca7a28dcbb2cf2c4f191",
+    "postgres_core_sha": "8ad5294e9e0f6d63a1d8ca7a28dcbb2cf2c4f191",
+    "postgres_major": 19,
+    "cassert": true
+  },
   "daemon_args": [
     "--page-size",
     "8192",

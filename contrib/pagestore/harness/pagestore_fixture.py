@@ -29,7 +29,8 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pagestore_harness as harness  # noqa: E402
 from pagestore_capture_source import (CaptureSourceError, add_capture_source_argument,
-                                      capture_source, validate_capture_source)  # noqa: E402
+                                      capture_source, validate_capture_source,
+                                      require_release_capture)  # noqa: E402
 
 DAEMON_ARGS = [
     "--page-size", "8192", "--nshards", "1", "--storage", "posix",
@@ -1017,6 +1018,8 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int | None:
             print(f"skip - {foreign} (a fixture for another PostgreSQL release)")
             return None
         if role == "current":
+            if args.require_build_match:
+                require_release_capture(metadata)
             if current != expected:
                 print("FAIL - compiled persisted-format identities differ from the fixture:")
                 for item in current:
