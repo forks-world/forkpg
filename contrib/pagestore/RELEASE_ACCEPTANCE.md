@@ -107,3 +107,8 @@ endurance/correctness/recovery evidence gathered separately. This workflow
 does not itself decide "restricted developer preview" vs. "production
 release" -- see `RELEASE_VALIDATION.md`'s evidence-required-for-sign-off
 section for that.
+
+Strict pgdata fixture checks (`--require-build-match`) require both `--build`
+and `--postgres-payload-identity[-tool]`. Format-only checks cannot supply
+release evidence: the checking build must identify itself and run the real
+PostgreSQL artifact loaders against a matching current capture.

@@ -49,6 +49,27 @@ class IdentityTests(unittest.TestCase):
              patch.object(fixture, 'build_payload_identity', return_value=build):
             return fixture.check_one(self.args, self.root)
 
+    def test_strict_check_requires_loaders_and_build_identity(self):
+        for build, identity in [(None, Path('supplied')), (Path('build'), None)]:
+            with self.subTest(build=build, identity=identity):
+                self.args.build = build
+                self.args.postgres_payload_identity = identity
+                self.args.check = [self.root]
+                with patch.object(fixture, 'check_one', return_value=0) as check_one, \
+                     patch.object(fixture, 'fixture_metadata', return_value={'role': 'current'}):
+                    with self.assertRaises(fixture.FixtureError):
+                        fixture.check(self.args)
+                    check_one.assert_not_called()
+
+    def test_strict_check_requires_a_matching_current_fixture(self):
+        self.args.build = Path('build')
+        self.args.check = [self.root]
+        for role, result in [('legacy', 0), ('current', None)]:
+            with self.subTest(role=role), \
+                 patch.object(fixture, 'check_one', return_value=result), \
+                 patch.object(fixture, 'fixture_metadata', return_value={'role': role}):
+                self.assertEqual(fixture.check(self.args), 1)
+
     def test_invalid_recorded_evidence_even_without_strict_gate(self):
         for value in INVALID:
             for strict in [False, True]:

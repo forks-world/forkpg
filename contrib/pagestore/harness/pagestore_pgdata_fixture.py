@@ -619,6 +619,14 @@ def check(args: argparse.Namespace) -> int:
     status = 0
     binds_build = (args.postgres_payload_identity is not None or
                    args.postgres_payload_identity_tool is not None)
+    # Strict evidence must prove both the build identity and actual loader
+    # execution. The optional format-only path cannot certify a release.
+    if args.require_build_match:
+        if args.build is None:
+            raise FixtureError("--require-build-match needs --build to exercise PostgreSQL loaders")
+        if not binds_build:
+            raise FixtureError("--require-build-match needs --postgres-payload-identity[-tool] "
+                               "to identify the checking build")
     matched_current = 0
     for fixture in args.check:
         result = check_one(args, fixture)
