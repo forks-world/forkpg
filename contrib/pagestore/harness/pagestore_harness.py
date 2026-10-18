@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from xml.sax.saxutils import escape
+from xml.sax.saxutils import quoteattr
 
 
 class PlanError(ValueError):
@@ -1436,10 +1436,10 @@ def validate_paths(
 
 def write_junit(path: Path, name: str, errors: list[PlanError]) -> None:
     failures = "".join(
-        f'<failure message="{escape(str(error))}" />' for error in errors
+        f'<failure message={quoteattr(str(error))} />' for error in errors
     )
     body = (
-        f'<testsuite name="{escape(name)}" tests="1" failures="{int(bool(errors))}">'
+        f'<testsuite name={quoteattr(name)} tests="1" failures="{int(bool(errors))}">'
         f'<testcase name="validation">{failures}</testcase></testsuite>'
     )
     path.write_text(f"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{body}\n", encoding="utf-8")
@@ -6959,6 +6959,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+    suite_name = (
+        "pagestore-harness-plan" if args.validate or args.list
+        else "pagestore-harness-runtime"
+    )
+
+    def report_success() -> int:
+        if args.junit:
+            write_junit(args.junit, suite_name, [])
+        return 0
+
     try:
         capabilities = read_json(args.capabilities)
         if capabilities.get("schema") != 1:
@@ -6980,7 +6990,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 sort_keys=True,
             ))
-            return 0
+            return report_success()
         if args.daemon_smoke:
             plan = read_plan(args.daemon_smoke)
             validate_plan(plan, capabilities, args.capabilities)
@@ -6991,7 +7001,7 @@ def main(argv: list[str] | None = None) -> int:
                                     args.inspect_binary, args.run_root, args.keep)
             if args.keep or args.run_root:
                 print(root)
-            return 0
+            return report_success()
         if args.daemon_fault_smoke:
             plan = read_plan(args.daemon_fault_smoke)
             validate_plan(plan, capabilities, args.capabilities)
@@ -7019,7 +7029,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.keep or args.run_root:
                 print(root)
-            return 0
+            return report_success()
         if args.writer_smoke:
             plan = read_plan(args.writer_smoke)
             validate_plan(plan, capabilities, args.capabilities)
@@ -7030,7 +7040,7 @@ def main(argv: list[str] | None = None) -> int:
                                     args.build_dir, args.run_root, args.keep)
             if args.keep or args.run_root:
                 print(root)
-            return 0
+            return report_success()
         if args.materializer_smoke:
             plan = read_plan(args.materializer_smoke)
             validate_plan(plan, capabilities, args.capabilities)
@@ -7047,12 +7057,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.keep or args.run_root:
                 print(root)
-            return 0
+            return report_success()
         if args.legacy_integration:
             root = run_legacy_integration(args.integration_script, args.build_dir, args.run_root, args.keep)
             if args.keep or args.run_root:
                 print(root)
-            return 0
+            return report_success()
         paths = [args.validate] if args.validate else list(plan_files(args.list))
         if not paths:
             raise PlanError("no scenario plans found")
@@ -7067,7 +7077,7 @@ def main(argv: list[str] | None = None) -> int:
     for error in errors:
         print(f"ERROR: {error}", file=sys.stderr)
     if args.junit:
-        write_junit(args.junit, "pagestore-harness-plan", errors)
+        write_junit(args.junit, suite_name, errors)
     return 1 if errors else 0
 
 
