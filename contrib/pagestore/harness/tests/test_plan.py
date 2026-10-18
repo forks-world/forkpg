@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from unittest import mock
 from pathlib import Path
 
@@ -3117,6 +3118,53 @@ class PlanValidationTests(unittest.TestCase):
             ])
         self.assertEqual(status, 0)
         self.assertEqual((root / "trace" / "integration.log").read_text(), "reader-coverage\n")
+
+    def test_materializer_success_writes_requested_junit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "materializer.xml"
+            with mock.patch.object(MODULE, "run_materializer_smoke", return_value=Path(directory)):
+                status = MODULE.main([
+                    "--capabilities", str(ROOT / "capabilities.json"),
+                    "--materializer-smoke", str(ROOT / "scenarios/materializer_lifecycle.jsonl"),
+                    "--build-dir", directory,
+                    "--daemon-binary", "/unused/daemon",
+                    "--inspect-binary", "/unused/inspect",
+                    "--materializer-supervisor", "/unused/supervisor",
+                    "--junit", str(report),
+                ])
+            self.assertEqual(status, 0)
+            suite = ET.parse(report).getroot()
+            self.assertEqual(suite.attrib["failures"], "0")
+            self.assertIsNotNone(suite.find("testcase"))
+
+    def test_runtime_failure_writes_requested_junit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "failure.xml"
+            message = 'worker "materializer" failed at <R> & stopped'
+            with (
+                mock.patch.object(MODULE, "run_legacy_integration", side_effect=MODULE.PlanError(message)),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                status = MODULE.main([
+                    "--capabilities", str(ROOT / "capabilities.json"),
+                    "--legacy-integration", "--build-dir", directory,
+                    "--junit", str(report),
+                ])
+            self.assertEqual(status, 1)
+            suite = ET.parse(report).getroot()
+            self.assertEqual(suite.attrib["failures"], "1")
+            self.assertEqual(suite.find("testcase/failure").attrib["message"], message)
+
+    def test_junit_error_attributes_preserve_quotes_and_metacharacters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "failure.xml"
+            message = 'worker "materializer" failed: expected <R> & got \'L\''
+            name = 'scenario "failure"'
+            MODULE.write_junit(report, name, [MODULE.PlanError(message)])
+            suite = ET.parse(report).getroot()
+            self.assertEqual(suite.attrib["name"], name)
+            self.assertEqual(suite.attrib["failures"], "1")
+            self.assertEqual(suite.find("testcase/failure").attrib["message"], message)
 
 
 if __name__ == "__main__":

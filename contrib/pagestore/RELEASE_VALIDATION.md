@@ -95,6 +95,45 @@ This is one dispatched run against the fix, not yet a scheduled-run history:
 the three-seed scheduled nightlies must still accumulate green runs against
 this revision before the final MVP status update.
 
+## Local PG18 functional evidence (2026-10-18)
+
+A local PG18.6 validation used the existing `branchdb_18-rc` core build
+(`19e0b8ef16a`) with the extension and standalone helpers rebuilt from the
+pagestore work at `c843ab8287c` / `e2ef15e1058`, in a private temporary install.
+This is an overlay validation, not a frozen or promoted release-branch build.
+
+| Check | Local result |
+|---|---|
+| `integration_test.sh` | PASS, 323 assertions |
+| `mvp_golden_test.sh` | PASS, 64 assertions; serialized finite branch receipt, portable bootstrap crash/retry, independent compute boot, reader advancement and deletion |
+| `branch_boot_test.sh` | PASS, ordinary branch plus real member-wrap zero/cross cases; 17 assertions per wrap case |
+| Store fixtures with `--require-build-match` | PASS, 66 checks across current PG18 and legacy fixtures; foreign PG19 payload skipped |
+| PGDATA fixtures with `--build --require-build-match` | PASS, 33 loader/mutation checks for the native PG18 fixture; foreign PG19 capture skipped |
+| Materializer lifecycle | PASS, replacement recovery compute catches up and writer reports zero lag |
+| Materializer restart combinations | PASS, store/writer/materializer restart and subsequent SQL results |
+| Restartpoint crash after relation sync, before marker | PASS, declared named fault reached and recovery oracle satisfied |
+| Restartpoint crash after marker sync | PASS, declared named fault reached and recovery oracle satisfied |
+
+The real-wrap zero scenario was also run with the pre-fix extension
+(`3d404935123`): it failed at the original checkpoint horizon rejection
+`[4294967292, 0)`. Both fixed cases boot a separate branch, decode the same
+member identities as the parent, allocate a new multixact after wrap, and
+retain inherited members after writes and restart. The wrap boot tests use
+the existing explicit expert-cut fixture; the ordinary composed golden test
+separately covers the serialized materializer/controller path.
+
+Report collection exposed two harness defects: successful runtime modes
+returned before writing requested JUnit evidence, and quotes in failure
+attributes produced invalid XML. The follow-up emits reports on runtime
+success as well as failure and quotes XML attributes correctly. Both CI
+lanes now request and retain JUnit reports for the four materializer cases;
+a repeated real PG18 lifecycle run produced a parseable success report.
+
+These bounded functional runs do not establish the proposed 24/72-hour
+endurance thresholds or power-loss durability. The fix must land on
+pagestore and be mechanically synchronized before a frozen PG18 candidate
+can be qualified under the authoritative release provenance checks.
+
 ## Gaps in release evidence
 
 1. **Duration and scale.** Repeated short runs cannot establish multi-day

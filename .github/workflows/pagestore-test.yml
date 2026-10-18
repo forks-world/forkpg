@@ -447,7 +447,8 @@ jobs:
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
             --materializer-supervisor \
-              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py" \
+            --junit build/pagestore-materializer_lifecycle.xml
 
       - name: Run H1 materializer crash after relation sync
         if: >
@@ -466,7 +467,8 @@ jobs:
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
             --materializer-supervisor \
-              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py" \
+            --junit build/pagestore-materializer_restartpoint_after_relation_sync_before_marker.xml
 
       - name: Run H1 materializer crash after marker sync
         if: >
@@ -485,7 +487,8 @@ jobs:
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
             --materializer-supervisor \
-              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py" \
+            --junit build/pagestore-materializer_restartpoint_after_marker_sync.xml
 
       - name: Run H1 store, writer, and materializer restart combinations
         if: >
@@ -504,7 +507,8 @@ jobs:
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
             --materializer-supervisor \
-              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py" \
+            --junit build/pagestore-materializer_restart_combinations.xml
 
       - name: Check persisted-format fixtures against this PostgreSQL build
         # the standalone lane checks the envelopes; only a lane with a
@@ -602,13 +606,14 @@ jobs:
           contrib/pagestore/branch_boot_test.sh "$(pwd)/build" --member-wrap=cross \
             2>&1 | tee build/pagestore-member-wrap-cross.log
 
-      - name: Upload branch boot evidence
+      - name: Upload branch boot and materializer evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pagestore-branch-boot-logs
           path: |
             build/pagestore-member-wrap-*.log
+            build/pagestore-materializer_*.xml
             build/pagestore-branch-boot-logs/*.log
           if-no-files-found: warn
           retention-days: 7
