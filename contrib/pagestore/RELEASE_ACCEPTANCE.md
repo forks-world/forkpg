@@ -83,6 +83,8 @@ evidence-<tag>/
     in-engine-store-fixture-check.log            --require-build-match store check
     in-engine-pgdata-fixture-check.log            --require-build-match pgdata check
     evidence-integration-logs/*.log               integration_test.sh daemon/server logs
+    build/pagestore-member-wrap-{zero,cross}.log         PG18 real-wrap branch boot (SKIP on PG19)
+    build/pagestore-branch-boot-logs/*.log               server/daemon diagnostics on boot failure
     pagestore-control-restore-payload-identity.json   `pagestore_control_restore --payload-identity`
     pagestore-format-versions.json                `pagestore_format_versions`
     git-describe.txt                              `git describe --tags --long`

@@ -594,3 +594,21 @@ jobs:
 
       - name: Run end-to-end branch boot test
         run: contrib/pagestore/branch_boot_test.sh "$(pwd)/build"
+
+      - name: Run PG18 multixact member wrap branch boot tests
+        run: |
+          contrib/pagestore/branch_boot_test.sh "$(pwd)/build" --member-wrap=zero \
+            2>&1 | tee build/pagestore-member-wrap-zero.log
+          contrib/pagestore/branch_boot_test.sh "$(pwd)/build" --member-wrap=cross \
+            2>&1 | tee build/pagestore-member-wrap-cross.log
+
+      - name: Upload branch boot evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagestore-branch-boot-logs
+          path: |
+            build/pagestore-member-wrap-*.log
+            build/pagestore-branch-boot-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
