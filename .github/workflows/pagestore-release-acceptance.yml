@@ -167,6 +167,12 @@ jobs:
             --daemon-binary ./pagestore_daemon \
             --inspect-binary ./pagestore_inspect
 
+      - name: Check multixact member horizon boundaries
+        working-directory: contrib/pagestore
+        run: |
+          cc -O2 -Wall -Wextra -Werror -o pagestore_multixact_horizon_test pagestore_multixact_horizon_test.c
+          ./pagestore_multixact_horizon_test
+
       - name: Run named fault registry unit test
         working-directory: contrib/pagestore
         run: ./pagestore_fault_test
@@ -516,6 +522,13 @@ jobs:
       - name: Run end-to-end branch boot test
         run: contrib/pagestore/branch_boot_test.sh "$(pwd)/build"
 
+      - name: Run PG18 multixact member wrap branch boot tests
+        run: |
+          contrib/pagestore/branch_boot_test.sh "$(pwd)/build" --member-wrap=zero \
+            2>&1 | tee build/pagestore-member-wrap-zero.log
+          contrib/pagestore/branch_boot_test.sh "$(pwd)/build" --member-wrap=cross \
+            2>&1 | tee build/pagestore-member-wrap-cross.log
+
       - name: Record the build's PostgreSQL payload identity and persisted-format identities
         run: |
           build/contrib/pagestore/pagestore_control_restore --payload-identity \
@@ -535,6 +548,8 @@ jobs:
             in-engine-store-fixture-check.log
             in-engine-pgdata-fixture-check.log
             evidence-integration-logs/*.log
+            build/pagestore-member-wrap-*.log
+            build/pagestore-branch-boot-logs/*.log
             pagestore-control-restore-payload-identity.json
             pagestore-format-versions.json
             git-describe.txt

@@ -83,7 +83,7 @@ independent of whether the C1-C7 series is present.
 | `ControlFileData.slru_pages_per_segment`, `SLRU_PAGES_PER_SEGMENT` | `ControlFileData.slru_pages_per_segment` is a real field (`catalog/pg_control.h:211`); `SLRU_PAGES_PER_SEGMENT` moved to `pg_config_manual.h` as a compile-time constant | **absent** -- `ControlFileData` has no `slru_pages_per_segment` field on 18 at all; only the `#define SLRU_PAGES_PER_SEGMENT 32` in `access/slru.h` exists | `pagestore.c` (`ps_checkpoint_matches_control()`/`pagestore_control_image_compatible()`), `pagestore_control_restore.c` (frontend; `access/slru.h` is not frontend-safe, so the constant 32 is aliased locally rather than included) | Guarded in this PR |
 | `T_RepackStmt` / `T_ClusterStmt` (pinned-reader deny-list) | `T_RepackStmt` (`REPACK`, unifying `CLUSTER`/`VACUUM FULL` as `RepackCommand` `REPACK_COMMAND_CLUSTER`/`_VACUUMFULL`/`_REPACK`); `RepackStmt` present in `nodes/parsenodes.h` | **absent** -- `RepackStmt` does not exist in 18's `parsenodes.h` at all (`REPACK` is a 19+ feature); 18 instead has its own `T_ClusterStmt` for `CLUSTER`, and `VACUUM FULL` stays a plain `T_VacuumStmt` with `VACOPT_FULL` | `backend_localsvc.c`'s `ls_pinned_process_utility()` | Guarded in this PR: `#if PG_VERSION_NUM < 190000` adds a `T_ClusterStmt` case denying `"CLUSTER"` the same way `T_RepackStmt` denies `"REPACK"` on 19+ (confirmed against `upstream/REL_18_STABLE`'s `parsenodes.h`); `VACUUM FULL` needed no new case, since the existing `T_VacuumStmt` case already denies `VACUUM`/`ANALYZE` unconditionally, `FULL` or not. Before this fix, `CLUSTER` on an 18 pinned reader fell through this early, friendly ERROR to the deeper `wal_insert_restricted` backstop (xlog.c, C5) and PANICked instead; the read-only guarantee held either way (the backstop still refuses the write), but the failure mode was worse |
 | `MULTIXACT_OFFSETS_PER_PAGE`, members segment name width | offsets = `BLCKSZ / 8` (`MultiXactOffset` 64-bit); members uses 15-hex "long" segment names | offsets = `BLCKSZ / 4` (`MultiXactOffset` 32-bit); members uses the short (4-hex) name every other SLRU uses | `pagestore.c`'s `PG_MULTIXACT_MEMBERS_LONG_NAMES`-gated call sites in `pagestore_seed_multixact()`; `integration_test.sh`'s `opp`/`mbSeg` derivation | Guarded in this PR. This was a real bug, not just a portability gap: the hardcoded `true` seeded a branch's `pg_multixact/members` at a 15-hex path an 18 cluster never reads, and the seeder's own reference-comparison path looked under the wrong name too — caught by `integration_test.sh`'s byte-for-byte members assertion (`could not open file "pg_multixact/members/000000000000000"`) |
-| Members-offset wraparound seeding | 64-bit `MultiXactOffset` space, "never wraps" in practice — no wraparound-aware seeding needed | 32-bit `MultiXactOffset` space, wraps in the same way `MultiXactId` does | `pagestore_seed_multixact()`, `pagestore.c` | Not guarded — no fix landed in this PR; see "Known limitations" below (limitation 2) |
+| Members-offset wraparound seeding | 64-bit `MultiXactOffset` space, "never wraps" in practice — no wraparound-aware seeding needed | 32-bit `MultiXactOffset` space, wraps in the same way `MultiXactId` does | `pagestore_seed_multixact()`, `pagestore.c` | Implemented for PG18: split seed ranges at the 32-bit wrap and replay circular member truncation ranges; see the wraparound evidence below |
 
 `GetMultiXactInfo()` (`pagestore_slru.c`'s `ps_slru_tomb_horizon_cutoff()`)
 is not in this table: no public API exposes `oldestMulti`/`oldestOffset`
@@ -118,7 +118,7 @@ reproduces the original refusal and exercises the corrected clock.
 
 ## Known limitations for 18 (not fixed by this PR)
 
-Two gaps remain deliberately undone, tracked here rather than papered over:
+One forward compatibility gap remains:
 
 1. **`dataChecksumState` is a forward, not an 18, risk.** Guarded correctly
    for today's matrix (row above: absent from both stock 18 and
@@ -131,19 +131,47 @@ Two gaps remain deliberately undone, tracked here rather than papered over:
    190000` will need to become unconditionally absent rather than
    version-gated. Not something to fix speculatively now; P0's own merge is
    where it gets resolved for real.
-2. **32-bit members-offset wraparound seeding is not implemented for 18.**
-   `pagestore_seed_multixact()` was given 18's correct
-   `pg_multixact/members` segment-*naming* convention (row above, a real
-   bug fix), but not wraparound-aware *seeding* across the 32-bit
-   `MultiXactOffset` space the way `MultiXactId` already has via
-   `PreviousMultiXactId`-style modular arithmetic — 19's 64-bit offset space
-   never needs this, so there was nothing to port from. The function's own
-   `oldest_member > next_member` check already rejects a wrapped
-   `[oldest_member, next_member)` range as an error rather than silently
-   mis-seeding it, so a members-offset wraparound on 18 fails closed
-   (branch creation across the wrap is refused) instead of corrupting data.
-   True wraparound-aware seeding is not otherwise supported by this compat
-   pass; a known, not silent, gap.
+### PG18 members-offset wraparound
+
+Branch seeding accepts member horizons in the PG18 32-bit offset space and
+splits a wrapped horizon into the final pages and page zero onwards. An exact
+wrap to next offset zero creates a zero bootstrap page, since the next
+allocation has not initialized that page yet. All three validation paths
+(direct seeding, composed SLRU seeding and checkpoint-derived horizons) share
+the same rule and reject values outside the PG18 offset space. PG19 retains
+its ordered 64-bit horizons.
+
+Both single-page and batched members reconstruction now apply the PG18 WAL
+record's circular segment deletion range, matching REL_18_6's
+`PerformMembersTruncation()`. The previous monotonic-cutoff test could mark
+unrelated low segments deleted and retain deleted high segments across wrap.
+PG19 still uses its single monotonic cutoff.
+
+The standalone `pagestore_multixact_horizon` Meson test covers wrap to zero,
+page boundaries, the partial final page, SQL bigint bounds, and all start/end
+pairs against a literal 17-segment circular deletion walk. The modified
+extension compiles against both PG18 and PG19 generated headers; the boundary
+test also passes with address and undefined-behavior sanitizers. A fresh PG18
+extension, daemon and restore/import tools passed `integration_test.sh` against
+an isolated PG18 installation, including ordinary multixact reconstruction,
+SLRU seeding, branch preparation and restart.
+
+`branch_boot_test.sh <pg18-build> --member-wrap=zero` and
+`--member-wrap=cross` exercise real SQL member allocation at the 32-bit
+boundary. Each uses `pg_resetwal` only on its private, never-started initdb
+cluster, then creates two-member multixacts with concurrent `FOR SHARE`
+lockers. The zero case ends exactly at offset zero; the cross case writes
+one member on either side of the boundary. Both validate checkpoint-derived
+horizons, seed and install an expert-mode branch, compare its decoded member
+identities with the parent's, allocate another multixact on the branch and
+recheck the inherited members after branch writes and restart. These tests
+retain the existing branch test's explicit unsafe expert-cut contract; they
+do not certify the serialized materializer/controller topology. Non-PG18
+builds report SKIP because their member offsets do not have this 32-bit wrap.
+The ordinary and candidate CI lanes run both cases and retain their logs.
+The zero case was also run with the pre-fix extension and failed at
+`checkpoint has invalid multixact member horizons [4294967292, 0)`,
+confirming that the scenario detects the original functional refusal.
 
 Process for adding a guard here: confirm the exact 18 shape against
 `upstream/REL_18_STABLE` (`git show upstream/REL_18_STABLE:<path>`, the same
