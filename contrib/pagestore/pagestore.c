@@ -104,6 +104,7 @@
 #include "utils/wait_classes.h"
 #include "utils/wait_event.h"
 #include "walredo_client.h"
+#include "pagestore_multixact_horizon.h"
 
 /*
  * PG 18/19 API compat shims.  This file is a byte-for-byte copy of
@@ -127,22 +128,16 @@
 #endif
 
 /*
- * xl_multixact_truncate was simplified after 18 from an explicit
- * start/end range (startTruncOff/endTruncOff/startTruncMemb/endTruncMemb)
- * to a single cutoff (oldestMulti/oldestOffset).  Cross-checked against
- * both versions' multixact_redo(): 18's endTruncOff/endTruncMemb are the
- * exact values SetMultiXactIdLimit()/PerformOffsetsTruncation()/
- * PerformMembersTruncation() are called with, the same role 19's
- * oldestMulti/oldestOffset play -- so this is a pure rename, not a shape
- * change, for every use in this file (all of which only read the new
- * cutoff, never the old range start).
+ * xl_multixact_truncate uses explicit start/end ranges on PG18 and a
+ * single cutoff on PG19.  Offsets use the end horizon on both majors;
+ * members must honor PG18's circular segment deletion range (see
+ * ps_mxmemb_segment_truncated), rather than treating endTruncMemb as a
+ * monotonic cutoff.
  */
 #if PG_VERSION_NUM >= 190000
 #define PS_XLREC_MXTRUNC_OLDEST_MULTI(x)	((x).oldestMulti)
-#define PS_XLREC_MXTRUNC_OLDEST_OFFSET(x)	((x).oldestOffset)
 #else
 #define PS_XLREC_MXTRUNC_OLDEST_MULTI(x)	((x).endTruncOff)
-#define PS_XLREC_MXTRUNC_OLDEST_OFFSET(x)	((x).endTruncMemb)
 #endif
 
 /* PageSetChecksum() is PageSetChecksumInplace() before 19 (pure rename, identical signature). */
@@ -178,15 +173,8 @@
  * matches THIS build, not assume long names unconditionally -- see the
  * PG_MULTIXACT_MEMBERS_LONG_NAMES call sites below.
  *
- * This is a naming/disk-layout concern only; the members offset space
- * itself is not given wraparound-aware handling here on 18 (unlike
- * MultiXactId, which already uses PreviousMultiXactId-style modular
- * arithmetic throughout) -- pagestore_seed_multixact()'s own oldest_member
- * > next_member check (a few hundred lines below) already rejects a
- * wrapped [oldest_member, next_member) range as an error rather than
- * silently mis-seeding it, so a 32-bit members-offset wraparound on 18
- * fails closed (branch creation across the wrap is refused) instead of
- * corrupting data; it is not otherwise supported by this compat pass.
+ * PG18 member horizons wrap in the 32-bit offset space; branch seeding
+ * splits such horizons into the tail and head of that space.
  */
 #if PG_VERSION_NUM >= 190000
 #define PG_MULTIXACT_MEMBERS_LONG_NAMES true
@@ -5175,17 +5163,17 @@ ps_mxmemb_segment(MultiXactOffset offset)
 	return ((int64) (offset / PS_MXMEMB_PER_PAGE)) / SLRU_PAGES_PER_SEGMENT;
 }
 
-/*
- * PerformMembersTruncation() truncates to MXOffsetToMemberPage(oldestOffset),
- * and SimpleLruTruncate keeps the segment containing that cutoff page, so a
- * members segment is gone only if it sorts strictly below the cutoff's
- * segment.  The truncate record carries just the new horizon (MultiXactOffset
- * is 64-bit and never wraps), so plain segment order suffices.
- */
+/* Match the actual member segments removed by this major's WAL record. */
 static bool
-ps_mxmemb_segment_truncated(int64 pageseg, MultiXactOffset oldestOffset)
+ps_mxmemb_segment_truncated(int64 pageseg, const xl_multixact_truncate *xlrec)
 {
-	return pageseg < ps_mxmemb_segment(oldestOffset);
+#if PG_VERSION_NUM >= 190000
+	return pageseg < ps_mxmemb_segment(xlrec->oldestOffset);
+#else
+	return ps_member_segment_in_range(pageseg,
+									  ps_mxmemb_segment(xlrec->startTruncMemb),
+									  ps_mxmemb_segment(xlrec->endTruncMemb));
+#endif
 }
 
 /* Replay (base_lsn, target_lsn] onto members page 'pageno'.  Mirrors ps_mxoff_apply_range,
@@ -5260,7 +5248,7 @@ ps_mxmemb_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 
 			memcpy(&xlrec, XLogRecGetData(reader), SizeOfMultiXactTruncate);
 			if (ps_mxmemb_segment_truncated(pageno / SLRU_PAGES_PER_SEGMENT,
-											PS_XLREC_MXTRUNC_OLDEST_OFFSET(xlrec)))
+											&xlrec))
 				r.page_truncated = true;
 		}
 	}
@@ -5951,7 +5939,7 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 				int64		segno = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
 
 				if (ps_mxmemb_segment_truncated(segno,
-												PS_XLREC_MXTRUNC_OLDEST_OFFSET(xlrec)))
+												&xlrec))
 				{
 					present[p] = false;
 					truncated[p] = true;
@@ -6883,8 +6871,7 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	int64		next_member = PG_GETARG_INT64(6);
 	int64		off_page_lo,
 				off_page_hi,
-				mem_page_lo,
-				mem_page_hi;
+				mem_page_lo;
 	int64		seeded = 0;
 	char		mxdir[MAXPGPATH],
 				mxstage[MAXPGPATH],
@@ -6911,12 +6898,8 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("invalid fork multixact horizon [%u, %u)",
 						oldest_multi, next_multi)));
-	/*
-	 * MultiXactOffset is 64-bit and monotonic (it no longer wraps), so any
-	 * non-negative ordered horizon is valid; a long-lived cluster can exceed
-	 * 2^32 members.  The bigint SQL argument bounds it at INT64_MAX.
-	 */
-	if (oldest_member < 0 || next_member < 0 || oldest_member > next_member)
+	if (!ps_member_horizon_valid(oldest_member, next_member,
+								 PG_MULTIXACT_MEMBERS_LONG_NAMES))
 		ereport(ERROR,
 				(errmsg("invalid fork multixact member horizon [%lld, %lld)",
 						(long long) oldest_member, (long long) next_member)));
@@ -7015,19 +6998,26 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	}
 	if (next_member != oldest_member)
 	{
-		/* 64-bit member offsets are monotonic: the horizon never wraps */
-		mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
-		/* include boundary page for next_member when it is the first slot on a new
-		 * members page so the branch can allocate the next multixact immediately.
-		 */
-		mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
-		if (next_member % PS_MXMEMB_PER_PAGE == 0)
-			mem_page_hi++;
-		mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
-												mem_page_lo, mem_page_hi,
-												ps_mxmemb_seed_reconstruct_range,
-												base, target, "multixact members", false,
-												PG_MULTIXACT_MEMBERS_LONG_NAMES);
+		int64_t lo[2], hi[2];
+		int nranges = ps_member_seed_ranges(oldest_member, next_member,
+											   PS_MXMEMB_PER_PAGE, lo, hi);
+
+		for (int i = 0; i < nranges; i++)
+		{
+			/* At an exact wrap the next allocation has not zeroed page 0 yet. */
+			if (i == 1 && next_member == 0)
+			{
+				pagestore_write_zero_slru_page(memdir, "multixact members",
+											   0, PG_MULTIXACT_MEMBERS_LONG_NAMES);
+				mem_seeded++;
+				continue;
+			}
+			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
+													lo[i], hi[i],
+													ps_mxmemb_seed_reconstruct_range,
+													base, target, "multixact members", false,
+													PG_MULTIXACT_MEMBERS_LONG_NAMES);
+		}
 	}
 	else
 	{
@@ -7211,12 +7201,8 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 		ereport(ERROR,
 				(errmsg("invalid fork multixact horizon [%u, %u)",
 						oldest_multi, next_multi)));
-	/*
-	 * MultiXactOffset is 64-bit and monotonic (it no longer wraps), so any
-	 * non-negative ordered horizon is valid; a long-lived cluster can exceed
-	 * 2^32 members.  The bigint SQL argument bounds it at INT64_MAX.
-	 */
-	if (oldest_member < 0 || next_member < 0 || oldest_member > next_member)
+	if (!ps_member_horizon_valid(oldest_member, next_member,
+								 PG_MULTIXACT_MEMBERS_LONG_NAMES))
 		ereport(ERROR,
 				(errmsg("invalid fork multixact member horizon [%lld, %lld)",
 						(long long) oldest_member, (long long) next_member)));
@@ -13443,7 +13429,8 @@ pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
 							h->oldest_multi)));
 		h->oldest_member = (int64) oldest_member;
 	}
-	if (h->oldest_member > h->next_member)
+	if (!ps_member_horizon_valid(h->oldest_member, h->next_member,
+								 PG_MULTIXACT_MEMBERS_LONG_NAMES))
 		ereport(ERROR,
 				(errmsg("checkpoint has invalid multixact member horizons [%lld, %lld)",
 						(long long) h->oldest_member,

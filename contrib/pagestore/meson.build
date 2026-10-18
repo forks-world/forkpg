@@ -1198,3 +1198,12 @@ test('pagestore_p5',
   suite: ['pagestore'],
   timeout: 60,
 )
+
+# No server required: PG18 wrap boundaries and circular WAL truncation oracle.
+pagestore_multixact_horizon_test = executable('pagestore_multixact_horizon_test',
+  files('pagestore_multixact_horizon_test.c'),
+  install: false,
+)
+test('pagestore_multixact_horizon', pagestore_multixact_horizon_test,
+  suite: ['pagestore'], timeout: 60,
+)

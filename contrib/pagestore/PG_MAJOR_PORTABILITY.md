@@ -118,7 +118,7 @@ reproduces the original refusal and exercises the corrected clock.
 
 ## Known limitations for 18 (not fixed by this PR)
 
-Two gaps remain deliberately undone, tracked here rather than papered over:
+One forward compatibility gap remains:
 
 1. **`dataChecksumState` is a forward, not an 18, risk.** Guarded correctly
    for today's matrix (row above: absent from both stock 18 and
@@ -131,19 +131,32 @@ Two gaps remain deliberately undone, tracked here rather than papered over:
    190000` will need to become unconditionally absent rather than
    version-gated. Not something to fix speculatively now; P0's own merge is
    where it gets resolved for real.
-2. **32-bit members-offset wraparound seeding is not implemented for 18.**
-   `pagestore_seed_multixact()` was given 18's correct
-   `pg_multixact/members` segment-*naming* convention (row above, a real
-   bug fix), but not wraparound-aware *seeding* across the 32-bit
-   `MultiXactOffset` space the way `MultiXactId` already has via
-   `PreviousMultiXactId`-style modular arithmetic — 19's 64-bit offset space
-   never needs this, so there was nothing to port from. The function's own
-   `oldest_member > next_member` check already rejects a wrapped
-   `[oldest_member, next_member)` range as an error rather than silently
-   mis-seeding it, so a members-offset wraparound on 18 fails closed
-   (branch creation across the wrap is refused) instead of corrupting data.
-   True wraparound-aware seeding is not otherwise supported by this compat
-   pass; a known, not silent, gap.
+### PG18 members-offset wraparound
+
+Branch seeding accepts member horizons in the PG18 32-bit offset space and
+splits a wrapped horizon into the final pages and page zero onwards. An exact
+wrap to next offset zero creates a zero bootstrap page, since the next
+allocation has not initialized that page yet. All three validation paths
+(direct seeding, composed SLRU seeding and checkpoint-derived horizons) share
+the same rule and reject values outside the PG18 offset space. PG19 retains
+its ordered 64-bit horizons.
+
+Both single-page and batched members reconstruction now apply the PG18 WAL
+record's circular segment deletion range, matching REL_18_6's
+`PerformMembersTruncation()`. The previous monotonic-cutoff test could mark
+unrelated low segments deleted and retain deleted high segments across wrap.
+PG19 still uses its single monotonic cutoff.
+
+The standalone `pagestore_multixact_horizon` Meson test covers wrap to zero,
+page boundaries, the partial final page, SQL bigint bounds, and all start/end
+pairs against a literal 17-segment circular deletion walk. The modified
+extension compiles against both PG18 and PG19 generated headers; the boundary
+test also passes with address and undefined-behavior sanitizers. A fresh PG18
+extension, daemon and restore/import tools passed `integration_test.sh` against
+an isolated PG18 installation, including ordinary multixact reconstruction,
+SLRU seeding, branch preparation and restart. This evidence does not replace
+a retained full branch-boot run on a cluster whose live multixact member
+offsets cross the wrap point.
 
 Process for adding a guard here: confirm the exact 18 shape against
 `upstream/REL_18_STABLE` (`git show upstream/REL_18_STABLE:<path>`, the same
