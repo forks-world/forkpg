@@ -84,6 +84,7 @@ evidence-<tag>/
     in-engine-pgdata-fixture-check.log            --require-build-match pgdata check
     evidence-integration-logs/*.log               integration_test.sh daemon/server logs
     build/pagestore-member-wrap-{zero,cross}.log         PG18 real-wrap branch boot (SKIP on PG19)
+    build/pagestore-materializer_*.xml            materializer lifecycle/crash/restart JUnit reports
     build/pagestore-branch-boot-logs/*.log               server/daemon diagnostics on boot failure
     pagestore-control-restore-payload-identity.json   `pagestore_control_restore --payload-identity`
     pagestore-format-versions.json                `pagestore_format_versions`

@@ -419,7 +419,8 @@ jobs:
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
             --materializer-supervisor \
-              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py" \
+            --junit build/pagestore-materializer_lifecycle.xml
 
       - name: Run H1 materializer crash after relation sync
         run: |
@@ -431,7 +432,8 @@ jobs:
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
             --materializer-supervisor \
-              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py" \
+            --junit build/pagestore-materializer_restartpoint_after_relation_sync_before_marker.xml
 
       - name: Run H1 materializer crash after marker sync
         run: |
@@ -443,7 +445,8 @@ jobs:
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
             --materializer-supervisor \
-              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py" \
+            --junit build/pagestore-materializer_restartpoint_after_marker_sync.xml
 
       - name: Run H1 store, writer, and materializer restart combinations
         run: |
@@ -455,7 +458,8 @@ jobs:
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
             --materializer-supervisor \
-              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py" \
+            --junit build/pagestore-materializer_restart_combinations.xml
 
       # Acceptance is always run against a candidate whose major is meant to
       # be supported (nothing tags a pagestore-candidate-* for branchdb_13/14
@@ -549,6 +553,7 @@ jobs:
             in-engine-pgdata-fixture-check.log
             evidence-integration-logs/*.log
             build/pagestore-member-wrap-*.log
+            build/pagestore-materializer_*.xml
             build/pagestore-branch-boot-logs/*.log
             pagestore-control-restore-payload-identity.json
             pagestore-format-versions.json
