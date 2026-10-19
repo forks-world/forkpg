@@ -336,6 +336,7 @@ static void publish_inspection_metrics(int force);
 static int branch_frontiers_allow(int parent, uint64_t branch_lsn);
 static int page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 								 uint32_t *nfences_out);
+static int page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t *max_lsn);
 static int page_storage_fences(uint32_t timeline, const PsHistoryFence *views,
 	uint32_t nviews, PsHistoryFence **fences_out, uint32_t *nfences_out);
 static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
@@ -19112,39 +19113,43 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		}
 	}
 	/*
-	 * A recovery-floor rewrite whose raw pd_lsn is below the floor may be a
-	 * late flush of a page that became addressable only after that raw LSN.
-	 * A finite branch cap hides such a version by admission sequence, but a
-	 * legacy/unproven branch (or pin) has an unbounded cap and would read it
-	 * at the raw position, mutating a snapshot taken before the flush.  Order
-	 * the rewrite at the floor when such a fence covers the raw LSN; the
-	 * existing ordered path then also lifts it past a fence at the same LSN.
+	 * A recovery-floor flush below the floor can still be growth at its raw
+	 * pd_lsn even though the block is already addressable at the floor.  Do
+	 * not record that growth back at the raw position: a branch subsequently
+	 * created between the raw LSN and the real growth would then see a size and
+	 * page that did not exist at its fork point.  Clamp it at the floor.
 	 */
 	if (key->klass == PS_KLASS_RELATION && !clamped && hdr.lsn != 0 &&
-		floor_lsn != 0 && hdr.lsn < floor_lsn)
+		floor_lsn != 0 && hdr.lsn < floor_lsn &&
+		(fe == NULL ||
+		 fork_size_asof_hop(fe, hdr.lsn, admission_seq) < block + 1))
 	{
-		PsHistoryFence *fences = NULL;
-		uint32_t	nfences = 0;
-		int			fenced = 0;
+		clamped = 1;
+		hdr.lsn = growth_floor;
+	}
+	/*
+	 * A floor rewrite at or below the replay endpoint must not leak into an
+	 * existing legacy/unproven branch (or pin): its unbounded sequence cap
+	 * admits every version at or below its LSN regardless of admission order.
+	 * A finite cap hides the late version by admission sequence alone.  The
+	 * unbounded-fence projection is cached per epoch, so a restartpoint's
+	 * page batch pays for it once rather than per page.
+	 */
+	if (key->klass == PS_KLASS_RELATION && !clamped && hdr.lsn != 0 &&
+		floor_lsn != 0 && hdr.lsn <= floor_lsn)
+	{
+		uint64_t	max_unbounded;
 		int			rc;
 
 		ps_lock_map_rd();
-		rc = page_prune_fences(timeline, &fences, &nfences);
+		rc = page_max_unbounded_fence_lsn(timeline, &max_unbounded);
 		ps_unlock_map();
 		if (rc != 0)
 		{
 			*outcome = PS_APPEND_IO_FAILED;
 			return -1;
 		}
-		for (uint32_t i = 0; i < nfences; i++)
-			if (fences[i].seq == PS_SEQ_UNBOUNDED &&
-				fences[i].lsn >= hdr.lsn)
-			{
-				fenced = 1;
-				break;
-			}
-		free(fences);
-		if (fenced)
+		if (max_unbounded >= hdr.lsn)
 		{
 			clamped = 1;
 			hdr.lsn = growth_floor;
@@ -21037,6 +21042,70 @@ page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 	free(pins);
 	*fences_out = fences;
 	*nfences_out = nfences;
+	return 0;
+}
+
+/*
+ * Highest position at which any fence on this timeline has an unbounded
+ * sequence cap (a legacy/unproven descendant branch or pin).  Such a fence
+ * admits every version at or below its LSN regardless of admission sequence,
+ * so a floor write must be ordered past it.  Cached per worker on the same
+ * timeline/retention epochs page_view_registered() uses: a restartpoint
+ * flushes many pages while neither set can change, so only the first page
+ * pays for the fence snapshot.  Caller holds map-rd or map-wr.
+ * Returns 0 on success (max_lsn is 0 when no such fence exists), -1 on a
+ * snapshot failure.
+ */
+static int
+page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t *max_lsn)
+{
+	static __thread struct {
+		uint32_t	timeline;
+		uint64_t	timeline_epoch, retention_epoch;
+		uint64_t	max_lsn;
+		int			valid;
+	} cache[16];
+	static __thread unsigned victim;
+	PsHistoryFence *fences = NULL;
+	uint32_t	nfences = 0;
+	uint64_t	retention_epoch, timeline_epoch, max_seen = 0;
+	unsigned	slot;
+
+	*max_lsn = 0;
+	if (timeline_meta_poisoned_load() ||
+		ps_retention_epoch(&retention_epoch) != 0)
+		return -1;
+	timeline_epoch = __atomic_load_n(&page_view_timeline_epoch,
+									 __ATOMIC_ACQUIRE);
+	for (unsigned i = 0; i < 16; i++)
+		if (cache[i].valid && cache[i].timeline == timeline &&
+			cache[i].timeline_epoch == timeline_epoch &&
+			cache[i].retention_epoch == retention_epoch)
+		{
+			*max_lsn = cache[i].max_lsn;
+			return 0;
+		}
+	if (page_prune_fences(timeline, &fences, &nfences) != 0)
+		return -1;
+	for (uint32_t i = 0; i < nfences; i++)
+		if (fences[i].seq == PS_SEQ_UNBOUNDED &&
+			fences[i].lsn > max_seen)
+			max_seen = fences[i].lsn;
+	free(fences);
+	{
+		uint64_t	after;
+
+		if (ps_retention_epoch(&after) == 0 && after == retention_epoch)
+		{
+			slot = victim++ % 16;
+			cache[slot].timeline = timeline;
+			cache[slot].timeline_epoch = timeline_epoch;
+			cache[slot].retention_epoch = retention_epoch;
+			cache[slot].max_lsn = max_seen;
+			cache[slot].valid = 1;
+		}
+	}
+	*max_lsn = max_seen;
 	return 0;
 }
 

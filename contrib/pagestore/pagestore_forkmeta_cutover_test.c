@@ -5728,6 +5728,54 @@ test_floor_rewrite_hidden_from_legacy_branch(void)
 		  read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
 		  page[128] == 0x20,
 		  "a legacy branch does not see the late floor rewrite");
+	check(append_relation_floor_timeline_tag(0, &key, 0, 200, page, 0x78, 200,
+										 NULL) == 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x78,
+		  "a rewrite at the replay endpoint replaces the parent page");
+	check(meta_request_timeline(1, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 1 &&
+		  read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x20,
+		  "a legacy branch at the same endpoint does not see the rewrite");
+	close_runtime();
+	remove_tree(store);
+}
+
+/* A floor write whose block was not addressable at its raw pd_lsn must not
+ * backdate the growth: a branch created between the raw LSN and the real
+ * growth would otherwise see both the page and the larger size. */
+static void
+test_floor_rewrite_not_backdated(void)
+{
+	char store[] = "/tmp/psfloorbackdateXXXXXX";
+	PsKey key = {6, 6, 43, 1, PS_KLASS_RELATION};
+	PsChannel reply;
+	unsigned char page[8192];
+
+	check(mkdtemp(store) != NULL, "floor/backdate create store");
+	flush_pages = 1;
+	check(ps_core_open(store) == 0, "floor/backdate open store");
+	check(meta_request_timeline(0, PS_OP_CREATE, &key, 100, 0, 0, 0, NULL),
+		  "floor/backdate create fork");
+	check(append_relation_timeline(0, &key, 0, 50, page, NULL) == 0,
+		  "floor/backdate write the initial page");
+	check(meta_request_timeline(0, PS_OP_ZEROEXTEND, &key, 200, 0, 4, 0,
+								NULL),
+		  "floor/backdate allocate the later block at 200");
+	check(append_relation_floor_timeline_tag(0, &key, 3, 50, page, 0x77, 400,
+											 NULL) == 0 &&
+		  meta_request_timeline(0, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 4 &&
+		  read_resolve(0, &key, 3, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x77,
+		  "floor/backdate late page is published at the floor");
+	check(create_branch_request(1, 0, 150),
+		  "floor/backdate create a branch below the real growth");
+	check(meta_request_timeline(1, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 1 &&
+		  read_resolve(1, &key, 3, UINT64_MAX, 0, page, NULL) == 0,
+		  "a post-flush branch cannot see the backdated block or size");
 	close_runtime();
 	remove_tree(store);
 }
@@ -6312,6 +6360,7 @@ main(void)
 	test_live_ordered_marker_walless_survives_two_cutovers();
 	test_floor_growth_before_later_branch();
 	test_floor_rewrite_hidden_from_legacy_branch();
+	test_floor_rewrite_not_backdated();
 	for (uint32_t timeline = 0; timeline <= 1; timeline++)
 		for (int walless = 0; walless <= 1; walless++)
 			test_ordered_write_after_cutoff(timeline, walless);
