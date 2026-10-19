@@ -5700,6 +5700,38 @@ test_floor_growth_before_later_branch(void)
 	remove_tree(store);
 }
 
+/* A branch forked after the replay floor must see the flush: fences ahead of
+ * the replay position are future branches, not snapshots to hide from. */
+static void
+test_floor_growth_visible_to_future_branch(void)
+{
+	char store[] = "/tmp/psfloorfuturebranchXXXXXX";
+	PsKey key = {6, 6, 44, 1, PS_KLASS_RELATION};
+	PsChannel reply;
+	unsigned char page[8192];
+
+	check(mkdtemp(store) != NULL, "floor/future-branch create store");
+	flush_pages = 1;
+	check(ps_core_open(store) == 0, "floor/future-branch open store");
+	check(meta_request_timeline(0, PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
+		  append_relation_timeline(0, &key, 0, 50, page, NULL) == 0,
+		  "floor/future-branch create fork");
+	check(create_branch_request(1, 0, 300),
+		  "floor/future-branch fork after the replay floor");
+	check(append_relation_floor_timeline_tag(0, &key, 5, 50, page, 0x79, 200,
+											 NULL) == 0 &&
+		  read_resolve(0, &key, 5, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x79,
+		  "floor/future-branch growth is published at the floor");
+	check(meta_request_timeline(1, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 6 &&
+		  read_resolve(1, &key, 5, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x79,
+		  "a future branch sees the floor growth instead of a fence-pushed version");
+	close_runtime();
+	remove_tree(store);
+}
+
 /* A late floor rewrite must not leak into an existing legacy/unproven branch
  * whose LSN cap covers the raw pd_lsn. */
 static void
@@ -5718,16 +5750,6 @@ test_floor_rewrite_hidden_from_legacy_branch(void)
 		  "floor/legacy-branch create fork");
 	check(create_branch_request(1, 0, 200),
 		  "floor/legacy-branch fork before the late rewrite");
-	check(append_relation_floor_timeline_tag(0, &key, 0, 50, page, 0x76, 300,
-											 NULL) == 0 &&
-		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
-		  page[128] == 0x76,
-		  "floor/legacy-branch late rewrite replaces the parent page");
-	check(meta_request_timeline(1, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
-		  reply.result == 1 &&
-		  read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
-		  page[128] == 0x20,
-		  "a legacy branch does not see the late floor rewrite");
 	check(append_relation_floor_timeline_tag(0, &key, 0, 200, page, 0x78, 200,
 										 NULL) == 0 &&
 		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
@@ -5738,6 +5760,16 @@ test_floor_rewrite_hidden_from_legacy_branch(void)
 		  read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
 		  page[128] == 0x20,
 		  "a legacy branch at the same endpoint does not see the rewrite");
+	check(append_relation_floor_timeline_tag(0, &key, 0, 50, page, 0x76, 300,
+											 NULL) == 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x76,
+		  "floor/legacy-branch late rewrite replaces the parent page");
+	check(meta_request_timeline(1, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 1 &&
+		  read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x20,
+		  "a legacy branch does not see the late floor rewrite");
 	close_runtime();
 	remove_tree(store);
 }
@@ -6359,6 +6391,7 @@ main(void)
 	test_live_ordered_commit_marker_survives_two_cutovers();
 	test_live_ordered_marker_walless_survives_two_cutovers();
 	test_floor_growth_before_later_branch();
+	test_floor_growth_visible_to_future_branch();
 	test_floor_rewrite_hidden_from_legacy_branch();
 	test_floor_rewrite_not_backdated();
 	for (uint32_t timeline = 0; timeline <= 1; timeline++)

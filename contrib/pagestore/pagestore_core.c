@@ -336,7 +336,8 @@ static void publish_inspection_metrics(int force);
 static int branch_frontiers_allow(int parent, uint64_t branch_lsn);
 static int page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 								 uint32_t *nfences_out);
-static int page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t *max_lsn);
+static int page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t at_or_below,
+											 uint64_t *max_lsn);
 static int page_storage_fences(uint32_t timeline, const PsHistoryFence *views,
 	uint32_t nviews, PsHistoryFence **fences_out, uint32_t *nfences_out);
 static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
@@ -19142,7 +19143,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		int			rc;
 
 		ps_lock_map_rd();
-		rc = page_max_unbounded_fence_lsn(timeline, &max_unbounded);
+		rc = page_max_unbounded_fence_lsn(timeline, floor_lsn, &max_unbounded);
 		ps_unlock_map();
 		if (rc != 0)
 		{
@@ -19223,6 +19224,18 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 			}
 		}
 		free(fences);
+		/*
+		 * A recovery write must stay within the replay horizon.  A fence ahead of
+		 * the current replay position is a future branch that includes this flush
+		 * in its snapshot, so it must not push the record past that horizon: a
+		 * growth ordered there would be invisible to redo until replay reaches it,
+		 * and redo needs the block now.  Only a fence exactly at the floor needs
+		 * the successor position (so an earlier branch at that endpoint does not
+		 * see the flush).
+		 */
+		if (key->klass == PS_KLASS_RELATION && floor_lsn != 0 &&
+			floor_lsn < UINT64_MAX && hdr.lsn > floor_lsn + 1)
+			hdr.lsn = floor_lsn + 1;
 	}
 	hdr_grow_lsn = hdr.lsn;
 	page_version = zero_version ? 0 : hdr.lsn;
@@ -21057,10 +21070,12 @@ page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
  * snapshot failure.
  */
 static int
-page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t *max_lsn)
+page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t at_or_below,
+							 uint64_t *max_lsn)
 {
 	static __thread struct {
 		uint32_t	timeline;
+		uint64_t	at_or_below;
 		uint64_t	timeline_epoch, retention_epoch;
 		uint64_t	max_lsn;
 		int			valid;
@@ -21079,6 +21094,7 @@ page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t *max_lsn)
 									 __ATOMIC_ACQUIRE);
 	for (unsigned i = 0; i < 16; i++)
 		if (cache[i].valid && cache[i].timeline == timeline &&
+			cache[i].at_or_below == at_or_below &&
 			cache[i].timeline_epoch == timeline_epoch &&
 			cache[i].retention_epoch == retention_epoch)
 		{
@@ -21089,6 +21105,7 @@ page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t *max_lsn)
 		return -1;
 	for (uint32_t i = 0; i < nfences; i++)
 		if (fences[i].seq == PS_SEQ_UNBOUNDED &&
+			fences[i].lsn <= at_or_below &&
 			fences[i].lsn > max_seen)
 			max_seen = fences[i].lsn;
 	free(fences);
@@ -21099,6 +21116,7 @@ page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t *max_lsn)
 		{
 			slot = victim++ % 16;
 			cache[slot].timeline = timeline;
+			cache[slot].at_or_below = at_or_below;
 			cache[slot].timeline_epoch = timeline_epoch;
 			cache[slot].retention_epoch = retention_epoch;
 			cache[slot].max_lsn = max_seen;
