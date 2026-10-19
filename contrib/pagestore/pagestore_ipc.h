@@ -30,7 +30,11 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		49	/* 49: atomic pins and capped artifact producers;
+#define PS_SHM_VERSION		50	/* 50: PS_WRITE_REPLAY_FLOOR semantics for relation
+								 * EXTEND/WRITEV; mixed old daemons would ignore the
+								 * floor and silently restore the historical-growth
+								 * refusal, so they must fail the handshake.
+								 * 49: atomic pins and capped artifact producers;
 								 * CREATE_BRANCH result bit 0 reports a new create
 								 * (no layout change; old daemons return zero).
 								 * 48: unstamped metadata request floor;

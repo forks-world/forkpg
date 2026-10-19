@@ -19182,61 +19182,88 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		hdr.lsn = fork_meta_snapshot_cutoff_lsn;
 	if (ordered_record)
 	{
-		PsHistoryFence *fences = NULL;
-		uint32_t nfences = 0;
-		uint64_t newest;
-		int rc;
+		uint64_t	newest;
 
-		/* An operational write must be newer than every protected snapshot,
-		 * not just the compaction cutoff.  Reuse pruning's ancestry projection
-		 * for branch caps and PAGE_HISTORY pins.  A tuple-capped reader can
-		 * exclude our fresh admission at the same LSN; a bare-LSN branch or
-		 * legacy pin requires its successor.  Admission-rd excludes pin SET,
-		 * and the caller's shard-write lock excludes CREATE_BRANCH through
-		 * publication, so neither fence set can change after this sample. */
-		ps_lock_map_rd();
-		rc = page_prune_fences(timeline, &fences, &nfences);
-		/* A dropped pin/branch must not make a later ordered write sort
-		 * behind a version already admitted at that former horizon.  The
-		 * bound markers preserve this operational position across restart. */
-		newest = fork_newest_visible_lsn_through(timeline, key);
-		ps_unlock_map();
-		if (hdr.lsn < newest)
-			hdr.lsn = newest;
-		if (rc != 0)
+		if (key->klass == PS_KLASS_RELATION && floor_lsn != 0)
 		{
-			*outcome = PS_APPEND_IO_FAILED;
-			return -1;
-		}
-		for (uint32_t i = 0; i < nfences; i++)
-		{
-			if (hdr.lsn < fences[i].lsn)
-				hdr.lsn = fences[i].lsn;
-			if (hdr.lsn == fences[i].lsn &&
-				admission_seq <= fences[i].admission_seq)
+			uint64_t	max_fence = 0;
+			int			rc;
+
+			/*
+			 * The floor path already knows every protected fence at or below
+			 * its endpoint.  Reuse that cached projection instead of rebuilding
+			 * the whole fence list for every ordered page in a restartpoint.
+			 */
+			ps_lock_map_rd();
+			newest = fork_newest_visible_lsn_through(timeline, key);
+			rc = page_max_fence_lsn(timeline, floor_lsn, &max_fence);
+			ps_unlock_map();
+			if (rc != 0)
 			{
-				if (hdr.lsn == UINT64_MAX)
-				{
-					free(fences);
-					*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
-					return -1;
-				}
-				hdr.lsn++;
+				*outcome = PS_APPEND_IO_FAILED;
+				return -1;
+			}
+			if (hdr.lsn < newest)
+				hdr.lsn = newest;
+			/*
+			 * A fence exactly at the floor represents an earlier snapshot at
+			 * this endpoint: take the successor.  A fence ahead of the floor is
+			 * a future branch that includes this flush, so it must not push the
+			 * record beyond the endpoint; cap there.
+			 */
+			if (floor_lsn < UINT64_MAX)
+			{
+				if (max_fence == floor_lsn)
+					hdr.lsn = hdr.lsn > floor_lsn + 1 ? hdr.lsn : floor_lsn + 1;
+				if (hdr.lsn > floor_lsn + 1)
+					hdr.lsn = floor_lsn + 1;
 			}
 		}
-		free(fences);
-		/*
-		 * A recovery write must stay within the replay horizon.  A fence ahead of
-		 * the current replay position is a future branch that includes this flush
-		 * in its snapshot, so it must not push the record past that horizon: a
-		 * growth ordered there would be invisible to redo until replay reaches it,
-		 * and redo needs the block now.  Only a fence exactly at the floor needs
-		 * the successor position (so an earlier branch at that endpoint does not
-		 * see the flush).
-		 */
-		if (key->klass == PS_KLASS_RELATION && floor_lsn != 0 &&
-			floor_lsn < UINT64_MAX && hdr.lsn > floor_lsn + 1)
-			hdr.lsn = floor_lsn + 1;
+		else
+		{
+			PsHistoryFence *fences = NULL;
+			uint32_t	nfences = 0;
+			int			rc;
+
+			/* An operational write must be newer than every protected snapshot,
+			 * not just the compaction cutoff.  Reuse pruning's ancestry projection
+			 * for branch caps and PAGE_HISTORY pins.  A tuple-capped reader can
+			 * exclude our fresh admission at the same LSN; a bare-LSN branch or
+			 * legacy pin requires its successor.  Admission-rd excludes pin SET,
+			 * and the caller's shard-write lock excludes CREATE_BRANCH through
+			 * publication, so neither fence set can change after this sample. */
+			ps_lock_map_rd();
+			rc = page_prune_fences(timeline, &fences, &nfences);
+			/* A dropped pin/branch must not make a later ordered write sort
+			 * behind a version already admitted at that former horizon.  The
+			 * bound markers preserve this operational position across restart. */
+			newest = fork_newest_visible_lsn_through(timeline, key);
+			ps_unlock_map();
+			if (hdr.lsn < newest)
+				hdr.lsn = newest;
+			if (rc != 0)
+			{
+				*outcome = PS_APPEND_IO_FAILED;
+				return -1;
+			}
+			for (uint32_t i = 0; i < nfences; i++)
+			{
+				if (hdr.lsn < fences[i].lsn)
+					hdr.lsn = fences[i].lsn;
+				if (hdr.lsn == fences[i].lsn &&
+					admission_seq <= fences[i].admission_seq)
+				{
+					if (hdr.lsn == UINT64_MAX)
+					{
+						free(fences);
+						*outcome = PS_APPEND_REFUSED_FORKMETA_CUTOFF;
+						return -1;
+					}
+					hdr.lsn++;
+				}
+			}
+			free(fences);
+		}
 	}
 	hdr_grow_lsn = hdr.lsn;
 	page_version = zero_version ? 0 : hdr.lsn;
