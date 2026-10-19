@@ -19111,6 +19111,45 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 				hdr.lsn = growth_floor;
 		}
 	}
+	/*
+	 * A recovery-floor rewrite whose raw pd_lsn is below the floor may be a
+	 * late flush of a page that became addressable only after that raw LSN.
+	 * A finite branch cap hides such a version by admission sequence, but a
+	 * legacy/unproven branch (or pin) has an unbounded cap and would read it
+	 * at the raw position, mutating a snapshot taken before the flush.  Order
+	 * the rewrite at the floor when such a fence covers the raw LSN; the
+	 * existing ordered path then also lifts it past a fence at the same LSN.
+	 */
+	if (key->klass == PS_KLASS_RELATION && !clamped && hdr.lsn != 0 &&
+		floor_lsn != 0 && hdr.lsn < floor_lsn)
+	{
+		PsHistoryFence *fences = NULL;
+		uint32_t	nfences = 0;
+		int			fenced = 0;
+		int			rc;
+
+		ps_lock_map_rd();
+		rc = page_prune_fences(timeline, &fences, &nfences);
+		ps_unlock_map();
+		if (rc != 0)
+		{
+			*outcome = PS_APPEND_IO_FAILED;
+			return -1;
+		}
+		for (uint32_t i = 0; i < nfences; i++)
+			if (fences[i].seq == PS_SEQ_UNBOUNDED &&
+				fences[i].lsn >= hdr.lsn)
+			{
+				fenced = 1;
+				break;
+			}
+		free(fences);
+		if (fenced)
+		{
+			clamped = 1;
+			hdr.lsn = growth_floor;
+		}
+	}
 	if (hdr.lsn == 0)
 	{
 		hdr.magic = SEG_WALLESS_ADMISSION_MAGIC;

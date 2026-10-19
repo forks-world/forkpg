@@ -816,8 +816,12 @@ ls_recovery_floor(PsChannel *ch)
 	}
 	else
 		now = (uint64) GetXLogReplayRecPtr(NULL);
-	if (now != 0 && now < UINT64_MAX - 1)
-		ch->req_floor_lsn = now + 1;
+	/* Use the replay position itself, not its successor: a branch created
+	 * later at this endpoint must still see a flush that preceded it.  For a
+	 * branch created earlier at the same LSN, admission-sequence caps (or the
+	 * ordered fence rule) exclude the flush. */
+	if (now != 0)
+		ch->req_floor_lsn = now;
 }
 
 static void
