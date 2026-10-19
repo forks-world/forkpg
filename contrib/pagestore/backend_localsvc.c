@@ -792,6 +792,34 @@ ls_unstamped_lsn(PsChannel *ch)
 	ch->req_floor_lsn = now + 1;
 }
 
+/*
+ * A materializer's checkpointer flushes pages replayed from WAL, so their
+ * pd_lsn can be older than the store's forkmeta cutoff even though the flush
+ * is a real-time operation.  Give the daemon that floor so growing flushes are
+ * ordered at "now" instead of being refused as historical growth.  Ordinary
+ * writers (not in recovery) leave it zero: their page LSN already is the
+ * operation's position.
+ */
+static void
+ls_recovery_floor(PsChannel *ch)
+{
+	uint64		now;
+
+	ch->req_floor_lsn = 0;
+	if (!RecoveryInProgress())
+		return;
+	if (AmStartupProcess())
+	{
+		now = (uint64) GetCurrentReplayRecPtr(NULL);
+		if (now == 0)
+			now = (uint64) GetXLogReplayRecPtr(NULL);
+	}
+	else
+		now = (uint64) GetXLogReplayRecPtr(NULL);
+	if (now != 0 && now < UINT64_MAX - 1)
+		ch->req_floor_lsn = now + 1;
+}
+
 static void
 ls_op_lsn(PsChannel *ch, bool is_unlink)
 {
@@ -1006,6 +1034,8 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 		ch->blocknum = blocknum + done;
 		ch->nblocks = chunk;
 		ch->skip_fsync = skipFsync ? 1 : 0;
+		ls_recovery_floor(ch);
+		ch->is_redo = ch->req_floor_lsn != 0 ? PS_WRITE_REPLAY_FLOOR : 0;
 		for (BlockNumber i = 0; i < chunk; i++)
 			memcpy(ch->data + (size_t) i * BLCKSZ, buffers[done + i], BLCKSZ);
 		ls_exec(ch);
@@ -1032,6 +1062,8 @@ ls_extend(const PageStoreRelKey *key, void *localreln,
 	ch->blocknum = blocknum;
 	ch->nblocks = 1;
 	ch->skip_fsync = skipFsync ? 1 : 0;
+	ls_recovery_floor(ch);
+	ch->is_redo = ch->req_floor_lsn != 0 ? PS_WRITE_REPLAY_FLOOR : 0;
 	memcpy(ch->data, buffer, BLCKSZ);
 	ls_exec(ch);
 }

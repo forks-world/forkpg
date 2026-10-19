@@ -856,8 +856,8 @@ typedef enum PsAppendOutcome
 } PsAppendOutcome;
 
 static int append_page_raw_outcome(uint32_t timeline, const PsKey *key, uint32_t block,
-	const unsigned char *page, uint64_t version, uint64_t *out_admission_seq,
-	PsAppendOutcome *outcome);
+	const unsigned char *page, uint64_t version, uint64_t floor_lsn,
+	uint64_t *out_admission_seq, PsAppendOutcome *outcome);
 typedef struct ArtifactPruneCache ArtifactPruneCache;
 static void artifact_prune_cache_free(ArtifactPruneCache *cache);
 static int artifact_prune_versions(uint32_t timeline, const PsKey *key,
@@ -18875,7 +18875,8 @@ page_lsn(const unsigned char *page)
  */
 static int append_page_impl(uint32_t timeline, const PsKey *key,
 							uint32_t block, const unsigned char *page,
-							uint64_t version, uint64_t *out_admission_seq,
+							uint64_t version, uint64_t floor_lsn,
+							uint64_t *out_admission_seq,
 							uint64_t *artifact_lsn, PsAppendOutcome *outcome);
 
 int
@@ -18885,15 +18886,24 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	return ps_artifact_write(timeline, key, block, page, version, 0, out_admission_seq, NULL);
 }
 
+int
+append_page_floor(uint32_t timeline, const PsKey *key, uint32_t block,
+	const unsigned char *page, uint64_t version, uint64_t floor_lsn,
+	uint64_t *out_admission_seq)
+{
+	return ps_artifact_write_floor(timeline, key, block, page, version, 0,
+								   floor_lsn, out_admission_seq, NULL);
+}
+
 static int
 append_page_raw_outcome(uint32_t timeline, const PsKey *key, uint32_t block,
-			const unsigned char *page, uint64_t version,
+			const unsigned char *page, uint64_t version, uint64_t floor_lsn,
 			uint64_t *out_admission_seq, PsAppendOutcome *outcome)
 {
 	uint64_t	artifact_lsn = 0;
 	PsAppendOutcome local_outcome = PS_APPEND_OK;
 	int			rc = append_page_impl(timeline, key, block, page, version,
-									  out_admission_seq, &artifact_lsn,
+									  floor_lsn, out_admission_seq, &artifact_lsn,
 									  &local_outcome);
 
 	/* An admitted artifact reserved its fence before the append; the version
@@ -18908,7 +18918,7 @@ append_page_raw_outcome(uint32_t timeline, const PsKey *key, uint32_t block,
 
 static int
 append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
-				 const unsigned char *page, uint64_t version,
+				 const unsigned char *page, uint64_t version, uint64_t floor_lsn,
 				 uint64_t *out_admission_seq, uint64_t *artifact_lsn,
 				 PsAppendOutcome *outcome)
 {
@@ -18919,6 +18929,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	reclen;
 	uint64_t	data_off;
 	uint64_t	hdr_grow_lsn = 0;
+	uint64_t	growth_check_lsn = 0;
 	uint64_t	order_id = 0;
 	uint64_t	page_version;
 	uint64_t	admission_seq;
@@ -18959,6 +18970,19 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 			growth_floor = branch_floor;
 	}
 	ps_unlock_map();
+
+	/*
+	 * A materializer flushing replayed pages writes them at their historical
+	 * pd_lsn.  If forkmeta compaction has already passed that position, a
+	 * growth would be invisible to recovery (the snapshot's cutoff hides it)
+	 * and is rejected below.  The flush itself is a real-time local operation,
+	 * though, so order it at the caller-supplied recovery floor exactly like a
+	 * below-floor copy: the page gets a representable position at/after the
+	 * floor, and its growth stays visible.  Non-growing rewrites keep their
+	 * raw pd_lsn; only growth (and WAL-less content) needs the floor.
+	 */
+	if (key->klass == PS_KLASS_RELATION && floor_lsn > growth_floor)
+		growth_floor = floor_lsn;
 
 	/* The header is persisted whole, so its alignment padding is persisted
 	 * too; zero it so equivalent stores hold identical bytes. */
@@ -19158,8 +19182,19 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	hdr_grow_lsn = hdr.lsn;
 	page_version = zero_version ? 0 : hdr.lsn;
+	/*
+	 * Whether this write grows the fork is judged at the real-time floor when
+	 * there is one.  A replayed page's raw pd_lsn can predate the fork's
+	 * current size, but a flush that rewrites an already-addressable block is
+	 * not historical growth: refusing it would abort the materializer's
+	 * restartpoint (the FSM/VM rewrite shape).  A block still beyond the floor
+	 * size remains growth and was clamped/ordered above.
+	 */
+	growth_check_lsn = hdr_grow_lsn;
+	if (key->klass == PS_KLASS_RELATION && floor_lsn > growth_check_lsn)
+		growth_check_lsn = floor_lsn;
 	extends_uncapped = (!fe ||
-		fork_size_asof_hop(fe, hdr_grow_lsn, admission_seq) < block + 1);
+		fork_size_asof_hop(fe, growth_check_lsn, admission_seq) < block + 1);
 	/* An ordered body is acknowledged only together with its bound marker.
 	 * Reject an inadmissible tuple before either header or page bytes reach the
 	 * segment, even when this is a non-growth commit marker. */

@@ -295,22 +295,34 @@ begin(uint32_t i, PsChannel *ch, int defer_done)
 	switch ((PsOpcode) ch->opcode)
 	{
 		case PS_OP_EXTEND:
-			/* append_page grows the fork with the page's exact LSN */
-			if (append_page(tl, &ch->key, ch->blocknum, ch->data,
-							ch->req_lsn, &ch->req_seq) != 0)
-				ch->status = PS_STATUS_ERROR;
+			{
+				uint64_t	floor_lsn = ch->is_redo == PS_WRITE_REPLAY_FLOOR ?
+					ch->req_floor_lsn : 0;
+
+				/* append_page grows the fork with the page's exact LSN */
+				if (append_page_floor(tl, &ch->key, ch->blocknum, ch->data,
+									  ch->req_lsn, floor_lsn,
+									  &ch->req_seq) != 0)
+					ch->status = PS_STATUS_ERROR;
+			}
 			ps_store_release(&ch->state, PS_STATE_DONE);
 			return;
 
 		case PS_OP_WRITEV:
-			for (uint32_t b = 0; b < ch->nblocks; b++)
 			{
-				if (append_page(tl, &ch->key, ch->blocknum + b,
-								 ch->data + (size_t) b * page_size,
-								 ch->req_lsn, &ch->req_seq) != 0)
+				uint64_t	floor_lsn = ch->is_redo == PS_WRITE_REPLAY_FLOOR ?
+					ch->req_floor_lsn : 0;
+
+				for (uint32_t b = 0; b < ch->nblocks; b++)
 				{
-					ch->status = PS_STATUS_ERROR;
-					break;
+					if (append_page_floor(tl, &ch->key, ch->blocknum + b,
+										  ch->data + (size_t) b * page_size,
+										  ch->req_lsn, floor_lsn,
+										  &ch->req_seq) != 0)
+					{
+						ch->status = PS_STATUS_ERROR;
+						break;
+					}
 				}
 			}
 			ps_store_release(&ch->state, PS_STATE_DONE);

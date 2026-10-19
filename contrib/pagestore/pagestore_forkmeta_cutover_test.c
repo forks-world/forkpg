@@ -347,6 +347,30 @@ append_relation_timeline(uint32_t timeline, const PsKey *key, uint32_t block,
 									   (unsigned char) (timeline + 0x20), seq);
 }
 
+/* A materializer flush: the page keeps its historical pd_lsn, but growth is
+ * ordered at floor_lsn because the write itself happens now. */
+static int
+append_relation_floor_timeline_tag(uint32_t timeline, const PsKey *key,
+								   uint32_t block, uint64_t lsn,
+								   unsigned char *page, unsigned char tag,
+								   uint64_t floor_lsn, uint64_t *seq)
+{
+	uint32_t hi = (uint32_t) (lsn >> 32);
+	uint32_t lo = (uint32_t) lsn;
+	int rc;
+
+	memset(page, 0, page_size);
+	memcpy(page, &hi, sizeof(hi));
+	memcpy(page + sizeof(hi), &lo, sizeof(lo));
+	page[128] = tag;
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(key));
+	rc = append_page_floor(timeline, key, block, page, 0, floor_lsn, seq);
+	ps_unlock_shard(ps_shard_of(key));
+	ps_admission_read_unlock();
+	return rc;
+}
+
 static off_t
 file_size(const char *path)
 {
@@ -2206,6 +2230,7 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 	char store[] = "/tmp/psforkmetaaftercutXXXXXX";
 	char snapshots[1024], manifest[1200], frontier[1200];
 	PsKey key = {6, 6, 31, 1, PS_KLASS_RELATION};
+	PsKey floor_key = {6, 6, 33, 1, PS_KLASS_RELATION};
 	PsKey pin_key = {6, 6, 32, 0, PS_KLASS_RELATION};
 	PsRetentionPin pin;
 	TestSnapshotHeader hdr;
@@ -2227,6 +2252,10 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 								 100 + timeline, 0, 0, 0, NULL) &&
 		  append_relation_timeline(timeline, &key, 0, lsn, page, NULL) == 0,
 		  "E6 initial ordered local write");
+	check(meta_request_timeline(timeline, PS_OP_CREATE, &floor_key,
+								 100 + timeline, 0, 0, 0, NULL) &&
+		  append_relation_timeline(timeline, &floor_key, 0, lsn, page, NULL) == 0,
+		  "E6 create the materializer-floor fork before the cutoff");
 	memset(&pin, 0, sizeof(pin));
 	pin.owner_kind = 1;
 	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
@@ -2267,6 +2296,30 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 		  meta_request_timeline(timeline, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
 		  reply.result == 3,
 		  "E6 explicit historical WAL growth is still refused without changing size");
+	check(append_relation_floor_timeline_tag(timeline, &floor_key, 5, lsn, page,
+											 0x73, 400, &seq) == 0 &&
+		  meta_request_timeline(timeline, PS_OP_NBLOCKS, &floor_key, 0, 0, 0, 0,
+								&reply) && reply.result == 6 &&
+		  read_resolve(timeline, &floor_key, 5, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x73,
+		  "E6 recovery-floor growth is admitted and visible at the newest horizon");
+	if (!walless)
+		check(read_resolve(timeline, &floor_key, 5, hdr.cutoff_lsn,
+						   hdr.cutoff_admission_seq, page, NULL) == 0,
+			  "E6 recovery-floor growth is ordered after the retained cutoff");
+	{
+		/* The FSM/VM shape: rewrite a block that is already addressable, with a
+		 * pd_lsn below the cutoff (and below the floor's clamped position). */
+		uint64_t rewrite_lsn = walless ? 0 : 250;
+
+		check(append_relation_floor_timeline_tag(timeline, &floor_key, 0,
+												 rewrite_lsn, page, 0x74, 401, &seq) == 0 &&
+			  meta_request_timeline(timeline, PS_OP_NBLOCKS, &floor_key, 0, 0, 0, 0,
+									&reply) && reply.result == 6 &&
+			  read_resolve(timeline, &floor_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x74,
+			  "E6 recovery-floor rewrite of an existing FSM/VM block is admitted");
+	}
 	/* Recover the promoted source-tail markers without a clean close/flush.
 	 * Both a commit-class rewrite and a growth-class append must survive. */
 	close_runtime();
@@ -2311,7 +2364,13 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 			  reply.result == 3 &&
 			  read_resolve(timeline, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
 			  page[128] == 0x71 &&
-			  read_resolve(timeline, &key, 4, UINT64_MAX, 0, page, NULL) == 0,
+			  read_resolve(timeline, &key, 4, UINT64_MAX, 0, page, NULL) == 0 &&
+			  meta_request_timeline(timeline, PS_OP_NBLOCKS, &floor_key, 0, 0, 0,
+									0, &reply) && reply.result == 6 &&
+			  read_resolve(timeline, &floor_key, 5, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x73 &&
+			  read_resolve(timeline, &floor_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x74,
 			  "E6 ordered bytes and size survive repeated reopen");
 		if (timeline)
 			check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 0 &&
