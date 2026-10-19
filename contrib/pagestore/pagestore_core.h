@@ -80,6 +80,11 @@ extern int ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 extern int ps_artifact_write_floor(uint32_t tl, const PsKey *key, uint32_t block,
 	const unsigned char *page, uint64_t lsn, uint64_t token,
 	uint64_t floor_lsn, uint64_t *seq, PsArtifactRefuseReason *reason);
+/* Materializer recovery flush: order growth at the durable forkmeta cutoff (or
+ * the page's own pd_lsn when it is newer), never at the live replay head. */
+extern int ps_artifact_write_recovery(uint32_t tl, const PsKey *key, uint32_t block,
+	const unsigned char *page, uint64_t lsn, uint64_t token, uint64_t *seq,
+	PsArtifactRefuseReason *reason);
 extern int ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
 	uint64_t token, uint64_t count, PsArtifactRefuseReason *reason);
 extern int ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn,

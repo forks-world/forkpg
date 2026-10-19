@@ -538,7 +538,7 @@ artifact_store_record(uint32_t tl, const PsKey *key, uint32_t block,
 	record->crc = ~ps_crc32c_update(UINT32_MAX, record,
 									offsetof(PsArtifactLifecycle, crc));
 	memcpy(page, record, sizeof(*record));
-	rc = append_page_raw_outcome(tl, &meta, block, page, lsn, 0, seq, &local_outcome);
+	rc = append_page_raw_outcome(tl, &meta, block, page, lsn, 0, 0, seq, &local_outcome);
 	free(page);
 	if (rc == 0)
 	{
@@ -758,7 +758,7 @@ artifact_completed_attempt(uint32_t tl, const PsKey *key, uint64_t lsn,
 static int
 ps_artifact_write_impl(uint32_t tl, const PsKey *key, uint32_t block,
 				  const unsigned char *page, uint64_t lsn, uint64_t token,
-				  uint64_t floor_lsn, uint64_t *seq,
+				  uint64_t floor_lsn, int floor_mode, uint64_t *seq,
 				  PsArtifactRefuseReason *reason)
 {
 	ForkEnt    *fork;
@@ -784,7 +784,7 @@ ps_artifact_write_impl(uint32_t tl, const PsKey *key, uint32_t block,
 		 * I/O failure). */
 		PsAppendOutcome raw_outcome;
 		int			rc = append_page_raw_outcome(tl, key, block, page, lsn,
-												 floor_lsn, seq, &raw_outcome);
+												 floor_lsn, floor_mode, seq, &raw_outcome);
 
 		if (rc != 0)
 			return artifact_refuse(reason, artifact_reason_for_outcome(raw_outcome));
@@ -799,7 +799,7 @@ ps_artifact_write_impl(uint32_t tl, const PsKey *key, uint32_t block,
 		{
 			PsAppendOutcome raw_outcome;
 			int			rc = append_page_raw_outcome(tl, key, block, page, lsn,
-													 floor_lsn, seq, &raw_outcome);
+													 floor_lsn, floor_mode, seq, &raw_outcome);
 
 			if (rc != 0)
 				return artifact_refuse(reason, artifact_reason_for_outcome(raw_outcome));
@@ -833,7 +833,7 @@ ps_artifact_write_impl(uint32_t tl, const PsKey *key, uint32_t block,
 	fork = fork_find(tl, key);
 	if (!fork || fork->artifact_attempt_seq != token)
 		return artifact_refuse(reason, PS_ARTIFACT_REFUSE_ATTEMPT_MISMATCH);
-	if (append_page_raw_outcome(tl, key, block, page, lsn, floor_lsn, seq, &outcome) != 0)
+	if (append_page_raw_outcome(tl, key, block, page, lsn, floor_lsn, floor_mode, seq, &outcome) != 0)
 	{
 		/* An ambiguous append must not escape the attempt's counters -- poison
 		 * only when the append's outcome was a real storage I/O failure; an
@@ -859,7 +859,7 @@ ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 				  const unsigned char *page, uint64_t lsn, uint64_t token,
 				  uint64_t *seq, PsArtifactRefuseReason *reason)
 {
-	return ps_artifact_write_impl(tl, key, block, page, lsn, token, 0, seq,
+	return ps_artifact_write_impl(tl, key, block, page, lsn, token, 0, 0, seq,
 								  reason);
 }
 
@@ -870,6 +870,15 @@ ps_artifact_write_floor(uint32_t tl, const PsKey *key, uint32_t block,
 				  PsArtifactRefuseReason *reason)
 {
 	return ps_artifact_write_impl(tl, key, block, page, lsn, token, floor_lsn,
+								  0, seq, reason);
+}
+
+int
+ps_artifact_write_recovery(uint32_t tl, const PsKey *key, uint32_t block,
+				  const unsigned char *page, uint64_t lsn, uint64_t token,
+				  uint64_t *seq, PsArtifactRefuseReason *reason)
+{
+	return ps_artifact_write_impl(tl, key, block, page, lsn, token, 0, 1,
 								  seq, reason);
 }
 

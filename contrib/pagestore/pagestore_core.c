@@ -334,6 +334,8 @@ static void inspection_metrics_changed(void);
 static void inspection_timeline_cache_changed(void);
 static void publish_inspection_metrics(int force);
 static int branch_frontiers_allow(int parent, uint64_t branch_lsn);
+static uint64_t fork_meta_snapshot_cutoff_lsn;
+static uint64_t fork_meta_snapshot_cutoff_seq;
 static int page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 								 uint32_t *nfences_out);
 static int page_max_fence_lsn(uint32_t timeline, uint64_t at_or_below,
@@ -859,7 +861,7 @@ typedef enum PsAppendOutcome
 
 static int append_page_raw_outcome(uint32_t timeline, const PsKey *key, uint32_t block,
 	const unsigned char *page, uint64_t version, uint64_t floor_lsn,
-	uint64_t *out_admission_seq, PsAppendOutcome *outcome);
+	int floor_mode, uint64_t *out_admission_seq, PsAppendOutcome *outcome);
 typedef struct ArtifactPruneCache ArtifactPruneCache;
 static void artifact_prune_cache_free(ArtifactPruneCache *cache);
 static int artifact_prune_versions(uint32_t timeline, const PsKey *key,
@@ -18878,7 +18880,7 @@ page_lsn(const unsigned char *page)
 static int append_page_impl(uint32_t timeline, const PsKey *key,
 							uint32_t block, const unsigned char *page,
 							uint64_t version, uint64_t floor_lsn,
-							uint64_t *out_admission_seq,
+							int floor_mode, uint64_t *out_admission_seq,
 							uint64_t *artifact_lsn, PsAppendOutcome *outcome);
 
 int
@@ -18900,12 +18902,12 @@ append_page_floor(uint32_t timeline, const PsKey *key, uint32_t block,
 static int
 append_page_raw_outcome(uint32_t timeline, const PsKey *key, uint32_t block,
 			const unsigned char *page, uint64_t version, uint64_t floor_lsn,
-			uint64_t *out_admission_seq, PsAppendOutcome *outcome)
+			int floor_mode, uint64_t *out_admission_seq, PsAppendOutcome *outcome)
 {
 	uint64_t	artifact_lsn = 0;
 	PsAppendOutcome local_outcome = PS_APPEND_OK;
 	int			rc = append_page_impl(timeline, key, block, page, version,
-									  floor_lsn, out_admission_seq, &artifact_lsn,
+									  floor_lsn, floor_mode, out_admission_seq, &artifact_lsn,
 									  &local_outcome);
 
 	/* An admitted artifact reserved its fence before the append; the version
@@ -18921,8 +18923,8 @@ append_page_raw_outcome(uint32_t timeline, const PsKey *key, uint32_t block,
 static int
 append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 				 const unsigned char *page, uint64_t version, uint64_t floor_lsn,
-				 uint64_t *out_admission_seq, uint64_t *artifact_lsn,
-				 PsAppendOutcome *outcome)
+				 int floor_mode, uint64_t *out_admission_seq,
+				 uint64_t *artifact_lsn, PsAppendOutcome *outcome)
 {
 	SegRecHdr	hdr;
 	SegRecHdrAdmission admission_hdr;
@@ -18939,6 +18941,10 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	int			ordered_record = 0;
 	int			extends_uncapped = 0;
 	int			zero_version = 0;
+	int			recovery_ordered = 0;
+	int			skip_grow_event = 0;
+	int			addressable_now = 0;
+	uint64_t	ordering_floor = 0;
 	Shard	   *s;
 	ForkEnt    *fe;
 	uint64_t	branch_floor = 0;
@@ -19070,6 +19076,49 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	hdr.len = page_size;
 
 	/*
+	 * Materializer recovery flush.  Do not use the live replay head as the
+	 * write position: a checkpointer can flush a page dirtied at P long after
+	 * replay advanced to F, and recording checkpoint state at F would put it
+	 * beyond the redo horizon that may need it after a crash.  The durable
+	 * forkmeta cutoff is the latest position already covered by the selected
+	 * snapshot; ordering a late write there keeps it visible to recovery from
+	 * that horizon.  If the page's own pd_lsn is at/after the cutoff, it is
+	 * already an ordinary position and needs no promotion.
+	 */
+	if (key->klass == PS_KLASS_RELATION && floor_mode == 1)
+	{
+		uint64_t	cutoff = fork_meta_snapshot_cutoff_lsn;
+
+		addressable_now = fe != NULL &&
+			fork_size_asof_hop(fe, UINT64_MAX, 0) >= block + 1;
+		/*
+		 * A block already addressable now is a rewrite, not growth: do not
+		 * insert a GROW at its historical pd_lsn, which would retroactively
+		 * make it visible to a branch created before it really existed.
+		 */
+		if (addressable_now)
+			skip_grow_event = 1;
+		if (cutoff != 0 && hdr.lsn != 0 && hdr.lsn < cutoff)
+		{
+			recovery_ordered = 1;
+			clamped = 1;
+			if (cutoff > growth_floor)
+				growth_floor = cutoff;
+			hdr.lsn = growth_floor;
+			/*
+			 * A rewrite needs no growth for recovery, and a first version at
+			 * the cutoff itself could still be admitted to a capped snapshot
+			 * through page_select()'s escape.  Put it just past the cutoff;
+			 * genuine growth stays at the cutoff because recovery at that
+			 * horizon may need its size.
+			 */
+			if (addressable_now && hdr.lsn < UINT64_MAX)
+				hdr.lsn++;
+		}
+		ordering_floor = hdr.lsn;
+	}
+
+	/*
 	 * Below-floor growth cannot be ordered by the page's raw LSN.  Two
 	 * shapes, two treatments:
 	 *
@@ -19184,8 +19233,10 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		uint64_t	newest;
 
-		if (key->klass == PS_KLASS_RELATION && floor_lsn != 0)
+		if (key->klass == PS_KLASS_RELATION &&
+			(floor_lsn != 0 || recovery_ordered))
 		{
+			uint64_t	fence_floor = recovery_ordered ? ordering_floor : floor_lsn;
 			uint64_t	max_fence = 0;
 			int			rc;
 
@@ -19196,7 +19247,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 			 */
 			ps_lock_map_rd();
 			newest = fork_newest_visible_lsn_through(timeline, key);
-			rc = page_max_fence_lsn(timeline, floor_lsn, &max_fence);
+			rc = page_max_fence_lsn(timeline, fence_floor, &max_fence);
 			ps_unlock_map();
 			if (rc != 0)
 			{
@@ -19211,12 +19262,12 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * a future branch that includes this flush, so it must not push the
 			 * record beyond the endpoint; cap there.
 			 */
-			if (floor_lsn < UINT64_MAX)
+			if (fence_floor < UINT64_MAX)
 			{
-				if (max_fence == floor_lsn)
-					hdr.lsn = hdr.lsn > floor_lsn + 1 ? hdr.lsn : floor_lsn + 1;
-				if (hdr.lsn > floor_lsn + 1)
-					hdr.lsn = floor_lsn + 1;
+				if (max_fence == fence_floor)
+					hdr.lsn = hdr.lsn > fence_floor + 1 ? hdr.lsn : fence_floor + 1;
+				if (hdr.lsn > fence_floor + 1)
+					hdr.lsn = fence_floor + 1;
 			}
 		}
 		else
@@ -19275,11 +19326,16 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * restartpoint (the FSM/VM rewrite shape).  A block still beyond the floor
 	 * size remains growth and was clamped/ordered above.
 	 */
-	growth_check_lsn = hdr_grow_lsn;
-	if (key->klass == PS_KLASS_RELATION && floor_lsn > growth_check_lsn)
-		growth_check_lsn = floor_lsn;
-	extends_uncapped = (!fe ||
-		fork_size_asof_hop(fe, growth_check_lsn, admission_seq) < block + 1);
+	if (key->klass == PS_KLASS_RELATION && floor_mode == 1)
+		extends_uncapped = !addressable_now;
+	else
+	{
+		growth_check_lsn = hdr_grow_lsn;
+		if (key->klass == PS_KLASS_RELATION && floor_lsn > growth_check_lsn)
+			growth_check_lsn = floor_lsn;
+		extends_uncapped = (!fe ||
+			fork_size_asof_hop(fe, growth_check_lsn, admission_seq) < block + 1);
+	}
 	/* An ordered body is acknowledged only together with its bound marker.
 	 * Reject an inadmissible tuple before either header or page bytes reach the
 	 * segment, even when this is a non-growth commit marker. */
@@ -19430,7 +19486,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		(void) fork_event_activate_seg(ofe, hdr_grow_lsn, block + 1,
 									   order_id, admission_seq);
 	}
-	else
+	else if (!skip_grow_event)
 		fork_grow_apply(timeline, key, block + 1, hdr_grow_lsn, admission_seq);
 	if (out_admission_seq)
 		*out_admission_seq = admission_seq;

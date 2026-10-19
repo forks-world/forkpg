@@ -485,13 +485,16 @@ handle_request(PsChannel *ch)
 				PsArtifactRefuseReason reason = PS_ARTIFACT_REFUSE_NONE;
 				int			artifact_klass = ch->key.klass == PS_KLASS_SLRU ||
 					ch->key.klass == PS_KLASS_READER_SNAPSHOT;
-				uint64_t	floor_lsn = ch->is_redo == PS_WRITE_REPLAY_FLOOR ?
-					ch->req_floor_lsn : 0;
+				int			recovery = ch->is_redo == PS_WRITE_REPLAY_FLOOR;
 
 				/* append_page grows the fork with the page's exact LSN */
-				if (ps_artifact_write_floor(tl, &ch->key, ch->blocknum, ch->data,
-								ch->req_lsn, ch->req_seq, floor_lsn,
-								&ch->req_seq, &reason) != 0)
+				if ((recovery ?
+					 ps_artifact_write_recovery(tl, &ch->key, ch->blocknum, ch->data,
+											  ch->req_lsn, ch->req_seq,
+											  &ch->req_seq, &reason) :
+					 ps_artifact_write(tl, &ch->key, ch->blocknum, ch->data,
+									 ch->req_lsn, ch->req_seq, &ch->req_seq,
+									 &reason)) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					if (artifact_klass)
@@ -509,15 +512,19 @@ handle_request(PsChannel *ch)
 				PsArtifactRefuseReason reason = PS_ARTIFACT_REFUSE_NONE;
 				int			artifact_klass = ch->key.klass == PS_KLASS_SLRU ||
 					ch->key.klass == PS_KLASS_READER_SNAPSHOT;
-				uint64_t	floor_lsn = ch->is_redo == PS_WRITE_REPLAY_FLOOR ?
-					ch->req_floor_lsn : 0;
+				int			recovery = ch->is_redo == PS_WRITE_REPLAY_FLOOR;
 
 				for (uint32_t i = 0; i < ch->nblocks; i++)
 				{
-					if (ps_artifact_write_floor(tl, &ch->key, ch->blocknum + i,
-									ch->data + (size_t) i * page_size,
-									 ch->req_lsn, ch->req_seq, floor_lsn,
-									 &ch->req_seq, &reason) != 0)
+					if ((recovery ?
+						 ps_artifact_write_recovery(tl, &ch->key, ch->blocknum + i,
+												 ch->data + (size_t) i * page_size,
+												 ch->req_lsn, ch->req_seq,
+												 &ch->req_seq, &reason) :
+						 ps_artifact_write(tl, &ch->key, ch->blocknum + i,
+										 ch->data + (size_t) i * page_size,
+										 ch->req_lsn, ch->req_seq, &ch->req_seq,
+										 &reason)) != 0)
 					{
 						ch->status = PS_STATUS_ERROR;
 						if (artifact_klass)

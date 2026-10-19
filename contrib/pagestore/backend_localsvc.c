@@ -803,28 +803,17 @@ ls_unstamped_lsn(PsChannel *ch)
 static void
 ls_recovery_floor(PsChannel *ch)
 {
-	uint64		now;
-
-	ch->req_floor_lsn = 0;
-	if (!pagestore_materializer_enabled())
-		return;
 	/*
-	 * GetCurrentReplayRecPtr() includes the record currently being applied,
-	 * unlike GetXLogReplayRecPtr(): a checkpointer can flush a page after the
-	 * startup process modified it but before that multi-page record finished,
-	 * and the floor must not place the effect before its own record.  The
-	 * value survives promotion, so the rest of an in-progress restartpoint and
-	 * the first post-promotion checkpoint keep the floor too.
+	 * Only mark the request; the daemon orders recovery growth at the durable
+	 * forkmeta cutoff (or the page's own pd_lsn when that is newer), never at
+	 * the live replay head.  A checkpointer can flush a page dirtied at P long
+	 * after replay advanced to F; stamping F would put checkpoint state beyond
+	 * the redo horizon that may need it.  The flag survives promotion, so the
+	 * rest of an in-progress restartpoint and the first post-promotion
+	 * checkpoint keep recovery semantics too.
 	 */
-	now = (uint64) GetCurrentReplayRecPtr(NULL);
-	if (now == 0)
-		now = (uint64) GetXLogReplayRecPtr(NULL);
-	/* Use the replay position itself, not its successor: a branch created
-	 * later at this endpoint must still see a flush that preceded it.  For a
-	 * branch created earlier at the same LSN, admission-sequence caps (or the
-	 * ordered fence rule) exclude the flush. */
-	if (now != 0)
-		ch->req_floor_lsn = now;
+	ch->req_floor_lsn = 0;
+	ch->is_redo = pagestore_materializer_enabled() ? PS_WRITE_REPLAY_FLOOR : 0;
 }
 
 static void
@@ -1042,7 +1031,6 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 		ch->nblocks = chunk;
 		ch->skip_fsync = skipFsync ? 1 : 0;
 		ls_recovery_floor(ch);
-		ch->is_redo = ch->req_floor_lsn != 0 ? PS_WRITE_REPLAY_FLOOR : 0;
 		for (BlockNumber i = 0; i < chunk; i++)
 			memcpy(ch->data + (size_t) i * BLCKSZ, buffers[done + i], BLCKSZ);
 		ls_exec(ch);
@@ -1070,7 +1058,6 @@ ls_extend(const PageStoreRelKey *key, void *localreln,
 	ch->nblocks = 1;
 	ch->skip_fsync = skipFsync ? 1 : 0;
 	ls_recovery_floor(ch);
-	ch->is_redo = ch->req_floor_lsn != 0 ? PS_WRITE_REPLAY_FLOOR : 0;
 	memcpy(ch->data, buffer, BLCKSZ);
 	ls_exec(ch);
 }

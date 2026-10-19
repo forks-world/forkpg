@@ -349,6 +349,30 @@ append_relation_timeline(uint32_t timeline, const PsKey *key, uint32_t block,
 
 /* A materializer flush: the page keeps its historical pd_lsn, but growth is
  * ordered at floor_lsn because the write itself happens now. */
+/* A materializer recovery flush (no explicit floor; the core uses the durable
+ * forkmeta cutoff). */
+static int
+append_relation_recovery_timeline_tag(uint32_t timeline, const PsKey *key,
+									  uint32_t block, uint64_t lsn,
+									  unsigned char *page, unsigned char tag,
+									  uint64_t *seq)
+{
+	uint32_t hi = (uint32_t) (lsn >> 32);
+	uint32_t lo = (uint32_t) lsn;
+	int rc;
+
+	memset(page, 0, page_size);
+	memcpy(page, &hi, sizeof(hi));
+	memcpy(page + sizeof(hi), &lo, sizeof(lo));
+	page[128] = tag;
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(key));
+	rc = ps_artifact_write_recovery(timeline, key, block, page, 0, 0, seq, NULL);
+	ps_unlock_shard(ps_shard_of(key));
+	ps_admission_read_unlock();
+	return rc;
+}
+
 static int
 append_relation_floor_timeline_tag(uint32_t timeline, const PsKey *key,
 								   uint32_t block, uint64_t lsn,
@@ -2231,6 +2255,7 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 	char snapshots[1024], manifest[1200], frontier[1200];
 	PsKey key = {6, 6, 31, 1, PS_KLASS_RELATION};
 	PsKey floor_key = {6, 6, 33, 1, PS_KLASS_RELATION};
+	PsKey rec_key = {6, 6, 45, 1, PS_KLASS_RELATION};
 	PsKey pin_key = {6, 6, 32, 0, PS_KLASS_RELATION};
 	PsRetentionPin pin;
 	TestSnapshotHeader hdr;
@@ -2256,6 +2281,10 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 								 100 + timeline, 0, 0, 0, NULL) &&
 		  append_relation_timeline(timeline, &floor_key, 0, lsn, page, NULL) == 0,
 		  "E6 create the materializer-floor fork before the cutoff");
+	check(meta_request_timeline(timeline, PS_OP_CREATE, &rec_key,
+								 100 + timeline, 0, 0, 0, NULL) &&
+		  append_relation_timeline(timeline, &rec_key, 0, lsn, page, NULL) == 0,
+		  "E6 create the recovery-flush fork before the cutoff");
 	memset(&pin, 0, sizeof(pin));
 	pin.owner_kind = 1;
 	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
@@ -2307,6 +2336,20 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 		check(read_resolve(timeline, &floor_key, 5, hdr.cutoff_lsn,
 						   hdr.cutoff_admission_seq, page, NULL) == 0,
 			  "E6 recovery-floor growth is ordered after the retained cutoff");
+	if (!walless)
+	{
+		int drc = append_relation_recovery_timeline_tag(timeline, &rec_key, 0, 250,
+													 page, 0x7b, &seq);
+		int drr = read_resolve(timeline, &rec_key, 0, UINT64_MAX, 0, page, NULL);
+		unsigned char dtag = drr == 1 ? page[128] : 0;
+		int dcut = read_resolve(timeline, &rec_key, 0, hdr.cutoff_lsn,
+							  hdr.cutoff_admission_seq, page, NULL);
+		unsigned char dctag = dcut == 1 ? page[128] : 0;
+
+		check(drc == 0 && drr == 1 && dtag == 0x7b &&
+			  dcut == 1 && dctag == (unsigned char) (timeline + 0x20),
+			  "E6 recovery flush is ordered after the durable forkmeta cutoff");
+	}
 	{
 		/* The FSM/VM shape: rewrite a block that is already addressable, with a
 		 * pd_lsn below the cutoff (and below the floor's clamped position). */
