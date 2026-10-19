@@ -806,15 +806,18 @@ ls_recovery_floor(PsChannel *ch)
 	uint64		now;
 
 	ch->req_floor_lsn = 0;
-	if (!RecoveryInProgress())
+	if (!pagestore_materializer_enabled())
 		return;
-	if (AmStartupProcess())
-	{
-		now = (uint64) GetCurrentReplayRecPtr(NULL);
-		if (now == 0)
-			now = (uint64) GetXLogReplayRecPtr(NULL);
-	}
-	else
+	/*
+	 * GetCurrentReplayRecPtr() includes the record currently being applied,
+	 * unlike GetXLogReplayRecPtr(): a checkpointer can flush a page after the
+	 * startup process modified it but before that multi-page record finished,
+	 * and the floor must not place the effect before its own record.  The
+	 * value survives promotion, so the rest of an in-progress restartpoint and
+	 * the first post-promotion checkpoint keep the floor too.
+	 */
+	now = (uint64) GetCurrentReplayRecPtr(NULL);
+	if (now == 0)
 		now = (uint64) GetXLogReplayRecPtr(NULL);
 	/* Use the replay position itself, not its successor: a branch created
 	 * later at this endpoint must still see a flush that preceded it.  For a

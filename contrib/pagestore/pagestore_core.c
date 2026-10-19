@@ -336,7 +336,7 @@ static void publish_inspection_metrics(int force);
 static int branch_frontiers_allow(int parent, uint64_t branch_lsn);
 static int page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 								 uint32_t *nfences_out);
-static int page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t at_or_below,
+static int page_max_fence_lsn(uint32_t timeline, uint64_t at_or_below,
 											 uint64_t *max_lsn);
 static int page_storage_fences(uint32_t timeline, const PsHistoryFence *views,
 	uint32_t nviews, PsHistoryFence **fences_out, uint32_t *nfences_out);
@@ -19130,27 +19130,28 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	/*
 	 * A floor rewrite at or below the replay endpoint must not leak into an
-	 * existing legacy/unproven branch (or pin): its unbounded sequence cap
-	 * admits every version at or below its LSN regardless of admission order.
-	 * A finite cap hides the late version by admission sequence alone.  The
-	 * unbounded-fence projection is cached per epoch, so a restartpoint's
-	 * page batch pays for it once rather than per page.
+	 * existing protected snapshot.  An unbounded legacy cap admits every
+	 * version at or below its LSN; a finite cap can still admit a first
+	 * arrival at the cap LSN through page_select()'s escape.  Order the
+	 * rewrite at the floor when such a fence covers the raw LSN.  The fence
+	 * projection is cached per epoch, so a restartpoint's page batch pays for
+	 * it once rather than per page.
 	 */
 	if (key->klass == PS_KLASS_RELATION && !clamped && hdr.lsn != 0 &&
 		floor_lsn != 0 && hdr.lsn <= floor_lsn)
 	{
-		uint64_t	max_unbounded;
+		uint64_t	max_fence;
 		int			rc;
 
 		ps_lock_map_rd();
-		rc = page_max_unbounded_fence_lsn(timeline, floor_lsn, &max_unbounded);
+		rc = page_max_fence_lsn(timeline, floor_lsn, &max_fence);
 		ps_unlock_map();
 		if (rc != 0)
 		{
 			*outcome = PS_APPEND_IO_FAILED;
 			return -1;
 		}
-		if (max_unbounded >= hdr.lsn)
+		if (max_fence >= hdr.lsn)
 		{
 			clamped = 1;
 			hdr.lsn = growth_floor;
@@ -21059,18 +21060,19 @@ page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 }
 
 /*
- * Highest position at which any fence on this timeline has an unbounded
- * sequence cap (a legacy/unproven descendant branch or pin).  Such a fence
- * admits every version at or below its LSN regardless of admission sequence,
- * so a floor write must be ordered past it.  Cached per worker on the same
- * timeline/retention epochs page_view_registered() uses: a restartpoint
- * flushes many pages while neither set can change, so only the first page
- * pays for the fence snapshot.  Caller holds map-rd or map-wr.
+ * Highest protected page-history position at or below at_or_below.  A fence
+ * there is an earlier snapshot: even a finite sequence cap can admit a
+ * first-arrival version at the exact cap LSN through page_select()'s escape,
+ * so a floor write at or below it must use the ordered representation.
+ * Cached per worker on the same timeline/retention epochs
+ * page_view_registered() uses: a restartpoint flushes many pages while
+ * neither set can change, so only the first page pays for the fence
+ * snapshot.  Caller holds map-rd or map-wr.
  * Returns 0 on success (max_lsn is 0 when no such fence exists), -1 on a
  * snapshot failure.
  */
 static int
-page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t at_or_below,
+page_max_fence_lsn(uint32_t timeline, uint64_t at_or_below,
 							 uint64_t *max_lsn)
 {
 	static __thread struct {
@@ -21104,8 +21106,7 @@ page_max_unbounded_fence_lsn(uint32_t timeline, uint64_t at_or_below,
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return -1;
 	for (uint32_t i = 0; i < nfences; i++)
-		if (fences[i].seq == PS_SEQ_UNBOUNDED &&
-			fences[i].lsn <= at_or_below &&
+		if (fences[i].lsn <= at_or_below &&
 			fences[i].lsn > max_seen)
 			max_seen = fences[i].lsn;
 	free(fences);

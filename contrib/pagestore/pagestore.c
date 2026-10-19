@@ -14924,3 +14924,11 @@ _PG_init(void)
 		RegisterBackgroundWorker(&worker);
 	}
 }
+
+/* The recovery floor is only a materializer concept; an ordinary writer's
+ * page LSN already names its operation. */
+bool
+pagestore_materializer_enabled(void)
+{
+	return pagestore_materializer;
+}
