@@ -347,6 +347,54 @@ append_relation_timeline(uint32_t timeline, const PsKey *key, uint32_t block,
 									   (unsigned char) (timeline + 0x20), seq);
 }
 
+/* A materializer flush: the page keeps its historical pd_lsn, but growth is
+ * ordered at floor_lsn because the write itself happens now. */
+/* A materializer recovery flush (no explicit floor; the core uses the durable
+ * forkmeta cutoff). */
+static int
+append_relation_recovery_timeline_tag(uint32_t timeline, const PsKey *key,
+									  uint32_t block, uint64_t lsn,
+									  unsigned char *page, unsigned char tag,
+									  uint64_t *seq)
+{
+	uint32_t hi = (uint32_t) (lsn >> 32);
+	uint32_t lo = (uint32_t) lsn;
+	int rc;
+
+	memset(page, 0, page_size);
+	memcpy(page, &hi, sizeof(hi));
+	memcpy(page + sizeof(hi), &lo, sizeof(lo));
+	page[128] = tag;
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(key));
+	rc = ps_artifact_write_recovery(timeline, key, block, page, 0, 0, seq, NULL);
+	ps_unlock_shard(ps_shard_of(key));
+	ps_admission_read_unlock();
+	return rc;
+}
+
+static int
+append_relation_floor_timeline_tag(uint32_t timeline, const PsKey *key,
+								   uint32_t block, uint64_t lsn,
+								   unsigned char *page, unsigned char tag,
+								   uint64_t floor_lsn, uint64_t *seq)
+{
+	uint32_t hi = (uint32_t) (lsn >> 32);
+	uint32_t lo = (uint32_t) lsn;
+	int rc;
+
+	memset(page, 0, page_size);
+	memcpy(page, &hi, sizeof(hi));
+	memcpy(page + sizeof(hi), &lo, sizeof(lo));
+	page[128] = tag;
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(key));
+	rc = append_page_floor(timeline, key, block, page, 0, floor_lsn, seq);
+	ps_unlock_shard(ps_shard_of(key));
+	ps_admission_read_unlock();
+	return rc;
+}
+
 static off_t
 file_size(const char *path)
 {
@@ -2206,6 +2254,8 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 	char store[] = "/tmp/psforkmetaaftercutXXXXXX";
 	char snapshots[1024], manifest[1200], frontier[1200];
 	PsKey key = {6, 6, 31, 1, PS_KLASS_RELATION};
+	PsKey floor_key = {6, 6, 33, 1, PS_KLASS_RELATION};
+	PsKey rec_key = {6, 6, 45, 1, PS_KLASS_RELATION};
 	PsKey pin_key = {6, 6, 32, 0, PS_KLASS_RELATION};
 	PsRetentionPin pin;
 	TestSnapshotHeader hdr;
@@ -2227,6 +2277,14 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 								 100 + timeline, 0, 0, 0, NULL) &&
 		  append_relation_timeline(timeline, &key, 0, lsn, page, NULL) == 0,
 		  "E6 initial ordered local write");
+	check(meta_request_timeline(timeline, PS_OP_CREATE, &floor_key,
+								 100 + timeline, 0, 0, 0, NULL) &&
+		  append_relation_timeline(timeline, &floor_key, 0, lsn, page, NULL) == 0,
+		  "E6 create the materializer-floor fork before the cutoff");
+	check(meta_request_timeline(timeline, PS_OP_CREATE, &rec_key,
+								 100 + timeline, 0, 0, 0, NULL) &&
+		  append_relation_timeline(timeline, &rec_key, 0, lsn, page, NULL) == 0,
+		  "E6 create the recovery-flush fork before the cutoff");
 	memset(&pin, 0, sizeof(pin));
 	pin.owner_kind = 1;
 	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
@@ -2267,6 +2325,44 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 		  meta_request_timeline(timeline, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
 		  reply.result == 3,
 		  "E6 explicit historical WAL growth is still refused without changing size");
+	check(append_relation_floor_timeline_tag(timeline, &floor_key, 5, lsn, page,
+											 0x73, 400, &seq) == 0 &&
+		  meta_request_timeline(timeline, PS_OP_NBLOCKS, &floor_key, 0, 0, 0, 0,
+								&reply) && reply.result == 6 &&
+		  read_resolve(timeline, &floor_key, 5, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x73,
+		  "E6 recovery-floor growth is admitted and visible at the newest horizon");
+	if (!walless)
+		check(read_resolve(timeline, &floor_key, 5, hdr.cutoff_lsn,
+						   hdr.cutoff_admission_seq, page, NULL) == 0,
+			  "E6 recovery-floor growth is ordered after the retained cutoff");
+	if (!walless)
+	{
+		int drc = append_relation_recovery_timeline_tag(timeline, &rec_key, 0, 250,
+													 page, 0x7b, &seq);
+		int drr = read_resolve(timeline, &rec_key, 0, UINT64_MAX, 0, page, NULL);
+		unsigned char dtag = drr == 1 ? page[128] : 0;
+		int dcut = read_resolve(timeline, &rec_key, 0, hdr.cutoff_lsn,
+							  hdr.cutoff_admission_seq, page, NULL);
+		unsigned char dctag = dcut == 1 ? page[128] : 0;
+
+		check(drc == 0 && drr == 1 && dtag == 0x7b &&
+			  dcut == 1 && dctag == (unsigned char) (timeline + 0x20),
+			  "E6 recovery flush is ordered after the durable forkmeta cutoff");
+	}
+	{
+		/* The FSM/VM shape: rewrite a block that is already addressable, with a
+		 * pd_lsn below the cutoff (and below the floor's clamped position). */
+		uint64_t rewrite_lsn = walless ? 0 : 250;
+
+		check(append_relation_floor_timeline_tag(timeline, &floor_key, 0,
+												 rewrite_lsn, page, 0x74, 401, &seq) == 0 &&
+			  meta_request_timeline(timeline, PS_OP_NBLOCKS, &floor_key, 0, 0, 0, 0,
+									&reply) && reply.result == 6 &&
+			  read_resolve(timeline, &floor_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x74,
+			  "E6 recovery-floor rewrite of an existing FSM/VM block is admitted");
+	}
 	/* Recover the promoted source-tail markers without a clean close/flush.
 	 * Both a commit-class rewrite and a growth-class append must survive. */
 	close_runtime();
@@ -2311,7 +2407,13 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 			  reply.result == 3 &&
 			  read_resolve(timeline, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
 			  page[128] == 0x71 &&
-			  read_resolve(timeline, &key, 4, UINT64_MAX, 0, page, NULL) == 0,
+			  read_resolve(timeline, &key, 4, UINT64_MAX, 0, page, NULL) == 0 &&
+			  meta_request_timeline(timeline, PS_OP_NBLOCKS, &floor_key, 0, 0, 0,
+									0, &reply) && reply.result == 6 &&
+			  read_resolve(timeline, &floor_key, 5, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x73 &&
+			  read_resolve(timeline, &floor_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+			  page[128] == 0x74,
 			  "E6 ordered bytes and size survive repeated reopen");
 		if (timeline)
 			check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 0 &&
@@ -5611,6 +5713,148 @@ test_finite_branch_cutovers(void)
 	remove_tree(store);
 }
 
+/* A floor-clamped growth flushed at replay LSN N must be visible to a branch
+ * created later at N.  Recording it at N + 1 would strand that branch. */
+static void
+test_floor_growth_before_later_branch(void)
+{
+	char store[] = "/tmp/psfloorlaterbranchXXXXXX";
+	PsKey key = {6, 6, 41, 1, PS_KLASS_RELATION};
+	PsChannel reply;
+	unsigned char page[8192];
+
+	check(mkdtemp(store) != NULL, "floor/later-branch create store");
+	flush_pages = 1;
+	check(ps_core_open(store) == 0, "floor/later-branch open store");
+	check(meta_request_timeline(0, PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
+		  append_relation_timeline(0, &key, 0, 50, page, NULL) == 0,
+		  "floor/later-branch create fork");
+	check(append_relation_floor_timeline_tag(0, &key, 5, 50, page, 0x75, 200,
+											 NULL) == 0,
+		  "floor/later-branch growth is admitted at the replay floor");
+	check(create_branch_request(1, 0, 200),
+		  "floor/later-branch create a branch at that same endpoint");
+	check(meta_request_timeline(1, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 6 &&
+		  read_resolve(1, &key, 5, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x75,
+		  "a later branch at the replay endpoint sees the floor growth");
+	close_runtime();
+	remove_tree(store);
+}
+
+/* A branch forked after the replay floor must see the flush: fences ahead of
+ * the replay position are future branches, not snapshots to hide from. */
+static void
+test_floor_growth_visible_to_future_branch(void)
+{
+	char store[] = "/tmp/psfloorfuturebranchXXXXXX";
+	PsKey key = {6, 6, 44, 1, PS_KLASS_RELATION};
+	PsChannel reply;
+	unsigned char page[8192];
+
+	check(mkdtemp(store) != NULL, "floor/future-branch create store");
+	flush_pages = 1;
+	check(ps_core_open(store) == 0, "floor/future-branch open store");
+	check(meta_request_timeline(0, PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
+		  append_relation_timeline(0, &key, 0, 50, page, NULL) == 0,
+		  "floor/future-branch create fork");
+	check(create_branch_request(1, 0, 300),
+		  "floor/future-branch fork after the replay floor");
+	check(append_relation_floor_timeline_tag(0, &key, 5, 50, page, 0x79, 200,
+											 NULL) == 0 &&
+		  read_resolve(0, &key, 5, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x79,
+		  "floor/future-branch growth is published at the floor");
+	check(meta_request_timeline(1, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 6 &&
+		  read_resolve(1, &key, 5, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x79,
+		  "a future branch sees the floor growth instead of a fence-pushed version");
+	close_runtime();
+	remove_tree(store);
+}
+
+/* A late floor rewrite must not leak into an existing legacy/unproven branch
+ * whose LSN cap covers the raw pd_lsn. */
+static void
+test_floor_rewrite_hidden_from_legacy_branch(void)
+{
+	char store[] = "/tmp/psfloorlegacybranchXXXXXX";
+	PsKey key = {6, 6, 42, 1, PS_KLASS_RELATION};
+	PsChannel reply;
+	unsigned char page[8192];
+
+	check(mkdtemp(store) != NULL, "floor/legacy-branch create store");
+	flush_pages = 1;
+	check(ps_core_open(store) == 0, "floor/legacy-branch open store");
+	check(meta_request_timeline(0, PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
+		  append_relation_timeline(0, &key, 0, 50, page, NULL) == 0,
+		  "floor/legacy-branch create fork");
+	check(create_branch_request(1, 0, 200),
+		  "floor/legacy-branch fork before the late rewrite");
+	check(append_relation_floor_timeline_tag(0, &key, 0, 200, page, 0x78, 200,
+										 NULL) == 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x78,
+		  "a rewrite at the replay endpoint replaces the parent page");
+	check(meta_request_timeline(1, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 1 &&
+		  read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x20,
+		  "a legacy branch at the same endpoint does not see the rewrite");
+	check(append_relation_floor_timeline_tag(0, &key, 0, 50, page, 0x76, 300,
+											 NULL) == 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x76,
+		  "floor/legacy-branch late rewrite replaces the parent page");
+	check(meta_request_timeline(1, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 1 &&
+		  read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x20,
+		  "a legacy branch does not see the late floor rewrite");
+	close_runtime();
+	remove_tree(store);
+}
+
+/* A floor write whose block was not addressable at its raw pd_lsn must not
+ * backdate the growth: a branch created between the raw LSN and the real
+ * growth would otherwise see both the page and the larger size. */
+static void
+test_floor_rewrite_not_backdated(void)
+{
+	char store[] = "/tmp/psfloorbackdateXXXXXX";
+	PsKey key = {6, 6, 43, 1, PS_KLASS_RELATION};
+	PsChannel reply;
+	unsigned char page[8192];
+
+	check(mkdtemp(store) != NULL, "floor/backdate create store");
+	flush_pages = 1;
+	check(ps_core_open(store) == 0, "floor/backdate open store");
+	check(meta_request_timeline(0, PS_OP_CREATE, &key, 100, 0, 0, 0, NULL),
+		  "floor/backdate create fork");
+	check(append_relation_timeline(0, &key, 0, 50, page, NULL) == 0,
+		  "floor/backdate write the initial page");
+	check(meta_request_timeline(0, PS_OP_ZEROEXTEND, &key, 200, 0, 4, 0,
+								NULL),
+		  "floor/backdate allocate the later block at 200");
+	check(append_relation_floor_timeline_tag(0, &key, 3, 50, page, 0x77, 400,
+											 NULL) == 0 &&
+		  meta_request_timeline(0, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 4 &&
+		  read_resolve(0, &key, 3, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x77,
+		  "floor/backdate late page is published at the floor");
+	check(create_branch_request(1, 0, 150),
+		  "floor/backdate create a branch below the real growth");
+	check(meta_request_timeline(1, PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 1 &&
+		  read_resolve(1, &key, 3, UINT64_MAX, 0, page, NULL) == 0,
+		  "a post-flush branch cannot see the backdated block or size");
+	close_runtime();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -6189,6 +6433,10 @@ main(void)
 	test_live_ordered_marker_survives_two_cutovers();
 	test_live_ordered_commit_marker_survives_two_cutovers();
 	test_live_ordered_marker_walless_survives_two_cutovers();
+	test_floor_growth_before_later_branch();
+	test_floor_growth_visible_to_future_branch();
+	test_floor_rewrite_hidden_from_legacy_branch();
+	test_floor_rewrite_not_backdated();
 	for (uint32_t timeline = 0; timeline <= 1; timeline++)
 		for (int walless = 0; walless <= 1; walless++)
 			test_ordered_write_after_cutoff(timeline, walless);

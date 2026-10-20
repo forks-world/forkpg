@@ -30,7 +30,11 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		49	/* 49: atomic pins and capped artifact producers;
+#define PS_SHM_VERSION		50	/* 50: PS_WRITE_REPLAY_FLOOR semantics for relation
+								 * EXTEND/WRITEV; mixed old daemons would ignore the
+								 * floor and silently restore the historical-growth
+								 * refusal, so they must fail the handshake.
+								 * 49: atomic pins and capped artifact producers;
 								 * CREATE_BRANCH result bit 0 reports a new create
 								 * (no layout change; old daemons return zero).
 								 * 48: unstamped metadata request floor;
@@ -349,6 +353,10 @@ typedef struct PsWalIndexEntry
 #define PS_FRONTEND_CAP_ATOMIC_PINS (UINT32_C(1) << 2)
 #define PS_BARRIER_REGISTER UINT32_C(0x50494e35)
 #define PS_ARTIFACT_BEGIN_CAPPED_READ UINT32_C(0x43415035)
+/* WRITEV/EXTEND: req_floor_lsn is a real-time recovery floor, not stale data.
+ * The materializer sets this on checkpoint flushes; all other clients leave
+ * is_redo zero, so an uninitialized req_floor_lsn is never interpreted. */
+#define PS_WRITE_REPLAY_FLOOR UINT32_C(0x52464c52)
 
 /* Retention owners are intentionally few: structural branch pins are derived
  * from timeline metadata instead of duplicated in this mutable registry. */

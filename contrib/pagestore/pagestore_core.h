@@ -73,6 +73,18 @@ extern int ps_artifact_begin(uint32_t tl, const PsKey *key, uint64_t lsn,
 extern int ps_artifact_write(uint32_t tl, const PsKey *key, uint32_t block,
 	const unsigned char *page, uint64_t lsn, uint64_t token, uint64_t *seq,
 	PsArtifactRefuseReason *reason);
+/* Variant for a write that is a real-time local operation even though the page
+ * it carries has an older pd_lsn (a materializer flushing replayed pages):
+ * growth is ordered at floor_lsn instead of being refused by the forkmeta
+ * cutoff.  The page keeps its raw pd_lsn unless it would otherwise be hidden. */
+extern int ps_artifact_write_floor(uint32_t tl, const PsKey *key, uint32_t block,
+	const unsigned char *page, uint64_t lsn, uint64_t token,
+	uint64_t floor_lsn, uint64_t *seq, PsArtifactRefuseReason *reason);
+/* Materializer recovery flush: order growth at the durable forkmeta cutoff (or
+ * the page's own pd_lsn when it is newer), never at the live replay head. */
+extern int ps_artifact_write_recovery(uint32_t tl, const PsKey *key, uint32_t block,
+	const unsigned char *page, uint64_t lsn, uint64_t token, uint64_t *seq,
+	PsArtifactRefuseReason *reason);
 extern int ps_artifact_commit(uint32_t tl, const PsKey *key, uint64_t lsn,
 	uint64_t token, uint64_t count, PsArtifactRefuseReason *reason);
 extern int ps_artifact_drop(uint32_t tl, const PsKey *key, uint64_t lsn,
@@ -389,6 +401,9 @@ extern int	ps_request_payload_fits(const PsChannel *ch);
 extern int	append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 						const unsigned char *page, uint64_t version,
 						uint64_t *out_admission_seq);
+extern int	append_page_floor(uint32_t timeline, const PsKey *key, uint32_t block,
+						const unsigned char *page, uint64_t version,
+						uint64_t floor_lsn, uint64_t *out_admission_seq);
 /* Checked index lookup: 1 found, 0 absent, -1 error (including WAL-less ancestry).
  * Byte-serving frontends must use this form rather than zero-fill on NULL. */
 extern int read_through_checked(uint32_t timeline, const PsKey *key, uint32_t block,

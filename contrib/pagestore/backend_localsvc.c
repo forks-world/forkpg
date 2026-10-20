@@ -792,6 +792,30 @@ ls_unstamped_lsn(PsChannel *ch)
 	ch->req_floor_lsn = now + 1;
 }
 
+/*
+ * A materializer's checkpointer flushes pages replayed from WAL, so their
+ * pd_lsn can be older than the store's forkmeta cutoff even though the flush
+ * is a real-time operation.  Give the daemon that floor so growing flushes are
+ * ordered at "now" instead of being refused as historical growth.  Ordinary
+ * writers (not in recovery) leave it zero: their page LSN already is the
+ * operation's position.
+ */
+static void
+ls_recovery_floor(PsChannel *ch)
+{
+	/*
+	 * Only mark the request; the daemon orders recovery growth at the durable
+	 * forkmeta cutoff (or the page's own pd_lsn when that is newer), never at
+	 * the live replay head.  A checkpointer can flush a page dirtied at P long
+	 * after replay advanced to F; stamping F would put checkpoint state beyond
+	 * the redo horizon that may need it.  The flag survives promotion, so the
+	 * rest of an in-progress restartpoint and the first post-promotion
+	 * checkpoint keep recovery semantics too.
+	 */
+	ch->req_floor_lsn = 0;
+	ch->is_redo = pagestore_materializer_enabled() ? PS_WRITE_REPLAY_FLOOR : 0;
+}
+
 static void
 ls_op_lsn(PsChannel *ch, bool is_unlink)
 {
@@ -1006,6 +1030,7 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 		ch->blocknum = blocknum + done;
 		ch->nblocks = chunk;
 		ch->skip_fsync = skipFsync ? 1 : 0;
+		ls_recovery_floor(ch);
 		for (BlockNumber i = 0; i < chunk; i++)
 			memcpy(ch->data + (size_t) i * BLCKSZ, buffers[done + i], BLCKSZ);
 		ls_exec(ch);
@@ -1032,6 +1057,7 @@ ls_extend(const PageStoreRelKey *key, void *localreln,
 	ch->blocknum = blocknum;
 	ch->nblocks = 1;
 	ch->skip_fsync = skipFsync ? 1 : 0;
+	ls_recovery_floor(ch);
 	memcpy(ch->data, buffer, BLCKSZ);
 	ls_exec(ch);
 }

@@ -466,6 +466,7 @@ psc_set_channel_key(PsChannel *ch, uint32_t tl, uint64_t incarnation,
 	ch->timeline = tl;
 	ch->incarnation = incarnation;
 	ch->req_lsn = 0;
+	ch->req_floor_lsn = 0;
 	ch->req_seq = 0;
 	ch->is_redo = 0;
 	ch->skip_fsync = 0;
@@ -484,6 +485,7 @@ psc_setmeta(PsChannel *ch, uint32_t tl, uint64_t incarnation)
 	ch->timeline = tl;
 	ch->incarnation = incarnation;
 	ch->req_lsn = 0;
+	ch->req_floor_lsn = 0;
 	ch->req_seq = 0;
 	ch->is_redo = 0;
 	ch->skip_fsync = 0;
