@@ -6018,8 +6018,11 @@ page_select_is_smin(const PageEnt *e, const PageVer *v)
  * argument" in the design doc's S9.3, and the differential tests in
  * ps_test_viewcap_differential().
  */
+static int walidx_base_version_durable(const PageVer *v);
+
 static PageVer *
-page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
+page_select_internal(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B,
+					 bool durable_only)
 {
 	PageVer    *best = NULL;
 	PsAdmitCap	ac;
@@ -6047,6 +6050,10 @@ page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
 		 */
 		if (!ps_admit_boundary_ok(v->lsn, vseq, &ac))
 			continue;
+		/* Filter bases without changing first-arrival admissibility: s_min
+		 * below still considers every version, including transient ones. */
+		if (durable_only && !walidx_base_version_durable(v))
+			continue;
 		/*
 		 * page_select_is_smin() is O(nver) per call; skip it unless the
 		 * boundary test already passed and the plain seq <= S disjunct
@@ -6066,6 +6073,12 @@ page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
 			best = v;
 	}
 	return best;
+}
+
+static PageVer *
+page_select(const PageEnt *e, const ViewCap *c, uint64_t B, bool has_B)
+{
+	return page_select_internal(e, c, B, has_B, false);
 }
 
 /* Newest version on this entry with lsn <= read_lsn, or NULL if none.  Kept
@@ -19974,8 +19987,8 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 										  w.has_inherited_below, &nb) :
 				FORK_HOP_NONE;
 			e = page_find(tl, key, block);
-			pv = e ? page_select(e, &cur, w.inherited_below,
-								 w.has_inherited_below) : NULL;
+			pv = e ? page_select_internal(e, &cur, w.inherited_below,
+											 w.has_inherited_below, index_cap != NULL) : NULL;
 			if (artifact_data_key(key))
 			{
 				int state = artifact_visible(tl, key, block, &cur,
@@ -20002,10 +20015,6 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 			uint64_t l, a;
 			int served;
 			int poisoned;
-
-			if (index_cap != NULL &&
-				(pv->lsn == 0 || !walidx_base_version_durable(pv)))
-				return 0;
 
 			if (fork_page_invalidated(fe, block, pv, &cur, w.inherited_below,
 									  w.has_inherited_below))
@@ -20082,7 +20091,7 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 			if (served)
 				ps_pgcache_insert(tl, key, block, pv->lsn,
 								  pv->admission_seq, out);
-			return served ? 1 : 0;
+			return served ? 1 : (index_cap != NULL ? -1 : 0);
 		}
 		if (fork_state == FORK_HOP_DEAD ||
 			(fork_state == FORK_HOP_DEF && block >= nb))
