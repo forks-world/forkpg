@@ -784,9 +784,17 @@ DO $$ DECLARE r record; BEGIN
         argv.append("postgres")
         return subprocess.Popen(argv, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
-    def ddl_chaos(self, stop: threading.Event, tolerate: threading.Event, rng: random.Random) -> None:
+    def ddl_chaos(self, stop: threading.Event, tolerate: threading.Event,
+                  rng: random.Random, deadline: float) -> None:
         n = ncol = 0
-        while not stop.wait(rng.uniform(0.3, 2.0)):
+        while True:
+            # Fault injection can wait for recovery/restartpoints much longer
+            # than the burst. Do not keep generating DDL/WAL during that wait.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or stop.wait(min(rng.uniform(0.3, 2.0), remaining)):
+                return
+            if time.monotonic() >= deadline:
+                return
             try:
                 scratch = [t for t in self.tables(self.writer) if t.startswith("scratch_")]
                 ops = ["create", "vacuum", "checkpoint", "analyze"]
@@ -845,7 +853,9 @@ DO $$ DECLARE r record; BEGIN
             [4, 2, 2, 1, 2, 1, 1])[0]
         self.event("burst", seconds=seconds, inject=event)
         stop, tolerate = threading.Event(), threading.Event()
-        chaos = threading.Thread(target=self.ddl_chaos, args=(stop, tolerate, random.Random(self.rng.random())))
+        chaos = threading.Thread(target=self.ddl_chaos,
+                                 args=(stop, tolerate, random.Random(self.rng.random()),
+                                       time.monotonic() + seconds))
         bench = self.pgbench(self.writer, seconds, self.args.clients)
         chaos.start()
         try:

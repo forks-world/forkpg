@@ -361,6 +361,40 @@ class RealPostgresTests(unittest.TestCase):
                         backend.wait(timeout=10)
 
 
+class BurstDeadlineTests(unittest.TestCase):
+    def test_ddl_does_not_start_after_burst_deadline(self):
+        run = Mock()
+        stop = Mock()
+        with patch.object(endurance.time, 'monotonic', return_value=10):
+            endurance.Run.ddl_chaos(run, stop, Mock(), Mock(), 10)
+        stop.wait.assert_not_called()
+        run.tables.assert_not_called()
+
+    def test_ddl_sleep_is_capped_and_rechecks_deadline(self):
+        run = Mock()
+        stop = Mock()
+        stop.wait.return_value = False
+        rng = Mock()
+        rng.uniform.return_value = 2
+        with patch.object(endurance.time, 'monotonic', side_effect=[9.75, 10]):
+            endurance.Run.ddl_chaos(run, stop, Mock(), rng, 10)
+        stop.wait.assert_called_once_with(0.25)
+        run.tables.assert_not_called()
+
+    def test_inflight_ddl_finishes_without_starting_another_operation(self):
+        run = Mock()
+        run.tables.return_value = []
+        stop = Mock()
+        stop.wait.return_value = False
+        rng = Mock()
+        rng.uniform.return_value = 0.3
+        rng.choice.return_value = 'checkpoint'
+        with patch.object(endurance.time, 'monotonic', side_effect=[9, 9.3, 11]):
+            endurance.Run.ddl_chaos(run, stop, Mock(), rng, 10)
+        run.writer.sql.assert_called_once_with('CHECKPOINT;', timeout=900)
+        stop.wait.assert_called_once_with(0.3)
+
+
 class RetentionLogTests(unittest.TestCase):
     def test_rejected_retention_progress_is_a_finding(self):
         with tempfile.TemporaryDirectory() as root:

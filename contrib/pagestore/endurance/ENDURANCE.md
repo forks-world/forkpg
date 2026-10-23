@@ -70,6 +70,10 @@ Each round is a seeded choice of:
    writer: create/drop/truncate, `VACUUM FULL`, `CLUSTER`, `REINDEX`,
    `ADD COLUMN`, bulk churn, `VACUUM (FREEZE)`, `CHECKPOINT`.  Autovacuum runs
    with a 5 s naptime and checkpoints every 30 s / 128 MB.
+The DDL thread has the same wall-clock deadline as pgbench. A statement
+already running may finish, but waiting for an injected restart or restartpoint
+does not extend the DDL window and keep adding WAL during recovery catch-up.
+
 2. **One injected event during the burst:** materializer fast restart,
    immediate stop, `SIGKILL` of its postmaster, a forced restartpoint (a
    writer `CHECKPOINT` is replayed first, and the materializer's `CHECKPOINT`
