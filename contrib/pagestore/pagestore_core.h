@@ -427,6 +427,10 @@ extern int	read_resolve_version(uint32_t timeline, const PsKey *key,
 extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 						 uint64_t read_lsn, uint64_t read_seq,
 						 unsigned char *out, uint64_t *out_ver);
+/* Current compute hint read: inherited WAL-less FSM hints may be rebuilt from
+ * zeros. Ordinary/historical reads and authoritative data retain their errors. */
+extern int read_resolve_fsm(uint32_t timeline, const PsKey *key, uint32_t block,
+							unsigned char *out, uint64_t *out_ver);
 extern int	fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 					  uint64_t lsn);
 

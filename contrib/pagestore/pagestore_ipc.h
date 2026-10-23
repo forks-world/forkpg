@@ -178,6 +178,8 @@ typedef enum PsOpcode
 	PS_OP_ARTIFACT_BEGIN,
 	PS_OP_ARTIFACT_COMMIT,
 	PS_OP_ARTIFACT_DROP,
+	/* Optional, capability-negotiated current FSM read; never a data-page read. */
+	PS_OP_READV_FSM,
 } PsOpcode;
 
 typedef enum PsTimelineState
@@ -351,6 +353,7 @@ typedef struct PsWalIndexEntry
 #define PS_BRANCH_R2_PROVEN UINT32_C(0x52325042)
 #define PS_FRONTEND_CAP_BRANCH_SEQ (UINT32_C(1) << 1)
 #define PS_FRONTEND_CAP_ATOMIC_PINS (UINT32_C(1) << 2)
+#define PS_FRONTEND_CAP_FSM_RESET (UINT32_C(1) << 3)
 #define PS_BARRIER_REGISTER UINT32_C(0x50494e35)
 #define PS_ARTIFACT_BEGIN_CAPPED_READ UINT32_C(0x43415035)
 /* WRITEV/EXTEND: req_floor_lsn is a real-time recovery floor, not stale data.

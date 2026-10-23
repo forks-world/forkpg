@@ -429,7 +429,8 @@ handle_request(PsChannel *ch)
 		return;
 	}
 	if ((ch->opcode == PS_OP_EXTEND || ch->opcode == PS_OP_WRITEV ||
-		 ch->opcode == PS_OP_READV || ch->opcode == PS_OP_READ_AT) &&
+		 ch->opcode == PS_OP_READV || ch->opcode == PS_OP_READV_FSM ||
+		 ch->opcode == PS_OP_READ_AT) &&
 		!ps_timeline_request_allowed(tl, ch->incarnation))
 	{
 		ch->status = PS_STATUS_ERROR;
@@ -539,6 +540,7 @@ handle_request(PsChannel *ch)
 			}
 			break;
 
+		case PS_OP_READV_FSM:
 		case PS_OP_READV:
 			/* "current" read on this timeline: resolve at max LSN, serving from
 			 * memtable / image layers with a segment fallback.  A pinned
@@ -558,8 +560,20 @@ handle_request(PsChannel *ch)
 					uint64_t	resolved = 0;
 					int			read_result;
 
-					read_result = read_resolve(tl, &ch->key, ch->blocknum + i, rl,
-												   ch->req_seq, dst, &resolved);
+					if (ch->opcode == PS_OP_READV_FSM)
+					{
+						if (ch->key.klass != PS_KLASS_RELATION ||
+							ch->key.forkNum != 1 || ch->req_lsn != 0 || ch->req_seq != 0)
+						{
+							ch->status = PS_STATUS_ERROR;
+							break;
+						}
+						read_result = read_resolve_fsm(tl, &ch->key,
+													 ch->blocknum + i, dst, &resolved);
+					}
+					else
+						read_result = read_resolve(tl, &ch->key, ch->blocknum + i, rl,
+												  ch->req_seq, dst, &resolved);
 					if (read_result < 0)
 					{
 						ch->status = PS_STATUS_ERROR;
@@ -659,6 +673,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_EXISTS:
 		case PS_OP_BLOCK_DEATH:
 		case PS_OP_NBLOCKS:
+		case PS_OP_READV_FSM:
 		case PS_OP_READV:
 		case PS_OP_READ_AT:
 		case PS_OP_REQUIRE_BRANCH:
@@ -888,7 +903,7 @@ run_request_admitted(PsChannel *ch)
 			/* READV/READ_AT snapshot ancestry internally before potentially blocking
 			 * remote-layer I/O.  Other timeline readers complete under map_rd. */
 			ps_lock_shard_rd(shard);
-			if (op == PS_OP_READV || op == PS_OP_READ_AT ||
+			if (op == PS_OP_READV || op == PS_OP_READV_FSM || op == PS_OP_READ_AT ||
 				op == PS_OP_WAL_RETAIN_FLOOR || op == PS_OP_RETENTION_FLOOR)
 				handle_request(ch);
 			else
@@ -1581,7 +1596,8 @@ main(int argc, char **argv)
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
 	hdr->frontend_capabilities = PS_FRONTEND_CAP_RELATION_INSPECTION |
-		PS_FRONTEND_CAP_BRANCH_SEQ | PS_FRONTEND_CAP_ATOMIC_PINS;
+		PS_FRONTEND_CAP_BRANCH_SEQ | PS_FRONTEND_CAP_ATOMIC_PINS |
+		PS_FRONTEND_CAP_FSM_RESET;
 	hdr->daemon_instance = new_daemon_instance();
 	daemon_hdr = hdr;
 	ps_core_set_metrics_header(hdr);
