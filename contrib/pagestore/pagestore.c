@@ -230,8 +230,11 @@ static bool pagestore_portable_install_faults_owned = false;
  * stay byte-identical to the format structs there. */
 #define PS_MATERIALIZER_MARKER_TIMEOUT_MS \
 	PS_FAULT_MATERIALIZER_MARKER_TIMEOUT_MS
-#define PS_MATERIALIZER_RETENTION_RESOURCES \
-	(PS_RETENTION_RESOURCE_WAL | PS_RETENTION_RESOURCE_WAL_INDEX)
+/* Recovery consumes the contiguous raw WAL stream, not per-page index views.
+ * A WAL_INDEX pin would require admitting each restartpoint as a new historical
+ * page view, which can already be behind the index compaction frontier.  The
+ * WAL pin also supplies the materializer's operational page-history cutoff. */
+#define PS_MATERIALIZER_RETENTION_RESOURCES PS_RETENTION_RESOURCE_WAL
 #define PS_READER_RETENTION_RESOURCES PS_RETENTION_RESOURCE_ALL
 #define PS_READER_RETENTION_TIMEOUT_MS 10000
 

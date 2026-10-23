@@ -23692,8 +23692,9 @@ ps_handle_meta(PsChannel *ch)
 					/* Page history permits an active owner to advance from its old
 					 * protected image.  WAL-index history is sparse after compaction,
 					 * so its new point must independently name a retained chain. */
-					ret = ((((pin.resources &
-							  PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
+					ret = (((((pin.resources &
+							   PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 ||
+							  pin.owner_kind == PS_RETENTION_OWNER_MATERIALIZER) &&
 							 !page_history_allowed &&
 							 !(old_found == 1 &&
 							   old_pin.generation == pin.generation &&
@@ -23813,9 +23814,13 @@ ps_handle_meta(PsChannel *ch)
 						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0);
 					/* A fresh WAL-index view also depends on retained
 					 * first-arrival page identities.  This validates
-					 * storage history without granting PAGE authority. */
+					 * storage history without granting PAGE authority.
+					 * Raw-WAL recovery still needs an admitted page base. Removing
+					 * its unnecessary index pin must not admit a new materializer
+					 * below history that has already been reclaimed. */
 					if (timeline_live &&
-						(((pin.resources &
+						((pin.owner_kind != PS_RETENTION_OWNER_MATERIALIZER &&
+						  (pin.resources &
 						   (PS_RETENTION_RESOURCE_PAGE_HISTORY |
 							PS_RETENTION_RESOURCE_WAL_INDEX)) == 0) ||
 						 page_history_allowed) &&
