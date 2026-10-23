@@ -143,6 +143,9 @@ shared_preload_libraries = 'pagestore'
 pagestore.backend = 'localsvc'
 pagestore.localsvc_shm = '$SHM'
 pagestore.route_all = off
+# Indexing can compact historical index views before recovery starts.  The
+# materializer must still register its raw-WAL owner and advance restartpoints.
+pagestore.auto_wal_index = on
 io_method = sync
 recovery_prefetch = try
 archive_mode = on
@@ -165,6 +168,7 @@ archive_current_wal || fail "base-backup WAL did not reach pagestore"
 cat >> "$REDO/postgresql.conf" <<EOF
 pagestore.route_all = on
 pagestore.materializer = on
+pagestore.auto_wal_index = off
 pagestore.retention_owner_id = '1'
 pagestore.retention_owner_generation = '1'
 archive_mode = off
@@ -363,7 +367,7 @@ echo "ok   - materializer progress releases WAL archive backpressure"
 takeover_lsn=$($WP -c "SELECT pagestore_retention_owner_lsn(0,2,1,1);") ||
 	fail "could not inspect the stopped materializer's retention pin"
 [ -n "$takeover_lsn" ] || fail "stopped materializer has no generation-1 pin"
-takeover_status=$($WP -c "SELECT pagestore_retention_set(0,2,1,2,6,'$takeover_lsn');")
+takeover_status=$($WP -c "SELECT pagestore_retention_set(0,2,1,2,2,'$takeover_lsn');")
 [ "$takeover_status" = "0" ] || fail "could not publish replacement owner generation"
 # Hot-standby startup can briefly make pg_ctl report success before recovery
 # reaches the pagestore owner check.  Observe the durable fencing result instead
@@ -415,4 +419,8 @@ echo "ok   - monitoring rejects a recovery worker without the materializer role"
 [ ! -f "$REDO/$relfile" ] ||
 	fail "redo worker created a local heap instead of materializing into pagestore"
 echo "ok   - recovery relation has no local heap file (pagestore is authoritative)"
+if grep -Eq 'materializer retention advance (was rejected|failed)' "$REDO/redo.log"; then
+	fail "materializer could not advance raw-WAL retention while indexing was enabled"
+fi
+echo "ok   - indexed WAL does not reject materializer retention advancement"
 echo "continuous redo demo: PASS"

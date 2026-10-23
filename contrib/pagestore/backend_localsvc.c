@@ -521,8 +521,7 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 	/* An artifact BEGIN/COMMIT/DROP refusal, or a WRITE (EXTEND/WRITEV)
 	 * refusal on an SLRU/reader-artifact key, carries its reason in
 	 * ch->result (pagestore_daemon.c logs the same reason plus the
-	 * key/lsn/horizon context); every other opcode still reports only the
-	 * opcode number.  The message embeds enough of the key that a caller
+	 * key/lsn/horizon context).  The message embeds enough of the key that a caller
 	 * that only sees edata->message (the automatic reader-snapshot worker's
 	 * WARNING sites) can still tell which generation was refused and why. */
 	if (status == PS_STATUS_ERROR &&
@@ -544,7 +543,12 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 						pagestore_artifact_refuse_reason_name((PsArtifactRefuseReason) ch->result))));
 	ereport(ERROR,
 			(errmsg("pagestore localsvc: daemon reported error for op %u",
-					ch->opcode)));
+					ch->opcode),
+			 errdetail("Timeline %u, key %u/%u/%u fork %u class %u, block %u count %u, LSN %X/%08X, admission %llu, result %u.",
+					   ch->timeline, ch->key.spcOid, ch->key.dbOid,
+					   ch->key.relNumber, ch->key.forkNum, ch->key.klass,
+					   ch->blocknum, ch->nblocks, LSN_FORMAT_ARGS(ch->req_lsn),
+					   (unsigned long long) ch->req_seq, ch->result)));
 }
 
 static void
@@ -964,6 +968,15 @@ ls_truncate(const PageStoreRelKey *key, void *localreln,
 	ls_exec(ch);
 }
 
+static void
+ls_read_opcode(PsChannel *ch, const PageStoreRelKey *key)
+{
+	ch->opcode = PS_OP_READV;
+	if (key->forkNum == FSM_FORKNUM && ch->req_lsn == 0 && ch->req_seq == 0 &&
+		(((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_FSM_RESET))
+		ch->opcode = PS_OP_READV_FSM;
+}
+
 /*
  * Read nblocks pages starting at blocknum into buffers[].  A request carries at
  * most one io_unit of page data, so larger reads are split into io_unit-sized
@@ -987,6 +1000,7 @@ ls_readv(const PageStoreRelKey *key, void *localreln,
 		ch->nblocks = chunk;
 		ch->req_lsn = ls_read_lsn();
 		ch->req_seq = read_seq;
+		ls_read_opcode(ch, key);
 		ls_exec(ch);
 
 		for (BlockNumber i = 0; i < chunk; i++)
@@ -1122,6 +1136,7 @@ ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 	ch->nblocks = nblocks;
 	ch->req_lsn = ls_read_lsn();
 	ch->req_seq = read_seq;
+	ls_read_opcode(ch, key);
 	ls_exec(ch);
 
 	/* the pages now live in the channel data buffer, readable via the shm fd */

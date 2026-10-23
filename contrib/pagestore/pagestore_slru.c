@@ -3918,6 +3918,8 @@ static void
 ps_slru_drain(void)
 {
 	MemoryContext drain_cxt = CurrentMemoryContext;
+	int saved_interrupt_holdoff = InterruptHoldoffCount;
+	int saved_cancel_holdoff = QueryCancelHoldoffCount;
 
 	Assert(CritSectionCount == 0);
 
@@ -4098,7 +4100,7 @@ post_again:
 	PG_CATCH();
 	{
 		ErrorData  *edata;
-		MemoryContext ecxt = MemoryContextSwitchTo(drain_cxt);
+		MemoryContextSwitchTo(drain_cxt);
 
 		/*
 		 * Whatever failed, entries posted in this drain were not confirmed
@@ -4112,7 +4114,6 @@ post_again:
 			ps_slru_queue[i].shipped = false;
 
 		edata = CopyErrorData();
-		MemoryContextSwitchTo(ecxt);
 
 		/*
 		 * Interrupts are not mirror failures; propagate them -- except in
@@ -4138,6 +4139,11 @@ post_again:
 		FreeErrorData(edata);
 
 		FlushErrorState();
+		/* ERROR resets these counters before longjmp. A ship point can
+		 * run with a buffer content lock held (XLogFlush from buffer I/O).
+		 * Restore the caller's holdoffs only on the swallowed-error path. */
+		InterruptHoldoffCount = saved_interrupt_holdoff;
+		QueryCancelHoldoffCount = saved_cancel_holdoff;
 		ereport(WARNING,
 				(errmsg("pagestore: SLRU mirror drain failed; staged images kept for the next ship point")));
 	}

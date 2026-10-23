@@ -4784,6 +4784,54 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 			  "child %s rejects unavailable WAL-less ancestor bytes",
 			  read_at ? "READ_AT" : "READV");
 	}
+	/* A writable PostgreSQL compute can discard inherited FSM hints and
+	 * rebuild them. This is an explicit operation; ordinary snapshot reads
+	 * above must continue to fail instead of exposing changing parent bytes. */
+	{
+		PsChannel *ch = ps_channel(cl_shm, cl_chan);
+
+		check((((PsShmHeader *) cl_shm)->frontend_capabilities &
+			   PS_FRONTEND_CAP_FSM_RESET) != 0, "daemon advertises FSM hint reset");
+		memset(rb, 0, ps);
+		for (int rewrite = 0; rewrite < 2; rewrite++)
+		{
+			if (rewrite)
+			{
+				fill_page(p, ps, 0, 62);
+				op_write_tl(0, REL_B, 1, 0, p);
+			}
+			cl_setkey(ch, REL_B, 1);
+			ch->timeline = 1;
+			ch->opcode = PS_OP_READV_FSM;
+			ch->blocknum = 0;
+			ch->nblocks = 1;
+			check(cl_exec()->status == PS_STATUS_OK && memcmp(ch->data, rb, ps) == 0,
+				  "compute rebuilds FSM hints without inheriting parent bytes (%d)", rewrite);
+		}
+		for (int invalid = 0; invalid < 4; invalid++)
+		{
+			cl_setkey(ch, REL_B, invalid == 0 ? FORK0 : 1);
+			ch->timeline = 1;
+			ch->opcode = PS_OP_READV_FSM;
+			ch->blocknum = 0;
+			ch->nblocks = invalid == 3 ? PS_IO_UNIT / ps + 1 : 1;
+			ch->req_lsn = invalid == 1 ? 1500 : 0;
+			ch->req_seq = invalid == 2 ? 1 : 0;
+			check(cl_exec()->status == PS_STATUS_ERROR,
+				  "FSM reset refuses data forks, historical views and oversized payloads (%d)", invalid);
+		}
+		fill_page(p, ps, 0, 63);
+		op_write_tl(1, REL_B, 1, 0, p);
+		cl_setkey(ch, REL_B, 1);
+		ch->timeline = 1;
+		ch->opcode = PS_OP_READV_FSM;
+		ch->blocknum = 0;
+		ch->nblocks = 1;
+		check(cl_exec()->status == PS_STATUS_OK && page_has_tag(ch->data, ps, 63),
+			  "compute keeps its own rebuilt FSM page");
+		op_read_tl(0, REL_B, 1, 0, rb);
+		check(page_has_tag(rb, ps, 62), "rebuilt child FSM does not change its parent");
+	}
 
 	/* writing on T1 diverges it (copy-on-write) */
 	fill_page(p, ps, 2000, 22);

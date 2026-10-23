@@ -29,6 +29,19 @@ pagestore = shared_module('pagestore',
 )
 contrib_targets += pagestore
 
+# Backend-only fault tests use private copies of the real mirror drains.
+pagestore_mirror_error_test = shared_module('pagestore_mirror_error_test',
+  files('pagestore_control_error_test.c', 'pagestore_slru_error_test.c',
+        'backend_localsvc.c', 'backend_passthrough.c', 'pagestore_fault.c',
+        'pagestore.c', 'walredo_client.c'),
+  # Keep all helpers private to this module. Do not initialize a second set
+  # of hooks when SQL loads the test functions into an existing backend.
+  c_args: ['-D_PG_init=pagestore_error_test_init'],
+  kwargs: pg_test_mod_args,
+)
+test_install_libs += pagestore_mirror_error_test
+
+
 install_data(
   'pagestore.control',
   'pagestore--1.0.sql',
@@ -1105,7 +1118,10 @@ pagestore_gate_sweep = executable('pagestore_gate_sweep',
         'pagestore_fault.c', 'fuzz/fuzz_common.c', 'fuzz/fuzz_crc_fixup.c',
         'fuzz/tests/gate_sweep.c'),
   include_directories: include_directories('.', 'fuzz'),
-  c_args: ['-DPS_FUZZ_FIXTURE_TGZ="' +
+  # Match fuzz/build.sh: the fixture has only a handful of keys, while each
+  # open/close clears every shard's buckets. Production-sized hash tables turn
+  # this bounded header sweep into minutes of empty-bucket bookkeeping.
+  c_args: ['-DIDX_BUCKETS=64', '-DPS_FUZZ_FIXTURE_TGZ="' +
            (meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline' / 'store.tar.gz') +
            '"'] + pagestore_cassert_c_args,
   dependencies: [dependency('threads')],

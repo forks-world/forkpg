@@ -361,5 +361,57 @@ class RealPostgresTests(unittest.TestCase):
                         backend.wait(timeout=10)
 
 
+class BurstDeadlineTests(unittest.TestCase):
+    def test_ddl_does_not_start_after_burst_deadline(self):
+        run = Mock()
+        stop = Mock()
+        with patch.object(endurance.time, 'monotonic', return_value=10):
+            endurance.Run.ddl_chaos(run, stop, Mock(), Mock(), 10)
+        stop.wait.assert_not_called()
+        run.tables.assert_not_called()
+
+    def test_ddl_sleep_is_capped_and_rechecks_deadline(self):
+        run = Mock()
+        stop = Mock()
+        stop.wait.return_value = False
+        rng = Mock()
+        rng.uniform.return_value = 2
+        with patch.object(endurance.time, 'monotonic', side_effect=[9.75, 10]):
+            endurance.Run.ddl_chaos(run, stop, Mock(), rng, 10)
+        stop.wait.assert_called_once_with(0.25)
+        run.tables.assert_not_called()
+
+    def test_inflight_ddl_finishes_without_starting_another_operation(self):
+        run = Mock()
+        run.tables.return_value = []
+        stop = Mock()
+        stop.wait.return_value = False
+        rng = Mock()
+        rng.uniform.return_value = 0.3
+        rng.choice.return_value = 'checkpoint'
+        with patch.object(endurance.time, 'monotonic', side_effect=[9, 9.3, 11]):
+            endurance.Run.ddl_chaos(run, stop, Mock(), rng, 10)
+        run.writer.sql.assert_called_once_with('CHECKPOINT;', timeout=900)
+        stop.wait.assert_called_once_with(0.3)
+
+
+class RetentionLogTests(unittest.TestCase):
+    def test_rejected_retention_progress_is_a_finding(self):
+        with tempfile.TemporaryDirectory() as root:
+            run = SimpleNamespace(root=Path(root), bin=Path(root), killed_pids=set())
+            pg = endurance.Pg(run, 'materializer', Path(root) / 'data')
+            for warning in (
+                'pagestore materializer retention advance was rejected by the daemon',
+                'pagestore materializer retention advance failed: request timed out',
+            ):
+                with self.subTest(warning=warning):
+                    pg.log_scanned = 0
+                    pg.log.write_text('2026-10-24 03:03:39 WARNING:  ' + warning + '\n')
+                    with self.assertRaises(endurance.Failure) as raised:
+                        pg.scan_log()
+                    self.assertEqual(raised.exception.kind, 'bad_log')
+                    self.assertIn(warning, raised.exception.detail)
+
+
 if __name__ == '__main__':
     unittest.main()

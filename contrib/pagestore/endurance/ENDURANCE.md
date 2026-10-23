@@ -70,6 +70,10 @@ Each round is a seeded choice of:
    writer: create/drop/truncate, `VACUUM FULL`, `CLUSTER`, `REINDEX`,
    `ADD COLUMN`, bulk churn, `VACUUM (FREEZE)`, `CHECKPOINT`.  Autovacuum runs
    with a 5 s naptime and checkpoints every 30 s / 128 MB.
+The DDL thread has the same wall-clock deadline as pgbench. A statement
+already running may finish, but waiting for an injected restart or restartpoint
+does not extend the DDL window and keep adding WAL during recovery catch-up.
+
 2. **One injected event during the burst:** materializer fast restart,
    immediate stop, `SIGKILL` of its postmaster, a forced restartpoint (a
    writer `CHECKPOINT` is replayed first, and the materializer's `CHECKPOINT`
@@ -330,6 +334,32 @@ Also needed: the daemon should log one line for every refused or failed
 READV/WRITEV/BEGIN_DELETE (opcode, timeline, key, block, reason), as it
 already does for artifact refusals.  E-3 and E-6 each took a preserved store
 and a debugger session to explain what one log line would have said.
+
+## WAL indexing and space limits
+
+The writer enables `pagestore.auto_wal_index`; the recovery materializer pins
+only the raw WAL it consumes. Per-page index compaction must not prevent that
+owner from advancing to a new restartpoint. Metrics include the daemon's
+backpressure, GC, pruning and owner snapshots alongside RSS, descriptors and
+per-file store sizes. An absent inspection sample can occur during a
+coordinated daemon restart.
+
+Rejected materializer retention advances are findings, rather than ignored
+warnings. Failed pgbench runs retain their complete output, including the
+initial error before the transaction statistics. Local-service failures also
+report the relation/fork/block and request fence in their error detail.
+
+Current writable-compute FSM reads negotiate the daemon's optional FSM-reset
+operation. They rebuild inherited WAL-less free-space hints from zeros rather
+than inheriting mutable parent hints. Ordinary and historical reads keep their
+existing refusal behavior; data forks are not eligible for hint reset.
+
+`--max-store-gb` is a stop threshold, not a reclamation controller. Controller
+high-water/catch-up settings are supplied with repeated `--daemon-arg` options.
+Indexing is necessary for WAL reclaim but does not guarantee bounded disk:
+unprotected WAL-index horizons conservatively keep FPI-led chains, and an
+unchanged page can retain an old raw-WAL dependency. Do not treat a short run
+with indexing enabled as proof that a 72-hour run fits its space budget.
 
 ## Not covered yet
 

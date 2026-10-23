@@ -3014,9 +3014,46 @@ test_checkpoint_owner_is_daemon_owned(void)
 	remove_tree(store);
 }
 
+/* Raw-WAL-only materializers no longer need index-view admission, but still
+ * must not start recovery from a page base that compaction has retired. */
+static void
+test_raw_materializer_requires_page_base(void)
+{
+	char store[] = "/tmp/pagestore-wal-materializer-page-base-XXXXXX";
+	uint64_t frontier = 0;
+	uint64_t seq = 0;
+
+	configure_core();
+	check(prepare_store(store, 0, 0, 0, 0) &&
+		  write_relation_page(0, 0, 100) &&
+		  write_relation_page(0, 0, 200) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 900, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 500),
+		  "prepare page history without WAL-index or raw-WAL reclamation");
+	for (int i = 0; i < 64; i++)
+	{
+		(void) ps_core_maintenance();
+		if (ps_test_page_frontier(0, &frontier, &seq) && frontier >= 500)
+			break;
+	}
+	check(frontier >= 500, "publish a page frontier above the old recovery base");
+	check(reserve_pin(0, PS_RETENTION_OWNER_READER, 901, 1,
+					  PS_RETENTION_RESOURCE_WAL, 200),
+		  "the old raw WAL is still retained independently of page history");
+	check(!reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 902, 1,
+					   PS_RETENTION_RESOURCE_WAL, 200),
+		  "a raw-WAL materializer cannot register below the page frontier");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 902, 1,
+					  PS_RETENTION_RESOURCE_WAL, 600),
+		  "a raw-WAL materializer with a retained page base is admitted");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
+	test_raw_materializer_requires_page_base();
 	test_horizon_formats();
 	test_no_floor_or_progress();
 	test_preselection_skips_empty_reclaim();

@@ -19778,6 +19778,12 @@ layer_map_lookup_locked(uint32_t timeline, const PsKey *key, uint32_t block,
 								 expected_lsn, out_lsn, out_seq, out, 1);
 }
 
+static int read_resolve_internal(uint32_t timeline, const PsKey *key,
+								 uint32_t block, uint64_t read_lsn,
+								 uint64_t read_seq, unsigned char *out,
+								 uint64_t *out_ver, uint64_t *out_seq,
+								 int reset_fsm);
+
 /*
  * Resolve a read into out (page_size bytes): walk the timeline ancestry as
  * read_through() does, but serve the bytes from the memtable or an image layer
@@ -19803,6 +19809,25 @@ int
 read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 					 uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
 					 uint64_t *out_ver, uint64_t *out_seq)
+{
+	return read_resolve_internal(timeline, key, block, read_lsn, read_seq,
+								 out, out_ver, out_seq, 0);
+}
+
+int
+read_resolve_fsm(uint32_t timeline, const PsKey *key, uint32_t block,
+				 unsigned char *out, uint64_t *out_ver)
+{
+	if (key->klass != PS_KLASS_RELATION || key->forkNum != 1)
+		return -1;
+	return read_resolve_internal(timeline, key, block, UINT64_MAX, 0,
+								 out, out_ver, NULL, 1);
+}
+
+static int
+read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
+					  uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
+					  uint64_t *out_ver, uint64_t *out_seq, int reset_fsm)
 {
 	Shard	   *s;				/* same shard across the ancestry walk */
 	TlWalk		walk[MAX_TIMELINES];
@@ -19924,7 +19949,15 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * reclaimed history (-2), which READ_AT reports as absent.  Never
 			 * substitute absence or the parent's latest WAL-less contents. */
 			if (key->klass == PS_KLASS_RELATION && tl != timeline && pv->lsn == 0)
+			{
+				/* FSM is a rebuildable hint tree, not authoritative data.
+				 * Never inherit the parent's current WAL-less hint bytes.
+				 * Only the explicit current-compute operation may instead
+				 * start with an empty hint page. No I/O failure is hidden. */
+				if (reset_fsm && key->forkNum == 1) /* FSM_FORKNUM */
+					return 0;
 				return -1;
+			}
 
 			/*
 			 * The materialized-page cache and the memtable are safe read sources
@@ -23076,6 +23109,7 @@ ps_request_payload_fits(const PsChannel *ch)
 	{
 		case PS_OP_WRITEV:
 		case PS_OP_READV:
+		case PS_OP_READV_FSM:
 			return page_size > 0 && page_size <= PS_IO_UNIT &&
 				ch->nblocks > 0 && ch->nblocks <= PS_IO_UNIT / page_size;
 		case PS_OP_WAL_APPEND:
@@ -23692,8 +23726,9 @@ ps_handle_meta(PsChannel *ch)
 					/* Page history permits an active owner to advance from its old
 					 * protected image.  WAL-index history is sparse after compaction,
 					 * so its new point must independently name a retained chain. */
-					ret = ((((pin.resources &
-							  PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
+					ret = (((((pin.resources &
+							   PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 ||
+							  pin.owner_kind == PS_RETENTION_OWNER_MATERIALIZER) &&
 							 !page_history_allowed &&
 							 !(old_found == 1 &&
 							   old_pin.generation == pin.generation &&
@@ -23813,9 +23848,13 @@ ps_handle_meta(PsChannel *ch)
 						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0);
 					/* A fresh WAL-index view also depends on retained
 					 * first-arrival page identities.  This validates
-					 * storage history without granting PAGE authority. */
+					 * storage history without granting PAGE authority.
+					 * Raw-WAL recovery still needs an admitted page base. Removing
+					 * its unnecessary index pin must not admit a new materializer
+					 * below history that has already been reclaimed. */
 					if (timeline_live &&
-						(((pin.resources &
+						((pin.owner_kind != PS_RETENTION_OWNER_MATERIALIZER &&
+						  (pin.resources &
 						   (PS_RETENTION_RESOURCE_PAGE_HISTORY |
 							PS_RETENTION_RESOURCE_WAL_INDEX)) == 0) ||
 						 page_history_allowed) &&
