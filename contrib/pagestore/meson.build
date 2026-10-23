@@ -1105,7 +1105,10 @@ pagestore_gate_sweep = executable('pagestore_gate_sweep',
         'pagestore_fault.c', 'fuzz/fuzz_common.c', 'fuzz/fuzz_crc_fixup.c',
         'fuzz/tests/gate_sweep.c'),
   include_directories: include_directories('.', 'fuzz'),
-  c_args: ['-DPS_FUZZ_FIXTURE_TGZ="' +
+  # Match fuzz/build.sh: the fixture has only a handful of keys, while each
+  # open/close clears every shard's buckets. Production-sized hash tables turn
+  # this bounded header sweep into minutes of empty-bucket bookkeeping.
+  c_args: ['-DIDX_BUCKETS=64', '-DPS_FUZZ_FIXTURE_TGZ="' +
            (meson.current_source_dir() / 'fixtures' / 'posix-mvp-baseline' / 'store.tar.gz') +
            '"'] + pagestore_cassert_c_args,
   dependencies: [dependency('threads')],
