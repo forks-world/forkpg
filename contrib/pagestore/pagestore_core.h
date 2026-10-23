@@ -438,6 +438,11 @@ extern int read_resolve_wal_base(uint32_t timeline, const PsKey *key,
 								uint32_t block, uint64_t read_lsn,
 								uint64_t read_seq, unsigned char *out,
 								uint64_t *out_ver, uint64_t *out_seq);
+/* Same index authority, with lifecycle metadata captured before page I/O. */
+extern int read_resolve_wal_state(uint32_t timeline, const PsKey *key,
+								 uint32_t block, uint64_t read_lsn,
+								 uint64_t read_seq, unsigned char *out,
+								 PsWalBaseState *state);
 extern int	fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 					  uint64_t lsn);
 

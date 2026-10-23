@@ -33,7 +33,7 @@ contrib_targets += pagestore
 pagestore_mirror_error_test = shared_module('pagestore_mirror_error_test',
   files('pagestore_control_error_test.c', 'pagestore_slru_error_test.c',
         'backend_localsvc.c', 'backend_passthrough.c', 'pagestore_fault.c',
-        'pagestore.c', 'walredo_client.c'),
+        'pagestore_redo_base_test.c', 'walredo_client.c'),
   # Keep all helpers private to this module. Do not initialize a second set
   # of hooks when SQL loads the test functions into an existing backend.
   c_args: ['-D_PG_init=pagestore_error_test_init'],
@@ -404,7 +404,7 @@ pagestore_wal_reclaim_core_test = executable('pagestore_wal_reclaim_core_test',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
-  c_args: pagestore_cassert_c_args,
+  c_args: ['-DPAGESTORE_RELATION_INSPECTION_TEST'] + pagestore_cassert_c_args,
   install: false,
 )
 test('pagestore_wal_reclaim_core',

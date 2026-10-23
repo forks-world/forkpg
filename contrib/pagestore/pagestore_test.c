@@ -4737,12 +4737,28 @@ request_index_base(uint32_t rel, uint64_t lsn, uint64_t seq)
 	return cl_exec();
 }
 
+static PsChannel *
+request_index_state(uint32_t rel, uint64_t lsn, uint64_t seq)
+{
+	PsChannel *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, FORK0);
+	ch->opcode = PS_OP_WAL_BASE_STATE;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	ch->req_lsn = lsn;
+	ch->req_seq = seq;
+	ch->result = 0;
+	return cl_exec();
+}
+
 static void
 run_wal_base_suite(const char *daemon_path, const char *tmpbase)
 {
 	char shm[64], store[256];
 	const uint32_t ps = 8192, rel = 29400;
 	unsigned char *page = malloc(ps);
+	PsWalBaseState state;
 	PsRetentionPin pin;
 	PsChannel *ch;
 	pid_t pid;
@@ -4777,6 +4793,13 @@ run_wal_base_suite(const char *daemon_path, const char *tmpbase)
 	ch = request_index_base(rel, 1500, pin.admission_seq);
 	check(ch->status == PS_STATUS_OK && ch->result == 1 && ch->req_lsn == 1000 &&
 		  page_has_tag(ch->data, ps, 61), "wire operation returns the protected durable base");
+	ch = request_index_state(rel, 1500, pin.admission_seq);
+	memcpy(&state, ch->data, sizeof(state));
+	check(ch->status == PS_STATUS_OK && ch->result == 1 &&
+		  ch->datalen == sizeof(state) + ps && state.found &&
+		  state.version_lsn == 1000 && state.nblocks == 1 && state.death_lsn == 0 &&
+		  page_has_tag(ch->data + sizeof(state), ps, 61),
+		  "wire state returns the durable base and lifecycle under one index cap");
 	cl_setkey(ch, rel, FORK0);
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = 0;
@@ -4787,17 +4810,20 @@ run_wal_base_suite(const char *daemon_path, const char *tmpbase)
 	ch = request_index_base(rel, 1500, pin.admission_seq + 1);
 	check(ch->status == PS_STATUS_ERROR && ch->result == PS_WAL_BASE_VIEW_UNREGISTERED,
 		  "a different sequence cannot borrow a retained index view");
-	for (int invalid = 0; invalid < 3; invalid++)
+	ch = request_index_state(rel, 1500, pin.admission_seq + 1);
+	check(ch->status == PS_STATUS_ERROR && ch->result == PS_WAL_BASE_VIEW_UNREGISTERED,
+		  "wire state rejects an unknown view rather than returning empty lifecycle");
+	for (int invalid = 0; invalid < 6; invalid++)
 	{
 		cl_setkey(ch, rel, FORK0);
-		ch->opcode = PS_OP_WAL_BASE_READ;
+		ch->opcode = invalid < 3 ? PS_OP_WAL_BASE_READ : PS_OP_WAL_BASE_STATE;
 		ch->blocknum = 0;
-		ch->nblocks = invalid == 0 ? 2 : 1;
+		ch->nblocks = invalid % 3 == 0 ? 2 : 1;
 		ch->req_lsn = 1500;
 		ch->req_seq = pin.admission_seq;
 		ch->result = 0;
-		if (invalid == 1) ch->key.klass = PS_KLASS_CONTROL;
-		if (invalid == 2) ch->incarnation = UINT64_MAX;
+		if (invalid % 3 == 1) ch->key.klass = PS_KLASS_CONTROL;
+		if (invalid % 3 == 2) ch->incarnation = UINT64_MAX;
 		check(cl_exec()->status == PS_STATUS_ERROR,
 			  "index-base operation rejects invalid size, class and incarnation (%d)", invalid);
 	}

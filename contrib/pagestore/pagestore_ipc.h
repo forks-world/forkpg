@@ -181,6 +181,7 @@ typedef enum PsOpcode
 	/* Optional, capability-negotiated current FSM read; never a data-page read. */
 	PS_OP_READV_FSM,
 	PS_OP_WAL_BASE_READ,		/* retained index-view base; no PAGE read grant */
+	PS_OP_WAL_BASE_STATE,		/* base and lifecycle at the same index view */
 } PsOpcode;
 
 typedef enum PsTimelineState
@@ -356,6 +357,7 @@ typedef struct PsWalIndexEntry
 #define PS_FRONTEND_CAP_ATOMIC_PINS (UINT32_C(1) << 2)
 #define PS_FRONTEND_CAP_FSM_RESET (UINT32_C(1) << 3)
 #define PS_FRONTEND_CAP_WAL_BASE (UINT32_C(1) << 4)
+#define PS_FRONTEND_CAP_WAL_BASE_STATE (UINT32_C(1) << 5)
 #define PS_WAL_BASE_VIEW_UNREGISTERED 1u
 #define PS_BARRIER_REGISTER UINT32_C(0x50494e35)
 #define PS_ARTIFACT_BEGIN_CAPPED_READ UINT32_C(0x43415035)
@@ -448,6 +450,20 @@ ps_key_shard(const PsKey *key, uint32_t nshards)
 	}
 	return ps_fnv1a32(key, sizeof(*key)) % nshards;
 }
+
+/* PS_OP_WAL_BASE_STATE response: this header followed by page_size bytes.
+ * The lifecycle answers and durable base use one registered finite index cap.
+ * A successful request may have found == 0 while nblocks still proves a
+ * zero-extended block live. Unknown views are errors, never empty answers. */
+typedef struct PsWalBaseState
+{
+	uint64_t version_lsn;
+	uint64_t version_seq;
+	uint64_t death_lsn;
+	uint64_t death_seq;
+	uint32_t nblocks;
+	uint32_t found;
+} PsWalBaseState;
 
 /* One channel = one backend's mailbox. */
 typedef struct PsChannel

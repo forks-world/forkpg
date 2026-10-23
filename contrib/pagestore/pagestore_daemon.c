@@ -430,7 +430,8 @@ handle_request(PsChannel *ch)
 	}
 	if ((ch->opcode == PS_OP_EXTEND || ch->opcode == PS_OP_WRITEV ||
 		 ch->opcode == PS_OP_READV || ch->opcode == PS_OP_READV_FSM ||
-		 ch->opcode == PS_OP_READ_AT || ch->opcode == PS_OP_WAL_BASE_READ) &&
+		 ch->opcode == PS_OP_READ_AT || ch->opcode == PS_OP_WAL_BASE_READ ||
+		 ch->opcode == PS_OP_WAL_BASE_STATE) &&
 		!ps_timeline_request_allowed(tl, ch->incarnation))
 	{
 		ch->status = PS_STATUS_ERROR;
@@ -599,6 +600,29 @@ handle_request(PsChannel *ch)
 			}
 			break;
 
+		case PS_OP_WAL_BASE_STATE:
+			{
+				PsWalBaseState state;
+				unsigned char *page = ch->data + sizeof(state);
+				int rc = read_resolve_wal_state(tl, &ch->key, ch->blocknum,
+					ch->req_lsn, ch->req_seq, page, &state);
+
+				if (rc < 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					ch->result = rc == -2 ? PS_WAL_BASE_VIEW_UNREGISTERED : 0;
+					ch->datalen = 0;
+				}
+				else
+				{
+					if (rc == 0) memset(page, 0, page_size);
+					memcpy(ch->data, &state, sizeof(state));
+					ch->result = state.found;
+					ch->datalen = sizeof(state) + page_size;
+				}
+			}
+			break;
+
 		case PS_OP_WAL_BASE_READ:
 		case PS_OP_READ_AT:
 			/* as-of read on this timeline, honoring branch ancestry.  Report
@@ -686,6 +710,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_NBLOCKS:
 		case PS_OP_READV_FSM:
 		case PS_OP_READV:
+		case PS_OP_WAL_BASE_STATE:
 		case PS_OP_WAL_BASE_READ:
 		case PS_OP_READ_AT:
 		case PS_OP_REQUIRE_BRANCH:
@@ -916,7 +941,7 @@ run_request_admitted(PsChannel *ch)
 			 * remote-layer I/O.  Other timeline readers complete under map_rd. */
 			ps_lock_shard_rd(shard);
 			if (op == PS_OP_READV || op == PS_OP_READV_FSM || op == PS_OP_READ_AT ||
-				op == PS_OP_WAL_BASE_READ ||
+				op == PS_OP_WAL_BASE_READ || op == PS_OP_WAL_BASE_STATE ||
 				op == PS_OP_WAL_RETAIN_FLOOR || op == PS_OP_RETENTION_FLOOR)
 				handle_request(ch);
 			else
@@ -1610,7 +1635,8 @@ main(int argc, char **argv)
 	hdr->channels_off = PS_CHANNELS_OFF;
 	hdr->frontend_capabilities = PS_FRONTEND_CAP_RELATION_INSPECTION |
 		PS_FRONTEND_CAP_BRANCH_SEQ | PS_FRONTEND_CAP_ATOMIC_PINS |
-		PS_FRONTEND_CAP_FSM_RESET | PS_FRONTEND_CAP_WAL_BASE;
+		PS_FRONTEND_CAP_FSM_RESET | PS_FRONTEND_CAP_WAL_BASE |
+		PS_FRONTEND_CAP_WAL_BASE_STATE;
 	hdr->daemon_instance = new_daemon_instance();
 	daemon_hdr = hdr;
 	ps_core_set_metrics_header(hdr);

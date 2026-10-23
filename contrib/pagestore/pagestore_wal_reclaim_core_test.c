@@ -3031,6 +3031,133 @@ read_index_base(uint64_t lsn, uint64_t seq, unsigned char *page,
 	return rc;
 }
 
+static int
+read_index_state(uint32_t timeline, uint32_t block, uint64_t lsn, uint64_t seq,
+				 unsigned char *page, PsWalBaseState *state)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	int rc;
+
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&key));
+	rc = read_resolve_wal_state(timeline, &key, block, lsn, seq, page, state);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+	return rc;
+}
+
+static void
+test_index_state_preserves_lifecycle(void)
+{
+	char store[] = "/tmp/pagestore-index-lifecycle-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	PsWalBaseState state;
+	PsRetentionPin before, dead, regrown;
+
+	configure_core();
+	check(prepare_store(store, 0, 0, 0, 0) &&
+		  write_relation_page(0, 0, 1000) && write_relation_page(0, 1, 1000) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 910, 1,
+			PS_RETENTION_RESOURCE_WAL_INDEX, 1500) &&
+		  ps_retention_lookup(0, PS_RETENTION_OWNER_READER, 910, &before) == 1 &&
+		  truncate_relation(0, 2000, 0) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 911, 1,
+			PS_RETENTION_RESOURCE_WAL_INDEX, 2100) &&
+		  ps_retention_lookup(0, PS_RETENTION_OWNER_READER, 911, &dead) == 1 &&
+		  fork_op_keyed(0, &key, PS_OP_ZEROEXTEND, 2200, 2, 0) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 912, 1,
+			PS_RETENTION_RESOURCE_WAL_INDEX, 2500) &&
+		  ps_retention_lookup(0, PS_RETENTION_OWNER_READER, 912, &regrown) == 1,
+		  "hold index-only views before death, after death, and after zero regrowth");
+	check(write_relation_page(0, 0, 3000) && unlink_relation(0, 4000) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 913, 1,
+			PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "advance PAGE history beyond all held lifecycle views");
+	for (int i = 0; i < 64; i++) (void) ps_core_maintenance();
+	for (int reopen = 0; reopen < 2; reopen++)
+	{
+		check(read_index_state(0, 0, 1500, before.admission_seq, page, &state) == 1 &&
+			  state.found && state.version_lsn == 1000 && state.nblocks == 2 &&
+			  state.death_lsn == 0 && page[128] == 0x5A,
+			  "index-state returns the old durable base and exact pre-truncate size");
+		check(read_index_state(0, 0, 2100, dead.admission_seq, page, &state) == 0 &&
+			  !state.found && state.nblocks == 0 && state.death_lsn == 2000 &&
+			  state.death_seq != 0,
+			  "index-state proves absence rather than resurrecting a pre-death base");
+		check(read_index_state(0, 0, 2500, regrown.admission_seq, page, &state) == 0 &&
+			  !state.found && state.nblocks == 2 && state.death_lsn == 2000,
+			  "index-state distinguishes zero regrowth from a dead block");
+		check(read_index_state(0, 0, 2500, regrown.admission_seq + 1, page, &state) == -2,
+			  "an unknown index cap cannot borrow lifecycle metadata");
+		if (reopen == 0)
+		{
+			close_store();
+			check(ps_core_open(store) == 0, "reopen compacted index-view lifecycle history");
+		}
+	}
+	ps_test_forkmeta_set_poisoned(1);
+	check(read_index_state(0, 0, 1500, before.admission_seq, page, &state) == -1,
+		  "poisoned fork metadata is a read error, not a missing base or unknown view");
+	ps_test_forkmeta_set_poisoned(0);
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_index_state_caps_ancestry(void)
+{
+	char store[] = "/tmp/pagestore-index-ancestry-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsRetentionPin pin;
+	PsWalBaseState state;
+	unsigned char page[8192];
+
+	configure_core();
+	check(prepare_store(store, 0, 0, 0, 0) && write_relation_page(0, 0, 1000) &&
+		  create_branch(1, 0, 1500) && truncate_relation(0, 2000, 0) &&
+		  fork_op_keyed(1, &key, PS_OP_ZEROEXTEND, 2200, 2, 0) &&
+		  reserve_pin(1, PS_RETENTION_OWNER_READER, 915, 1,
+			PS_RETENTION_RESOURCE_WAL_INDEX, 2500) &&
+		  ps_retention_lookup(1, PS_RETENTION_OWNER_READER, 915, &pin) == 1,
+		  "hold a child index view after parent truncation and child growth");
+	check(read_index_state(1, 0, 2500, pin.admission_seq, page, &state) == 1 &&
+		  state.version_lsn == 1000 && state.nblocks == 2 && state.death_lsn == 0,
+		  "index-state caps parent data and lifecycle at the child's fork");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  read_index_state(1, 0, 2500, pin.admission_seq, page, &state) == 1 &&
+		  state.version_lsn == 1000 && state.nblocks == 2 && state.death_lsn == 0,
+		  "child index-state authority and ancestry caps survive recovery");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_index_state_refuses_wal_less_zero_fallback(void)
+{
+	char store[] = "/tmp/pagestore-index-wal-less-XXXXXX";
+	unsigned char page[8192];
+	PsWalBaseState state;
+	PsRetentionPin pin;
+	uint64_t version;
+
+	configure_core();
+	check(prepare_store(store, 0, 0, 0, 0) && write_relation_page(0, 0, 0) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 914, 1,
+			PS_RETENTION_RESOURCE_WAL_INDEX, 1500) &&
+		  ps_retention_lookup(0, PS_RETENTION_OWNER_READER, 914, &pin) == 1,
+		  "hold an index view over an unversioned data page");
+	check(read_index_state(0, 0, 1500, pin.admission_seq, page, &state) == -1,
+		  "unversioned contents cannot masquerade as a zero-regrown block");
+	check(read_index_base(1500, pin.admission_seq, page, &version) == 0,
+		  "the original base-only interface still reports no durable version");
+	close_store();
+	remove_tree(store);
+}
+
 static unsigned int base_segment_reads;
 
 static int
@@ -3051,6 +3178,7 @@ test_index_base_skips_transient_and_reports_io(void)
 {
 	char store[] = "/tmp/pagestore-wal-base-buffered-XXXXXX";
 	unsigned char page[8192];
+	PsWalBaseState state;
 	PsRetentionPin pin;
 	uint64_t version = 0;
 	PsStorage failing_storage = PsStoragePosix;
@@ -3079,6 +3207,8 @@ test_index_base_skips_transient_and_reports_io(void)
 	check(read_index_base(1500, pin.admission_seq, page, &version) == -1 &&
 		  base_segment_reads > 0,
 		  "a failed segment read reports failure rather than a missing base");
+	check(read_index_state(0, 0, 1500, pin.admission_seq, page, &state) == -1,
+		  "the combined base/lifecycle read also reports segment I/O failure");
 	ps_storage = &PsStoragePosix;
 	check(read_index_base(1500, pin.admission_seq, page, &version) == 1 &&
 		  version == 1000,
@@ -3199,6 +3329,9 @@ test_raw_materializer_requires_page_base(void)
 int
 main(void)
 {
+	test_index_state_caps_ancestry();
+	test_index_state_refuses_wal_less_zero_fallback();
+	test_index_state_preserves_lifecycle();
 	test_index_base_skips_transient_and_reports_io();
 	test_index_view_keeps_its_storage_base();
 	test_raw_materializer_requires_page_base();

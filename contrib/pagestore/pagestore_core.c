@@ -9306,12 +9306,10 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
  * the branch.
  */
 static uint32_t
-fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
-					 uint64_t read_seq)
+fork_nblocks_through_cap(uint32_t timeline, const PsKey *key, ViewCap cap)
 {
 	uint32_t	maxnb = 0;
-	TlWalk		w = tl_walk_first_cap(timeline,
-									  viewcap_from_request(read_lsn, read_seq));
+	TlWalk		w = tl_walk_first_cap(timeline, cap);
 
 	do
 	{
@@ -9332,6 +9330,14 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 		}
 	} while (tl_walk_next(&w));
 	return maxnb;
+}
+
+static uint32_t
+fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
+					 uint64_t read_seq)
+{
+	return fork_nblocks_through_cap(timeline, key,
+								   viewcap_from_request(read_lsn, read_seq));
 }
 
 /* Redo must reserve every block that can be reached by WAL already accepted
@@ -9367,12 +9373,11 @@ fork_nblocks_recovery(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
  * compacted index may still list older records for older horizons.
  */
 static uint64_t
-fork_block_death_through(uint32_t timeline, const PsKey *key, uint32_t block,
-						 uint64_t read_lsn, uint64_t read_seq,
+fork_block_death_through_cap(uint32_t timeline, const PsKey *key, uint32_t block,
+							   ViewCap cap,
 						 uint64_t *seq_out)
 {
-	TlWalk		w = tl_walk_first_cap(timeline,
-									  viewcap_from_request(read_lsn, read_seq));
+	TlWalk		w = tl_walk_first_cap(timeline, cap);
 
 	*seq_out = 0;
 	do
@@ -9412,6 +9417,14 @@ fork_block_death_through(uint32_t timeline, const PsKey *key, uint32_t block,
 		}
 	} while (tl_walk_next(&w));
 	return 0;
+}
+
+static uint64_t
+fork_block_death_through(uint32_t timeline, const PsKey *key, uint32_t block,
+						 uint64_t read_lsn, uint64_t read_seq, uint64_t *seq_out)
+{
+	return fork_block_death_through_cap(timeline, key, block,
+									   viewcap_from_request(read_lsn, read_seq), seq_out);
 }
 
 /* Does the fork exist on 'timeline' or any ancestor, as of read_lsn? */
@@ -19817,7 +19830,8 @@ static int read_resolve_internal(uint32_t timeline, const PsKey *key,
 								 uint32_t block, uint64_t read_lsn,
 								 uint64_t read_seq, unsigned char *out,
 								 uint64_t *out_ver, uint64_t *out_seq,
-								 int reset_fsm, const ViewCap *index_cap);
+								 int reset_fsm, const ViewCap *index_cap,
+								 PsWalBaseState *index_state);
 
 /*
  * Resolve a read into out (page_size bytes): walk the timeline ancestry as
@@ -19846,7 +19860,7 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 					 uint64_t *out_ver, uint64_t *out_seq)
 {
 	return read_resolve_internal(timeline, key, block, read_lsn, read_seq,
-								 out, out_ver, out_seq, 0, NULL);
+								 out, out_ver, out_seq, 0, NULL, NULL);
 }
 
 int
@@ -19856,16 +19870,51 @@ read_resolve_fsm(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (key->klass != PS_KLASS_RELATION || key->forkNum != 1)
 		return -1;
 	return read_resolve_internal(timeline, key, block, UINT64_MAX, 0,
-								 out, out_ver, NULL, 1, NULL);
+								 out, out_ver, NULL, 1, NULL, NULL);
 }
+
+static int read_resolve_wal_view(uint32_t timeline, const PsKey *key,
+	uint32_t block, uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
+	PsWalBaseState *state, int include_lifecycle);
 
 int
 read_resolve_wal_base(uint32_t timeline, const PsKey *key, uint32_t block,
 					  uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
 					  uint64_t *out_ver, uint64_t *out_seq)
 {
+	PsWalBaseState state;
+	int result = read_resolve_wal_view(timeline, key, block, read_lsn,
+									 read_seq, out, &state, 0);
+
+	if (result > 0)
+	{
+		if (out_ver != NULL) *out_ver = state.version_lsn;
+		if (out_seq != NULL) *out_seq = state.version_seq;
+	}
+	return result;
+}
+
+int
+read_resolve_wal_state(uint32_t timeline, const PsKey *key, uint32_t block,
+					  uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
+					  PsWalBaseState *state)
+{
+	return read_resolve_wal_view(timeline, key, block, read_lsn, read_seq,
+								 out, state, 1);
+}
+
+static int
+read_resolve_wal_view(uint32_t timeline, const PsKey *key, uint32_t block,
+					 uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
+					 PsWalBaseState *state, int include_lifecycle)
+{
 	ViewCap cap;
 	int allowed;
+	int result;
+
+	memset(state, 0, sizeof(*state));
+	if (fork_meta_poisoned_load())
+		return -1;
 
 	if (!core_process_valid() || key->klass != PS_KLASS_RELATION ||
 		timeline >= MAX_TIMELINES || read_lsn == 0 || read_lsn == UINT64_MAX)
@@ -19888,15 +19937,18 @@ read_resolve_wal_base(uint32_t timeline, const PsKey *key, uint32_t block,
 	ps_unlock_map();
 	if (!allowed)
 		return -2;
-	return read_resolve_internal(timeline, key, block, read_lsn, read_seq,
-								 out, out_ver, out_seq, 0, &cap);
+	result = read_resolve_internal(timeline, key, block, read_lsn, read_seq,
+								   out, &state->version_lsn, &state->version_seq,
+								   0, &cap, include_lifecycle ? state : NULL);
+	state->found = result > 0;
+	return result;
 }
 
 static int
 read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 					  uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
 					  uint64_t *out_ver, uint64_t *out_seq, int reset_fsm,
-					  const ViewCap *index_cap)
+					  const ViewCap *index_cap, PsWalBaseState *index_state)
 {
 	Shard	   *s;				/* same shard across the ancestry walk */
 	TlWalk		walk[MAX_TIMELINES];
@@ -19949,6 +20001,21 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 		walk[levels++] = w;
 	}
 	while (levels < MAX_TIMELINES && tl_walk_next(&w));
+	if (index_state != NULL)
+	{
+		/* A missing durable image must not turn a WAL-less data page into
+		 * a fabricated zero page. Match capped NBLOCKS completeness rules. */
+		if (fork_has_wal_less_page(timeline, key))
+		{
+			walidx_publish_rdunlock();
+			ps_unlock_map();
+			return -1;
+		}
+		index_state->nblocks = fork_nblocks_through_cap(timeline, key, *index_cap);
+		index_state->death_lsn = fork_block_death_through_cap(timeline, key,
+															 block, *index_cap,
+															 &index_state->death_seq);
+	}
 	if (index_cap != NULL)
 		walidx_publish_rdunlock();
 	ps_unlock_map();
@@ -23191,6 +23258,9 @@ ps_request_payload_fits(const PsChannel *ch)
 				ch->nblocks > 0 && ch->nblocks <= PS_IO_UNIT / page_size;
 		case PS_OP_WAL_BASE_READ:
 			return page_size > 0 && page_size <= PS_IO_UNIT && ch->nblocks == 1;
+		case PS_OP_WAL_BASE_STATE:
+			return page_size > 0 && page_size <= PS_IO_UNIT - sizeof(PsWalBaseState) &&
+				ch->nblocks == 1;
 		case PS_OP_WAL_APPEND:
 		case PS_OP_WAL_READ:
 			return ch->datalen <= PS_IO_UNIT;
