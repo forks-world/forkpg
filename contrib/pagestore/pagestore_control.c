@@ -155,6 +155,8 @@ ps_control_drain(void)
 {
 	bool		shipped = false;
 	MemoryContext drain_cxt = CurrentMemoryContext;
+	int saved_interrupt_holdoff = InterruptHoldoffCount;
+	int saved_cancel_holdoff = QueryCancelHoldoffCount;
 
 	Assert(CritSectionCount == 0);
 
@@ -464,13 +466,19 @@ ps_control_drain(void)
 
 		/*
 		 * Swallow store failures: the queue was not advanced, so every image
-		 * is retried at the next ship point.  No locks are held here and a
+		 * is retried at the next ship point.  The caller may hold buffer
+		 * locks; the drain acquires no additional surviving locks, and a
 		 * timed-out op marked its channel abandoned, so downgrading to a
 		 * WARNING is safe -- and required: ship points live inside
 		 * checkpoints, recovery steps, and the checksum state machines,
 		 * none of which a mirror outage may abort.
 		 */
 		FlushErrorState();
+		/* ERROR resets these counters before longjmp. A ship point can
+		 * run with a buffer content lock held (XLogFlush from buffer I/O).
+		 * Restore the caller's holdoffs only on the swallowed-error path. */
+		InterruptHoldoffCount = saved_interrupt_holdoff;
+		QueryCancelHoldoffCount = saved_cancel_holdoff;
 		ereport(WARNING,
 				(errmsg("pagestore: pg_control mirror ship failed; %d image(s) remain queued",
 						ps_control_queue_count),

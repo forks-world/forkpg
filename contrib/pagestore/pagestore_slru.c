@@ -3918,6 +3918,8 @@ static void
 ps_slru_drain(void)
 {
 	MemoryContext drain_cxt = CurrentMemoryContext;
+	int saved_interrupt_holdoff = InterruptHoldoffCount;
+	int saved_cancel_holdoff = QueryCancelHoldoffCount;
 
 	Assert(CritSectionCount == 0);
 
@@ -4138,6 +4140,11 @@ post_again:
 		FreeErrorData(edata);
 
 		FlushErrorState();
+		/* ERROR resets these counters before longjmp. A ship point can
+		 * run with a buffer content lock held (XLogFlush from buffer I/O).
+		 * Restore the caller's holdoffs only on the swallowed-error path. */
+		InterruptHoldoffCount = saved_interrupt_holdoff;
+		QueryCancelHoldoffCount = saved_cancel_holdoff;
 		ereport(WARNING,
 				(errmsg("pagestore: SLRU mirror drain failed; staged images kept for the next ship point")));
 	}

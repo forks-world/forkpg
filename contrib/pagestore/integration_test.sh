@@ -1709,6 +1709,18 @@ $P -c "ROLLBACK PREPARED 'window_open_prepared';" >/dev/null
 assert "$($P -c "SELECT prepared_count FROM pagestore_branch_window_open();")" "0" \
     "transaction window opens after the surviving prepared transaction is resolved"
 
+# Mirror ERROR recovery must preserve holdoffs while a buffer lock is held.
+$P -c "CREATE FUNCTION pagestore_test_control_error(regclass) RETURNS boolean
+       AS '$BUILD/contrib/pagestore/pagestore_mirror_error_test',
+          'pagestore_test_control_error' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_test_slru_error(regclass) RETURNS boolean
+       AS '$BUILD/contrib/pagestore/pagestore_mirror_error_test',
+          'pagestore_test_slru_error' LANGUAGE C STRICT;" >/dev/null
+assert "$($P -c "SELECT pagestore_test_control_error('pg_class');")" "t" \
+    "control mirror failure preserves buffer-lock interrupt holdoffs and queued image"
+assert "$($P -c "SELECT pagestore_test_slru_error('pg_class');")" "t" \
+    "SLRU mirror failure preserves buffer-lock interrupt holdoffs and staged image"
+
 # --- 26. pg_control mirror: control writes publish LSN-versioned store images ---
 # Every UpdateControlFile() queues the just-written image (versioned by the LSN
 # of the update that caused it) and ships it at the next post-critical point,

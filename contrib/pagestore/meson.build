@@ -29,6 +29,19 @@ pagestore = shared_module('pagestore',
 )
 contrib_targets += pagestore
 
+# Backend-only fault tests use private copies of the real mirror drains.
+pagestore_mirror_error_test = shared_module('pagestore_mirror_error_test',
+  files('pagestore_control_error_test.c', 'pagestore_slru_error_test.c',
+        'backend_localsvc.c', 'backend_passthrough.c', 'pagestore_fault.c',
+        'pagestore.c', 'walredo_client.c'),
+  # Keep all helpers private to this module. Do not initialize a second set
+  # of hooks when SQL loads the test functions into an existing backend.
+  c_args: ['-D_PG_init=pagestore_error_test_init'],
+  kwargs: pg_test_mod_args,
+)
+test_install_libs += pagestore_mirror_error_test
+
+
 install_data(
   'pagestore.control',
   'pagestore--1.0.sql',
