@@ -431,6 +431,13 @@ extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
  * zeros. Ordinary/historical reads and authoritative data retain their errors. */
 extern int read_resolve_fsm(uint32_t timeline, const PsKey *key, uint32_t block,
 							unsigned char *out, uint64_t *out_ver);
+/* Read a durable stored base at an explicitly held finite WAL-index view,
+ * or at the current durable index progress (read_seq == 0). This operation
+ * does not grant ordinary page-history authority; -2 denies an unknown view. */
+extern int read_resolve_wal_base(uint32_t timeline, const PsKey *key,
+								uint32_t block, uint64_t read_lsn,
+								uint64_t read_seq, unsigned char *out,
+								uint64_t *out_ver, uint64_t *out_seq);
 extern int	fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 					  uint64_t lsn);
 
