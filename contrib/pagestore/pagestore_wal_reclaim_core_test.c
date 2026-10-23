@@ -3014,6 +3014,152 @@ test_checkpoint_owner_is_daemon_owned(void)
 	remove_tree(store);
 }
 
+static int
+read_index_base(uint64_t lsn, uint64_t seq, unsigned char *page,
+				uint64_t *version)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	int rc;
+
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&key));
+	rc = read_resolve_wal_base(0, &key, 0, lsn, seq, page, version, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+	return rc;
+}
+
+static unsigned int base_segment_reads;
+
+static int
+fail_base_segment_read(uint32_t shard, int seg, uint64_t off, void *buf,
+					   uint32_t len)
+{
+	(void) shard;
+	(void) seg;
+	(void) off;
+	(void) buf;
+	(void) len;
+	base_segment_reads++;
+	return -1;
+}
+
+static void
+test_index_base_skips_transient_and_reports_io(void)
+{
+	char store[] = "/tmp/pagestore-wal-base-buffered-XXXXXX";
+	unsigned char page[8192];
+	PsRetentionPin pin;
+	uint64_t version = 0;
+	PsStorage failing_storage = PsStoragePosix;
+
+	configure_core();
+	flush_pages = 4;
+	check(prepare_store(store, 0, 0, 0, 0) &&
+		  write_relation_page(0, 0, 1000) &&
+		  write_relation_page(0, 1, 1000) &&
+		  write_relation_page(0, 2, 1000) &&
+		  write_relation_page(0, 3, 1000) &&
+		  write_relation_page(0, 0, 1200) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 905, 1,
+					  PS_RETENTION_RESOURCE_WAL_INDEX, 1500) &&
+		  ps_retention_lookup(0, PS_RETENTION_OWNER_READER, 905, &pin) == 1,
+		  "flush an old base, buffer its replacement, and hold an index view");
+	check(read_index_base(1500, pin.admission_seq, page, &version) == 1 &&
+		  version == 1000 && page[128] == 0x5A,
+		  "a transient replacement does not hide an older durable index base");
+
+	/* cache_pages is zero and the old base left the memtable at flush, so
+	 * this must attempt a real segment read, not a cached success. */
+	failing_storage.seg_read = fail_base_segment_read;
+	base_segment_reads = 0;
+	ps_storage = &failing_storage;
+	check(read_index_base(1500, pin.admission_seq, page, &version) == -1 &&
+		  base_segment_reads > 0,
+		  "a failed segment read reports failure rather than a missing base");
+	ps_storage = &PsStoragePosix;
+	check(read_index_base(1500, pin.admission_seq, page, &version) == 1 &&
+		  version == 1000,
+		  "the base remains readable when segment I/O recovers");
+	check(unlink_relation(0, 1400) &&
+		  read_index_base(1500, pin.admission_seq, page, &version) == 0,
+		  "durable fallback cannot resurrect a base invalidated by unlink");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_index_view_keeps_its_storage_base(void)
+{
+	char store[] = "/tmp/pagestore-wal-index-base-XXXXXX";
+	unsigned char page[8192];
+	PsRetentionPin pin;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	uint64_t frontier = 0, seq = 0, version = 0;
+	int ordinary;
+
+	configure_core();
+	check(prepare_store(store, 0, 0, 0, 0) &&
+		  write_relation_page(0, 0, 1000) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 903, 1,
+					  PS_RETENTION_RESOURCE_WAL_INDEX, 1500) &&
+		  ps_retention_lookup(0, PS_RETENTION_OWNER_READER, 903, &pin) == 1,
+		  "hold a finite index-only view after a durable page image");
+	check(write_relation_page(0, 0, 2000) && write_relation_page(0, 0, 3000) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 904, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "move ordinary page history beyond the index-only view");
+	for (int i = 0; i < 64; i++)
+	{
+		(void) ps_core_maintenance();
+		if (ps_test_page_frontier(0, &frontier, &seq) && frontier >= 5000)
+			break;
+	}
+	check(frontier >= 5000, "page compaction publishes the newer frontier");
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&key));
+	ordinary = read_resolve(0, &key, 0, 1500, pin.admission_seq, page, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+	check(ordinary == -2, "an index-only pin does not grant ordinary page history");
+	check(read_index_base(1500, pin.admission_seq, page, &version) == 1 &&
+		  version == 1000 && page[128] == 0x5A,
+		  "the index view can read its retained durable base past the page frontier");
+	check(read_index_base(1500, pin.admission_seq + 1, page, &version) == -2 &&
+		  read_index_base(1500, 0, page, &version) == -2,
+		  "unknown and ambiguous index views cannot borrow another pin");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  read_index_base(1500, pin.admission_seq, page, &version) == 1 && version == 1000,
+		  "the stored base and index-view authority survive recovery");
+	check(drop_wal_pin(0, 903, 1) &&
+		  read_index_base(1500, pin.admission_seq, page, &version) == -2,
+		  "dropping an index view revokes base access immediately");
+
+	/* The current finite progress is also a storage fence. It need not carry
+	 * PAGE authority, but its base must not disappear before index compaction. */
+	check(wal_index_progress(0, 0, WAL_TOTAL) &&
+		  write_relation_page(0, 0, WAL_TOTAL + 1000) &&
+		  write_relation_page(0, 0, WAL_TOTAL + 2000) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 904, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, WAL_TOTAL + 3000),
+		  "advance the ordinary page frontier beyond durable index progress");
+	for (int i = 0; i < 64; i++)
+		(void) ps_core_maintenance();
+	check(read_index_base(WAL_TOTAL, 0, page, &version) == 1 && version == 3000,
+		  "current index progress keeps a durable base independently of PAGE authority");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  read_index_base(WAL_TOTAL, 0, page, &version) == 1 && version == 3000,
+		  "the implicit progress base survives a second recovery");
+	close_store();
+	remove_tree(store);
+}
+
 /* Raw-WAL-only materializers no longer need index-view admission, but still
  * must not start recovery from a page base that compaction has retired. */
 static void
@@ -3053,6 +3199,8 @@ test_raw_materializer_requires_page_base(void)
 int
 main(void)
 {
+	test_index_base_skips_transient_and_reports_io();
+	test_index_view_keeps_its_storage_base();
 	test_raw_materializer_requires_page_base();
 	test_horizon_formats();
 	test_no_floor_or_progress();
