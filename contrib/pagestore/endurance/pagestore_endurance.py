@@ -43,7 +43,8 @@ class Failure(Exception):
 BAD_LOG = re.compile(
     r"PANIC:|TRAP:|invalid page in block|could not read block|"
     r"unexpected data beyond EOF|terminated by signal (6|7|9|11)\b|"
-    r"AddressSanitizer|stack smashing"
+    r"AddressSanitizer|stack smashing|"
+    r"pagestore materializer retention advance (was rejected|failed)"
 )
 INJECTED_KILL = re.compile(r"\(PID (\d+)\) was terminated by signal 9\b")
 
@@ -587,6 +588,7 @@ shared_preload_libraries = 'pagestore'
 pagestore.backend = 'localsvc'
 pagestore.localsvc_shm = {quoted(self.shm)}
 pagestore.route_all = off
+pagestore.auto_wal_index = on
 pagestore.timeline = 0
 io_method = sync
 recovery_prefetch = try
@@ -612,6 +614,7 @@ log_line_prefix = '%m [%p] '
             f.write(f"""
 pagestore.route_all = on
 pagestore.materializer = on
+pagestore.auto_wal_index = off
 pagestore.retention_owner_id = '1'
 pagestore.retention_owner_generation = '1'
 archive_mode = off
@@ -892,8 +895,10 @@ DO $$ DECLARE r record; BEGIN
                 bench.kill()
         if self.async_failure:
             raise self.async_failure
+        if bench.returncode != 0:
+            (self.root / f"pgbench-writer-r{self.round}.log").write_text(out or "")
         if bench.returncode != 0 and not tolerate.is_set():
-            raise Failure("workload_failed", f"pgbench rc={bench.returncode}: {out[-1500:]}")
+            raise Failure("workload_failed", f"pgbench rc={bench.returncode}: {out[:1500]}")
         if bench.returncode != 0 and (bench.returncode != 2 or unexpected_errors(out or "")
                                       or not FAULT_ERROR.search(out or "")):
             # pgbench exits 2 for errors during the run; anything else, or no crash error, is unexplained
@@ -1116,7 +1121,8 @@ recovery_target_action = 'promote'
             bench.wait()
             raise Failure("timeout", f"branch {tl} pgbench still running after 900 s")
         if bench.returncode != 0:
-            raise Failure("workload_failed", f"branch {tl} pgbench rc={bench.returncode}: {out[-1500:]}")
+            (self.root / f"pgbench-branch-{tl}-r{self.round}.log").write_text(out or "")
+            raise Failure("workload_failed", f"branch {tl} pgbench rc={bench.returncode}: {out[:1500]}")
         self.resolve_prepared(b)
         b.sql("CHECKPOINT;")
         before = self.checksums(b)
@@ -1154,6 +1160,17 @@ recovery_target_action = 'promote'
                         "fds": len(os.listdir(f"/proc/{pid}/fd"))}
                 except (OSError, AttributeError, TypeError):
                     pass
+            if self.daemon_expected_up:
+                for operation in ("backpressure", "gc", "pruning", "owners"):
+                    try:
+                        probe = subprocess.run(
+                            [str(self.inspect_bin), "--shm", self.shm, operation],
+                            capture_output=True, text=True, timeout=10)
+                        if probe.returncode == 0:
+                            rec[operation] = json.loads(probe.stdout)
+                    except (OSError, subprocess.TimeoutExpired, ValueError):
+                        # A coordinated restart may invalidate READY during a sample.
+                        pass
             try:
                 du = subprocess.run(["du", "-sk", "--", *[str(p) for p in sorted(self.store.iterdir())]],
                                     capture_output=True, text=True, timeout=120)

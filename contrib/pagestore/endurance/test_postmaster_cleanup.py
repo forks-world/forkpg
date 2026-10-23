@@ -361,5 +361,23 @@ class RealPostgresTests(unittest.TestCase):
                         backend.wait(timeout=10)
 
 
+class RetentionLogTests(unittest.TestCase):
+    def test_rejected_retention_progress_is_a_finding(self):
+        with tempfile.TemporaryDirectory() as root:
+            run = SimpleNamespace(root=Path(root), bin=Path(root), killed_pids=set())
+            pg = endurance.Pg(run, 'materializer', Path(root) / 'data')
+            for warning in (
+                'pagestore materializer retention advance was rejected by the daemon',
+                'pagestore materializer retention advance failed: request timed out',
+            ):
+                with self.subTest(warning=warning):
+                    pg.log_scanned = 0
+                    pg.log.write_text('2026-10-24 03:03:39 WARNING:  ' + warning + '\n')
+                    with self.assertRaises(endurance.Failure) as raised:
+                        pg.scan_log()
+                    self.assertEqual(raised.exception.kind, 'bad_log')
+                    self.assertIn(warning, raised.exception.detail)
+
+
 if __name__ == '__main__':
     unittest.main()
