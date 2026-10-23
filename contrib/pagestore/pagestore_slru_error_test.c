@@ -22,6 +22,7 @@ pagestore_test_slru_error(PG_FUNCTION_ARGS)
 {
 	Relation rel = table_open(PG_GETARG_OID(0), AccessShareLock);
 	Buffer buffer = ReadBuffer(rel, 0);
+	MemoryContext context = CurrentMemoryContext;
 	int interrupts;
 	int cancels;
 	bool ok;
@@ -37,7 +38,9 @@ pagestore_test_slru_error(PG_FUNCTION_ARGS)
 	ps_slru_drain();
 	ok = injected_slru_error && ps_slru_queue_count == 1 &&
 		!ps_slru_queue[0].shipped &&
-		InterruptHoldoffCount == interrupts && QueryCancelHoldoffCount == cancels;
+		InterruptHoldoffCount == interrupts && QueryCancelHoldoffCount == cancels &&
+		CurrentMemoryContext == context;
+	MemoryContextSwitchTo(context);
 	InterruptHoldoffCount = interrupts;
 	QueryCancelHoldoffCount = cancels;
 	ps_slru_queue[0].used = false;

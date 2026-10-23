@@ -23,6 +23,7 @@ pagestore_test_control_error(PG_FUNCTION_ARGS)
 {
 	Relation rel = table_open(PG_GETARG_OID(0), AccessShareLock);
 	Buffer buffer = ReadBuffer(rel, 0);
+	MemoryContext context = CurrentMemoryContext;
 	int interrupts;
 	int cancels;
 	bool ok;
@@ -37,9 +38,11 @@ pagestore_test_control_error(PG_FUNCTION_ARGS)
 	ps_control_queue[0].update_lsn = 1;
 	ps_control_drain();
 	ok = injected_control_error && ps_control_queue_count == 1 &&
-		InterruptHoldoffCount == interrupts && QueryCancelHoldoffCount == cancels;
+		InterruptHoldoffCount == interrupts && QueryCancelHoldoffCount == cancels &&
+		CurrentMemoryContext == context;
 	/* Report an ordinary test failure even against the unfixed drain; do
 	 * not let its corrupted count abort the test backend on unlock. */
+	MemoryContextSwitchTo(context);
 	InterruptHoldoffCount = interrupts;
 	QueryCancelHoldoffCount = cancels;
 	ps_control_queue_count = 0;

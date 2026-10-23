@@ -1721,6 +1721,11 @@ assert "$($P -c "SELECT pagestore_test_control_error('pg_class');")" "t" \
 assert "$($P -c "SELECT pagestore_test_slru_error('pg_class');")" "t" \
     "SLRU mirror failure preserves buffer-lock interrupt holdoffs and staged image"
 
+assert "$($P -c "SELECT pagestore_test_control_error('pg_class') AND
+                           pagestore_test_slru_error('pg_class') AND
+                           pagestore_test_control_error('pg_class');")" "t" \
+    "consecutive mirror failures restore the caller memory context"
+
 # --- 26. pg_control mirror: control writes publish LSN-versioned store images ---
 # Every UpdateControlFile() queues the just-written image (versioned by the LSN
 # of the update that caused it) and ships it at the next post-critical point,

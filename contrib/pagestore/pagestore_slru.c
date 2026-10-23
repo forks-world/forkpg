@@ -4100,7 +4100,7 @@ post_again:
 	PG_CATCH();
 	{
 		ErrorData  *edata;
-		MemoryContext ecxt = MemoryContextSwitchTo(drain_cxt);
+		MemoryContextSwitchTo(drain_cxt);
 
 		/*
 		 * Whatever failed, entries posted in this drain were not confirmed
@@ -4114,7 +4114,6 @@ post_again:
 			ps_slru_queue[i].shipped = false;
 
 		edata = CopyErrorData();
-		MemoryContextSwitchTo(ecxt);
 
 		/*
 		 * Interrupts are not mirror failures; propagate them -- except in
