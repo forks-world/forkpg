@@ -1214,6 +1214,36 @@ pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
 	return 1;
 }
 
+int
+pagestore_localsvc_wal_base_read(const PageStoreRelKey *key,
+								BlockNumber blocknum, uint64 lsn,
+								uint64 read_seq, void *out,
+								uint64 *version_out, uint64 *seq_out)
+{
+	PsChannel *ch = ls_chan_for_key_stamped(key);
+	uint8 status;
+
+	if ((((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_WAL_BASE) == 0)
+		return -2;
+	ch->opcode = PS_OP_WAL_BASE_READ;
+	ch->blocknum = blocknum;
+	ch->nblocks = 1;
+	ch->req_lsn = lsn;
+	ch->req_seq = read_seq;
+	ch->result = 0;
+	status = ls_exec_wait(ch, 0);
+	if (status != PS_STATUS_OK)
+		return status == PS_STATUS_ERROR && ch->result == PS_WAL_BASE_VIEW_UNREGISTERED ? -2 : -1;
+	if (ch->result == 0)
+		return 0;
+	memcpy(out, ch->data, BLCKSZ);
+	if (version_out != NULL)
+		*version_out = ch->req_lsn;
+	if (seq_out != NULL)
+		*seq_out = ch->req_seq;
+	return 1;
+}
+
 /* Read-only compatibility preflight for safe preparation and creation. */
 void
 pagestore_localsvc_require_branch_seq(void)

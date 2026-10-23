@@ -19778,11 +19778,33 @@ layer_map_lookup_locked(uint32_t timeline, const PsKey *key, uint32_t block,
 								 expected_lsn, out_lsn, out_seq, out, 1);
 }
 
+/* Caller holds map-rd and the request's admission/shard read fences. */
+static int
+wal_base_view_registered(uint32_t timeline, const ViewCap *cap)
+{
+	PsHistoryFence *fences = NULL;
+	uint32_t n = 0;
+	int found = 0;
+
+	if (timeline_meta_poisoned_load() || cap->legacy ||
+		walidx_view_fences(timeline, &fences, &n) != 0)
+		return 0;
+	for (uint32_t i = 0; i < n; i++)
+		if (fences[i].lsn == cap->lsn && fences[i].seq == cap->seq &&
+			fences[i].admission_seq == cap->strict_seq)
+		{
+			found = 1;
+			break;
+		}
+	free(fences);
+	return found;
+}
+
 static int read_resolve_internal(uint32_t timeline, const PsKey *key,
 								 uint32_t block, uint64_t read_lsn,
 								 uint64_t read_seq, unsigned char *out,
 								 uint64_t *out_ver, uint64_t *out_seq,
-								 int reset_fsm);
+								 int reset_fsm, const ViewCap *index_cap);
 
 /*
  * Resolve a read into out (page_size bytes): walk the timeline ancestry as
@@ -19811,7 +19833,7 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 					 uint64_t *out_ver, uint64_t *out_seq)
 {
 	return read_resolve_internal(timeline, key, block, read_lsn, read_seq,
-								 out, out_ver, out_seq, 0);
+								 out, out_ver, out_seq, 0, NULL);
 }
 
 int
@@ -19821,13 +19843,47 @@ read_resolve_fsm(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (key->klass != PS_KLASS_RELATION || key->forkNum != 1)
 		return -1;
 	return read_resolve_internal(timeline, key, block, UINT64_MAX, 0,
-								 out, out_ver, NULL, 1);
+								 out, out_ver, NULL, 1, NULL);
+}
+
+int
+read_resolve_wal_base(uint32_t timeline, const PsKey *key, uint32_t block,
+					  uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
+					  uint64_t *out_ver, uint64_t *out_seq)
+{
+	ViewCap cap;
+	int allowed;
+
+	if (!core_process_valid() || key->klass != PS_KLASS_RELATION ||
+		timeline >= MAX_TIMELINES || read_lsn == 0 || read_lsn == UINT64_MAX)
+		return -2;
+	ps_lock_map_rd();
+	walidx_publish_rdlock();
+	if (read_seq == 0)
+	{
+		uint64_t seq = cap_effective_seq(CAP_WALIDX, walidx_horizon_seq[timeline]);
+		cap = (ViewCap) {read_lsn, seq, PS_SEQ_UNBOUNDED, seq == PS_SEQ_UNBOUNDED};
+		allowed = read_lsn == walidx_progress_read(timeline) &&
+			wal_base_view_registered(timeline, &cap);
+	}
+	else
+	{
+		cap = viewcap_from_request(read_lsn, read_seq);
+		allowed = wal_base_view_registered(timeline, &cap);
+	}
+	walidx_publish_rdunlock();
+	ps_unlock_map();
+	if (!allowed)
+		return -2;
+	return read_resolve_internal(timeline, key, block, read_lsn, read_seq,
+								 out, out_ver, out_seq, 0, &cap);
 }
 
 static int
 read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 					  uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
-					  uint64_t *out_ver, uint64_t *out_seq, int reset_fsm)
+					  uint64_t *out_ver, uint64_t *out_seq, int reset_fsm,
+					  const ViewCap *index_cap)
 {
 	Shard	   *s;				/* same shard across the ancestry walk */
 	TlWalk		walk[MAX_TIMELINES];
@@ -19837,15 +19893,17 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (!core_process_valid())
 		return -1;
 	s = shard_for(key);
-	w = tl_walk_first_cap(timeline, key->klass == PS_KLASS_CONTROL ?
-	artifact_control_cap(timeline, read_lsn, read_seq) : viewcap_from_request(read_lsn, read_seq));
+	w = tl_walk_first_cap(timeline, index_cap != NULL ? *index_cap :
+		(key->klass == PS_KLASS_CONTROL ?
+		 artifact_control_cap(timeline, read_lsn, read_seq) :
+		 viewcap_from_request(read_lsn, read_seq)));
 	/*
 	 * A durable compaction frontier makes older page history unavailable even
 	 * while a crash-recovery pass still has its source layers to clean up.
 	 * Current reads remain valid: their UINT64_MAX horizon is always newer
 	 * than the frontier.
 	 */
-	if (read_lsn != UINT64_MAX && key->klass == PS_KLASS_RELATION)
+	if (index_cap == NULL && read_lsn != UINT64_MAX && key->klass == PS_KLASS_RELATION)
 	{
 		int		frontier_allows;
 
@@ -19861,18 +19919,25 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 	/* Copy ancestry while CREATE_BRANCH is excluded, then release map_lock
 	 * before a remote layer read can block. */
 	ps_lock_map_rd();
+	if (index_cap != NULL)
+		walidx_publish_rdlock();
 	do
 	{
 		if ((key->klass == PS_KLASS_RELATION || (key->klass == PS_KLASS_CONTROL && read_seq != 0)) &&
-		!(key->klass == PS_KLASS_CONTROL ?
-		  control_view_registered(w.tl, &w.cap) : page_view_registered(w.tl, &w.cap)))
+		!(index_cap != NULL ? wal_base_view_registered(w.tl, &w.cap) :
+		  (key->klass == PS_KLASS_CONTROL ?
+		   control_view_registered(w.tl, &w.cap) : page_view_registered(w.tl, &w.cap))))
 		{
+			if (index_cap != NULL)
+				walidx_publish_rdunlock();
 			ps_unlock_map();
 			return -2;
 		}
 		walk[levels++] = w;
 	}
 	while (levels < MAX_TIMELINES && tl_walk_next(&w));
+	if (index_cap != NULL)
+		walidx_publish_rdunlock();
 	ps_unlock_map();
 
 	for (uint32_t level = 0; level < levels; level++)
@@ -19893,7 +19958,7 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 			/* A child can inherit this page from a parent.  Check every
 			 * traversed timeline so a parent frontier cannot be bypassed merely
 			 * because the child has not compacted locally. */
-			if (read_lsn != UINT64_MAX && key->klass == PS_KLASS_RELATION)
+			if (index_cap == NULL && read_lsn != UINT64_MAX && key->klass == PS_KLASS_RELATION)
 			{
 				int	frontier_allows;
 
@@ -19934,10 +19999,13 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 
 		if (pv)
 		{
-			uint64_t	l,
-						a;
-			int			served;
-			int			poisoned;
+			uint64_t l, a;
+			int served;
+			int poisoned;
+
+			if (index_cap != NULL &&
+				(pv->lsn == 0 || !walidx_base_version_durable(pv)))
+				return 0;
 
 			if (fork_page_invalidated(fe, block, pv, &cur, w.inherited_below,
 									  w.has_inherited_below))
@@ -23112,6 +23180,8 @@ ps_request_payload_fits(const PsChannel *ch)
 		case PS_OP_READV_FSM:
 			return page_size > 0 && page_size <= PS_IO_UNIT &&
 				ch->nblocks > 0 && ch->nblocks <= PS_IO_UNIT / page_size;
+		case PS_OP_WAL_BASE_READ:
+			return page_size > 0 && page_size <= PS_IO_UNIT && ch->nblocks == 1;
 		case PS_OP_WAL_APPEND:
 		case PS_OP_WAL_READ:
 			return ch->datalen <= PS_IO_UNIT;
