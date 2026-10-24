@@ -135,7 +135,7 @@ jobs:
         run: |
           python3 harness/pagestore_fixture_identities.py \
             --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
-                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/posix-timeline-delete-holes-horizon-v2 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 fixtures/pgdata-artifacts fixtures/pgdata-artifacts-pg18 \
+                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/posix-timeline-delete-holes-horizon-v2 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 fixtures/posix-timeline-delete-holes-index-bases fixtures/pgdata-artifacts fixtures/pgdata-artifacts-pg18 \
             --format-tool ./pagestore_format_versions
 
       - name: Validate release manifest and promotion evidence
@@ -248,7 +248,7 @@ jobs:
         run: |
           python3 harness/pagestore_fixture.py \
             --check fixtures/posix-mvp-baseline fixtures/posix-forkmeta-crc fixtures/posix-wal-payload-identity fixtures/posix-backend-objects \
-                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/posix-timeline-delete-holes-horizon-v2 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 \
+                    fixtures/posix-artifact-lifecycle fixtures/posix-timeline-delete-holes fixtures/posix-timeline-delete-holes-seqcap fixtures/posix-timeline-delete-holes-forkmeta-v4 fixtures/posix-timeline-delete-holes-horizon-v2 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 fixtures/posix-timeline-delete-holes-index-bases \
             --daemon-binary ./pagestore_daemon \
             --client-binary ./pagestore_gc_crash_client \
             --inspect-binary ./pagestore_inspect \
@@ -475,7 +475,7 @@ jobs:
                     contrib/pagestore/fixtures/posix-artifact-lifecycle \
                     contrib/pagestore/fixtures/posix-timeline-delete-holes \
                     contrib/pagestore/fixtures/posix-timeline-delete-holes-seqcap \
-                    contrib/pagestore/fixtures/posix-timeline-delete-holes-forkmeta-v4 contrib/pagestore/fixtures/posix-timeline-delete-holes-horizon-v2 contrib/pagestore/fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 contrib/pagestore/fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 \
+                    contrib/pagestore/fixtures/posix-timeline-delete-holes-forkmeta-v4 contrib/pagestore/fixtures/posix-timeline-delete-holes-horizon-v2 contrib/pagestore/fixtures/posix-timeline-delete-holes-checkpoint-fence-v3 contrib/pagestore/fixtures/posix-timeline-delete-holes-checkpoint-fence-v3-pg18 contrib/pagestore/fixtures/posix-timeline-delete-holes-index-bases \
             --daemon-binary build/contrib/pagestore/pagestore_daemon \
             --client-binary build/contrib/pagestore/pagestore_gc_crash_client \
             --inspect-binary build/contrib/pagestore/pagestore_inspect \

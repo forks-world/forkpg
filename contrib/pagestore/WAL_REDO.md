@@ -195,10 +195,9 @@ Ancestry must also have a registered index view. The backend helper returns
 `-2` for an unsupported interface or an unregistered view, `-1` for a read
 failure, `0` for no durable base, and `1` for a returned base.
 
-This interface is groundwork for replacing old full-page-image dependencies.
-SQL redo uses the combined base/lifecycle interface below when available.
-WAL-index compaction and raw-WAL deletion policies are unchanged. In particular, its availability alone does not prove
-bounded disk use for the 72-hour endurance workload.
+SQL redo uses the combined base/lifecycle interface below. Finite index views
+retain their own durable bases, allowing the retirement policy below to replace
+old full-page-image dependencies.
 
 ### A base and its lifecycle from one view
 
@@ -222,6 +221,31 @@ Both SQL single-page redo entrypoints cache this combined response for one
 invocation. Base selection, death comparisons, and size checks therefore use
 one cap and do not borrow ordinary PAGE authority for an index-only base.
 Unsupported daemons and unregistered index horizons use the existing ordinary
-history path; a registered view's I/O error fails the operation. This is still
-preparation for changing FPI/WAL retirement: the deletion policy is unchanged,
-and no 72-hour or bounded-disk qualification is implied.
+history path; a registered view's I/O error fails the operation.
+
+### Retiring full-page-image dependencies
+
+Finite index views, including durable indexing progress, retain durable base
+versions independently of ordinary PAGE owners. Index compaction can replace
+an FPI-led chain with such a base; raw-WAL reclamation then excludes the retired
+FPI dependency. The base and lifecycle remain readable through WAL_BASE_STATE,
+even after the PAGE frontier passes the index view. Releasing the index owner
+removes that authority. New owners cannot reserve already reclaimed PAGE history.
+
+Legacy unbounded index views still require their FPI chains, including when they
+share an LSN with finite views. Forks containing unversioned pages also keep the
+conservative policy: the finite lifecycle interface cannot reconstruct them.
+Poisoned metadata or missing replacement evidence never authorize retirement.
+
+Protocol 51 requires clients that understand this base/lifecycle contract. Before
+reclamation can use it, opening a store durably appends a required kind-4
+INDEX_BASES activation in the existing 64-byte timeline V3 envelope. The marker
+consumes no admission sequence. It is appended once; torn tails are repaired
+before activation, while malformed, corrupt or duplicate complete markers fail
+closed. Older daemons reject the unknown event kind, so this upgrade prevents
+opening the store with an older binary. Upgrade readers and daemon together.
+The `posix-timeline-delete-holes-index-bases` fixture records this semantic upgrade;
+older fixture archives are unchanged and remain readable through the upgrade.
+
+This removes one source of indefinitely retained raw WAL. It does not establish
+a storage bound or qualify the 72-hour endurance workload.

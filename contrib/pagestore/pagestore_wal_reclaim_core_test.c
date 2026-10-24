@@ -3183,6 +3183,42 @@ test_finite_index_base_reclaims_raw_wal(void)
 }
 
 static void
+test_index_base_reclaim_conservative_fallback(void)
+{
+	for (int legacy = 0; legacy < 2; legacy++)
+	{
+		char store[] = "/tmp/pagestore-index-base-fallback-XXXXXX";
+		PsWalBaseState state;
+		unsigned char page[8192];
+
+		configure_core();
+		check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+			  prepare_store(store, WAL_TOTAL, 0, WAL_SEGMENT + 100, 0) &&
+			  write_relation_page(0, 0, WAL_SEGMENT + 200) &&
+			  wal_index_progress(0, 0, WAL_TOTAL) &&
+			  reserve_pin(0, PS_RETENTION_OWNER_READER, 921, 1,
+				PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL_INDEX,
+				WAL_TOTAL) &&
+			  (legacy ? set_legacy_index_pin(0, 922, WAL_TOTAL) :
+				write_relation_page(0, 1, 0)),
+			  "finite replacement evidence coexists with a legacy view or WAL-less fork");
+		for (int i = 0; i < 128; i++) (void) ps_core_maintenance();
+		check(segment_count(store, 0) > 0 && wal_index_count(0, 0, WAL_TOTAL) == 1,
+			  "legacy and unversioned fallback keeps its FPI and physical raw WAL");
+		if (!legacy)
+			check(read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == -1,
+				  "unversioned fork cannot consume the finite lifecycle contract");
+		close_store();
+		check(ps_core_open(store) == 0 && segment_count(store, 0) > 0 &&
+			  wal_index_count(0, 0, WAL_TOTAL) == 1,
+			  "conservative FPI fallback survives recovery");
+		close_store();
+		(void) unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+		remove_tree(store);
+	}
+}
+
+static void
 test_index_state_caps_ancestry(void)
 {
 	char store[] = "/tmp/pagestore-index-ancestry-XXXXXX";
@@ -3412,6 +3448,7 @@ main(int argc, char **argv)
 		return failed != 0;
 	}
 	test_finite_index_base_reclaims_raw_wal();
+	test_index_base_reclaim_conservative_fallback();
 	test_index_state_caps_ancestry();
 	test_index_state_refuses_wal_less_zero_fallback();
 	test_index_state_preserves_lifecycle();
