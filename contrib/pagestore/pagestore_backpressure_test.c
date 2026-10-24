@@ -2589,15 +2589,6 @@ test_wal_automatic_observation_rate(void)
 	remove_tree(store);
 }
 
-typedef struct AdmissionFairnessState
-{
-	volatile int reader1_ready;
-	volatile int release_reader1;
-	volatile int writer_queued;
-	volatile int writer_acquired;
-	volatile int release_writer;
-	volatile int reader2_acquired;
-} AdmissionFairnessState;
 static void
 test_walidx_automatic_observation_rate(void)
 {
