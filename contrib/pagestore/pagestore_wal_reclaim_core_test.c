@@ -1017,9 +1017,9 @@ test_late_durable_base_requests_compaction(void)
 }
 
 /*
- * Residual 1b: the same shape for an unprotected horizon (a WAL_INDEX-only
- * pin, no page history), where the event that can shorten the chain is a
- * newer full-page-image item instead of a durable base.
+ * Residual 1b: the same shape for a WAL_INDEX-only pin with no durable page
+ * base yet. A newer full-page-image item can shorten the chain even before
+ * materialization supplies a durable replacement.
  */
 static void
 test_late_fpi_requests_compaction(void)
@@ -1036,8 +1036,8 @@ test_late_fpi_requests_compaction(void)
 		  wal_index_add_record(0, limited, 0, /* fpi */ 0) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_READER, 301, 1,
 					  PS_RETENTION_RESOURCE_WAL_INDEX, WAL_TOTAL),
-		  "construct a non-FPI raw item whose only horizon is an unprotected"
-		  " WAL_INDEX-only pin");
+		  "construct a non-FPI raw item whose only horizon is a finite"
+		  " WAL_INDEX-only pin without a durable base");
 	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
 		  "segment 0 goes; segment 1 is blocked, and the request is served fruitless");
 	check(ps_test_walidx_reclaim_due(0) == 0,
@@ -1437,14 +1437,9 @@ test_late_fpi_requests_compaction_protected_horizon(void)
 
 	configure_core();
 	flush_pages = 4;
-	/* Progress is set past WAL_TOTAL (a durable WAL-index frontier beyond
-	 * the sealed prefix is a supported case) precisely so it does not equal
-	 * the materializer pin's LSN: walidx_protected_horizons_build's
-	 * standing-horizon exception excludes a materializer grant whenever its
-	 * LSN coincides with the shipper's progress (or the durable frontier),
-	 * which would otherwise make this horizon unprotected instead -- see
-	 * test_late_fpi_requests_compaction for that (correct) unprotected
-	 * case. */
+	/* Keep the materializer and durable-progress horizons distinct, also
+	 * exercising progress beyond the sealed raw-WAL prefix. Both are finite
+	 * storage fences; without a durable base they still need an FPI chain. */
 	check(prepare_store(store, WAL_TOTAL, 0, 0, 0) &&
 		  wal_index_add_record(0, limited, 0, /* fpi */ 0) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
