@@ -291,6 +291,24 @@ set_legacy_index_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
 	return ch.status == PS_STATUS_OK;
 }
 
+/* Model an owner recovered from a pre-upgrade registry. New unbounded
+ * index owners must use RESERVE instead; only its exact retry is admitted. */
+static int
+seed_legacy_index_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
+{
+	PsRetentionPin pin = {0};
+
+	pin.timeline = timeline;
+	pin.owner_kind = PS_RETENTION_OWNER_READER;
+	pin.resources = PS_RETENTION_RESOURCE_WAL_INDEX;
+	pin.generation = 1;
+	pin.owner_id = owner_id;
+	pin.lsn = lsn;
+	pin.admission_seq = 1;
+	return ps_retention_set(&pin) == PS_RETENTION_OK &&
+		set_legacy_index_pin(timeline, owner_id, lsn);
+}
+
 static int
 write_keyed_page(uint32_t timeline, const PsKey *keyp, uint32_t block,
 				 uint64_t lsn)
@@ -875,7 +893,7 @@ test_unreplaceable_dependency_requests_once(void)
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
 		  write_relation_page(0, 0, limited + 100) &&
-		  set_legacy_index_pin(0, 916, WAL_TOTAL - 4096),
+		  seed_legacy_index_pin(0, 916, WAL_TOTAL - 4096),
 		  "a legacy index view retains its FPI while finite progress has a durable base");
 	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
 		  "the unreplaceable raw dependency still blocks the segment after 64 passes");
@@ -1498,7 +1516,7 @@ test_fpi_between_protected_and_progress_retires(void)
 					  PS_RETENTION_RESOURCE_PAGE_HISTORY |
 					  PS_RETENTION_RESOURCE_WAL_INDEX, F) &&
 		  write_relation_page(0, 0, limited + 100) &&
-		  set_legacy_index_pin(0, 916, WAL_TOTAL),
+		  seed_legacy_index_pin(0, 916, WAL_TOTAL),
 		  "a known WAL-index item at `limited`, a page-history+walidx pin at"
 		  " F (protected, below progress), a durable base below F");
 	check(!maintenance_until_count(store, 0, 1) && segment_count(store, 0) == 2,
@@ -1557,7 +1575,7 @@ test_watch_does_not_refire_on_satisfied_base_evidence(void)
 					  PS_RETENTION_RESOURCE_PAGE_HISTORY |
 					  PS_RETENTION_RESOURCE_WAL_INDEX, F) &&
 		  write_relation_page(0, 0, limited + 100) &&
-		  set_legacy_index_pin(0, 916, WAL_TOTAL),
+		  seed_legacy_index_pin(0, 916, WAL_TOTAL),
 		  "same construction as the previous test: base durable in [lo,F],"
 		  " item still stuck on the legacy view's FPI requirement");
 	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
@@ -1638,7 +1656,7 @@ test_walidx_only_pin_drop_requests_compaction(void)
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
 		  write_relation_page(0, 0, limited + 100) &&
-		  set_legacy_index_pin(0, 301, limited + 200) &&
+		  seed_legacy_index_pin(0, 301, limited + 200) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
 					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL),
 		  "construct a stored page base whose chain a WAL_INDEX-only reader still fences");
@@ -3128,6 +3146,15 @@ test_finite_index_base_reclaims_raw_wal(void)
 			PS_RETENTION_RESOURCE_WAL_INDEX, view_lsn) &&
 		  ps_retention_lookup(0, PS_RETENTION_OWNER_READER, 917, &pin) == 1 &&
 		  wal_index_progress(0, 0, WAL_TOTAL) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 923, 1,
+			PS_RETENTION_RESOURCE_PAGE_HISTORY, WAL_TOTAL),
+		  "retain PAGE authority at finite progress before its FPI is retired");
+	check(maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 0 &&
+		  wal_index_count(0, 0, WAL_TOTAL) == 0,
+		  "finite progress retires its FPI while PAGE history is still held there");
+	check(!set_legacy_index_pin(0, 924, WAL_TOTAL),
+		  "new legacy index owner cannot borrow PAGE admissibility after FPI retirement");
+	check(drop_wal_pin(0, 923, 1) &&
 		  write_relation_page(0, 0, WAL_TOTAL + 100) &&
 		  write_relation_page(0, 0, WAL_TOTAL + 200) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_READER, 918, 1,
@@ -3194,7 +3221,7 @@ test_index_base_reclaim_conservative_fallback(void)
 			  reserve_pin(0, PS_RETENTION_OWNER_READER, 921, 1,
 				PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL_INDEX,
 				WAL_TOTAL) &&
-			  (legacy ? set_legacy_index_pin(0, 922, WAL_TOTAL) :
+			  (legacy ? seed_legacy_index_pin(0, 922, WAL_TOTAL) :
 				write_relation_page(0, 1, 0)),
 			  "finite replacement evidence coexists with a legacy view or WAL-less fork");
 		for (int i = 0; i < 128; i++) (void) ps_core_maintenance();

@@ -230,7 +230,10 @@ versions independently of ordinary PAGE owners. Index compaction can replace
 an FPI-led chain with such a base; raw-WAL reclamation then excludes the retired
 FPI dependency. The base and lifecycle remain readable through WAL_BASE_STATE,
 even after the PAGE frontier passes the index view. Releasing the index owner
-removes that authority. New owners cannot reserve already reclaimed PAGE history.
+removes that authority. New owners cannot reserve already reclaimed PAGE history. New unbounded
+index caps are refused even while their LSN is PAGE-admissible: FPI retirement
+may already have removed their reconstruction chain. Existing legacy owners
+can retry their exact registered cap; new owners must use finite RESERVE.
 
 Legacy unbounded index views still require their FPI chains, including when they
 share an LSN with finite views. Forks containing unversioned pages also keep the

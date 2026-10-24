@@ -23736,7 +23736,10 @@ ps_handle_meta(PsChannel *ch)
 						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0) &&
 						!(old_found == 1 &&
 						  memcmp(&old_pin, &pin, sizeof(pin)) == 0);
-					/* Page history permits an active owner to advance from its old
+					/* A new legacy index cap cannot use retained finite bases, even
+					 * while ordinary PAGE history still admits its LSN. Only exact
+					 * retries of already retained legacy caps are accepted.
+					 * Page history permits an active owner to advance from its old
 					 * protected image.  WAL-index history is sparse after compaction,
 					 * so its new point must independently name a retained chain. */
 					ret = (((((pin.resources &
@@ -23755,7 +23758,7 @@ ps_handle_meta(PsChannel *ch)
 							((pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
 							 (!wal_index_allowed ||
 							  (cap_effective_seq(CAP_PIN, pin.admission_seq) == PS_SEQ_UNBOUNDED &&
-							   !page_history_allowed && !(old_found == 1 &&
+							   !(old_found == 1 &&
 							   memcmp(&old_pin, &pin, sizeof(pin)) == 0)))) || wal_index_pending) ||
 							!timeline_live) ?
 						PS_RETENTION_ERROR :
