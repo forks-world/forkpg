@@ -92,6 +92,7 @@ jobs:
             --seed "$SEED" --duration "$DURATION" --scale "$SCALE" \
             --clients 4 --burst-min 5 --burst-max 20 \
             --branch-probability 0.5 --max-branches 1 \
+            --materializer-max-lag-mb 32 --wal-index-max-lag-mb 8 \
             --sample-interval 15 --max-store-gb 40 --max-run-gb 50 --min-free-gb 5
 
       - name: Collect run evidence
