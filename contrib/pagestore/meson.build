@@ -793,6 +793,12 @@ test('pagestore_endurance_cleanup',
   suite: ['pagestore'],
   timeout: 60,
 )
+test('pagestore_endurance_space_budget',
+  pagestore_harness_python,
+  args: [files('endurance/test_space_budget.py')],
+  suite: ['pagestore'],
+  timeout: 60,
+)
 test('pagestore_store_owner_recovery',
   pagestore_harness_python,
   args: [files('harness/tests/test_store_owner_recovery.py'),

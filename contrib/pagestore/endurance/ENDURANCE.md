@@ -36,6 +36,43 @@ artifact.  It keeps the driver exercised on the current tree; multi-hour
 runs stay on a developer box, and neither is release evidence
 (`RELEASE_VALIDATION.md`).
 
+## Space budget
+
+Set all three limits explicitly for a long run, for example:
+
+```sh
+python3 contrib/pagestore/endurance/pagestore_endurance.py --build build \
+    --root /path/on/a/real/filesystem --duration 259200 \
+    --max-run-gb 12 --max-store-gb 8 --min-free-gb 5 --sample-interval 5
+```
+
+`--max-run-gb` counts allocated space for the entire current run directory:
+writer and materializer data/WAL, branch computes, prepared copies, redo scratch
+space, logs and the page store. `--max-store-gb` retains the independent page
+store limit. `--min-free-gb` applies before every run (including a single run)
+and at every sample; it sees disk use by other runs and other applications.
+Defaults are 100 GiB per run, 100 GiB per store and 50 GiB minimum free.
+Choose these values for the machine and preserve headroom for cleanup/diagnostics.
+A budget is a stopping threshold, not preallocated space or a filesystem quota.
+
+Sampling starts before provisioning. Metrics include `space.run_kb`,
+`space.store_total_kb` and `space.filesystem_free_bytes`, as well as the existing
+`store_kb` categories. A breach records `run_size`, `store_size` or `disk_free`;
+three consecutive failed measurements fail as `space_unmeasurable`. The first
+failure is preserved. Normal failure cleanup keeps the evidence and stops the
+owned computes. The main driver observes sampled failures at health checks and
+between provisioning commands; an in-flight command can delay shutdown until
+it returns or times out. Allocation can exceed the sampled threshold, so leave
+ample headroom and use a filesystem quota if a strict physical bound is needed.
+The scan counts files under the run root without following external symlinks;
+externally located storage is not covered by the directory limit. Filesystem
+free-space monitoring covers the filesystem containing the run root.
+
+These checks prevent an unnoticed space-budget breach; they do not establish
+bounded reclamation or qualify a 72-hour run. `--forever --duration 3600`
+creates a fresh topology each hour; `--duration 259200` keeps one topology for
+72 hours, plus provisioning and the final verification/cleanup.
+
 ## Topology
 
 The provisioning mirrors `mvp_golden_test.sh` step for step, so a failure here
