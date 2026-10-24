@@ -245,6 +245,36 @@ def mutation(name: str, pattern: str, apply: Callable[[Path], None], expect: str
     return {"name": name, "pattern": pattern, "apply": apply, "expect": expect}
 
 
+def index_bases_record(data: bytes) -> int | None:
+    """Find the required index-base activation in the existing V3 envelope."""
+    offset = 0
+    while offset + 12 <= len(data):
+        length, kind = struct.unpack_from("=II", data, offset + 4)
+        if length < 12 or offset + length > len(data):
+            break
+        if length == 64 and kind == 4:
+            return offset
+        offset += length
+    return None
+
+
+def mutate_index_bases(path: Path, field: str) -> None:
+    data = bytearray(path.read_bytes())
+    offset = index_bases_record(data)
+    if offset is None:
+        raise FixtureError("missing required index-base activation")
+    if field == "duplicate":
+        data.extend(data[offset:offset + 64])
+    elif field == "crc":
+        data[offset + 56] ^= 1
+    else:
+        struct.pack_into("=I", data, offset + (8 if field == "kind" else 12),
+                         99 if field == "kind" else 1)
+        struct.pack_into("=I", data, offset + 56, 0)
+        struct.pack_into("=I", data, offset + 56, fnv1a(data[offset:offset + 64]))
+    path.write_bytes(data)
+
+
 SEG_HOLE_MAGICS = {0x53454830, 0x53454831, 0x53454832}
 
 
@@ -348,6 +378,10 @@ MUTATIONS = [
              lambda p: flip_byte(p, 8), OPEN_REJECTED),
     mutation("walidx_watermark.truncated", "walidx_0_0_e*.size",
              lambda p: truncate_to(p, 16), OPEN_REJECTED),
+    *({**mutation(f"timelines.index_bases.{field}", "timelines",
+                  lambda p, field=field: mutate_index_bases(p, field), OPEN_REJECTED),
+       "requires_index_bases": True}
+      for field in ("kind", "id", "crc", "duplicate")),
     mutation("timelines.unknown_magic", "timelines",
              lambda p: bump_le32(p, 0), OPEN_REJECTED),
     mutation("timelines.crc", "timelines",
@@ -817,6 +851,7 @@ def capture(args: argparse.Namespace) -> int:
         check_archived_identities(store, identities)
         payload_identity = archive_payload_identity(store)
         canonicalize_manifest(store)
+        index_bases = index_bases_record((store / "timelines").read_bytes()) is not None
         names = deterministic_tar(store, fixture / STORE_TAR)
     (fixture / FORMAT_JSON).write_text(json.dumps(identities, indent=2) + "\n", encoding="utf-8")
     (fixture / FIXTURE_JSON).write_text(json.dumps({
@@ -825,6 +860,7 @@ def capture(args: argparse.Namespace) -> int:
         "role": "current",
         "workload": "fixture",
         "checkpoint_fence": args.checkpoint_retention_tool is not None,
+        "index_bases": index_bases,
         **({"capture_source": provenance} if provenance is not None else {}),
         "daemon_args": DAEMON_ARGS,
         "daemon_env": DAEMON_ENV,
@@ -1039,6 +1075,8 @@ def check_one(args: argparse.Namespace, fixture: Path) -> int | None:
             return 0
         (root / "mutations").mkdir()
         for case in MUTATIONS:
+            if case.get("requires_index_bases") and not metadata.get("index_bases"):
+                continue
             if args.only and case["name"] not in args.only:
                 continue
             try:

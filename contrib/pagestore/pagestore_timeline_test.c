@@ -4398,7 +4398,7 @@ test_timeline_seqcap_format(void)
 	char store[] = "/tmp/pagestore-timeline-seqcap-XXXXXX";
 	char path[512];
 	TestTimelineEventV2 old;
-	TestTimelineEvent current, mutation;
+	TestTimelineEvent current, mutation, activation;
 	PsTimelineState state;
 	uint64_t incarnation;
 	struct stat st;
@@ -4422,10 +4422,19 @@ test_timeline_seqcap_format(void)
 	check(create_branch(2, 1, 110), "append cap-format child to legacy log");
 	close_store();
 	fd = open(path, O_RDONLY);
-	check(fd >= 0 && pread(fd, &current, sizeof(current), sizeof(old) + 3 * sizeof(current)) ==
+	check(fd >= 0 && pread(fd, &current, sizeof(current), sizeof(old) + 4 * sizeof(current)) ==
 		  (ssize_t) sizeof(current), "read 64-byte cap-format create");
 	if (fd >= 0)
 		(void) close(fd);
+	fd = open(path, O_RDONLY);
+	check(fd >= 0 && pread(fd, &activation, sizeof(activation),
+		  sizeof(old) + 3 * sizeof(activation)) == (ssize_t) sizeof(activation),
+		  "read required index-base activation after existing cap activations");
+	if (fd >= 0)
+		(void) close(fd);
+	check(activation.kind == 4 && activation.id == 0 &&
+		  activation.parent == -1 && activation.branch_seq == UINT64_MAX,
+		  "upgrade persists required index-base semantics before new lifecycle events");
 	check(current.rec_len == 64 && current.branch_seq == UINT64_MAX &&
 		  current.id == 2 && current.parent_incarnation == 1,
 		  "new creates persist an unbounded edge cap");
@@ -4473,8 +4482,21 @@ test_timeline_seqcap_format(void)
 			  append_bytes(path, &current, len) == 0 && ps_core_open(store) == 0,
 			  "every incomplete cap-format tail preserves the legacy prefix");
 		close_store();
-		check(stat(path, &st) == 0 && st.st_size == (off_t) (sizeof(old) + 3 * sizeof(current)),
+		check(stat(path, &st) == 0 && st.st_size == (off_t) (sizeof(old) + 4 * sizeof(current)),
 			  "incomplete cap-format tail is truncated at its record boundary");
+	}
+	for (int len = 1; len < (int) sizeof(activation); len++)
+	{
+		check(write_bytes(path, &old, sizeof(old)) == 0 &&
+			  append_bytes(path, &activation, len) == 0 && ps_core_open(store) == 0,
+			  "torn index-base activation is repaired before opening the store");
+		close_store();
+		check(ps_core_open(store) == 0,
+			  "repaired activation replays without a duplicate on next restart");
+		close_store();
+		check(stat(path, &st) == 0 && st.st_size ==
+			  (off_t) (sizeof(old) + 4 * sizeof(current)),
+			  "repair durably appends exactly one activation per feature");
 	}
 	/* Old complete records must be checked before conversion to V3. */
 	old.crc ^= 1;

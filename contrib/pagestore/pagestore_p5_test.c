@@ -114,8 +114,8 @@ test_legacy_upgrade(void)
 	check(ps_admission_barrier_register(0, 300) > legacy_seq,
 		  "activation observes recovered high-word sequences before sampling");
 	snprintf(path, sizeof(path), "%s/timelines", store);
-	check(stat(path, &before) == 0 && before.st_size == 3 * 64,
-		  "startup persists exactly three independent activation records");
+	check(stat(path, &before) == 0 && before.st_size == 4 * 64,
+		  "startup persists three cap activations and one index-base activation");
 	ps_core_close();
 	check(ps_core_open(store) == 0 && stat(path, &after) == 0 &&
 		  before.st_size == after.st_size, "restart preserves epochs without appending new activation");
