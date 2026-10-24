@@ -687,6 +687,31 @@ CREATE INDEX ev_k ON ev(k);
         for name, (_, body) in WORKLOAD.items():
             (wl / f"{name}.sql").write_text(body)
 
+    def configure_archive_lag_limits(self) -> None:
+        materializer = self.args.materializer_max_lag_mb
+        index = self.args.wal_index_max_lag_mb
+        if materializer == 0 and index == 0:
+            return
+        # A limiter enabled before a durable marker exists can strand bootstrap.
+        # Publish a replayed writer checkpoint before restarting with the limits.
+        self.writer.sql("CHECKPOINT;")
+        self.sync_materializer()
+        self.mat.sql("CHECKPOINT;")
+        self.wait_for("durable materializer marker before enabling archive limits",
+                      lambda: self.mat.sql(
+                          "SELECT pagestore_ext.pagestore_materialized_wal_lsn() > '0/0'::pg_lsn;",
+                          timeout=self.probe_timeout()) == "t", self.args.sync_timeout)
+        self.writer.stop("fast")
+        with (self.writer.datadir / "postgresql.conf").open("a") as config:
+            config.write(f"\npagestore.materializer_max_lag_mb = {materializer}\n"
+                         f"pagestore.wal_index_max_lag_mb = {index}\n")
+        self.writer.start()
+        actual = self.writer.sql("SELECT current_setting('pagestore.materializer_max_lag_mb'), "
+                                 "current_setting('pagestore.wal_index_max_lag_mb');")
+        if actual != f"{materializer}|{index}":
+            raise Failure("archive_lag_config", f"requested {materializer}|{index}, observed {actual}")
+        self.event("archive_lag_limits", materializer_mb=materializer, wal_index_mb=index)
+
     # ---- WAL shipping and materialization waits --------------------------
 
     def probe_timeout(self) -> float:
@@ -1220,6 +1245,16 @@ recovery_target_action = 'promote'
             if self.async_failure:
                 out.write(json.dumps(rec) + "\n")
                 return
+            # The whole-run budget also covers local WAL. Expose it separately
+            # to show when archive limiting moves backlog out of the page store.
+            rec["compute_wal_kb"] = {}
+            for pg in self.computes():
+                wal = pg.datadir / "pg_wal"
+                if wal.exists():
+                    try:
+                        rec["compute_wal_kb"][pg.name] = directory_kb(wal)
+                    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                        rec.setdefault("compute_wal_errors", {})[pg.name] = str(error)
             pids = {"daemon": self.daemon.pid if self.daemon else None}
             pids.update({pg.name: pg.pid() for pg in self.computes()})
             for name, pid in pids.items():
@@ -1321,6 +1356,7 @@ recovery_target_action = 'promote'
         self.provision()
         self.check_health()
         self.verify_materializer("initial load")
+        self.configure_archive_lag_limits()
         # the duration counts rounds, not provisioning, and a run has at least one
         deadline = time.time() + self.args.duration
         while self.round == 0 or time.time() < deadline:
@@ -1455,6 +1491,10 @@ def main() -> int:
     p.add_argument("--max-run-gb", type=float, default=100,
                    help="allocated GiB limit for the whole run directory, including computes and WAL")
     p.add_argument("--max-store-gb", type=float, default=100)
+    p.add_argument("--materializer-max-lag-mb", type=int, default=0,
+                   help="writer archive materialization lag limit, enabled after bootstrap; zero disables")
+    p.add_argument("--wal-index-max-lag-mb", type=int, default=0,
+                   help="writer archive index lag limit plus maximum-record headroom; zero disables")
     p.add_argument("--daemon-arg", action="append", default=[],
                    help="extra pagestore_daemon argument; repeat for each word (experiments)")
     args = p.parse_args()
@@ -1462,6 +1502,10 @@ def main() -> int:
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
             p.error(f"--{name.replace('_', '-')} must be finite and greater than zero")
+
+    for name in ("materializer_max_lag_mb", "wal_index_max_lag_mb"):
+        if not 0 <= getattr(args, name) <= 2147483647:
+            p.error(f"--{name.replace('_', '-')} must be between 0 and 2147483647")
 
     # A driver started with "&" from a non-interactive shell inherits SIGINT
     # ignored, and SIGTERM would skip the teardown and orphan every compute.

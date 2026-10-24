@@ -68,7 +68,9 @@ jobs:
         run: meson test -C build --suite setup
 
       - name: Verify endurance space budgets
-        run: python3 contrib/pagestore/endurance/test_space_budget.py
+        run: |
+          python3 contrib/pagestore/endurance/test_space_budget.py
+          python3 contrib/pagestore/endurance/test_archive_lag.py
 
       - name: Verify postmaster cleanup including a forced pg_ctl timeout
         run: |
