@@ -67,6 +67,9 @@ jobs:
       - name: Prepare temporary install tree
         run: meson test -C build --suite setup
 
+      - name: Verify endurance space budgets
+        run: python3 contrib/pagestore/endurance/test_space_budget.py
+
       - name: Verify postmaster cleanup including a forced pg_ctl timeout
         run: |
           PAGESTORE_CLEANUP_TEST_BUILD="$(pwd)/build" \
@@ -87,7 +90,7 @@ jobs:
             --seed "$SEED" --duration "$DURATION" --scale "$SCALE" \
             --clients 4 --burst-min 5 --burst-max 20 \
             --branch-probability 0.5 --max-branches 1 \
-            --sample-interval 15 --max-store-gb 40
+            --sample-interval 15 --max-store-gb 40 --max-run-gb 50 --min-free-gb 5
 
       - name: Collect run evidence
         if: always()

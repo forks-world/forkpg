@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import random
 import re
@@ -34,6 +35,35 @@ class Failure(Exception):
         super().__init__(f"{kind}: {detail}")
         self.kind = kind
         self.detail = detail
+
+
+def directory_kb(path: Path) -> int:
+    """Allocated bytes, including hidden files; never follow external symlinks."""
+    result = subprocess.run(["du", "-sk", "--", str(path)],
+                            capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise ValueError(f"du {path.name}: {result.stderr.strip()[:200]}")
+    return int(result.stdout.split("\t", 1)[0])
+
+
+def space_snapshot(root: Path, store: Path, args: argparse.Namespace) -> dict[str, Any]:
+    # Read filesystem headroom first, so other users' consumption is visible
+    # even if an allocated-size scan subsequently fails.
+    free = shutil.disk_usage(root).free
+    if free < args.min_free_gb * 2**30:
+        raise Failure("disk_free", f"filesystem has {free / 2**30:.2f} GiB free "
+                      f"< --min-free-gb={args.min_free_gb:g}")
+    total = directory_kb(root)
+    if total > args.max_run_gb * 1048576:
+        raise Failure("run_size", f"whole run is {total / 1048576:.2f} GiB "
+                      f"> --max-run-gb={args.max_run_gb:g}")
+    # A missing store is expected during provisioning, before import starts.
+    store_size = directory_kb(store) if store.exists() else 0
+    if store_size > args.max_store_gb * 1048576:
+        raise Failure("store_size", f"store is {store_size / 1048576:.2f} GiB "
+                      f"> --max-store-gb={args.max_store_gb:g}")
+    return {"run_kb": total, "store_total_kb": store_size,
+            "filesystem_free_bytes": free}
 
 
 # Log lines that are never legitimate, whatever event the driver injected --
@@ -560,7 +590,9 @@ class Run:
     # ---- provisioning (mirrors mvp_golden_test.sh) ------------------------
 
     def run_tool(self, argv: list[str], what: str, timeout: int = 900) -> str:
+        self.check_health()
         r = subprocess.run(argv, env=self.env, capture_output=True, text=True, timeout=timeout)
+        self.check_health()
         if r.returncode != 0:
             raise Failure("tool_failed", f"{what}: rc={r.returncode} {r.stderr[-1500:]}")
         return r.stdout
@@ -1160,6 +1192,34 @@ recovery_target_action = 'promote'
         unmeasured = 0
         while not self.stop_sampler.wait(self.args.sample_interval):
             rec: dict[str, Any] = {"t": round(time.time(), 1), "round": self.round, "procs": {}}
+            try:
+                rec["space"] = space_snapshot(self.root, self.store, self.args)
+                # Retain the existing per-store category metrics.
+                if self.store.exists():
+                    entries = sorted(self.store.iterdir())
+                    rec["store_kb"] = {}
+                    if entries:
+                        categories = subprocess.run(
+                            ["du", "-sk", "--", *map(str, entries)],
+                            capture_output=True, text=True, timeout=120)
+                        if categories.returncode != 0:
+                            raise ValueError(f"store categories: {categories.stderr.strip()[:200]}")
+                        rec["store_kb"] = {Path(line.split("\t", 1)[1]).name:
+                                           int(line.split("\t", 1)[0])
+                                           for line in categories.stdout.splitlines()}
+                unmeasured = 0
+            except Failure as error:
+                self.async_failure = self.async_failure or error
+                rec["space_failure"] = {"kind": error.kind, "detail": error.detail}
+            except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+                unmeasured += 1
+                rec["space_error"] = str(error)
+                if unmeasured >= 3:
+                    self.async_failure = self.async_failure or Failure(
+                        "space_unmeasurable", f"space unmeasurable {unmeasured} times: {error!r}")
+            if self.async_failure:
+                out.write(json.dumps(rec) + "\n")
+                return
             pids = {"daemon": self.daemon.pid if self.daemon else None}
             pids.update({pg.name: pg.pid() for pg in self.computes()})
             for name, pid in pids.items():
@@ -1181,23 +1241,6 @@ recovery_target_action = 'promote'
                     except (OSError, subprocess.TimeoutExpired, ValueError):
                         # A coordinated restart may invalidate READY during a sample.
                         pass
-            try:
-                du = subprocess.run(["du", "-sk", "--", *[str(p) for p in sorted(self.store.iterdir())]],
-                                    capture_output=True, text=True, timeout=120)
-                if du.returncode != 0 or not du.stdout:
-                    raise ValueError(f"du exited {du.returncode}: {du.stderr.strip()[:200]}")
-                rec["store_kb"] = {Path(l.split("\t")[1]).name: int(l.split("\t")[0])
-                                   for l in du.stdout.splitlines() if "\t" in l}
-                total_gb = sum(rec["store_kb"].values()) / 1048576
-                if total_gb > self.args.max_store_gb:
-                    self.async_failure = Failure("store_size", f"store is {total_gb:.1f} GiB > --max-store-gb")
-                unmeasured = 0
-            except (OSError, subprocess.TimeoutExpired, ValueError) as e:
-                # --max-store-gb is only a bound while the store can be measured
-                unmeasured += 1
-                if unmeasured >= 3:
-                    self.async_failure = self.async_failure or Failure(
-                        "store_size", f"store size unmeasurable {unmeasured} times in a row: {e!r}")
             out.write(json.dumps(rec) + "\n")
 
     def dump_diagnostics(self) -> None:
@@ -1270,9 +1313,13 @@ recovery_target_action = 'promote'
     # ---- main loop -------------------------------------------------------
 
     def execute(self) -> None:
-        self.provision()
+        self.event("space_budget", max_run_gb=self.args.max_run_gb,
+                   max_store_gb=self.args.max_store_gb, min_free_gb=self.args.min_free_gb,
+                   **space_snapshot(self.root, self.store, self.args))
         self.sampler_thread = threading.Thread(target=self.sampler, daemon=True)
         self.sampler_thread.start()
+        self.provision()
+        self.check_health()
         self.verify_materializer("initial load")
         # the duration counts rounds, not provisioning, and a run has at least one
         deadline = time.time() + self.args.duration
@@ -1396,7 +1443,7 @@ def main() -> int:
     p.add_argument("--duration", type=int, default=3600, help="seconds per run (one topology lifetime)")
     p.add_argument("--forever", action="store_true", help="run seed, seed+1, ... until --max-failures")
     p.add_argument("--max-failures", type=int, default=5, help="preserved failure roots before stopping")
-    p.add_argument("--min-free-gb", type=float, default=50, help="stop --forever below this free space")
+    p.add_argument("--min-free-gb", type=float, default=50, help="minimum filesystem free GiB before and during every run")
     p.add_argument("--scale", type=int, default=5)
     p.add_argument("--clients", type=int, default=4)
     p.add_argument("--burst-min", type=int, default=5)
@@ -1405,10 +1452,16 @@ def main() -> int:
     p.add_argument("--max-branches", type=int, default=2)
     p.add_argument("--sync-timeout", type=float, default=1800)
     p.add_argument("--sample-interval", type=float, default=15)
+    p.add_argument("--max-run-gb", type=float, default=100,
+                   help="allocated GiB limit for the whole run directory, including computes and WAL")
     p.add_argument("--max-store-gb", type=float, default=100)
     p.add_argument("--daemon-arg", action="append", default=[],
                    help="extra pagestore_daemon argument; repeat for each word (experiments)")
     args = p.parse_args()
+    for name in ("max_run_gb", "max_store_gb", "min_free_gb", "sample_interval"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0:
+            p.error(f"--{name.replace('_', '-')} must be finite and greater than zero")
 
     # A driver started with "&" from a non-interactive shell inherits SIGINT
     # ignored, and SIGTERM would skip the teardown and orphan every compute.
@@ -1427,7 +1480,7 @@ def main() -> int:
         print(f"stopping: {failures} preserved failure roots under {args.root} already", flush=True)
         return 1
     while True:
-        if args.forever and shutil.disk_usage(args.root).free / 2**30 < args.min_free_gb:
+        if shutil.disk_usage(args.root).free / 2**30 < args.min_free_gb:
             print("stopping: free space below --min-free-gb", flush=True)
             return 1
         root = args.root / f"run-{seed}"
