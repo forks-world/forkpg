@@ -268,6 +268,47 @@ set_wal_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
 	return set_wal_pin_generation(timeline, owner_id, 1, lsn);
 }
 
+/* Legacy, unbounded index views cannot use WAL_BASE_STATE. Keep an explicit
+ * one when testing the conservative FPI-only fallback and its wakeups. */
+static int
+set_legacy_index_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_RETENTION_PIN_SET;
+	ch.timeline = timeline;
+	ch.blocknum = PS_RETENTION_OWNER_READER;
+	ch.parent_timeline = PS_RETENTION_RESOURCE_WAL_INDEX;
+	ch.old_nblocks = 1;
+	ch.nblocks = 1; /* nonzero sequence at/before PIN activation => legacy */
+	ch.req_seq = owner_id;
+	ch.req_lsn = lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+/* Model an owner recovered from a pre-upgrade registry. New unbounded
+ * index owners must use RESERVE instead; only its exact retry is admitted. */
+static int
+seed_legacy_index_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
+{
+	PsRetentionPin pin = {0};
+
+	pin.timeline = timeline;
+	pin.owner_kind = PS_RETENTION_OWNER_READER;
+	pin.resources = PS_RETENTION_RESOURCE_WAL_INDEX;
+	pin.generation = 1;
+	pin.owner_id = owner_id;
+	pin.lsn = lsn;
+	pin.admission_seq = 1;
+	return ps_retention_set(&pin) == PS_RETENTION_OK &&
+		set_legacy_index_pin(timeline, owner_id, lsn);
+}
+
 static int
 write_keyed_page(uint32_t timeline, const PsKey *keyp, uint32_t block,
 				 uint64_t lsn)
@@ -851,8 +892,9 @@ test_unreplaceable_dependency_requests_once(void)
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
-		  write_relation_page(0, 0, limited + 100),
-		  "construct a stored page with no page-history owner to authorize replacement");
+		  write_relation_page(0, 0, limited + 100) &&
+		  seed_legacy_index_pin(0, 916, WAL_TOTAL - 4096),
+		  "a legacy index view retains its FPI while finite progress has a durable base");
 	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
 		  "the unreplaceable raw dependency still blocks the segment after 64 passes");
 	check(ps_test_walidx_reclaim_due(0) == 0,
@@ -889,7 +931,8 @@ test_unreplaceable_dependency_requests_once(void)
 		check(ps_walidx_snapshot_next_generation(directory, 0, &next_generation) == 0 &&
 			  next_generation <= 2,
 			  "progress advances alone produce no further compacted publication");
-		check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+		check(drop_wal_pin(0, 916, 1) &&
+			  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
 						  PS_RETENTION_RESOURCE_ALL, end) &&
 			  maintenance_until_count(store, 0, 0),
 			  "a fence change (the materializer pin, which also authorizes the"
@@ -992,9 +1035,9 @@ test_late_durable_base_requests_compaction(void)
 }
 
 /*
- * Residual 1b: the same shape for an unprotected horizon (a WAL_INDEX-only
- * pin, no page history), where the event that can shorten the chain is a
- * newer full-page-image item instead of a durable base.
+ * Residual 1b: the same shape for a WAL_INDEX-only pin with no durable page
+ * base yet. A newer full-page-image item can shorten the chain even before
+ * materialization supplies a durable replacement.
  */
 static void
 test_late_fpi_requests_compaction(void)
@@ -1011,8 +1054,8 @@ test_late_fpi_requests_compaction(void)
 		  wal_index_add_record(0, limited, 0, /* fpi */ 0) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_READER, 301, 1,
 					  PS_RETENTION_RESOURCE_WAL_INDEX, WAL_TOTAL),
-		  "construct a non-FPI raw item whose only horizon is an unprotected"
-		  " WAL_INDEX-only pin");
+		  "construct a non-FPI raw item whose only horizon is a finite"
+		  " WAL_INDEX-only pin without a durable base");
 	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
 		  "segment 0 goes; segment 1 is blocked, and the request is served fruitless");
 	check(ps_test_walidx_reclaim_due(0) == 0,
@@ -1412,14 +1455,9 @@ test_late_fpi_requests_compaction_protected_horizon(void)
 
 	configure_core();
 	flush_pages = 4;
-	/* Progress is set past WAL_TOTAL (a durable WAL-index frontier beyond
-	 * the sealed prefix is a supported case) precisely so it does not equal
-	 * the materializer pin's LSN: walidx_protected_horizons_build's
-	 * standing-horizon exception excludes a materializer grant whenever its
-	 * LSN coincides with the shipper's progress (or the durable frontier),
-	 * which would otherwise make this horizon unprotected instead -- see
-	 * test_late_fpi_requests_compaction for that (correct) unprotected
-	 * case. */
+	/* Keep the materializer and durable-progress horizons distinct, also
+	 * exercising progress beyond the sealed raw-WAL prefix. Both are finite
+	 * storage fences; without a durable base they still need an FPI chain. */
 	check(prepare_store(store, WAL_TOTAL, 0, 0, 0) &&
 		  wal_index_add_record(0, limited, 0, /* fpi */ 0) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
@@ -1477,7 +1515,8 @@ test_fpi_between_protected_and_progress_retires(void)
 		  reserve_pin(0, PS_RETENTION_OWNER_READER, 300, 1,
 					  PS_RETENTION_RESOURCE_PAGE_HISTORY |
 					  PS_RETENTION_RESOURCE_WAL_INDEX, F) &&
-		  write_relation_page(0, 0, limited + 100),
+		  write_relation_page(0, 0, limited + 100) &&
+		  seed_legacy_index_pin(0, 916, WAL_TOTAL),
 		  "a known WAL-index item at `limited`, a page-history+walidx pin at"
 		  " F (protected, below progress), a durable base below F");
 	check(!maintenance_until_count(store, 0, 1) && segment_count(store, 0) == 2,
@@ -1535,9 +1574,10 @@ test_watch_does_not_refire_on_satisfied_base_evidence(void)
 		  reserve_pin(0, PS_RETENTION_OWNER_READER, 300, 1,
 					  PS_RETENTION_RESOURCE_PAGE_HISTORY |
 					  PS_RETENTION_RESOURCE_WAL_INDEX, F) &&
-		  write_relation_page(0, 0, limited + 100),
+		  write_relation_page(0, 0, limited + 100) &&
+		  seed_legacy_index_pin(0, 916, WAL_TOTAL),
 		  "same construction as the previous test: base durable in [lo,F],"
-		  " item still stuck on progress's own FPI requirement");
+		  " item still stuck on the legacy view's FPI requirement");
 	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
 		  "stuck at 2, request served fruitless");
 	check(ps_test_wal_reclaim_watch_count(0) == 1, "watch armed (1 entry)");
@@ -1616,8 +1656,7 @@ test_walidx_only_pin_drop_requests_compaction(void)
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
 		  write_relation_page(0, 0, limited + 100) &&
-		  reserve_pin(0, PS_RETENTION_OWNER_READER, 301, 1,
-					  PS_RETENTION_RESOURCE_WAL_INDEX, limited + 200) &&
+		  seed_legacy_index_pin(0, 301, limited + 200) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
 					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL),
 		  "construct a stored page base whose chain a WAL_INDEX-only reader still fences");
@@ -1785,25 +1824,20 @@ test_dependency_cutoffs(void)
 	close_store();
 	remove_tree(store);
 
-	/* With no page-history owner nothing protects a stored version for a
-	 * later owner's horizon, so the FPI chain is kept and the dependency
-	 * stays. */
+	/* Finite durable progress is a storage fence even without a PAGE owner. */
 	configure_core();
 	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
 		  write_relation_page(0, 0, limited + 100) &&
-		  !maintenance_until_count(store, 0, 0) &&
-		  segment_count(store, 0) == 2,
-		  "a stored page without any page-history owner is not a base");
+		  maintenance_until_count(store, 0, 0),
+		  "finite durable progress uses its retained base without a PAGE owner");
 	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
 		  "clear the WAL-index snapshot trigger override again");
 	close_store();
 	remove_tree(store);
 
-	/* A WAL-index-only owner is not protected by page-history retention, so
-	 * its horizon keeps the FPI-led chain even though a stored image exists;
-	 * the raw dependency therefore stays. */
+	/* A finite index-only owner independently keeps its replacement base. */
 	configure_core();
 	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
@@ -1813,25 +1847,14 @@ test_dependency_cutoffs(void)
 					  PS_RETENTION_RESOURCE_WAL_INDEX, limited + 200) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
 					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL) &&
-		  !maintenance_until_count(store, 0, 0) &&
-		  segment_count(store, 0) == 2,
-		  "a WAL-index-only owner keeps its FPI chain despite a stored image");
+		  maintenance_until_count(store, 0, 0),
+		  "a finite index-only owner releases its FPI against its own retained base");
 	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
 		  "clear the WAL-index snapshot trigger override after the WAL-index owner");
 	close_store();
 	remove_tree(store);
 
-	/* A materializer pins only WAL resources, but its pin LSN (the redo of its
-	 * last durable restartpoint) is the operational page-history cutoff, so
-	 * the stored base at its own horizon is retained by that same pin and
-	 * may authorize the replacement -- except where the pin coincides with a
-	 * standing horizon: the shipper's progress admits a new WAL-index-only
-	 * owner at exactly its LSN, which would arrive after the materializer
-	 * advanced and the base was retired, so a materializer pinned there
-	 * keeps its FPI-led chain.  (This harness indexes through the whole
-	 * shipped WAL, so the only materializer pin that could free every
-	 * segment is one at the progress; the exception's positive effect is
-	 * not representable here.) */
+	/* The materializer and finite progress can share one stored base. */
 	configure_core();
 	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
@@ -1840,18 +1863,15 @@ test_dependency_cutoffs(void)
 		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
 					  PS_RETENTION_RESOURCE_WAL |
 					  PS_RETENTION_RESOURCE_WAL_INDEX, WAL_TOTAL) &&
-		  !maintenance_until_count(store, 0, 0) &&
-		  segment_count(store, 0) == 2,
-		  "a materializer pinned at the shipper's progress keeps its FPI-led chain");
+		  maintenance_until_count(store, 0, 0),
+		  "finite progress keeps its base independently of the materializer pin");
 	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
 		  "clear the WAL-index snapshot trigger override after the WAL-only pin");
 	close_store();
 	remove_tree(store);
 
-	/* Protection belongs to the horizon's own owner: a page-history owner at
-	 * the same LSN as a WAL-index-only owner may advance or drop its pin
-	 * first, so it does not authorize the base for the other owner's
-	 * horizon and the FPI chain stays. */
+	/* PAGE and finite index owners at the same LSN each retain their own
+	 * selected base; either owner can release independently. */
 	configure_core();
 	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
@@ -1861,9 +1881,8 @@ test_dependency_cutoffs(void)
 					  PS_RETENTION_RESOURCE_ALL, WAL_TOTAL) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_READER, 301, 1,
 					  PS_RETENTION_RESOURCE_WAL_INDEX, WAL_TOTAL) &&
-		  !maintenance_until_count(store, 0, 0) &&
-		  segment_count(store, 0) == 2,
-		  "another owner's page fence at the same LSN does not authorize the base");
+		  maintenance_until_count(store, 0, 0),
+		  "finite PAGE and index views at one LSN each retain their own base");
 	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
 		  "clear the WAL-index snapshot trigger override after the shared LSN");
 	close_store();
@@ -3107,6 +3126,121 @@ test_index_state_preserves_lifecycle(void)
 }
 
 static void
+test_finite_index_base_reclaims_raw_wal(void)
+{
+	const uint64_t record = WAL_SEGMENT + WAL_SEGMENT / 2;
+	const uint64_t view_lsn = record + 200;
+	char store[] = "/tmp/pagestore-index-base-reclaim-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsRetentionPin pin;
+	PsWalBaseState state;
+	unsigned char page[8192];
+	uint64_t frontier = 0, seq = 0;
+	int ordinary;
+
+	configure_core();
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  prepare_store(store, WAL_TOTAL, 0, record, 0) &&
+		  write_relation_page(0, 0, record + 100) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 917, 1,
+			PS_RETENTION_RESOURCE_WAL_INDEX, view_lsn) &&
+		  ps_retention_lookup(0, PS_RETENTION_OWNER_READER, 917, &pin) == 1 &&
+		  wal_index_progress(0, 0, WAL_TOTAL) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 923, 1,
+			PS_RETENTION_RESOURCE_PAGE_HISTORY, WAL_TOTAL),
+		  "retain PAGE authority at finite progress before its FPI is retired");
+	check(maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 0 &&
+		  wal_index_count(0, 0, WAL_TOTAL) == 0,
+		  "finite progress retires its FPI while PAGE history is still held there");
+	check(!set_legacy_index_pin(0, 924, WAL_TOTAL),
+		  "new legacy index owner cannot borrow PAGE admissibility after FPI retirement");
+	check(drop_wal_pin(0, 923, 1) &&
+		  write_relation_page(0, 0, WAL_TOTAL + 100) &&
+		  write_relation_page(0, 0, WAL_TOTAL + 200) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 918, 1,
+			PS_RETENTION_RESOURCE_PAGE_HISTORY, WAL_TOTAL + 1000) &&
+		  write_control(0, WAL_TOTAL + 2000, WAL_TOTAL + 1000),
+		  "create an old FPI, durable replacement, and finite index-only view");
+	check(maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 0 &&
+		  wal_index_count(0, 0, view_lsn) == 0,
+		  "retire the FPI and physically delete every raw WAL segment it pinned");
+	for (int i = 0; i < 64; i++) (void) ps_core_maintenance();
+	check(ps_test_page_frontier(0, &frontier, &seq) && frontier >= WAL_TOTAL + 1000,
+		  "ordinary PAGE history advances beyond the retained index-only view");
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&key));
+	ordinary = read_resolve(0, &key, 0, view_lsn, pin.admission_seq, page, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+	check(ordinary == -2, "physical base retention does not grant ordinary PAGE authority");
+	for (int reopen = 0; reopen < 2; reopen++)
+	{
+		check(read_index_state(0, 0, view_lsn, pin.admission_seq, page, &state) == 1 &&
+			  state.found && state.version_lsn == record + 100 && state.nblocks == 1 &&
+			  state.death_lsn == 0 && page[128] == 0x5A,
+			  "the finite view reads its exact base and lifecycle with its FPI/WAL gone");
+		check(read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == 1 &&
+			  state.version_lsn == record + 100 && state.nblocks == 1,
+			  "durable progress also reads its replacement below the PAGE frontier");
+		check(segment_count(store, 0) == 0, "old raw WAL stays deleted across recovery");
+		if (reopen == 0)
+		{
+			close_store();
+			check(ps_core_open(store) == 0, "recover the base-dependent compacted index");
+		}
+	}
+	check(!reserve_pin(0, PS_RETENTION_OWNER_READER, 919, 1,
+			PS_RETENTION_RESOURCE_WAL_INDEX, view_lsn) &&
+		  !set_legacy_index_pin(0, 920, view_lsn),
+		  "new finite and legacy owners cannot invent reclaimed history");
+	check(drop_wal_pin(0, 917, 1) &&
+		  read_index_state(0, 0, view_lsn, pin.admission_seq, page, &state) == -2,
+		  "releasing the finite view revokes access after physical WAL reclamation");
+	close_store();
+	check(unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES") == 0,
+		  "clear the base-reclamation snapshot trigger");
+	remove_tree(store);
+}
+
+static void
+test_index_base_reclaim_conservative_fallback(void)
+{
+	for (int legacy = 0; legacy < 2; legacy++)
+	{
+		char store[] = "/tmp/pagestore-index-base-fallback-XXXXXX";
+		PsWalBaseState state;
+		unsigned char page[8192];
+
+		configure_core();
+		check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+			  prepare_store(store, WAL_TOTAL, 0, WAL_SEGMENT + 100, 0) &&
+			  write_relation_page(0, 0, WAL_SEGMENT + 200) &&
+			  wal_index_progress(0, 0, WAL_TOTAL) &&
+			  reserve_pin(0, PS_RETENTION_OWNER_READER, 921, 1,
+				PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL_INDEX,
+				WAL_TOTAL) &&
+			  (legacy ? seed_legacy_index_pin(0, 922, WAL_TOTAL) :
+				write_relation_page(0, 1, 0)),
+			  "finite replacement evidence coexists with a legacy view or WAL-less fork");
+		for (int i = 0; i < 128; i++) (void) ps_core_maintenance();
+		check(segment_count(store, 0) > 0 && wal_index_count(0, 0, WAL_TOTAL) == 1,
+			  "legacy and unversioned fallback keeps its FPI and physical raw WAL");
+		if (!legacy)
+			check(read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == -1,
+				  "unversioned fork cannot consume the finite lifecycle contract");
+		close_store();
+		check(ps_core_open(store) == 0 && segment_count(store, 0) > 0 &&
+			  wal_index_count(0, 0, WAL_TOTAL) == 1,
+			  "conservative FPI fallback survives recovery");
+		close_store();
+		(void) unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+		remove_tree(store);
+	}
+}
+
+static void
 test_index_state_caps_ancestry(void)
 {
 	char store[] = "/tmp/pagestore-index-ancestry-XXXXXX";
@@ -3327,8 +3461,16 @@ test_raw_materializer_requires_page_base(void)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "--finite-index-base") == 0)
+	{
+		test_finite_index_base_reclaims_raw_wal();
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	test_finite_index_base_reclaims_raw_wal();
+	test_index_base_reclaim_conservative_fallback();
 	test_index_state_caps_ancestry();
 	test_index_state_refuses_wal_less_zero_fallback();
 	test_index_state_preserves_lifecycle();
