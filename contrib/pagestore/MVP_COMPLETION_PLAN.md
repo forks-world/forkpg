@@ -919,7 +919,11 @@ immutable payload checksums remain a startup/publication responsibility, and
 per-timeline tail candidates can force fair snapshot publication below the
 geometric trigger.  Forkmeta adds a POSIX-only compacted-source baseline plus
 append growth and obsolete snapshot/temp debris, with bounded metadata
-observation and forced fair snapshot maintenance.  Queue-bound soak evidence
+observation and forced fair snapshot maintenance.  WAL debt observations take an admission writer fence to scan raw dependencies.
+Automatic observations wait 100 ms from the previous observation completion,
+allowing foreground requests between scans; skipped observations preserve the
+last lag/throttle snapshot. Explicit refreshes still observe immediately.
+Queue-bound soak evidence
 and controller-specific tuning remain follow-up work in R6; forkmeta does not
 include any forkmeta-index or H0 changes.
 

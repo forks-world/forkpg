@@ -2552,6 +2552,44 @@ test_walidx_aggregate_force(void)
 }
 
 static void
+test_wal_automatic_observation_rate(void)
+{
+	char store[] = "/tmp/pagestore-wal-observation-XXXXXX";
+	PsShmHeader metrics;
+	uint64_t before;
+	uint64_t after;
+
+	configure_page_core();
+	memset(&metrics, 0, sizeof(metrics));
+	check(ps_backpressure_configure_all(0, 0, 100, 0, 0, 0) == 0 &&
+		  mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open a store for automatic WAL observation pacing");
+	ps_core_set_metrics_header(&metrics);
+	before = ps_test_backpressure_wal_observation_count();
+	ps_backpressure_refresh();
+	after = ps_test_backpressure_wal_observation_count();
+	check(after > before,
+		  "explicit WAL observation runs immediately");
+	ps_test_backpressure_set_lag(0, 100);
+	(void) ps_core_maintenance();
+	check(metrics.wal_backpressure.throttled != 0 &&
+		  metrics.wal_backpressure.lag_bytes == 100 &&
+		  ps_test_backpressure_wal_observation_count() == after,
+		  "skipped WAL observation retains the lag and throttle snapshot");
+	usleep(120000);
+	(void) ps_core_maintenance();
+	check(ps_test_backpressure_wal_observation_count() > after &&
+		  metrics.wal_backpressure.throttled == 0,
+		  "automatic WAL observation resumes after its interval");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+		  "disable WAL backpressure after observation pacing test");
+	remove_tree(store);
+}
+
+static void
 test_walidx_automatic_observation_rate(void)
 {
 	char store[] = "/tmp/pagestore-walidx-observation-XXXXXX";
@@ -3127,6 +3165,7 @@ main(void)
 	test_forkmeta_self_recovery();
 	test_walidx_append_tail_restart();
 	test_walidx_aggregate_force();
+	test_wal_automatic_observation_rate();
 	test_walidx_automatic_observation_rate();
 	test_admission_writer_preference();
 	test_page_debt_disabled_fast_path();

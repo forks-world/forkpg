@@ -3989,14 +3989,22 @@ def _check_wal_reclaim_recovery(
         time.sleep(min(0.05, deadline - now))
     if not (store / WAL_RECLAIM_IDENTITY).exists():
         raise OracleMismatch(f"after_{stage} recovery lost the shipped-WAL identity")
-    backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
-    if backpressure.get("wal_throttled") not in (0, False) or \
-            backpressure.get("wal_lag_bytes") != 0:
-        raise OracleMismatch(
-            f"after_{stage} recovery kept WAL reclaim debt: "
-            f"throttled={backpressure.get('wal_throttled')!r} "
-            f"lag={backpressure.get('wal_lag_bytes')!r}"
-        )
+    # File removal can precede the next paced controller observation. Require
+    # both physical cleanup and the zero-debt snapshot within the same bound.
+    while True:
+        backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
+        if backpressure.get("wal_throttled") in (0, False) and \
+                backpressure.get("wal_lag_bytes") == 0:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery kept WAL reclaim debt: "
+                f"throttled={backpressure.get('wal_throttled')!r} "
+                f"lag={backpressure.get('wal_lag_bytes')!r} "
+                f"after {poll_timeout:.3f}s"
+            )
+        time.sleep(min(0.05, deadline - now))
     owners = inspect_store(inspector, shm, "owners", inspection_schema)
     if owners.get("retention_poisoned") is not False or owners.get("owner_count") != 0:
         raise OracleMismatch(
