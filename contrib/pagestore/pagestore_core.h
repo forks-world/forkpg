@@ -273,6 +273,7 @@ extern void ps_test_set_wal_reclaim_watch_fire_hook(int suppress);
 extern uint64_t ps_test_control_flush_wanted(void);
 extern uint64_t ps_test_control_flush_stored(void);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);
+extern uint64_t ps_test_backpressure_wal_observation_count(void);
 extern uint64_t ps_test_backpressure_walidx_observation_count(void);
 extern uint64_t ps_test_backpressure_forkmeta_observation_count(void);
 extern uint64_t ps_test_page_gc_debt_segments(uint32_t shard);

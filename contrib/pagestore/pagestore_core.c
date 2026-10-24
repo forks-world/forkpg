@@ -742,6 +742,9 @@ ps_test_control_flush_stored(void)
 	return __atomic_load_n(&ps_test_control_flush_store_count, __ATOMIC_RELAXED);
 }
 
+static uint64_t wal_observation_next_ns;
+static uint64_t wal_observation_count;
+#define WAL_AUTO_OBSERVATION_INTERVAL_NS UINT64_C(100000000)
 static uint64_t walidx_observation_next_ns;
 static uint64_t walidx_observation_count;
 #define WALIDX_AUTO_OBSERVATION_INTERVAL_NS UINT64_C(100000000)
@@ -1536,6 +1539,8 @@ ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
 	page_reclaim_catchup_bytes = page_catchup;
 	wal_reclaim_high_water_bytes = wal_high_water;
 	wal_reclaim_catchup_bytes = wal_catchup;
+	__atomic_store_n(&wal_observation_next_ns, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&wal_observation_count, 0, __ATOMIC_RELEASE);
 	walidx_reclaim_high_water_bytes = walidx_high_water;
 	walidx_reclaim_catchup_bytes = walidx_catchup;
 	forkmeta_reclaim_high_water_bytes = forkmeta_high_water;
@@ -1776,6 +1781,12 @@ ps_test_walidx_gc_force_due(uint32_t timeline)
 	return timeline < MAX_TIMELINES ?
 		__atomic_load_n(&walidx_snapshot_gc_force_due[timeline],
 							__ATOMIC_ACQUIRE) : 0;
+}
+
+uint64_t
+ps_test_backpressure_wal_observation_count(void)
+{
+	return __atomic_load_n(&wal_observation_count, __ATOMIC_ACQUIRE);
 }
 
 uint64_t
@@ -22121,6 +22132,48 @@ backpressure_monotonic_ns(void)
 		(uint64_t) now.tv_nsec;
 }
 
+/* WAL debt takes an admission writer fence and scans raw dependencies.
+ * Sample from completion, allowing foreground requests between observations. */
+static int
+wal_auto_observation_claim(void)
+{
+	uint64_t now = backpressure_monotonic_ns();
+	uint64_t next;
+
+	if (now == UINT64_MAX)
+		return 1;
+	for (;;)
+	{
+		next = __atomic_load_n(&wal_observation_next_ns, __ATOMIC_ACQUIRE);
+		if (next == UINT64_MAX || now < next)
+			return 0;
+		/* Reserve the scan itself.  Arming from the completion timestamp is
+		 * important when the bounded physical scan takes >=100ms. */
+		if (__atomic_compare_exchange_n(&wal_observation_next_ns, &next,
+										UINT64_MAX,
+										0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+			return 1;
+	}
+}
+
+static void
+wal_arm_observation_timer(void)
+{
+	uint64_t now = backpressure_monotonic_ns();
+	uint64_t due;
+
+	if (now == UINT64_MAX)
+	{
+		/* Do not leave the in-progress sentinel armed forever if the clock
+		 * cannot be sampled.  The next automatic call may retry safely. */
+		__atomic_store_n(&wal_observation_next_ns, 0, __ATOMIC_RELEASE);
+		return;
+	}
+	due = UINT64_MAX - now < WAL_AUTO_OBSERVATION_INTERVAL_NS ?
+		UINT64_MAX - 1 : now + WAL_AUTO_OBSERVATION_INTERVAL_NS;
+	__atomic_store_n(&wal_observation_next_ns, due, __ATOMIC_RELEASE);
+}
+
 static int
 walidx_auto_observation_claim(void)
 {
@@ -22214,13 +22267,15 @@ ps_backpressure_refresh_internal(int automatic)
 {
 	unsigned char walidx_tail_candidates[MAX_TIMELINES] = {0};
 	unsigned char walidx_gc_candidates[MAX_TIMELINES] = {0};
+	int observe_wal = wal_reclaim_high_water_bytes != 0 &&
+		(!automatic || wal_auto_observation_claim());
 	int observe_walidx = walidx_reclaim_high_water_bytes != 0 &&
 		(!automatic || walidx_auto_observation_claim());
 	int observe_forkmeta = forkmeta_reclaim_high_water_bytes != 0 &&
 		(!automatic || forkmeta_auto_observation_claim());
 	uint64_t page_lag = page_reclaim_high_water_bytes != 0 ?
 		page_reclaim_lag_bytes() : 0;
-	uint64_t wal_lag = wal_reclaim_high_water_bytes != 0 ?
+	uint64_t wal_lag = observe_wal ?
 		wal_reclaim_lag_bytes() : 0;
 	uint64_t walidx_lag = observe_walidx ?
 		walidx_reclaim_lag_bytes(walidx_tail_candidates,
@@ -22228,6 +22283,11 @@ ps_backpressure_refresh_internal(int automatic)
 	uint64_t forkmeta_lag = observe_forkmeta ?
 		forkmeta_reclaim_lag_bytes() : 0;
 
+	if (observe_wal)
+	{
+		__atomic_fetch_add(&wal_observation_count, 1, __ATOMIC_RELAXED);
+		wal_arm_observation_timer();
+	}
 	if (observe_walidx)
 	{
 		__atomic_fetch_add(&walidx_observation_count, 1, __ATOMIC_RELAXED);
@@ -22243,9 +22303,10 @@ ps_backpressure_refresh_internal(int automatic)
 	backpressure_update_locked(&page_backpressure, page_lag,
 							   page_reclaim_high_water_bytes,
 							   page_reclaim_catchup_bytes);
-	backpressure_update_locked(&wal_backpressure, wal_lag,
-							   wal_reclaim_high_water_bytes,
-							   wal_reclaim_catchup_bytes);
+	if (observe_wal)
+		backpressure_update_locked(&wal_backpressure, wal_lag,
+								   wal_reclaim_high_water_bytes,
+								   wal_reclaim_catchup_bytes);
 	if (observe_walidx)
 	{
 		backpressure_update_locked(&walidx_backpressure, walidx_lag,
