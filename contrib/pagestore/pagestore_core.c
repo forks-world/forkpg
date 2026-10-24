@@ -4301,6 +4301,7 @@ segment_hole_magic_for_header_size(uint64_t header_size)
 
 enum { CAP_PIN = 1, CAP_WALIDX = 2, CAP_ARTIFACT = 3, CAP_COUNT = 4 };
 static uint64_t cap_activation[CAP_COUNT];
+static int walidx_base_reads_active;
 
 static uint64_t
 cap_effective_seq(unsigned kind, uint64_t seq)
@@ -9617,6 +9618,8 @@ typedef struct TimelineRecEventV2
 
 /* Branch activation is durable so a format-only binary refuses this store. */
 #define TIMELINE_META_EVENT_CAP_ACTIVATION 3U
+/* Durable semantic upgrade: finite index views may replace FPI chains. */
+#define TIMELINE_META_EVENT_INDEX_BASES 4U
 typedef struct TimelineRecEventV3
 {
 	uint32_t magic;
@@ -9801,6 +9804,27 @@ timeline_activate_view_caps(void)
 			return -1;
 		cap_activation[kind] = rec.branch_seq;
 	}
+	return 0;
+}
+
+/* Persist before any base-dependent index compaction. The record consumes no
+ * admission position: it changes the interpretation, not any retained view. */
+static int
+timeline_activate_index_bases(void)
+{
+	TimelineRecEventV3 rec = {0};
+
+	if (walidx_base_reads_active)
+		return 0;
+	rec.magic = TIMELINE_META_V2_MAGIC;
+	rec.rec_len = sizeof(rec);
+	rec.kind = TIMELINE_META_EVENT_INDEX_BASES;
+	rec.parent = -1;
+	rec.branch_seq = PS_SEQ_UNBOUNDED;
+	rec.crc = timeline_event_v3_crc(&rec);
+	if (timeline_meta_append(&rec, sizeof(rec)) != 0)
+		return -1;
+	walidx_base_reads_active = 1;
 	return 0;
 }
 
@@ -12626,6 +12650,20 @@ load_timelines(void)
 						break;
 					return -1;
 				}
+				if (rec.kind == TIMELINE_META_EVENT_INDEX_BASES)
+				{
+					if (rec.magic != TIMELINE_META_V2_MAGIC ||
+						rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
+						rec.crc != timeline_event_v3_crc(&rec) ||
+						rec.id != 0 || rec.parent != -1 || rec.state != 0 ||
+						rec.branch_lsn != 0 || rec.incarnation != 0 ||
+						rec.parent_incarnation != 0 ||
+						rec.branch_seq != PS_SEQ_UNBOUNDED || walidx_base_reads_active)
+						return -1;
+					walidx_base_reads_active = 1;
+					off += rec_len;
+					continue;
+				}
 				if (rec.kind == TIMELINE_META_EVENT_CAP_ACTIVATION)
 				{
 					if (rec.magic != TIMELINE_META_V2_MAGIC ||
@@ -14481,24 +14519,9 @@ typedef struct WalIdxBaseEntry
 static WalIdxBaseEntry *walidx_plan_bases;
 static uint32_t walidx_plan_nbases;
 static int walidx_plan_bases_valid;
-/* Horizons whose page history is protected for as long as they exist: the
- * exact page-history fences (owner pins carrying page history, live branch
- * caps).  Only such a horizon may rely on a stored image as its replacement
- * base; any other horizon keeps its FPI-led chain. */
+/* PAGE fences and finite index storage fences can use durable replacement
+ * bases. Legacy unbounded index views continue to require FPI-led chains. */
 static uint64_t *walidx_plan_protected;
-/* The horizons the materializer exception granted: their protection depends
- * on no standing horizon sitting at the same LSN, which publication itself
- * can change.  `added` records whether the exception is what put the horizon
- * into the protected set; a horizon an exact page fence protects on its own
- * keeps that protection when the exception is withdrawn. */
-typedef struct WalIdxMatGrant
-{
-	uint64_t	lsn;
-	int			added;
-} WalIdxMatGrant;
-
-static WalIdxMatGrant *walidx_plan_mat_protected;
-static uint32_t walidx_plan_n_mat_protected;
 static uint32_t walidx_plan_nprotected;
 
 static int
@@ -14539,48 +14562,6 @@ walidx_plan_bases_free(void)
 	free(walidx_plan_protected);
 	walidx_plan_protected = NULL;
 	walidx_plan_nprotected = 0;
-	free(walidx_plan_mat_protected);
-	walidx_plan_mat_protected = NULL;
-	walidx_plan_n_mat_protected = 0;
-}
-
-/*
- * The plan is built before publication is excluded, and walidx_commit() can
- * advance the shipper's progress in between.  A materializer horizon that has
- * become equal to a standing horizon since then must lose its exception, or
- * this publication would drop the FPI chain at an LSN a later WAL-index-only
- * owner is still admitted at.  Called with the publish write lock held.
- */
-static void
-walidx_plan_recheck_standing(uint32_t tl)
-{
-	uint64_t	frontier = walidx_frontier_current(tl);
-	uint64_t	progress = walidx_progress_read(tl);
-
-	for (uint32_t i = 0; i < walidx_plan_n_mat_protected; i++)
-	{
-		uint64_t	lsn = walidx_plan_mat_protected[i].lsn;
-		uint32_t	out = 0;
-		int			dropped = 0;
-
-		if (lsn != frontier && lsn != progress)
-			continue;
-		/* Withdraw only what this exception added.  An exact page fence at
-		 * the same LSN protects that horizon in its own right, and the plan
-		 * keeps such a fence even when a standing WAL-index horizon shares
-		 * its LSN; removing every entry would withdraw the page owner's
-		 * protection too, and the publication would keep an FPI chain and
-		 * its raw WAL for a horizon whose base is already retained. */
-		if (!walidx_plan_mat_protected[i].added)
-			continue;
-		for (uint32_t j = 0; j < walidx_plan_nprotected; j++)
-			if (walidx_plan_protected[j] == lsn && !dropped)
-				dropped = 1;
-			else
-				walidx_plan_protected[out++] = walidx_plan_protected[j];
-		walidx_plan_nprotected = out;
-		walidx_plan_mat_protected[i].added = 0;
-	}
 }
 
 static int
@@ -14706,171 +14687,55 @@ wal_reclaim_raw_dependency_floor(uint32_t timeline, uint64_t store_start,
 	return 0;
 }
 
-/* Build the set of protected horizons for timeline tl: the exact
- * page-history fences (page_prune_fences: owner pins carrying page history,
- * live branch caps), minus every LSN a non-materializer WAL_INDEX-only pin
- * projects to (that owner's protection depends on its own pin, not a page
- * fence at the same LSN it does not hold), plus the materializer's own
- * derived cutoff -- except when that LSN is already a standing WAL-index
- * horizon (the durable frontier or the shipper's progress: a new
- * WAL_INDEX-only owner can be admitted there after the materializer moves)
- * or is shared with another WAL_INDEX-only, non-page-history pin at the same
- * LSN.  Only a protected horizon's WAL-index chain is led by a durable
- * replacement base; an unprotected horizon's chain is led by the newest FPI
- * at or below it.
- *
- * Shared by walidx_plan_bases_build (the full per-page replacement-base
- * table) and the WAL reclaimer's fruitless-evaluation watch computation, so
- * the two can never diverge on what counts as protected.  Caller holds
- * map-rd; the retention snapshot is taken inside.
- *
- * grants_out/ngrants_out are optional: when given, the caller takes
- * ownership of the materializer-grant array that records which entries the
- * materializer exception added (needed only by the plan builder's own later
- * walidx_plan_recheck_standing at publish time, not by a one-off query).
- *
- * Design doc S3.7(7) rev 3, S4 ("page prune keeps the base versions the
- * WAL index depends on"): satisfied by construction, pre-existing and
- * unchanged by P2.  The protected set here is built directly from
- * page_prune_fences()'s own fence list (above), the identical fence set
- * ps_page_prune_plan_capped() consumes for image retention (design doc
- * S1.3 step 2: the newest admissible version at or below *every* fence it
- * is given is kept).  So a horizon can only be "protected" -- and only
- * then may walidx_plan_bases_build() rely on a stored image at or below it
- * as a base -- when page-level retention is independently already
- * committed to keeping a version there.  An unprotected horizon never
- * trusts a stored image and falls back to the FPI-led chain instead. */
+/* Finite index views retain their own durable bases via page_storage_fences.
+ * WAL_BASE_STATE exposes those bases and lifecycle without PAGE authority.
+ * Legacy unbounded views still require an FPI-led chain: they cannot use that
+ * interface and must never borrow a finite view's protection at the same LSN.
+ * Caller holds map-rd and excludes owner mutations. */
 static int
 walidx_protected_horizons_build(uint32_t tl, uint64_t **set_out,
-								uint32_t *n_out, WalIdxMatGrant **grants_out,
-								uint32_t *ngrants_out)
+								uint32_t *n_out)
 {
-	PsHistoryFence *fences = NULL;
-	uint32_t	nfences = 0;
-	uint64_t   *protected_set;
-	uint32_t	nprotected = 0;
-	WalIdxMatGrant *mat_protected = NULL;
-	uint32_t	n_mat_protected = 0;
-	PsRetentionPin *pins = NULL;
-	uint32_t	npins = 0;
+	PsHistoryFence *pages = NULL, *storage = NULL, *index = NULL;
+	uint32_t npages = 0, nstorage = 0, nindex = 0, n = 0;
+	uint64_t *set = NULL;
+	int rc = -1;
 
-	if (page_prune_fences(tl, &fences, &nfences) != 0)
-		return -1;
-	protected_set = malloc((size_t) (nfences + 1) * sizeof(*protected_set));
-	if (protected_set == NULL)
+	/* Startup durably records this semantic upgrade before enabling GC.
+	 * Pre-upgrade daemons reject its unknown timeline event kind. */
+	if (!walidx_base_reads_active || fork_meta_poisoned_load() ||
+		page_prune_fences(tl, &pages, &npages) != 0 ||
+		page_storage_fences(tl, pages, npages, &storage, &nstorage) != 0 ||
+		walidx_view_fences(tl, &index, &nindex) != 0)
+		goto out;
+	set = malloc((size_t) (nstorage + 1) * sizeof(*set));
+	if (set == NULL)
+		goto out;
+	for (uint32_t i = 0; i < nstorage; i++)
 	{
-		free(fences);
-		return -1;
-	}
-	for (uint32_t i = 0; i < nfences; i++)
-		protected_set[nprotected++] = fences[i].lsn;
-	free(fences);
-	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
-	{
-		free(protected_set);
-		return -1;
-	}
-	for (uint32_t i = 0; i < npins; i++)
-	{
-		uint64_t	projected = pins[i].lsn;
-		uint32_t	out = 0;
+		int legacy = 0;
 
-		if ((pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) == 0 ||
-			(pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 ||
-			!retention_project_lsn(pins[i].timeline, tl, &projected))
+		if (storage[i].lsn == 0)
 			continue;
-		if (pins[i].timeline == tl &&
-			pins[i].owner_kind == PS_RETENTION_OWNER_MATERIALIZER)
-			continue;
-		for (uint32_t j = 0; j < nprotected; j++)
-			if (protected_set[j] != projected)
-				protected_set[out++] = protected_set[j];
-		nprotected = out;
-	}
-	/* A materializer horizon is protected by its own derived cutoff, unless
-	 * another WAL-index-only owner shares the LSN or a standing horizon
-	 * (the durable frontier or the shipper's progress) already sits there. */
-	for (uint32_t i = 0; i < npins; i++)
-	{
-		int			present = 0;
-		int			shared = 0;
-
-		if (pins[i].timeline != tl ||
-			pins[i].owner_kind != PS_RETENTION_OWNER_MATERIALIZER ||
-			(pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) == 0 ||
-			pins[i].lsn == 0)
-			continue;
-		if (pins[i].lsn == walidx_frontier_current(tl) ||
-			pins[i].lsn == walidx_progress_read(tl))
-			continue;
-		for (uint32_t k = 0; k < npins && !shared; k++)
-		{
-			uint64_t	projected = pins[k].lsn;
-
-			if (k != i &&
-				(pins[k].resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
-				(pins[k].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0 &&
-				!(pins[k].timeline == tl &&
-				  pins[k].owner_kind == PS_RETENTION_OWNER_MATERIALIZER) &&
-				retention_project_lsn(pins[k].timeline, tl, &projected) &&
-				projected == pins[i].lsn)
-				shared = 1;
-		}
-		if (shared)
-			continue;
-		/* Record the grant before asking whether the horizon is already
-		 * protected: an LSN that a page fence protects today can still
-		 * become a standing WAL-index horizon before publication, and the
-		 * recheck can only withdraw what it knows about. */
-		{
-			WalIdxMatGrant *grown = realloc(mat_protected,
-										(size_t) (n_mat_protected + 1) *
-										sizeof(*mat_protected));
-
-			if (grown == NULL)
+		for (uint32_t j = 0; j < nindex; j++)
+			if (index[j].lsn == storage[i].lsn && index[j].seq == PS_SEQ_UNBOUNDED)
 			{
-				free(pins);
-				free(protected_set);
-				free(mat_protected);
-				return -1;
+				legacy = 1;
+				break;
 			}
-			mat_protected = grown;
-			mat_protected[n_mat_protected].lsn = pins[i].lsn;
-			mat_protected[n_mat_protected++].added = 0;
-		}
-		for (uint32_t j = 0; j < nprotected && !present; j++)
-			if (protected_set[j] == pins[i].lsn)
-				present = 1;
-		if (present)
-			continue;
-		mat_protected[n_mat_protected - 1].added = 1;
-		{
-			uint64_t   *grown = realloc(protected_set,
-										(size_t) (nprotected + 1) *
-										sizeof(*protected_set));
-
-			if (grown == NULL)
-			{
-				free(pins);
-				free(protected_set);
-				free(mat_protected);
-				return -1;
-			}
-			protected_set = grown;
-			protected_set[nprotected++] = pins[i].lsn;
-		}
+		if (!legacy)
+			set[n++] = storage[i].lsn;
 	}
-	free(pins);
-	*set_out = protected_set;
-	*n_out = nprotected;
-	if (grants_out != NULL)
-	{
-		*grants_out = mat_protected;
-		*ngrants_out = n_mat_protected;
-	}
-	else
-		free(mat_protected);
-	return 0;
+	*set_out = set;
+	*n_out = n;
+	set = NULL;
+	rc = 0;
+out:
+	free(pages);
+	free(storage);
+	free(index);
+	free(set);
+	return rc;
 }
 
 /* True iff h is a member of a protected-horizon set built by
@@ -15501,12 +15366,14 @@ wal_segment_reclaim_one(void)
 					uint32_t n_idx_fences = 0;
 					uint64_t *protected_set = NULL;
 					uint32_t n_protected = 0;
+					unsigned char base_eligible[WAL_RECLAIM_WATCH_MAX];
 
 					ps_lock_map_rd();
 					(void) walidx_prune_fences(tl, &idx_fences, &n_idx_fences);
 					(void) walidx_protected_horizons_build(tl, &protected_set,
-														   &n_protected, NULL,
-														   NULL);
+														   &n_protected);
+					for (uint32_t wi = 0; wi < watch_n; wi++)
+						base_eligible[wi] = !fork_has_wal_less_page(tl, &watch_items[wi].key);
 					ps_unlock_map();
 					for (uint32_t wi = 0; wi < watch_n; wi++)
 					{
@@ -15519,14 +15386,12 @@ wal_segment_reclaim_one(void)
 						WalReclaimEvidence ev;
 
 						memset(&ev, 0, sizeof(ev));
-						/* Progress (the durable-progress cutoff) is itself a
-						 * candidate horizon -- unprotected unless a
-						 * page-history fence happens to sit exactly there --
-						 * and, unlike the other fences below, has no
-						 * separate entry in idx_fences. */
+						/* Durable progress is itself a finite storage fence.
+						 * A legacy view sharing its LSN, or an unversioned
+						 * fork, still requires an FPI-led chain. */
 						if (progress >= lo)
 						{
-							if (walidx_horizon_in_set(protected_set,
+							if (base_eligible[wi] && walidx_horizon_in_set(protected_set,
 													  n_protected, progress))
 							{
 								have_p = 1;
@@ -15544,7 +15409,7 @@ wal_segment_reclaim_one(void)
 
 							if (h < lo || h >= progress)
 								continue;
-							if (walidx_horizon_in_set(protected_set,
+							if (base_eligible[wi] && walidx_horizon_in_set(protected_set,
 													  n_protected, h))
 							{
 								if (!have_p || h < p_min)
@@ -17199,9 +17064,7 @@ walidx_plan_bases_build(uint32_t tl)
 	 * the raw (lsn, admission_seq) fence tuples walidx_protected_horizons_build
 	 * does not expose. */
 	if (walidx_protected_horizons_build(tl, &walidx_plan_protected,
-										&walidx_plan_nprotected,
-										&walidx_plan_mat_protected,
-										&walidx_plan_n_mat_protected) != 0)
+										&walidx_plan_nprotected) != 0)
 	{
 		free(fences);
 		return -1;
@@ -17247,6 +17110,8 @@ walidx_plan_bases_build(uint32_t tl)
 				uint32_t	ndeaths_out = 0;
 
 				if (e->timeline != tl || e->n == 0)
+					continue;
+				if (fork_has_wal_less_page(tl, &e->key))
 					continue;
 				p = page_find(tl, &e->key, e->block);
 				f = fork_find(tl, &e->key);
@@ -18136,7 +18001,6 @@ walidx_snapshot_publish_one(void)
 	 */
 	plan_epoch = fork_event_plan_epoch_capture((uint32_t) candidate);
 	walidx_publish_wrlock();
-	walidx_plan_recheck_standing((uint32_t) candidate);
 	{
 		uint32_t tl = (uint32_t) candidate;
 		uint64_t generation;
@@ -23872,7 +23736,10 @@ ps_handle_meta(PsChannel *ch)
 						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0) &&
 						!(old_found == 1 &&
 						  memcmp(&old_pin, &pin, sizeof(pin)) == 0);
-					/* Page history permits an active owner to advance from its old
+					/* A new legacy index cap cannot use retained finite bases, even
+					 * while ordinary PAGE history still admits its LSN. Only exact
+					 * retries of already retained legacy caps are accepted.
+					 * Page history permits an active owner to advance from its old
 					 * protected image.  WAL-index history is sparse after compaction,
 					 * so its new point must independently name a retained chain. */
 					ret = (((((pin.resources &
@@ -23889,7 +23756,10 @@ ps_handle_meta(PsChannel *ch)
 							((pin.resources & PS_RETENTION_RESOURCE_WAL) != 0 &&
 							 !wal_allowed) ||
 							((pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
-							 !wal_index_allowed) || wal_index_pending) ||
+							 (!wal_index_allowed ||
+							  (cap_effective_seq(CAP_PIN, pin.admission_seq) == PS_SEQ_UNBOUNDED &&
+							   !(old_found == 1 &&
+							   memcmp(&old_pin, &pin, sizeof(pin)) == 0)))) || wal_index_pending) ||
 							!timeline_live) ?
 						PS_RETENTION_ERROR :
 			(cap_effective_seq(CAP_PIN, pin.admission_seq) == PS_SEQ_UNBOUNDED ?
@@ -25559,6 +25429,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	memset(timelines, 0, sizeof(timelines));
 	branch_caps_active = 0;
 	memset(cap_activation, 0, sizeof(cap_activation));
+	walidx_base_reads_active = 0;
 	memset(inspection_timeline_cache, 0,
 		   sizeof(inspection_timeline_cache));
 	inspection_timeline_cache_valid = 0;
@@ -26088,7 +25959,8 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	if (forkmeta_reclaim_high_water_bytes != 0 &&
 		fork_meta_reclaim_baseline_init() != 0)
 		return OPEN_STEP("initialize forkmeta reclaim baseline");
-	if (artifact_caps_recover() != 0 || timeline_activate_view_caps() != 0)
+	if (artifact_caps_recover() != 0 || timeline_activate_view_caps() != 0 ||
+		timeline_activate_index_bases() != 0)
 		return OPEN_STEP("activate finite view caps");
 	__atomic_store_n(&core_opened, 1, __ATOMIC_RELEASE);
 

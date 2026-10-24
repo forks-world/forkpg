@@ -357,8 +357,9 @@ existing refusal behavior; data forks are not eligible for hint reset.
 `--max-store-gb` is a stop threshold, not a reclamation controller. Controller
 high-water/catch-up settings are supplied with repeated `--daemon-arg` options.
 Indexing is necessary for WAL reclaim but does not guarantee bounded disk:
-unprotected WAL-index horizons conservatively keep FPI-led chains, and an
-unchanged page can retain an old raw-WAL dependency. Do not treat a short run
+legacy unbounded WAL-index horizons and unversioned forks conservatively keep
+FPI-led chains. Finite index views can instead retain durable bases, releasing
+obsolete FPI dependencies after compaction. Do not treat a short run
 with indexing enabled as proof that a 72-hour run fits its space budget.
 
 ## Not covered yet

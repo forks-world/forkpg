@@ -30,7 +30,10 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		50	/* 50: PS_WRITE_REPLAY_FLOOR semantics for relation
+#define PS_SHM_VERSION		51	/* 51: finite index views can depend on retained
+								 * bases/lifecycle via WAL_BASE_STATE after FPI
+								 * retirement; old readers must fail the handshake.
+								 * 50: PS_WRITE_REPLAY_FLOOR semantics for relation
 								 * EXTEND/WRITEV; mixed old daemons would ignore the
 								 * floor and silently restore the historical-growth
 								 * refusal, so they must fail the handshake.
