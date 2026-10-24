@@ -4722,6 +4722,130 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
  * not affect the parent or sibling branches; and it sees the parent frozen at
  * the branch LSN, not the parent's later writes.
  */
+static PsChannel *
+request_index_base(uint32_t rel, uint64_t lsn, uint64_t seq)
+{
+	PsChannel *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, FORK0);
+	ch->opcode = PS_OP_WAL_BASE_READ;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	ch->req_lsn = lsn;
+	ch->req_seq = seq;
+	ch->result = 0;
+	return cl_exec();
+}
+
+static PsChannel *
+request_index_state(uint32_t rel, uint64_t lsn, uint64_t seq)
+{
+	PsChannel *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, FORK0);
+	ch->opcode = PS_OP_WAL_BASE_STATE;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	ch->req_lsn = lsn;
+	ch->req_seq = seq;
+	ch->result = 0;
+	return cl_exec();
+}
+
+static void
+run_wal_base_suite(const char *daemon_path, const char *tmpbase)
+{
+	char shm[64], store[256];
+	const uint32_t ps = 8192, rel = 29400;
+	unsigned char *page = malloc(ps);
+	PsWalBaseState state;
+	PsRetentionPin pin;
+	PsChannel *ch;
+	pid_t pid;
+	uint64_t compactions, scanned, kept, deleted;
+
+	fprintf(stderr, "== retained WAL-index bases ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_wbase", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_wbase", tmpbase);
+	rm_rf(store);
+	ps_shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check((((PsShmHeader *) cl_shm)->frontend_capabilities & PS_FRONTEND_CAP_WAL_BASE) != 0,
+		  "daemon advertises retained index-base reads");
+	fill_page(page, ps, 1000, 61);
+	op_write_tl(0, rel, FORK0, 0, page);
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29400, 1,
+						  PS_RETENTION_RESOURCE_WAL_INDEX, 1500) == PS_STATUS_OK &&
+		  op_retention_lookup(0, PS_RETENTION_OWNER_READER, 29400, &pin),
+		  "reserve a finite index-only view of the first image");
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29401, 1,
+						  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) == PS_STATUS_OK,
+		  "advance page retention independently of the index view");
+	for (int i = 0; i < 40; i++)
+	{
+		fill_page(page, ps, 2000 + i * 100, 70 + i);
+		op_write_tl(0, rel, FORK0, 0, page);
+	}
+	check(wait_for_accounted_pruning_metrics(shm, 1, &compactions, &scanned, &kept, &deleted),
+		  "compact and retire ordinary page history before reading the index base");
+	ch = request_index_base(rel, 1500, pin.admission_seq);
+	check(ch->status == PS_STATUS_OK && ch->result == 1 && ch->req_lsn == 1000 &&
+		  page_has_tag(ch->data, ps, 61), "wire operation returns the protected durable base");
+	ch = request_index_state(rel, 1500, pin.admission_seq);
+	memcpy(&state, ch->data, sizeof(state));
+	check(ch->status == PS_STATUS_OK && ch->result == 1 &&
+		  ch->datalen == sizeof(state) + ps && state.found &&
+		  state.version_lsn == 1000 && state.nblocks == 1 && state.death_lsn == 0 &&
+		  page_has_tag(ch->data + sizeof(state), ps, 61),
+		  "wire state returns the durable base and lifecycle under one index cap");
+	cl_setkey(ch, rel, FORK0);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	ch->req_lsn = 1500;
+	ch->req_seq = pin.admission_seq;
+	check(cl_exec()->status == PS_STATUS_ERROR, "index-base access does not grant ordinary page reads");
+	ch = request_index_base(rel, 1500, pin.admission_seq + 1);
+	check(ch->status == PS_STATUS_ERROR && ch->result == PS_WAL_BASE_VIEW_UNREGISTERED,
+		  "a different sequence cannot borrow a retained index view");
+	ch = request_index_state(rel, 1500, pin.admission_seq + 1);
+	check(ch->status == PS_STATUS_ERROR && ch->result == PS_WAL_BASE_VIEW_UNREGISTERED,
+		  "wire state rejects an unknown view rather than returning empty lifecycle");
+	for (int invalid = 0; invalid < 6; invalid++)
+	{
+		cl_setkey(ch, rel, FORK0);
+		ch->opcode = invalid < 3 ? PS_OP_WAL_BASE_READ : PS_OP_WAL_BASE_STATE;
+		ch->blocknum = 0;
+		ch->nblocks = invalid % 3 == 0 ? 2 : 1;
+		ch->req_lsn = 1500;
+		ch->req_seq = pin.admission_seq;
+		ch->result = 0;
+		if (invalid % 3 == 1) ch->key.klass = PS_KLASS_CONTROL;
+		if (invalid % 3 == 2) ch->incarnation = UINT64_MAX;
+		check(cl_exec()->status == PS_STATUS_ERROR,
+			  "index-base operation rejects invalid size, class and incarnation (%d)", invalid);
+	}
+	client_detach();
+	stop_daemon(pid);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	ch = request_index_base(rel, 1500, pin.admission_seq);
+	check(ch->status == PS_STATUS_OK && ch->result == 1 && page_has_tag(ch->data, ps, 61),
+		  "index-base bytes and authority survive daemon restart");
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 29400, 1) == PS_STATUS_OK,
+		  "release the index view");
+	ch = request_index_base(rel, 1500, pin.admission_seq);
+	check(ch->status == PS_STATUS_ERROR && ch->result == PS_WAL_BASE_VIEW_UNREGISTERED,
+		  "released index authority cannot read an old base");
+	client_detach();
+	stop_daemon(pid);
+	ps_shm_unlink(shm);
+	free(page);
+}
+
 static void
 run_branch_suite(const char *daemon_path, const char *tmpbase)
 {
@@ -6778,6 +6902,7 @@ main(int argc, char **argv)
 	run_retention_suite(daemon_path, tmpbase);
 
 	/* branch / snapshot isolation (page-size independent, run once) */
+	run_wal_base_suite(daemon_path, tmpbase);
 	run_branch_suite(daemon_path, tmpbase);
 	run_bugb_suite(daemon_path, tmpbase);
 

@@ -177,6 +177,12 @@ extern int	pagestore_localsvc_read_at_found(const PageStoreRelKey *key,
 											 BlockNumber blocknum, uint64 lsn,
 											 void *out, uint64 *version_out,
 											 uint64 *version_seq_out);
+/* 1 = durable base, 0 = no base, -2 = unsupported/unregistered view,
+ * -1 = read failure. The caller must not turn a failure into an empty page. */
+extern int pagestore_localsvc_wal_base_read(const PageStoreRelKey *key,
+										  BlockNumber blocknum, uint64 lsn,
+										  uint64 read_seq, void *out,
+										  uint64 *version_out, uint64 *seq_out);
 extern void pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
 										   uint64 branch_lsn,
 										   uint64 target_incarnation,
@@ -195,6 +201,10 @@ extern bool pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 												 uint64 branch_lsn,
 												 uint64 target_incarnation,
 												 uint64 parent_incarnation);
+/* Durable base plus lifecycle at one held index view: 1 found, 0 no base,
+ * -2 unsupported/unregistered, -1 read failure. Pinned reads use their S. */
+extern int pagestore_localsvc_wal_base_state(const PageStoreRelKey *key,
+	BlockNumber blocknum, uint64 lsn, void *out, PsWalBaseState *state);
 extern void pagestore_localsvc_require_branch_seq(void);
 extern bool pagestore_localsvc_create_branch_proven(uint32 new_tl, uint32 parent_tl,
 												   uint64 branch_lsn, uint64 target_incarnation,

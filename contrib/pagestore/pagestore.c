@@ -1013,23 +1013,61 @@ ps_redo_daemon_error(const char *what, const PageStoreRelKey *key,
 					key->forkNum, LSN_FORMAT_ARGS(lsn))));
 }
 
+/* One response supplies the base and the lifecycle used to judge it. Never
+ * combine an index-only base with ordinary PAGE metadata from another cap. */
+typedef struct PsRedoStoredView
+{
+	int mode; /* 0 not loaded, 1 index view, 2 ordinary compatibility path */
+	PsWalBaseState state;
+	char page[BLCKSZ];
+} PsRedoStoredView;
+
+static void
+ps_redo_load_stored_view(PsRedoStoredView *view, const PageStoreRelKey *key,
+						BlockNumber blocknum, XLogRecPtr lsn)
+{
+	int rc;
+
+	if (view->mode != 0)
+		return;
+	rc = pagestore_localsvc_wal_base_state(key, blocknum, (uint64) lsn,
+										view->page, &view->state);
+	if (rc == -1)
+		ps_redo_daemon_error("the index-view base and lifecycle", key, blocknum, lsn);
+	/* Older daemons and arbitrary horizons retain the existing PAGE-authority
+	 * path. A registered view with a missing base still has exact lifecycle
+	 * metadata, and must not fall back to a different ordinary view. */
+	view->mode = rc == -2 ? 2 : 1;
+}
+
 static uint64
-ps_redo_nblocks_asof(const PageStoreRelKey *key, BlockNumber blocknum,
+ps_redo_nblocks_asof(PsRedoStoredView *view, const PageStoreRelKey *key,
+					 BlockNumber blocknum,
 					 XLogRecPtr lsn)
 {
 	uint64		nblocks = 0;
 
+	ps_redo_load_stored_view(view, key, blocknum, lsn);
+	if (view->mode == 1)
+		return view->state.nblocks;
 	if (!pagestore_localsvc_nblocks_asof_checked(key, (uint64) lsn, &nblocks))
 		ps_redo_daemon_error("the relation size", key, blocknum, lsn);
 	return nblocks;
 }
 
 static uint64
-ps_redo_block_death(const PageStoreRelKey *key, BlockNumber blocknum,
+ps_redo_block_death(PsRedoStoredView *view, const PageStoreRelKey *key,
+					BlockNumber blocknum,
 					XLogRecPtr lsn, uint64 *seq_out)
 {
 	uint64		death = 0;
 
+	ps_redo_load_stored_view(view, key, blocknum, lsn);
+	if (view->mode == 1)
+	{
+		*seq_out = view->state.death_seq;
+		return view->state.death_lsn;
+	}
 	if (!pagestore_localsvc_block_death_asof(key, blocknum, (uint64) lsn,
 											 &death, seq_out))
 		ps_redo_daemon_error("the fork death", key, blocknum, lsn);
@@ -1037,7 +1075,8 @@ ps_redo_block_death(const PageStoreRelKey *key, BlockNumber blocknum,
 }
 
 static bool
-ps_redo_stored_base(const PageStoreRelKey *key, BlockNumber blocknum,
+ps_redo_stored_base(PsRedoStoredView *view, const PageStoreRelKey *key,
+					BlockNumber blocknum,
 					XLogRecPtr lsn, char *out, XLogRecPtr *base_end_lsn,
 					uint64 *base_seq)
 {
@@ -1046,8 +1085,17 @@ ps_redo_stored_base(const PageStoreRelKey *key, BlockNumber blocknum,
 	int			found;
 
 	*base_seq = 0;
-	found = pagestore_localsvc_read_at_found(key, blocknum, (uint64) lsn, out,
-											 &version, &version_seq);
+	ps_redo_load_stored_view(view, key, blocknum, lsn);
+	if (view->mode == 1)
+	{
+		found = view->state.found;
+		version = view->state.version_lsn;
+		version_seq = view->state.version_seq;
+		if (found) memcpy(out, view->page, BLCKSZ);
+	}
+	else
+		found = pagestore_localsvc_read_at_found(key, blocknum, (uint64) lsn,
+												 out, &version, &version_seq);
 	if (found < 0)
 		ps_redo_daemon_error("the stored base", key, blocknum, lsn);
 	if (found > 0)
@@ -1065,7 +1113,7 @@ ps_redo_stored_base(const PageStoreRelKey *key, BlockNumber blocknum,
 			*base_seq = version_seq;
 		return true;
 	}
-	if (ps_redo_nblocks_asof(key, blocknum, lsn) > (uint64) blocknum)
+	if (ps_redo_nblocks_asof(view, key, blocknum, lsn) > (uint64) blocknum)
 	{
 		memset(out, 0, BLCKSZ);
 		*base_end_lsn = InvalidXLogRecPtr;
@@ -2538,6 +2586,7 @@ PG_FUNCTION_INFO_V1(pagestore_redo_page);
 Datum
 pagestore_redo_page(PG_FUNCTION_ARGS)
 {
+	PsRedoStoredView stored_view = {0};
 	XLogRecPtr	fpi_end = InvalidXLogRecPtr;
 	Oid			relid = PG_GETARG_OID(0);
 	int32		forknum = PG_GETARG_INT32(1);
@@ -2570,7 +2619,7 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		 * durable stored version (or proven absence) covers every visible
 		 * record; that stored version is then the base. */
 		page = palloc(BLCKSZ);
-		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
+		if (ps_redo_stored_base(&stored_view, &key, (BlockNumber) blocknum, lsn, page,
 								&base_end, &base_seq))
 		{
 			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
@@ -2654,7 +2703,7 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		uint64		base_seq = 0;
 
 		if (result == NULL &&
-			ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
+			ps_redo_stored_base(&stored_view, &key, (BlockNumber) blocknum, lsn, page,
 								&base_end, &base_seq))
 		{
 			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
@@ -2677,12 +2726,12 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		if (result != NULL)
 		{
 			uint64		death_seq = 0;
-			uint64		death = ps_redo_block_death(&key, (BlockNumber) blocknum,
+			uint64		death = ps_redo_block_death(&stored_view, &key, (BlockNumber) blocknum,
 													lsn, &death_seq);
 
 			if (ps_death_supersedes(death, death_seq, base_end, base_seq))
 			{
-				if (ps_redo_nblocks_asof(&key, (BlockNumber) blocknum, lsn) >
+				if (ps_redo_nblocks_asof(&stored_view, &key, (BlockNumber) blocknum, lsn) >
 					(uint64) blocknum)
 					memset(VARDATA(result), 0, BLCKSZ);
 				else
@@ -2813,6 +2862,7 @@ PG_FUNCTION_INFO_V1(pagestore_redo_page_asof);
 Datum
 pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 {
+	PsRedoStoredView stored_view = {0};
 	bool		death_based = false;
 	uint64		base_seq = 0;
 	Oid			relid = PG_GETARG_OID(0);
@@ -2856,7 +2906,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		 * at or below lsn (or a zero page for a regrown block) already is the
 		 * page as of lsn; a truncated or dropped block is absent. */
 		page = palloc(BLCKSZ);
-		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, page,
+		if (ps_redo_stored_base(&stored_view, &key, (BlockNumber) blocknum, lsn, page,
 								&base_end, &base_seq))
 		{
 			result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
@@ -2939,7 +2989,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		 * version at or below lsn is the replacement base: start from it and
 		 * apply only the records that complete after its pd_lsn.
 		 */
-		if (ps_redo_stored_base(&key, (BlockNumber) blocknum, lsn, base,
+		if (ps_redo_stored_base(&stored_view, &key, (BlockNumber) blocknum, lsn, base,
 								&base_end_lsn, &base_seq))
 		{
 			for (int i = 0; i < n; i++)
@@ -2976,12 +3026,12 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 */
 	{
 		uint64		death_seq = 0;
-		uint64		death = ps_redo_block_death(&key, (BlockNumber) blocknum,
+		uint64		death = ps_redo_block_death(&stored_view, &key, (BlockNumber) blocknum,
 												lsn, &death_seq);
 
 		if (ps_death_supersedes(death, death_seq, base_end_lsn, base_seq))
 		{
-			if (ps_redo_nblocks_asof(&key, (BlockNumber) blocknum, lsn) <=
+			if (ps_redo_nblocks_asof(&stored_view, &key, (BlockNumber) blocknum, lsn) <=
 				(uint64) blocknum)
 			{
 				XLogReaderFree(reader);

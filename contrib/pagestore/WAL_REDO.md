@@ -178,3 +178,50 @@ Branch computes must be booted through the prepared branch manifest/install
 flow so WAL/SLRU/control state matches the fork point.  The older same-PGDATA
 timeline-switch demo has been removed because branch timeline startup now fails
 closed without `pagestore_branch.manifest`.
+
+## Reading a retained WAL-index base
+
+`PS_OP_WAL_BASE_READ` is an optional interface advertised by
+`PS_FRONTEND_CAP_WAL_BASE`. It retrieves a durable, versioned relation page
+selected by an exactly registered finite WAL-index view. An explicit sequence
+selects a held index view; sequence zero selects only the timeline's current
+durable indexing progress. An unknown or released view fails with
+`PS_WAL_BASE_VIEW_UNREGISTERED`, rather than looking like a missing page.
+
+The interface can read a base retained for indexing below the ordinary page
+history frontier. It does not grant ordinary page-read authority, return
+unversioned pages, or make transient page versions valid recovery bases.
+Ancestry must also have a registered index view. The backend helper returns
+`-2` for an unsupported interface or an unregistered view, `-1` for a read
+failure, `0` for no durable base, and `1` for a returned base.
+
+This interface is groundwork for replacing old full-page-image dependencies.
+SQL redo uses the combined base/lifecycle interface below when available.
+WAL-index compaction and raw-WAL deletion policies are unchanged. In particular, its availability alone does not prove
+bounded disk use for the 72-hour endurance workload.
+
+### A base and its lifecycle from one view
+
+`PS_OP_WAL_BASE_STATE`, advertised separately by
+`PS_FRONTEND_CAP_WAL_BASE_STATE`, returns a `PsWalBaseState` header and one page.
+The header contains the selected durable version and admission sequence, the
+relation size, and the last truncate/unlink position and sequence for this
+block. All answers use the same finite WAL-index cap and ancestry; lifecycle
+metadata is captured before page I/O while the request's read fences exclude
+mutations and reclamation. Sequence zero selects current durable indexing
+progress; a pinned compute supplies its explicit sequence.
+
+A registered view can return no durable base while still proving that the
+block exists after zero extension. It can also prove that the block is gone.
+Unknown views, corrupt/unreadable data, and WAL-less relation contents do not
+become successful empty lifecycle answers. Unversioned relations are refused
+because their missing durable base cannot justify synthesizing a zero page.
+The original base-only operation retains its existing contract.
+
+Both SQL single-page redo entrypoints cache this combined response for one
+invocation. Base selection, death comparisons, and size checks therefore use
+one cap and do not borrow ordinary PAGE authority for an index-only base.
+Unsupported daemons and unregistered index horizons use the existing ordinary
+history path; a registered view's I/O error fails the operation. This is still
+preparation for changing FPI/WAL retirement: the deletion policy is unchanged,
+and no 72-hour or bounded-disk qualification is implied.
