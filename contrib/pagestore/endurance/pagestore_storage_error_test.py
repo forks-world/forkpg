@@ -54,6 +54,12 @@ class StorageErrorRun(driver.Run):
         except (FileNotFoundError, json.JSONDecodeError):
             return None
 
+    def fault_response(self, text):
+        # Replay promotes storage errors to FATAL and exits with status 1.
+        # Only this explicit metadata fault permits that controlled outcome.
+        severity = r'(?:ERROR|FATAL)' if self.fault_operation == 'forkmeta-fsync' else 'ERROR'
+        return re.search(severity + r':.*pagestore localsvc: daemon reported error[^\n]*', text)
+
     def check_health(self):
         if not self.injecting:
             return super().check_health()
@@ -71,6 +77,12 @@ class StorageErrorRun(driver.Run):
         self.provision()
         self.verify_materializer('before storage fault')
         self.mat.stop('fast')
+        wal_fault = self.fault_operation == 'wal-fsync'
+        if wal_fault:
+            fault_offsets = {pg.name: pg.log.stat().st_size for pg in self.computes()}
+            self.injecting = True
+            self.arm.touch()
+            self.event('storage_fault_armed', operation=self.fault_operation)
         # Commit and archive the writer's independent local-WAL truth before
         # preventing the materializer from publishing its new page images.
         self.writer.sql("BEGIN; UPDATE acct SET bal=bal-1 WHERE id=1; "
@@ -78,11 +90,16 @@ class StorageErrorRun(driver.Run):
                         "CREATE TABLE storage_error_probe AS SELECT g, md5(g::text) AS v "
                         "FROM generate_series(1,5000) g; CHECKPOINT;")
         expected = self.checksums(self.writer)
-        self.archive_current_wal()
-        fault_offsets = {pg.name: pg.log.stat().st_size for pg in self.computes()}
-        self.injecting = True
-        self.arm.touch()
-        self.event('storage_fault_armed', operation=self.fault_operation)
+        if wal_fault:
+            switch = self.writer.sql('SELECT pg_switch_wal();')
+            segment = self.writer.sql(f"SELECT pg_walfile_name('{switch}'::pg_lsn - 1);")
+            archive_done = self.writer.datadir / 'pg_wal/archive_status' / (segment + '.done')
+        else:
+            self.archive_current_wal()
+            fault_offsets = {pg.name: pg.log.stat().st_size for pg in self.computes()}
+            self.injecting = True
+            self.arm.touch()
+            self.event('storage_fault_armed', operation=self.fault_operation)
         try:
             self.mat.start()
         except driver.Failure as error:
@@ -102,9 +119,9 @@ class StorageErrorRun(driver.Run):
             time.sleep(.1)
             hit = self.read_fault_report()
         if hit is None:
-            raise driver.Failure('fault_unreached', 'no complete page-segment I/O fault report')
+            raise driver.Failure('fault_unreached', 'no complete storage I/O fault report')
         expected_errno = {'pwrite': errno.ENOSPC, 'fsync': errno.EIO,
-                          'short-pwrite': 0}[self.fault_operation]
+                          'short-pwrite': 0, 'wal-fsync': errno.EIO, 'forkmeta-fsync': errno.EIO}[self.fault_operation]
         if (hit.get('operation') != self.fault_operation or hit.get('errno') != expected_errno or
                 hit.get('pid') != self.daemon.pid):
             raise driver.Failure('fault_identity', f'unexpected I/O hit: {hit}')
@@ -114,13 +131,16 @@ class StorageErrorRun(driver.Run):
             raise driver.Failure('fault_identity', f'no actual positive short write: {hit}')
         # A connection failure alone is not proof that storage errors surfaced.
         # Require the actual daemon-error response in the compute's fault window.
+        fault_compute = self.writer if wal_fault else self.mat
         compute_error = None
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             self.check_health()
-            text = self.mat.log.read_bytes()[fault_offsets[self.mat.name]:].decode(errors='replace')
-            response = re.search(r'ERROR:.*pagestore localsvc: daemon reported error[^\n]*', text)
-            if response:
+            text = fault_compute.log.read_bytes()[fault_offsets[fault_compute.name]:].decode(errors='replace')
+            response = self.fault_response(text)
+            archive_failure = (not wal_fault or
+                               f'archiving write-ahead log file "{segment}" failed' in text)
+            if response and archive_failure:
                 compute_error = response.group(0)
                 break
             try:
@@ -130,6 +150,12 @@ class StorageErrorRun(driver.Run):
             time.sleep(.1)
         if compute_error is None:
             raise driver.Failure('fault_not_surfaced', 'no compute daemon-error response after I/O failure')
+        if wal_fault:
+            if archive_done.exists():
+                raise driver.Failure('false_archive_success', 'faulted WAL was marked archived')
+            if not (self.writer.datadir / 'pg_wal' / segment).is_file():
+                raise driver.Failure('wal_retry_source_lost', 'faulted WAL missing from writer')
+            self.event('wal_archive_rejected', segment=segment, retry_source_retained=True)
         self.event('storage_fault_observed', compute_error=compute_error, **hit)
         # Stop computes immediately, then crash daemon while fault is still
         # armed. No successful segment sync is allowed to mask the error.
@@ -154,10 +180,14 @@ class StorageErrorRun(driver.Run):
         (evidence / 'scope.json').write_text(json.dumps({
             'operation': self.fault_operation, 'hit': hit, 'compute_error': compute_error,
             'library_sha256': hashlib.sha256(self.library.read_bytes()).hexdigest(),
-            'model': ('positive short pwrite on daemon page segments'
+            'model': ('pre-syscall fsync EIO on daemon forkmeta append log'
+                      if self.fault_operation == 'forkmeta-fsync' else
+                      'pre-syscall fsync EIO on daemon legacy WAL logs wal_<timeline>'
+                      if self.fault_operation == 'wal-fsync' else
+                      'positive short pwrite on daemon page segments'
                       if self.fault_operation == 'short-pwrite' else
                       'pre-syscall failure on daemon page-segment files only'),
-            'not_covered': ['torn writes after successful return', 'WAL/metadata failures',
+            'not_covered': ['torn writes after successful return', 'immutable WAL segment failures', 'metadata failures',
                             'slow I/O', 'power loss']},
             indent=2) + '\n')
         self.arm.unlink()
@@ -166,6 +196,10 @@ class StorageErrorRun(driver.Run):
         self.mat.start()
         self.injecting = False
         self.verify_materializer('after I/O failure and daemon crash')
+        if wal_fault:
+            if not archive_done.exists() and (self.writer.datadir / 'pg_wal' / segment).exists():
+                raise driver.Failure('wal_retry_incomplete', 'faulted WAL still awaiting archive')
+            self.event('wal_archive_recovered', segment=segment)
         if self.checksums(self.writer) != expected:
             raise driver.Failure('committed_data_lost', 'writer lost committed fault-window data')
         for pg in reversed(self.computes()):
@@ -178,7 +212,7 @@ class StorageErrorRun(driver.Run):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--library', required=True, type=Path)
-    parser.add_argument('--operation', required=True, choices=('pwrite', 'fsync', 'short-pwrite'))
+    parser.add_argument('--operation', required=True, choices=('pwrite', 'fsync', 'short-pwrite', 'wal-fsync', 'forkmeta-fsync'))
     parser.add_argument('driver_args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     library = args.library.resolve()

@@ -80,9 +80,17 @@ jobs:
           PAGESTORE_CLEANUP_TEST_BUILD="$(pwd)/build" \
             python3 contrib/pagestore/endurance/test_postmaster_cleanup.py
 
+      - name: Verify metadata publication after directory sync failure
+        run: |
+          set -o pipefail
+          python3 contrib/pagestore/endurance/test_metadata_directory_sync.py \
+            --library "$(pwd)/build/contrib/pagestore/pagestore_storage_io_fault.so" \
+            --probe "$(pwd)/build/contrib/pagestore/pagestore_metadata_publish_probe" \
+            | tee "$RUNNER_TEMP/metadata-directory-sync.log"
+
       - name: Verify SQL recovery after page-store I/O errors
         run: |
-          for operation in pwrite fsync short-pwrite; do
+          for operation in pwrite fsync short-pwrite wal-fsync forkmeta-fsync; do
             python3 contrib/pagestore/endurance/pagestore_storage_error_test.py \
               --library "$(pwd)/build/contrib/pagestore/pagestore_storage_io_fault.so" \
               --operation "$operation" -- \
@@ -120,6 +128,7 @@ jobs:
           root="$RUNNER_TEMP/endurance"
           out="$(pwd)/build/pagestore-endurance-evidence"
           mkdir -p "$out"
+          cp "$RUNNER_TEMP/metadata-directory-sync.log" "$out"/ 2>/dev/null || true
           cp "$root"/history.jsonl "$out"/ 2>/dev/null || true
           # a pass leaves its summary, events and metrics under passed/<seed>/;
           # a failure leaves the whole run root, of which the logs, events,
