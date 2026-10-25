@@ -80,6 +80,19 @@ jobs:
           PAGESTORE_CLEANUP_TEST_BUILD="$(pwd)/build" \
             python3 contrib/pagestore/endurance/test_postmaster_cleanup.py
 
+      - name: Verify SQL recovery after page-store I/O errors
+        run: |
+          for operation in pwrite fsync short-pwrite; do
+            python3 contrib/pagestore/endurance/pagestore_storage_error_test.py \
+              --library "$(pwd)/build/contrib/pagestore/pagestore_storage_io_fault.so" \
+              --operation "$operation" -- \
+              --build "$(pwd)/build" --root "$RUNNER_TEMP/storage-errors/$operation" \
+              --seed 1 --scale 1 --clients 1 --max-branches 0 \
+              --sample-interval 1 --sync-timeout 120 \
+              --max-run-gb 3 --max-store-gb 2 --min-free-gb 5 \
+              --max-rss-mb 4096 --max-fds 4096
+          done
+
       - name: Run the endurance driver
         env:
           SEED: ${{ inputs.seed || '1' }}
@@ -122,6 +135,20 @@ jobs:
               [ -f "$prepared/pagestore_branch.prepare.json" ] || continue
               mkdir -p "$dest/$(basename "$prepared")"
               cp "$prepared/pagestore_branch.prepare.json" "$dest/$(basename "$prepared")/"
+            done
+          done
+          for faultcase in "$RUNNER_TEMP/storage-errors"/*; do
+            [ -d "$faultcase" ] || continue
+            faultdest="$out/storage-errors/$(basename "$faultcase")"
+            mkdir -p "$faultdest"
+            cp "$faultcase"/history.jsonl "$faultdest"/ 2>/dev/null || true
+            if [ -d "$faultcase/passed" ]; then cp -r "$faultcase/passed" "$faultdest"/; fi
+            for faultrun in "$faultcase"/run-*; do
+              [ -d "$faultrun" ] || continue
+              faultlogdest="$faultdest/$(basename "$faultrun")"
+              mkdir -p "$faultlogdest"
+              cp "$faultrun"/*.json "$faultrun"/*.jsonl "$faultrun"/*.log "$faultlogdest"/ 2>/dev/null || true
+              if [ -d "$faultrun/diagnostics" ]; then cp -r "$faultrun/diagnostics" "$faultlogdest"/; fi
             done
           done
           du -sh "$out"
