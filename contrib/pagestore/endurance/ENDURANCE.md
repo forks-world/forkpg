@@ -19,6 +19,10 @@ postmaster is pinned by a kernel process handle after checking its executable
 and data directory. If immediate `pg_ctl` shutdown fails or times out, cleanup
 sends SIGKILL through that handle; PostgreSQL backends observe postmaster death.
 An exited generation is never signalled through its old PID or process group.
+The `mat_kill9` injection also pins descendants before killing its owned
+postmaster and waits for those handles before restarting. PostgreSQL children
+create separate sessions/process groups, so disappearance of the postmaster
+process group does not prove its children have released shared memory.
 A partially started compute is adopted only after the same ownership checks.
 Cleanup waits for pinned descendants before inspecting or removing shared
 resources. Failed compute cleanup is retried once; if it remains incomplete,
