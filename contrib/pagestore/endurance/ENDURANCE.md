@@ -73,6 +73,25 @@ bounded reclamation or qualify a 72-hour run. `--forever --duration 3600`
 creates a fresh topology each hour; `--duration 259200` keeps one topology for
 72 hours, plus provisioning and the final verification/cleanup.
 
+## Archive lag limits
+
+`--materializer-max-lag-mb N` and `--wal-index-max-lag-mb N` configure the
+writer's existing PostgreSQL archive lag limiters. Both default to zero
+(disabled). The driver first loads and verifies the initial data, replays a
+writer checkpoint and publishes a durable materializer marker. It then restarts
+the writer with the requested postmaster settings and verifies the effective
+values before starting the timed workload. Missing markers fail the setup;
+limits are never installed into bootstrap configurations before this gate.
+
+These are archive limits, not limits on WAL generation. A paused archiver can
+move backlog to writer-local `pg_wal`; `compute_wal_kb` samples each compute's
+local WAL allocation separately. The whole-run space budget covers these files.
+Keep total-run and filesystem headroom limits enabled. Materializer bounds allow
+segment alignment and a latched checkpoint crossing; WAL-index limits reserve
+maximum-record/padding headroom, so neither setting is an exact byte ceiling.
+Warnings that archiving is paused are expected while the worker catches up;
+failure to catch up within `--sync-timeout` remains a finding.
+
 ## Topology
 
 The provisioning mirrors `mvp_golden_test.sh` step for step, so a failure here

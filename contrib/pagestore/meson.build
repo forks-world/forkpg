@@ -793,6 +793,12 @@ test('pagestore_endurance_cleanup',
   suite: ['pagestore'],
   timeout: 60,
 )
+test('pagestore_endurance_archive_lag',
+  pagestore_harness_python,
+  args: [files('endurance/test_archive_lag.py')],
+  suite: ['pagestore'],
+  timeout: 60,
+)
 test('pagestore_endurance_space_budget',
   pagestore_harness_python,
   args: [files('endurance/test_space_budget.py')],
