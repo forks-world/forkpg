@@ -71,6 +71,9 @@ jobs:
         run: |
           python3 contrib/pagestore/endurance/test_space_budget.py
           python3 contrib/pagestore/endurance/test_archive_lag.py
+          python3 contrib/pagestore/endurance/test_branch_reclaim.py
+          python3 contrib/pagestore/endurance/test_endurance_watch.py
+          python3 contrib/pagestore/endurance/test_resources.py
 
       - name: Verify postmaster cleanup including a forced pg_ctl timeout
         run: |
@@ -92,7 +95,9 @@ jobs:
             --seed "$SEED" --duration "$DURATION" --scale "$SCALE" \
             --clients 4 --burst-min 5 --burst-max 20 \
             --branch-probability 0.5 --max-branches 1 \
+            --branch-reclaim-cycles 3 --branch-reclaim-slack-mb 64 \
             --materializer-max-lag-mb 32 --wal-index-max-lag-mb 8 \
+            --max-rss-mb 4096 --max-fds 4096 \
             --sample-interval 15 --max-store-gb 40 --max-run-gb 50 --min-free-gb 5
 
       - name: Collect run evidence

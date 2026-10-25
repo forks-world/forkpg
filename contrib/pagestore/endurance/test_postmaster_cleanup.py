@@ -214,6 +214,29 @@ class TeardownTests(unittest.TestCase):
 
 
 
+class ChildExitRaceTests(unittest.TestCase):
+    def test_procfs_esrch_requires_pinned_child_exit(self):
+        for exited in (True, False):
+            with self.subTest(exited=exited):
+                handle = endurance.PostmasterHandle(7, 123)
+                handle.exited = Mock(return_value=False)
+                def proc_read(path, *args, **kwargs):
+                    if path.name == 'children':
+                        return '456'
+                    raise ProcessLookupError('child exited while procfs stat was read')
+                with patch.object(Path, 'read_text', new=proc_read), \
+                     patch.object(endurance.os, 'pidfd_open', return_value=8), \
+                     patch.object(endurance.select, 'select', return_value=([8] if exited else [], [], [])), \
+                     patch.object(endurance.os, 'close') as close:
+                    if exited:
+                        handle.pin_children()
+                    else:
+                        with self.assertRaises(ProcessLookupError):
+                            handle.pin_children()
+                    close.assert_called_once_with(8)
+                    self.assertFalse(handle.children)
+
+
 @unittest.skipUnless(hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal'),
                      'Linux pidfd support required for real process tests')
 class RealHandleTests(unittest.TestCase):

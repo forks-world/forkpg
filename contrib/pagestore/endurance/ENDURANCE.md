@@ -92,6 +92,85 @@ maximum-record/padding headroom, so neither setting is an exact byte ceiling.
 Warnings that archiving is paused are expected while the worker catches up;
 failure to catch up within `--sync-timeout` remains a finding.
 
+## Exit notifications and persistent status
+
+Use `pagestore_endurance_watch.py` outside the driver to observe normal exits,
+startup exceptions and a driver killed by a signal. The hook is explicitly
+configured; the watcher has no default remote recipient. For example, a local
+desktop notification (when a desktop notification service is available):
+
+```sh
+python3 contrib/pagestore/endurance/pagestore_endurance_watch.py \
+    --status-file /path/to/endurance/watch.json --label '72h seed 1' \
+    --notify-command "notify-send 'forkpg endurance stopped'" \
+    -- python3 contrib/pagestore/endurance/pagestore_endurance.py \
+    --build build --root /path/to/endurance/runs --seed 1 --duration 259200 \
+    --max-run-gb 12 --max-store-gb 8 --min-free-gb 5
+```
+
+The command is parsed into words and executed without a shell. The absolute
+status-file path is appended as one argument. A custom delivery script should
+read that JSON and send it through the operator's existing notification system.
+Do not put credentials in command arguments. Hook output is discarded to avoid
+leaking secrets. Run a delivery probe with the same status path and hook plus
+`--test-notification` (without a driver command) and confirm it actually reaches
+the recipient before starting a long run.
+
+The atomic, fsynced status file contains a unique run ID, label, watcher/driver
+PIDs, phase, heartbeat, exit code, completion timestamp and hook result. One
+watcher owns each status path via an advisory lock. Heartbeats default to five
+seconds and continue while an interrupted driver cleans up. Failure evidence
+is written before the hook runs; notifications are attempted once for a failed
+or interrupted command, and optionally for success (`--notify-on-success`).
+The ten-second default hook timeout is adjustable. A hook failure is recorded
+separately, preserves the driver's nonzero exit status, and makes a successful
+driver/watch combination exit nonzero. `command_succeeded` means only that the
+hook exited zero: it does not certify human receipt or provider delivery.
+There is no automatic delivery retry or cross-restart exactly-once guarantee.
+
+The watcher must also be kept alive, for example by an existing service manager
+or external monitor. Its heartbeat proves the watcher is running, not that SQL
+is making progress; use driver timeouts and a service/CI runtime limit as well.
+If the watcher or host is killed, crashes, loses power or cannot write its status,
+it cannot guarantee a notification; an independent monitor must detect a stale
+heartbeat. A killed driver may leave computes behind: the watcher does not guess
+ownership or kill arbitrary descendants. During ordinary interruption it sends
+one SIGINT to the driver, allowing the driver's pidfd cleanup to finish; it does
+not enforce an extra cleanup deadline. Notification is attempted when the driver
+exits, so lengthy diagnostics/cleanup can delay it. Keep the status file outside
+per-seed run directories, since successful runs remove their bulky data.
+
+## Memory and descriptor budgets
+
+`--max-rss-mb 4096 --max-fds 4096` enables sampled stopping thresholds for
+summed RSS and open descriptors across the daemon and tracked compute process
+trees, including PostgreSQL backends and background workers. Both options
+otherwise default to zero (disabled). The CI endurance lane sets them explicitly.
+An over-budget sample fails as `resource_rss` or `resource_fds`. Three consecutive
+incomplete live-root observations fail as `resource_unmeasurable` while either
+limit is enabled. As with space budgets, a running command may delay shutdown.
+
+Metrics retain the `procs` root-process readings and add `resource_groups` and
+`resource_totals`, with process count, RSS KiB and descriptor count. Roots record
+PID and Linux start-time ticks to distinguish restarted generations. Collection
+uses in-memory parentage from procfs and checks identities before/after reads;
+it discards a group if its owning pidfd/Popen generation exits while sampling.
+Short-lived backends may disappear between observations. Overlapping roots are
+counted only once in the total. `resource_errors` records incomplete observations;
+summary `stats.resource_peaks` preserves sampled maxima after successful run data
+is removed. No process is signalled by this read-only collector.
+
+The RSS sum deliberately double-counts shared mappings across different
+processes. It is a conservative budget rather than PSS or a physical-memory
+measurement. Descriptor counts are per process, including inherited descriptors.
+The readings are not an atomic process census and are not a kernel memory/FD
+quota. Temporarily controller-owned/private computes and processes no longer in
+a tracked root's ancestry can fall outside coverage; use a service/cgroup budget
+for a hard whole-service bound. A threshold breach does not by itself prove a
+leak. Cache warming, shared memory, branch creation and restart generations must
+be separated before diagnosing a growth trend. Short budget probes do not
+qualify 72-hour memory stability.
+
 ## Topology
 
 The provisioning mirrors `mvp_golden_test.sh` step for step, so a failure here
@@ -113,6 +192,32 @@ One run is one topology lifetime: provisioning, then rounds for
 `--duration` seconds (at least one).  `--forever` runs seed,
 seed+1, ... each from a fresh `initdb` and import, so the bootstrap paths are
 exercised as often as the steady state.
+
+## Repeated branch reclamation
+
+`--branch-reclaim-cycles 3 --branch-reclaim-slack-mb 64` runs fixed-parent
+create/write/restart/delete cycles before the random workload. At least two
+cycles and `--max-branches >= 1` are required. The first deleted branch warms
+up the parent checkpoint/materialization paths and establishes a physical store
+allocation and retention-owner baseline. Subsequent cycles must return below
+that store allocation plus the configured slack, and must not increase any
+owner/resource count. Generation advances are expected and are not treated as
+leaks. The existing `--sync-timeout` bounds each reclamation wait.
+
+Each cycle requires the real timeline deletion API, verifies deletion reaches
+`deleted`, advances parent checkpoints/materialization, checks parent contents
+are unchanged, and rejects leftover branch PGDATA, redo scratch or prepared
+copies. `branch_reclaim_complete` events record the warmup flag, timeline,
+pre-delete store sample, retained allocation, baseline, slack and owner counts.
+`store_kb()` fails on measurement errors instead of reporting false zero usage.
+The global run/store budgets and free-space reserve apply throughout.
+
+This is a finite residual-allocation regression check, not proof of a
+long-term plateau: metadata may grow within the slack and the warmup itself
+has no separate reclamation bound beyond the global space budgets. Increase
+cycle count for longer qualification; the configured random-workload duration
+starts after these cycles. Parent data is held constant during the preflight
+so branch disposal is measured independently of random parent growth.
 
 ## Rounds
 
@@ -433,6 +538,7 @@ with indexing enabled as proof that a 72-hour run fits its space budget.
 - **Storage faults** (disk full, write/fsync errors, slow device) and the
   named fault points under load.
 - **Power loss.**  Process kills leave the OS page cache intact.
-- **Leak verdicts.**  RSS, descriptors and store size are recorded, not yet
-  judged.
+- **Long-term leak verdicts.** Sampled RSS/descriptor budgets and resource peaks
+  are enforced when configured, but steady-state leak trends across a long
+  topology lifetime are not yet qualified.
 - Branches of branches, user tablespaces, more than one database.
