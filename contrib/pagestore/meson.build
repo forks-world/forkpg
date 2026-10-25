@@ -800,6 +800,21 @@ if host_system == 'linux'
     name_prefix: '',
     install: false,
   )
+  pagestore_metadata_publish_probe = executable('pagestore_metadata_publish_probe',
+    files('endurance/metadata_publish_probe.c', 'storage_posix.c', 'pagestore_store_owner.c'),
+    include_directories: include_directories('.'),
+    dependencies: [dependency('threads')],
+    install: false,
+  )
+  test('pagestore_metadata_directory_sync',
+    pagestore_harness_python,
+    args: [files('endurance/test_metadata_directory_sync.py'),
+           '--library', pagestore_storage_io_fault,
+           '--probe', pagestore_metadata_publish_probe],
+    depends: [pagestore_storage_io_fault, pagestore_metadata_publish_probe],
+    suite: ['pagestore'],
+    timeout: 60,
+  )
   test('pagestore_storage_io_fault',
     pagestore_harness_python,
     args: [files('endurance/test_storage_io_fault.py'),

@@ -17,6 +17,8 @@
 static ssize_t (*real_pwrite)(int, const void *, size_t, off_t);
 static ssize_t (*real_pwrite64)(int, const void *, size_t, off64_t);
 static int (*real_fsync)(int);
+static int (*real_rename)(const char *, const char *);
+static int metadata_renamed;
 static const char *root, *arm, *report, *operation;
 
 static int
@@ -32,17 +34,19 @@ initialize(void)
 	real_pwrite = dlsym(RTLD_NEXT, "pwrite");
 	real_pwrite64 = dlsym(RTLD_NEXT, "pwrite64");
 	real_fsync = dlsym(RTLD_NEXT, "fsync");
+	real_rename = dlsym(RTLD_NEXT, "rename");
 	root = getenv("PAGESTORE_IO_TEST_ROOT");
 	arm = getenv("PAGESTORE_IO_TEST_ARM");
 	report = getenv("PAGESTORE_IO_TEST_REPORT");
 	operation = getenv("PAGESTORE_IO_TEST_OPERATION");
-	if (!real_pwrite || !real_pwrite64 || !real_fsync || !root || !arm || !report ||
+	if (!real_pwrite || !real_pwrite64 || !real_fsync || !real_rename || !root || !arm || !report ||
 		!operation || root[0] != '/' || arm[0] != '/' || report[0] != '/' ||
 		strlen(root) >= PATH_MAX || under_root(arm) || under_root(report) ||
 		(strcmp(operation, "pwrite") != 0 && strcmp(operation, "fsync") != 0 &&
 		 strcmp(operation, "short-pwrite") != 0 &&
 		 strcmp(operation, "wal-fsync") != 0 &&
-		 strcmp(operation, "forkmeta-fsync") != 0))
+		 strcmp(operation, "forkmeta-fsync") != 0 &&
+		 strcmp(operation, "metadata-dir-fsync") != 0))
 		_exit(125);
 }
 
@@ -55,12 +59,13 @@ inject(int fd, const char *op, const void *buffer, size_t count,
 	int saved = errno;
 	int error = strcmp(op, "pwrite") == 0 ? ENOSPC : EIO;
 	int output;
+	int directory_sync = strcmp(operation, "metadata-dir-fsync") == 0;
 	int forkmeta_sync = strcmp(operation, "forkmeta-fsync") == 0;
 	int wal_sync = strcmp(operation, "wal-fsync") == 0;
 	int short_write = strcmp(operation, "short-pwrite") == 0;
 
 	if ((strcmp(operation, op) != 0 && !(short_write && strcmp(op, "pwrite") == 0) &&
-		 !((wal_sync || forkmeta_sync) && strcmp(op, "fsync") == 0)) ||
+		 !((wal_sync || forkmeta_sync || directory_sync) && strcmp(op, "fsync") == 0)) ||
 		access(arm, F_OK) != 0)
 		goto inactive;
 	snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
@@ -70,7 +75,12 @@ inject(int fd, const char *op, const void *buffer, size_t count,
 	path[length] = '\0';
 	if (!under_root(path))
 		goto inactive;
-	if (forkmeta_sync)
+	if (directory_sync)
+	{
+		if (strcmp(path, root) != 0 || !__atomic_load_n(&metadata_renamed, __ATOMIC_ACQUIRE))
+			goto inactive;
+	}
+	else if (forkmeta_sync)
 	{
 		if (strcmp(path + strlen(root), "/forkmeta") != 0)
 			goto inactive;
@@ -134,4 +144,20 @@ fsync(int fd)
 {
 	ssize_t result;
 	return inject(fd, "fsync", NULL, 0, 0, &result) ? -1 : real_fsync(fd);
+}
+
+/* Only a successful publication of the exact forkmeta replacement arms the
+ * directory boundary. Unrelated renames and ordinary directory syncs pass. */
+int
+rename(const char *source, const char *destination)
+{
+	int result = real_rename(source, destination);
+	int saved = errno;
+	if (result == 0 && strcmp(operation, "metadata-dir-fsync") == 0 &&
+		access(arm, F_OK) == 0 && under_root(source) && under_root(destination) &&
+		strcmp(source + strlen(root), "/forkmeta.rewrite.tmp") == 0 &&
+		strcmp(destination + strlen(root), "/forkmeta") == 0)
+		__atomic_store_n(&metadata_renamed, 1, __ATOMIC_RELEASE);
+	errno = saved;
+	return result;
 }

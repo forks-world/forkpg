@@ -233,6 +233,20 @@ This covers append-log file sync, including bytes written before the error;
 it does not qualify metadata rewrite/rename, directory sync, timeline logs or
 retention metadata. The fault remains armed until the daemon is killed.
 
+`test_metadata_directory_sync.py` additionally runs the real POSIX backend in
+an isolated subprocess. Its preload mode `metadata-dir-fsync` starts failing
+only after the exact `forkmeta.rewrite.tmp` to `forkmeta` rename succeeds; it
+then returns EIO for the containing store directory's fsync. Ordinary directory
+syncs before publication and unrelated renames remain healthy. The backend
+must report rewrite failure even though the complete replacement is visible.
+The child exits immediately without backend close or a later successful sync.
+A new process reopens the complete replacement, retries its publication, appends
+new metadata and reopens again to check both acknowledged operations. CI runs
+this probe and retains its syscall report in `metadata-directory-sync.log`.
+This is storage-backend publication/retry coverage with opaque byte records,
+not SQL-level snapshot-selector recovery or power-loss durability. It does not
+model loss/reordering of kernel-cached directory entries after host failure.
+
 The models cover persistent pre-syscall errors and positive short writes on page
 segments, legacy WAL-log fsync EIO and forkmeta append-log fsync EIO. They do not model torn writes after a successful full-length return,
 actual full-filesystem behavior, immutable WAL-segment and other metadata I/O failures,
