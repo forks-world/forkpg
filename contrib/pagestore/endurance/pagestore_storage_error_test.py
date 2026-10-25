@@ -36,7 +36,7 @@ class StorageErrorRun(driver.Run):
                        'PAGESTORE_IO_TEST_ARM': str(self.arm),
                        'PAGESTORE_IO_TEST_REPORT': str(self.report),
                        'PAGESTORE_IO_TEST_OPERATION': self.fault_operation}
-        if self.fault_operation == 'metadata-dir-fsync':
+        if self.fault_operation in ('metadata-dir-fsync', 'selector-dir-fsync'):
             environment['PAGESTORE_FORKMETA_HIGH_WATER_BYTES'] = '65536'
             environment['PAGESTORE_FORKMETA_CATCH_UP_BYTES'] = '32768'
         wrapper.write_text('#!/bin/sh\n' + '\n'.join(
@@ -92,7 +92,7 @@ class StorageErrorRun(driver.Run):
                         "UPDATE acct SET bal=bal+1 WHERE id=2; COMMIT; "
                         "CREATE TABLE storage_error_probe AS SELECT g, md5(g::text) AS v "
                         "FROM generate_series(1,5000) g; CHECKPOINT;")
-        if self.fault_operation == 'metadata-dir-fsync':
+        if self.fault_operation in ('metadata-dir-fsync', 'selector-dir-fsync'):
             self.writer.sql("DO $$ BEGIN FOR i IN 1..128 LOOP "
                             "EXECUTE format('CREATE TABLE metadata_churn_%s (id int PRIMARY KEY)', i); "
                             "EXECUTE format('DROP TABLE metadata_churn_%s', i); "
@@ -130,7 +130,7 @@ class StorageErrorRun(driver.Run):
             raise driver.Failure('fault_unreached', 'no complete storage I/O fault report')
         expected_errno = {'pwrite': errno.ENOSPC, 'fsync': errno.EIO,
                           'short-pwrite': 0, 'wal-fsync': errno.EIO, 'forkmeta-fsync': errno.EIO,
-                          'metadata-dir-fsync': errno.EIO}[self.fault_operation]
+                          'metadata-dir-fsync': errno.EIO, 'selector-dir-fsync': errno.EIO}[self.fault_operation]
         if (hit.get('operation') != self.fault_operation or hit.get('errno') != expected_errno or
                 hit.get('pid') != self.daemon.pid):
             raise driver.Failure('fault_identity', f'unexpected I/O hit: {hit}')
@@ -146,7 +146,7 @@ class StorageErrorRun(driver.Run):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             self.check_health()
-            if self.fault_operation == 'metadata-dir-fsync':
+            if self.fault_operation in ('metadata-dir-fsync', 'selector-dir-fsync'):
                 state = json.loads(self.inspect('gc'))
                 if state.get('forkmeta_poisoned') is True:
                     publication_state = state
@@ -176,7 +176,7 @@ class StorageErrorRun(driver.Run):
         if publication_state is not None:
             selector = self.store / 'forkmeta_snapshots/forkmeta_manifest_v1'
             if not selector.is_file() or selector.stat().st_size == 0:
-                raise driver.Failure('selector_missing', 'no selected snapshot after source rewrite')
+                raise driver.Failure('selector_missing', 'no selected snapshot after metadata publication')
         self.event('storage_fault_observed', compute_error=compute_error,
                    publication_state=publication_state, **hit)
         # Stop computes immediately, then crash daemon while fault is still
@@ -206,8 +206,10 @@ class StorageErrorRun(driver.Run):
             'operation': self.fault_operation, 'hit': hit, 'compute_error': compute_error,
             'publication_state': publication_state,
             'library_sha256': hashlib.sha256(self.library.read_bytes()).hexdigest(),
-            'model': ('post-rename store-directory fsync EIO during SQL snapshot cutover'
-                      if self.fault_operation == 'metadata-dir-fsync' else
+            'model': ('post-manifest-rename snapshot-directory fsync EIO during SQL cutover'
+                      if self.fault_operation == 'selector-dir-fsync' else
+                      'post-rename store-directory fsync EIO during SQL snapshot cutover'
+                      if self.fault_operation in ('metadata-dir-fsync', 'selector-dir-fsync') else
                       'pre-syscall fsync EIO on daemon forkmeta append log'
                       if self.fault_operation == 'forkmeta-fsync' else
                       'pre-syscall fsync EIO on daemon legacy WAL logs wal_<timeline>'
@@ -245,7 +247,7 @@ class StorageErrorRun(driver.Run):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--library', required=True, type=Path)
-    parser.add_argument('--operation', required=True, choices=('pwrite', 'fsync', 'short-pwrite', 'wal-fsync', 'forkmeta-fsync', 'metadata-dir-fsync'))
+    parser.add_argument('--operation', required=True, choices=('pwrite', 'fsync', 'short-pwrite', 'wal-fsync', 'forkmeta-fsync', 'metadata-dir-fsync', 'selector-dir-fsync'))
     parser.add_argument('driver_args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     library = args.library.resolve()

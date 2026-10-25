@@ -199,7 +199,7 @@ fault window permits the intended storage/RPC errors but still rejects traps,
 segfaults and invalid-page corruption; normal strict log checks resume before
 recovery. Passed fault reports, fault-window logs and scope/provenance remain
 under `passed/<seed>/storage-error-<operation>/` alongside the usual metrics.
-CI runs all six operations and uploads these artifacts, including failed-run logs.
+CI runs all seven operations and uploads these artifacts, including failed-run logs.
 
 Use `--operation short-pwrite` in another fresh root to write and return only
 half of each requested segment write of at least 512 bytes while armed.
@@ -259,6 +259,18 @@ and source-log evidence, then reopens and requires poison to clear, materializer
 catch-up, matching committed contents and mandatory amcheck on both computes.
 This qualifies SQL recovery for this process-crash boundary, not selector loss
 or directory-entry reordering under power failure.
+
+Use `--operation selector-dir-fsync` for the earlier selector commit boundary.
+It uses the same SQL churn, poison-state, armed daemon crash and recovery
+oracles, but fails fsync of `forkmeta_snapshots` only after a successful
+`renameat` of `forkmeta_manifest_v1.tmp.*` to `forkmeta_manifest_v1` in that
+exact directory. This exercises manifest publication failure before the later
+source-log rewrite; metadata-dir-fsync instead fails after source replacement.
+`test_selector_directory_sync.py` verifies successful-rename gating, persistent
+EIO, disarming and unaffected file/root/other-store fsyncs and unrelated renames.
+CI retains the scope report as `selector-directory-sync.log` and the SQL runner
+retains snapshot/source evidence. Process restart reconciles a manifest visible
+in the kernel cache; power-loss disappearance or reordering is not simulated.
 
 The models cover persistent pre-syscall errors and positive short writes on page
 segments, legacy WAL-log fsync EIO and forkmeta append-log fsync EIO. They do not model torn writes after a successful full-length return,
