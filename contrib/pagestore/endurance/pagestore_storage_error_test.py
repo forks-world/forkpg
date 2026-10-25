@@ -54,6 +54,12 @@ class StorageErrorRun(driver.Run):
         except (FileNotFoundError, json.JSONDecodeError):
             return None
 
+    def fault_response(self, text):
+        # Replay promotes storage errors to FATAL and exits with status 1.
+        # Only this explicit metadata fault permits that controlled outcome.
+        severity = r'(?:ERROR|FATAL)' if self.fault_operation == 'forkmeta-fsync' else 'ERROR'
+        return re.search(severity + r':.*pagestore localsvc: daemon reported error[^\n]*', text)
+
     def check_health(self):
         if not self.injecting:
             return super().check_health()
@@ -115,7 +121,7 @@ class StorageErrorRun(driver.Run):
         if hit is None:
             raise driver.Failure('fault_unreached', 'no complete storage I/O fault report')
         expected_errno = {'pwrite': errno.ENOSPC, 'fsync': errno.EIO,
-                          'short-pwrite': 0, 'wal-fsync': errno.EIO}[self.fault_operation]
+                          'short-pwrite': 0, 'wal-fsync': errno.EIO, 'forkmeta-fsync': errno.EIO}[self.fault_operation]
         if (hit.get('operation') != self.fault_operation or hit.get('errno') != expected_errno or
                 hit.get('pid') != self.daemon.pid):
             raise driver.Failure('fault_identity', f'unexpected I/O hit: {hit}')
@@ -131,7 +137,7 @@ class StorageErrorRun(driver.Run):
         while time.monotonic() < deadline:
             self.check_health()
             text = fault_compute.log.read_bytes()[fault_offsets[fault_compute.name]:].decode(errors='replace')
-            response = re.search(r'ERROR:.*pagestore localsvc: daemon reported error[^\n]*', text)
+            response = self.fault_response(text)
             archive_failure = (not wal_fault or
                                f'archiving write-ahead log file "{segment}" failed' in text)
             if response and archive_failure:
@@ -174,7 +180,9 @@ class StorageErrorRun(driver.Run):
         (evidence / 'scope.json').write_text(json.dumps({
             'operation': self.fault_operation, 'hit': hit, 'compute_error': compute_error,
             'library_sha256': hashlib.sha256(self.library.read_bytes()).hexdigest(),
-            'model': ('pre-syscall fsync EIO on daemon legacy WAL logs wal_<timeline>'
+            'model': ('pre-syscall fsync EIO on daemon forkmeta append log'
+                      if self.fault_operation == 'forkmeta-fsync' else
+                      'pre-syscall fsync EIO on daemon legacy WAL logs wal_<timeline>'
                       if self.fault_operation == 'wal-fsync' else
                       'positive short pwrite on daemon page segments'
                       if self.fault_operation == 'short-pwrite' else
@@ -204,7 +212,7 @@ class StorageErrorRun(driver.Run):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--library', required=True, type=Path)
-    parser.add_argument('--operation', required=True, choices=('pwrite', 'fsync', 'short-pwrite', 'wal-fsync'))
+    parser.add_argument('--operation', required=True, choices=('pwrite', 'fsync', 'short-pwrite', 'wal-fsync', 'forkmeta-fsync'))
     parser.add_argument('driver_args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     library = args.library.resolve()

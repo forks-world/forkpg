@@ -10,6 +10,15 @@ import pagestore_storage_error_test as probe
 
 
 class StorageErrorTests(unittest.TestCase):
+    def test_fatal_daemon_error_is_scoped_to_metadata_replay(self):
+        run = object.__new__(probe.StorageErrorRun)
+        fatal = 'FATAL:  pagestore localsvc: daemon reported error for op 1'
+        for operation in ('pwrite', 'fsync', 'short-pwrite', 'wal-fsync', 'forkmeta-fsync'):
+            run.fault_operation = operation
+            self.assertEqual(bool(run.fault_response(fatal)), operation == 'forkmeta-fsync')
+            self.assertIsNone(run.fault_response('FATAL: connection to server failed'))
+            self.assertIsNotNone(run.fault_response(fatal.replace('FATAL:', 'ERROR:')))
+
     def test_report_can_be_created_before_json_is_complete(self):
         with tempfile.TemporaryDirectory() as root:
             run = object.__new__(probe.StorageErrorRun)

@@ -41,7 +41,8 @@ initialize(void)
 		strlen(root) >= PATH_MAX || under_root(arm) || under_root(report) ||
 		(strcmp(operation, "pwrite") != 0 && strcmp(operation, "fsync") != 0 &&
 		 strcmp(operation, "short-pwrite") != 0 &&
-		 strcmp(operation, "wal-fsync") != 0))
+		 strcmp(operation, "wal-fsync") != 0 &&
+		 strcmp(operation, "forkmeta-fsync") != 0))
 		_exit(125);
 }
 
@@ -54,11 +55,12 @@ inject(int fd, const char *op, const void *buffer, size_t count,
 	int saved = errno;
 	int error = strcmp(op, "pwrite") == 0 ? ENOSPC : EIO;
 	int output;
+	int forkmeta_sync = strcmp(operation, "forkmeta-fsync") == 0;
 	int wal_sync = strcmp(operation, "wal-fsync") == 0;
 	int short_write = strcmp(operation, "short-pwrite") == 0;
 
 	if ((strcmp(operation, op) != 0 && !(short_write && strcmp(op, "pwrite") == 0) &&
-		 !(wal_sync && strcmp(op, "fsync") == 0)) ||
+		 !((wal_sync || forkmeta_sync) && strcmp(op, "fsync") == 0)) ||
 		access(arm, F_OK) != 0)
 		goto inactive;
 	snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
@@ -68,7 +70,12 @@ inject(int fd, const char *op, const void *buffer, size_t count,
 	path[length] = '\0';
 	if (!under_root(path))
 		goto inactive;
-	if (wal_sync)
+	if (forkmeta_sync)
+	{
+		if (strcmp(path + strlen(root), "/forkmeta") != 0)
+			goto inactive;
+	}
+	else if (wal_sync)
 	{
 		const char *name = path + strlen(root);
 		if (strncmp(name, "/wal_", 5) != 0 || name[5] == '\0' ||
