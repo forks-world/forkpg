@@ -42,6 +42,18 @@ class StorageErrorRun(driver.Run):
         wrapper.chmod(0o700)
         self.daemon_bin = wrapper
 
+    def verify_materializer(self, why):
+        # Storage recovery probes require structural checks for every seed.
+        return super().verify_materializer(why, amcheck=True)
+
+    def read_fault_report(self):
+        # The preload hook creates the pathname before writing its JSON.
+        # A missing or incomplete report is pending, never successful evidence.
+        try:
+            return json.loads(self.report.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
     def check_health(self):
         if not self.injecting:
             return super().check_health()
@@ -77,7 +89,8 @@ class StorageErrorRun(driver.Run):
             if error.kind != 'start_failed' or not self.report.exists():
                 raise
         deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and not self.report.exists():
+        hit = self.read_fault_report()
+        while time.monotonic() < deadline and hit is None:
             self.check_health()
             # A restartpoint forces page-segment fsync after the replayed
             # writer checkpoint, even when the workload is too small for a
@@ -87,9 +100,9 @@ class StorageErrorRun(driver.Run):
             except (driver.SqlError, driver.subprocess.TimeoutExpired):
                 pass
             time.sleep(.1)
-        if not self.report.exists():
-            raise driver.Failure('fault_unreached', 'page-segment I/O fault was not reached')
-        hit = json.loads(self.report.read_text())
+            hit = self.read_fault_report()
+        if hit is None:
+            raise driver.Failure('fault_unreached', 'no complete page-segment I/O fault report')
         expected_errno = errno.ENOSPC if self.fault_operation == 'pwrite' else errno.EIO
         if (hit.get('operation') != self.fault_operation or hit.get('errno') != expected_errno or
                 hit.get('pid') != self.daemon.pid):

@@ -809,6 +809,12 @@ if host_system == 'linux'
     timeout: 60,
   )
 endif
+test('pagestore_storage_error_recovery',
+  pagestore_harness_python,
+  args: [files('endurance/test_storage_error_recovery.py')],
+  suite: ['pagestore'],
+  timeout: 60,
+)
 test('pagestore_endurance_resources',
   pagestore_harness_python,
   args: [files('endurance/test_resources.py')],
