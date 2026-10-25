@@ -72,6 +72,7 @@ jobs:
           python3 contrib/pagestore/endurance/test_space_budget.py
           python3 contrib/pagestore/endurance/test_archive_lag.py
           python3 contrib/pagestore/endurance/test_branch_reclaim.py
+          python3 contrib/pagestore/endurance/test_endurance_watch.py
 
       - name: Verify postmaster cleanup including a forced pg_ctl timeout
         run: |

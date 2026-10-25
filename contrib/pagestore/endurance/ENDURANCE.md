@@ -92,6 +92,54 @@ maximum-record/padding headroom, so neither setting is an exact byte ceiling.
 Warnings that archiving is paused are expected while the worker catches up;
 failure to catch up within `--sync-timeout` remains a finding.
 
+## Exit notifications and persistent status
+
+Use `pagestore_endurance_watch.py` outside the driver to observe normal exits,
+startup exceptions and a driver killed by a signal. The hook is explicitly
+configured; the watcher has no default remote recipient. For example, a local
+desktop notification (when a desktop notification service is available):
+
+```sh
+python3 contrib/pagestore/endurance/pagestore_endurance_watch.py \
+    --status-file /path/to/endurance/watch.json --label '72h seed 1' \
+    --notify-command "notify-send 'forkpg endurance stopped'" \
+    -- python3 contrib/pagestore/endurance/pagestore_endurance.py \
+    --build build --root /path/to/endurance/runs --seed 1 --duration 259200 \
+    --max-run-gb 12 --max-store-gb 8 --min-free-gb 5
+```
+
+The command is parsed into words and executed without a shell. The absolute
+status-file path is appended as one argument. A custom delivery script should
+read that JSON and send it through the operator's existing notification system.
+Do not put credentials in command arguments. Hook output is discarded to avoid
+leaking secrets. Run a delivery probe with the same status path and hook plus
+`--test-notification` (without a driver command) and confirm it actually reaches
+the recipient before starting a long run.
+
+The atomic, fsynced status file contains a unique run ID, label, watcher/driver
+PIDs, phase, heartbeat, exit code, completion timestamp and hook result. One
+watcher owns each status path via an advisory lock. Heartbeats default to five
+seconds and continue while an interrupted driver cleans up. Failure evidence
+is written before the hook runs; notifications are attempted once for a failed
+or interrupted command, and optionally for success (`--notify-on-success`).
+The ten-second default hook timeout is adjustable. A hook failure is recorded
+separately, preserves the driver's nonzero exit status, and makes a successful
+driver/watch combination exit nonzero. `command_succeeded` means only that the
+hook exited zero: it does not certify human receipt or provider delivery.
+There is no automatic delivery retry or cross-restart exactly-once guarantee.
+
+The watcher must also be kept alive, for example by an existing service manager
+or external monitor. Its heartbeat proves the watcher is running, not that SQL
+is making progress; use driver timeouts and a service/CI runtime limit as well.
+If the watcher or host is killed, crashes, loses power or cannot write its status,
+it cannot guarantee a notification; an independent monitor must detect a stale
+heartbeat. A killed driver may leave computes behind: the watcher does not guess
+ownership or kill arbitrary descendants. During ordinary interruption it sends
+one SIGINT to the driver, allowing the driver's pidfd cleanup to finish; it does
+not enforce an extra cleanup deadline. Notification is attempted when the driver
+exits, so lengthy diagnostics/cleanup can delay it. Keep the status file outside
+per-seed run directories, since successful runs remove their bulky data.
+
 ## Topology
 
 The provisioning mirrors `mvp_golden_test.sh` step for step, so a failure here

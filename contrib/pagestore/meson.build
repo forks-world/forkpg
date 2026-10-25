@@ -793,6 +793,12 @@ test('pagestore_endurance_cleanup',
   suite: ['pagestore'],
   timeout: 60,
 )
+test('pagestore_endurance_watch',
+  pagestore_harness_python,
+  args: [files('endurance/test_endurance_watch.py')],
+  suite: ['pagestore'],
+  timeout: 60,
+)
 test('pagestore_endurance_branch_reclaim',
   pagestore_harness_python,
   args: [files('endurance/test_branch_reclaim.py')],
