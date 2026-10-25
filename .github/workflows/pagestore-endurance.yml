@@ -82,7 +82,7 @@ jobs:
 
       - name: Verify SQL recovery after page-store I/O errors
         run: |
-          for operation in pwrite fsync short-pwrite; do
+          for operation in pwrite fsync short-pwrite wal-fsync; do
             python3 contrib/pagestore/endurance/pagestore_storage_error_test.py \
               --library "$(pwd)/build/contrib/pagestore/pagestore_storage_io_fault.so" \
               --operation "$operation" -- \
