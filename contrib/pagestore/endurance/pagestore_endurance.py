@@ -28,6 +28,23 @@ from pathlib import Path
 from typing import Any
 
 
+import pagestore_resources
+
+
+def compute_resources_alive(pg, handle) -> bool:
+    # stop() clears expected_up before closing its pidfd. Check on both sides
+    # of select so a reused/closed descriptor cannot be sampled as the old root.
+    if not pg.expected_up or pg.postmaster is not handle:
+        return False
+    try:
+        alive = not handle.exited()
+    except (OSError, ValueError):
+        if not pg.expected_up or pg.postmaster is not handle:
+            return False
+        raise
+    return alive and pg.expected_up and pg.postmaster is handle
+
+
 class Failure(Exception):
     """A product-level finding: the run stops and its root is preserved."""
 
@@ -1266,8 +1283,12 @@ recovery_target_action = 'promote'
             self.async_failure = self.async_failure or Failure("driver_exception", f"sampler: {e!r}")
 
     def sample_loop(self) -> None:
-        out = open(self.root / "metrics.jsonl", "a", buffering=1)
+        with (self.root / "metrics.jsonl").open("a", buffering=1) as out:
+            self.sample_records(out)
+
+    def sample_records(self, out) -> None:
         unmeasured = 0
+        resource_unmeasured = 0
         while not self.stop_sampler.wait(self.args.sample_interval):
             rec: dict[str, Any] = {"t": round(time.time(), 1), "round": self.round, "procs": {}}
             try:
@@ -1308,16 +1329,38 @@ recovery_target_action = 'promote'
                         rec["compute_wal_kb"][pg.name] = directory_kb(wal)
                     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
                         rec.setdefault("compute_wal_errors", {})[pg.name] = str(error)
-            pids = {"daemon": self.daemon.pid if self.daemon else None}
-            pids.update({pg.name: pg.pid() for pg in self.computes()})
-            for name, pid in pids.items():
-                try:
-                    status = Path(f"/proc/{pid}/status").read_text()
-                    rec["procs"][name] = {
-                        "rss_kb": int(re.search(r"VmRSS:\s+(\d+)", status).group(1)),
-                        "fds": len(os.listdir(f"/proc/{pid}/fd"))}
-                except (OSError, AttributeError, TypeError):
-                    pass
+            roots = {}
+            daemon = self.daemon
+            if self.daemon_expected_up and daemon is not None:
+                roots["daemon"] = (daemon.pid, lambda daemon=daemon: daemon.poll() is None)
+            for pg in self.computes():
+                handle = pg.postmaster
+                if pg.expected_up and handle is not None:
+                    roots[pg.name] = (handle.pid, lambda pg=pg, handle=handle:
+                                      compute_resources_alive(pg, handle))
+            resource_start = time.monotonic()
+            resources = pagestore_resources.snapshot(roots)
+            rec["resource_sample_ms"] = round((time.monotonic() - resource_start) * 1000, 2)
+            rec.update(resources)
+            totals = resources["resource_totals"]
+            peaks = self.stats.setdefault("resource_peaks", dict(rss_kb=0, fds=0, processes=0))
+            for field in peaks:
+                peaks[field] = max(peaks[field], totals[field])
+            if self.args.max_rss_mb and totals["rss_kb"] > self.args.max_rss_mb * 1024:
+                self.async_failure = self.async_failure or Failure(
+                    "resource_rss", f"owned process RSS sum {totals['rss_kb']} KiB "
+                    f"> --max-rss-mb={self.args.max_rss_mb}")
+            if self.args.max_fds and totals["fds"] > self.args.max_fds:
+                self.async_failure = self.async_failure or Failure(
+                    "resource_fds", f"owned descriptor sum {totals['fds']} > --max-fds={self.args.max_fds}")
+            resource_unmeasured = resource_unmeasured + 1 if resources["resource_errors"] else 0
+            if resource_unmeasured >= 3 and (self.args.max_rss_mb or self.args.max_fds):
+                self.async_failure = self.async_failure or Failure(
+                    "resource_unmeasurable", f"resource sampling failed {resource_unmeasured} times: "
+                    f"{resources['resource_errors']}")
+            if self.async_failure:
+                out.write(json.dumps(rec) + "\n")
+                return
             if self.daemon_expected_up:
                 for operation in ("backpressure", "gc", "pruning", "owners"):
                     try:
@@ -1404,6 +1447,7 @@ recovery_target_action = 'promote'
         self.event("space_budget", max_run_gb=self.args.max_run_gb,
                    max_store_gb=self.args.max_store_gb, min_free_gb=self.args.min_free_gb,
                    **space_snapshot(self.root, self.store, self.args))
+        self.event("resource_budget", max_rss_mb=self.args.max_rss_mb, max_fds=self.args.max_fds)
         self.sampler_thread = threading.Thread(target=self.sampler, daemon=True)
         self.sampler_thread.start()
         self.provision()
@@ -1542,6 +1586,10 @@ def main() -> int:
     p.add_argument("--max-branches", type=int, default=2)
     p.add_argument("--sync-timeout", type=float, default=1800)
     p.add_argument("--sample-interval", type=float, default=15)
+    p.add_argument("--max-rss-mb", type=int, default=0,
+                   help="stop above summed RSS MiB across daemon/compute process trees; zero disables")
+    p.add_argument("--max-fds", type=int, default=0,
+                   help="stop above summed descriptors across daemon/compute process trees; zero disables")
     p.add_argument("--max-run-gb", type=float, default=100,
                    help="allocated GiB limit for the whole run directory, including computes and WAL")
     p.add_argument("--max-store-gb", type=float, default=100)
@@ -1562,6 +1610,8 @@ def main() -> int:
         if not math.isfinite(value) or value <= 0:
             p.error(f"--{name.replace('_', '-')} must be finite and greater than zero")
 
+    if args.max_rss_mb < 0 or args.max_fds < 0:
+        p.error("--max-rss-mb and --max-fds must be nonnegative")
     if args.branch_reclaim_cycles < 0 or args.branch_reclaim_cycles == 1:
         p.error("--branch-reclaim-cycles must be zero or at least two")
     if args.branch_reclaim_cycles and args.max_branches < 1:

@@ -140,6 +140,37 @@ not enforce an extra cleanup deadline. Notification is attempted when the driver
 exits, so lengthy diagnostics/cleanup can delay it. Keep the status file outside
 per-seed run directories, since successful runs remove their bulky data.
 
+## Memory and descriptor budgets
+
+`--max-rss-mb 4096 --max-fds 4096` enables sampled stopping thresholds for
+summed RSS and open descriptors across the daemon and tracked compute process
+trees, including PostgreSQL backends and background workers. Both options
+otherwise default to zero (disabled). The CI endurance lane sets them explicitly.
+An over-budget sample fails as `resource_rss` or `resource_fds`. Three consecutive
+incomplete live-root observations fail as `resource_unmeasurable` while either
+limit is enabled. As with space budgets, a running command may delay shutdown.
+
+Metrics retain the `procs` root-process readings and add `resource_groups` and
+`resource_totals`, with process count, RSS KiB and descriptor count. Roots record
+PID and Linux start-time ticks to distinguish restarted generations. Collection
+uses in-memory parentage from procfs and checks identities before/after reads;
+it discards a group if its owning pidfd/Popen generation exits while sampling.
+Short-lived backends may disappear between observations. Overlapping roots are
+counted only once in the total. `resource_errors` records incomplete observations;
+summary `stats.resource_peaks` preserves sampled maxima after successful run data
+is removed. No process is signalled by this read-only collector.
+
+The RSS sum deliberately double-counts shared mappings across different
+processes. It is a conservative budget rather than PSS or a physical-memory
+measurement. Descriptor counts are per process, including inherited descriptors.
+The readings are not an atomic process census and are not a kernel memory/FD
+quota. Temporarily controller-owned/private computes and processes no longer in
+a tracked root's ancestry can fall outside coverage; use a service/cgroup budget
+for a hard whole-service bound. A threshold breach does not by itself prove a
+leak. Cache warming, shared memory, branch creation and restart generations must
+be separated before diagnosing a growth trend. Short budget probes do not
+qualify 72-hour memory stability.
+
 ## Topology
 
 The provisioning mirrors `mvp_golden_test.sh` step for step, so a failure here
@@ -507,6 +538,7 @@ with indexing enabled as proof that a 72-hour run fits its space budget.
 - **Storage faults** (disk full, write/fsync errors, slow device) and the
   named fault points under load.
 - **Power loss.**  Process kills leave the OS page cache intact.
-- **Leak verdicts.**  RSS, descriptors and store size are recorded, not yet
-  judged.
+- **Long-term leak verdicts.** Sampled RSS/descriptor budgets and resource peaks
+  are enforced when configured, but steady-state leak trends across a long
+  topology lifetime are not yet qualified.
 - Branches of branches, user tablespaces, more than one database.
