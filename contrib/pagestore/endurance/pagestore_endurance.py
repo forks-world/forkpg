@@ -823,13 +823,14 @@ DO $$ DECLARE r record; BEGIN
             if bad:
                 raise Failure("amcheck", f"{pg.name}: {bad[:400]}")
 
-    def verify_materializer(self, why: str) -> dict[str, str]:
+    def verify_materializer(self, why: str, *, amcheck: bool | None = None) -> dict[str, str]:
         """The writer keeps its heap local (route_all=off); the materializer
         serves the same relations from the store after replaying shipped WAL.
         With the writer quiescent they must agree."""
         self.resolve_prepared(self.writer)
         lsn = self.sync_materializer()
-        amcheck = self.rng.random() < 0.34
+        if amcheck is None:
+            amcheck = self.rng.random() < 0.34
         t0 = time.time()
         want, got = self.checksums(self.writer), self.checksums(self.mat)
         self.timing["checksum_s"] = round(time.time() - t0, 1)

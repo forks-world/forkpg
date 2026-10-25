@@ -793,6 +793,28 @@ test('pagestore_endurance_cleanup',
   suite: ['pagestore'],
   timeout: 60,
 )
+if host_system == 'linux'
+  pagestore_storage_io_fault = shared_module('pagestore_storage_io_fault',
+    files('endurance/storage_io_fault.c'),
+    dependencies: [dl_dep],
+    name_prefix: '',
+    install: false,
+  )
+  test('pagestore_storage_io_fault',
+    pagestore_harness_python,
+    args: [files('endurance/test_storage_io_fault.py'),
+           '--library', pagestore_storage_io_fault],
+    depends: [pagestore_storage_io_fault],
+    suite: ['pagestore'],
+    timeout: 60,
+  )
+endif
+test('pagestore_storage_error_recovery',
+  pagestore_harness_python,
+  args: [files('endurance/test_storage_error_recovery.py')],
+  suite: ['pagestore'],
+  timeout: 60,
+)
 test('pagestore_endurance_resources',
   pagestore_harness_python,
   args: [files('endurance/test_resources.py')],
