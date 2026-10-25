@@ -114,6 +114,32 @@ One run is one topology lifetime: provisioning, then rounds for
 seed+1, ... each from a fresh `initdb` and import, so the bootstrap paths are
 exercised as often as the steady state.
 
+## Repeated branch reclamation
+
+`--branch-reclaim-cycles 3 --branch-reclaim-slack-mb 64` runs fixed-parent
+create/write/restart/delete cycles before the random workload. At least two
+cycles and `--max-branches >= 1` are required. The first deleted branch warms
+up the parent checkpoint/materialization paths and establishes a physical store
+allocation and retention-owner baseline. Subsequent cycles must return below
+that store allocation plus the configured slack, and must not increase any
+owner/resource count. Generation advances are expected and are not treated as
+leaks. The existing `--sync-timeout` bounds each reclamation wait.
+
+Each cycle requires the real timeline deletion API, verifies deletion reaches
+`deleted`, advances parent checkpoints/materialization, checks parent contents
+are unchanged, and rejects leftover branch PGDATA, redo scratch or prepared
+copies. `branch_reclaim_complete` events record the warmup flag, timeline,
+pre-delete store sample, retained allocation, baseline, slack and owner counts.
+`store_kb()` fails on measurement errors instead of reporting false zero usage.
+The global run/store budgets and free-space reserve apply throughout.
+
+This is a finite residual-allocation regression check, not proof of a
+long-term plateau: metadata may grow within the slack and the warmup itself
+has no separate reclamation bound beyond the global space budgets. Increase
+cycle count for longer qualification; the configured random-workload duration
+starts after these cycles. Parent data is held constant during the preflight
+so branch disposal is measured independently of random parent growth.
+
 ## Rounds
 
 Each round is a seeded choice of:

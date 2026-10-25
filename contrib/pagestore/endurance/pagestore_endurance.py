@@ -293,7 +293,10 @@ class PostmasterHandle:
                 self.children[fd] = child
                 adopted = True
                 child.pin_children()
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
+                # Linux procfs may report ESRCH after opening stat but before
+                # reading it. Ignore disappearance only if this pinned child
+                # has actually exited; retain fail-closed ownership checks.
                 if not select.select([fd], [], [], 0)[0]:
                     raise
             finally:
@@ -1145,8 +1148,7 @@ recovery_target_action = 'promote'
             raise Failure("isolation", f"parent contents changed while only branch {tl} was written")
 
     def store_kb(self) -> int:
-        out = subprocess.run(["du", "-sk", str(self.store)], capture_output=True, text=True, timeout=300).stdout
-        return int(out.split()[0]) if out else 0
+        return directory_kb(self.store)
 
     def delete_timeline(self, tl: int) -> None:
         """Delete a retired branch through the operator entry point (extension
@@ -1165,6 +1167,57 @@ recovery_target_action = 'promote'
             self.args.sync_timeout)
         self.event("branch_deleted", timeline=tl, seconds=round(time.time() - started, 1),
                    store_kb_before=before, store_kb_after=self.store_kb())
+
+    def branch_reclaim_cycles(self) -> None:
+        """Fixed-parent churn: one warmup, then bounded residual allocation."""
+        cycles = self.args.branch_reclaim_cycles
+        if cycles == 0:
+            return
+        if self.writer.sql("SELECT to_regprocedure('pagestore_ext.pagestore_delete_branch(integer,bigint)') "
+                           "IS NOT NULL;") != "t":
+            raise Failure("branch_reclaim", "branch cycles require the timeline deletion API")
+        parent = self.checksums(self.writer)
+        baseline = None
+        owner_baseline = None
+        owner_fields = ("owner_count", "page_history_owners", "wal_owners", "wal_index_owners")
+        for cycle in range(1, cycles + 1):
+            self.check_health()
+            self.event("branch_reclaim_begin", cycle=cycle, store_kb=self.store_kb())
+            self.create_branch(parent)
+            timeline = self.branches[0][0]
+            pre_retire = self.store_kb()
+            self.retire_branch()
+            # Advance root operational fences after releasing the child cap.
+            self.writer.sql("CHECKPOINT;")
+            self.sync_materializer()
+            self.mat.sql("CHECKPOINT;")
+            settled = {}
+
+            def reclaimed() -> bool:
+                owners = json.loads(self.inspect("owners"))
+                size = self.store_kb()
+                settled.update(store_kb=size, owners=owners)
+                if owners.get("retention_poisoned") is not False:
+                    raise Failure("branch_reclaim", "retention registry is poisoned")
+                if baseline is None:
+                    return True
+                return (size <= baseline + self.args.branch_reclaim_slack_mb * 1024 and
+                        all(owners[field] <= owner_baseline[field] for field in owner_fields))
+
+            self.wait_for(f"branch {timeline} reclaimed within warmup space/owner bounds",
+                          reclaimed, self.args.sync_timeout)
+            if baseline is None:
+                baseline = settled["store_kb"]
+                owner_baseline = settled["owners"]
+            self.event("branch_reclaim_complete", cycle=cycle, timeline=timeline,
+                       warmup=cycle == 1, pre_retire_store_kb=pre_retire,
+                       baseline_store_kb=baseline, slack_mb=self.args.branch_reclaim_slack_mb,
+                       **settled)
+            if self.checksums(self.writer) != parent:
+                raise Failure("branch_reclaim", "parent contents changed during branch churn")
+            for path in (f"branch-{timeline}", f"branch-{timeline}-walredo", f"prepared-{timeline}"):
+                if (self.root / path).exists():
+                    raise Failure("branch_reclaim", f"retired branch left {path}")
 
     def verify_branch_idle(self, tl: int, b: Pg) -> dict[str, str]:
         """An idle branch must still hold what it was last verified to hold:
@@ -1357,6 +1410,7 @@ recovery_target_action = 'promote'
         self.check_health()
         self.verify_materializer("initial load")
         self.configure_archive_lag_limits()
+        self.branch_reclaim_cycles()
         # the duration counts rounds, not provisioning, and a run has at least one
         deadline = time.time() + self.args.duration
         while self.round == 0 or time.time() < deadline:
@@ -1491,6 +1545,11 @@ def main() -> int:
     p.add_argument("--max-run-gb", type=float, default=100,
                    help="allocated GiB limit for the whole run directory, including computes and WAL")
     p.add_argument("--max-store-gb", type=float, default=100)
+    p.add_argument("--branch-reclaim-cycles", type=int, default=0,
+                   help="fixed-parent branch create/write/delete cycles before random rounds; "
+                        "one warmup plus at least one measured cycle")
+    p.add_argument("--branch-reclaim-slack-mb", type=int, default=64,
+                   help="allowed store allocation above the first deleted branch's warmup baseline")
     p.add_argument("--materializer-max-lag-mb", type=int, default=0,
                    help="writer archive materialization lag limit, enabled after bootstrap; zero disables")
     p.add_argument("--wal-index-max-lag-mb", type=int, default=0,
@@ -1503,6 +1562,12 @@ def main() -> int:
         if not math.isfinite(value) or value <= 0:
             p.error(f"--{name.replace('_', '-')} must be finite and greater than zero")
 
+    if args.branch_reclaim_cycles < 0 or args.branch_reclaim_cycles == 1:
+        p.error("--branch-reclaim-cycles must be zero or at least two")
+    if args.branch_reclaim_cycles and args.max_branches < 1:
+        p.error("--branch-reclaim-cycles requires --max-branches >= 1")
+    if args.branch_reclaim_slack_mb < 0:
+        p.error("--branch-reclaim-slack-mb must be nonnegative")
     for name in ("materializer_max_lag_mb", "wal_index_max_lag_mb"):
         if not 0 <= getattr(args, name) <= 2147483647:
             p.error(f"--{name.replace('_', '-')} must be between 0 and 2147483647")
