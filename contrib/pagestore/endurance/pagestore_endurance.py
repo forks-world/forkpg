@@ -1185,7 +1185,7 @@ recovery_target_action = 'promote'
             self.event("branch_reclaim_begin", cycle=cycle, store_kb=self.store_kb())
             self.create_branch(parent)
             timeline = self.branches[0][0]
-            peak = self.store_kb()
+            pre_retire = self.store_kb()
             self.retire_branch()
             # Advance root operational fences after releasing the child cap.
             self.writer.sql("CHECKPOINT;")
@@ -1210,7 +1210,7 @@ recovery_target_action = 'promote'
                 baseline = settled["store_kb"]
                 owner_baseline = settled["owners"]
             self.event("branch_reclaim_complete", cycle=cycle, timeline=timeline,
-                       warmup=cycle == 1, peak_store_kb=peak,
+                       warmup=cycle == 1, pre_retire_store_kb=pre_retire,
                        baseline_store_kb=baseline, slack_mb=self.args.branch_reclaim_slack_mb,
                        **settled)
             if self.checksums(self.writer) != parent:
