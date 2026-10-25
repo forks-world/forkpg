@@ -13,7 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--library', required=True, type=Path)
     args = parser.parse_args()
-    for operation in ('pwrite', 'fsync', 'short-pwrite', 'wal-fsync'):
+    for operation in ('pwrite', 'fsync', 'short-pwrite', 'wal-fsync', 'forkmeta-fsync'):
         with tempfile.TemporaryDirectory(prefix='ps-io-fault-') as temp:
             root = Path(temp)
             store = root / 'store'
@@ -25,14 +25,16 @@ def main():
             code = '''import errno,json,os,sys
 from pathlib import Path
 store, arm, report, operation = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
-fd=os.open(store/('wal_1' if operation=='wal-fsync' else 'seg_00000000'), os.O_CREAT|os.O_RDWR, 0o600)
-other=os.open(store/('wal_invalid' if operation=='wal-fsync' else 'unrelated'), os.O_CREAT|os.O_RDWR, 0o600)
-outside=os.open(store.parent/('wal_1' if operation=='wal-fsync' else 'seg_other_store'), os.O_CREAT|os.O_RDWR, 0o600)
+fd=os.open(store/('forkmeta' if operation=='forkmeta-fsync' else 'wal_1' if operation=='wal-fsync' else 'seg_00000000'), os.O_CREAT|os.O_RDWR, 0o600)
+other=os.open(store/('forkmeta.bak' if operation=='forkmeta-fsync' else 'wal_invalid' if operation=='wal-fsync' else 'unrelated'), os.O_CREAT|os.O_RDWR, 0o600)
+outside=os.open(store.parent/('forkmeta' if operation=='forkmeta-fsync' else 'wal_1' if operation=='wal-fsync' else 'seg_other_store'), os.O_CREAT|os.O_RDWR, 0o600)
 controls=[]
-if operation=='wal-fsync':
+if operation in ('wal-fsync','forkmeta-fsync'):
  (store/'wal_segments_1').mkdir()
- for name in ('seg_00000000','wal_1.bak','wal_segments_1/walv1_1_00000000000000000001'):
+ for name in ('seg_00000000','wal_1.bak','timelines','wal_segments_1/walv1_1_00000000000000000001'):
   controls.append(os.open(store/name,os.O_CREAT|os.O_RDWR,0o600))
+if operation=='forkmeta-fsync':
+ controls.append(os.open(store/'wal_1',os.O_CREAT|os.O_RDWR,0o600))
 try:
  os.pwrite(fd,b'B'*8192 if operation=='short-pwrite' else b'baseline',0);os.fsync(fd)
  arm.touch()
