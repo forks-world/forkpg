@@ -88,9 +88,16 @@ jobs:
             --probe "$(pwd)/build/contrib/pagestore/pagestore_metadata_publish_probe" \
             | tee "$RUNNER_TEMP/metadata-directory-sync.log"
 
+      - name: Verify selector publication fault scope
+        run: |
+          set -o pipefail
+          python3 contrib/pagestore/endurance/test_selector_directory_sync.py \
+            --library "$(pwd)/build/contrib/pagestore/pagestore_storage_io_fault.so" \
+            | tee "$RUNNER_TEMP/selector-directory-sync.log"
+
       - name: Verify SQL recovery after page-store I/O errors
         run: |
-          for operation in pwrite fsync short-pwrite wal-fsync forkmeta-fsync metadata-dir-fsync; do
+          for operation in pwrite fsync short-pwrite wal-fsync forkmeta-fsync metadata-dir-fsync selector-dir-fsync; do
             python3 contrib/pagestore/endurance/pagestore_storage_error_test.py \
               --library "$(pwd)/build/contrib/pagestore/pagestore_storage_io_fault.so" \
               --operation "$operation" -- \
@@ -128,6 +135,7 @@ jobs:
           root="$RUNNER_TEMP/endurance"
           out="$(pwd)/build/pagestore-endurance-evidence"
           mkdir -p "$out"
+          cp "$RUNNER_TEMP/selector-directory-sync.log" "$out"/ 2>/dev/null || true
           cp "$RUNNER_TEMP/metadata-directory-sync.log" "$out"/ 2>/dev/null || true
           cp "$root"/history.jsonl "$out"/ 2>/dev/null || true
           # a pass leaves its summary, events and metrics under passed/<seed>/;

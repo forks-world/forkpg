@@ -256,7 +256,10 @@ class PostmasterHandle:
                 raise ProcessLookupError(f"postmaster {pid} exited while its identity was checked")
             return cls(fd, pid)
         except FileNotFoundError as error:
-            exited = bool(select.select([fd], [], [], 0)[0])
+            # Linux tears down /proc/<pid>/exe before the exiting task
+            # necessarily makes its pidfd readable. Wait on the pinned kernel
+            # identity briefly; never infer exit from missing procfs alone.
+            exited = bool(select.select([fd], [], [], 1)[0])
             os.close(fd)
             if exited:
                 raise ProcessLookupError(f"postmaster {pid} exited") from error

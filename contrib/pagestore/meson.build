@@ -806,6 +806,14 @@ if host_system == 'linux'
     dependencies: [dependency('threads')],
     install: false,
   )
+  test('pagestore_selector_directory_sync',
+    pagestore_harness_python,
+    args: [files('endurance/test_selector_directory_sync.py'),
+           '--library', pagestore_storage_io_fault],
+    depends: [pagestore_storage_io_fault],
+    suite: ['pagestore'],
+    timeout: 60,
+  )
   test('pagestore_metadata_directory_sync',
     pagestore_harness_python,
     args: [files('endurance/test_metadata_directory_sync.py'),

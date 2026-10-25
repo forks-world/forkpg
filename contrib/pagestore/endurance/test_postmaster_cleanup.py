@@ -215,6 +215,21 @@ class TeardownTests(unittest.TestCase):
 
 
 class ChildExitRaceTests(unittest.TestCase):
+    def test_missing_executable_waits_for_pinned_exit_and_fails_closed_if_live(self):
+        for exited in (False, True):
+            with self.subTest(exited=exited), \
+                 patch.object(endurance.os, 'pidfd_open', return_value=8), \
+                 patch.object(Path, 'read_bytes', return_value=b'postgres\0-D\0/tmp/owned\0'), \
+                 patch.object(Path, 'samefile', side_effect=FileNotFoundError('executable torn down')), \
+                 patch.object(endurance.select, 'select',
+                              return_value=([8] if exited else [], [], [])) as wait, \
+                 patch.object(endurance.os, 'close') as close:
+                expected = ProcessLookupError if exited else endurance.Failure
+                with self.assertRaises(expected):
+                    endurance.PostmasterHandle.open(123, Path('/tmp/owned'), Path('/bin/postgres'))
+                wait.assert_called_once_with([8], [], [], 1)
+                close.assert_called_once_with(8)
+
     def test_procfs_esrch_requires_pinned_child_exit(self):
         for exited in (True, False):
             with self.subTest(exited=exited):
