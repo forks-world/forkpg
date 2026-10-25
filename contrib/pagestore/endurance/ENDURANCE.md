@@ -199,7 +199,7 @@ fault window permits the intended storage/RPC errors but still rejects traps,
 segfaults and invalid-page corruption; normal strict log checks resume before
 recovery. Passed fault reports, fault-window logs and scope/provenance remain
 under `passed/<seed>/storage-error-<operation>/` alongside the usual metrics.
-CI runs all five operations and uploads these artifacts, including failed-run logs.
+CI runs all six operations and uploads these artifacts, including failed-run logs.
 
 Use `--operation short-pwrite` in another fresh root to write and return only
 half of each requested segment write of at least 512 bytes while armed.
@@ -246,6 +246,19 @@ this probe and retains its syscall report in `metadata-directory-sync.log`.
 This is storage-backend publication/retry coverage with opaque byte records,
 not SQL-level snapshot-selector recovery or power-loss durability. It does not
 model loss/reordering of kernel-cached directory entries after host failure.
+
+The SQL runner also accepts `--operation metadata-dir-fsync`. It enables the
+forkmeta reclamation controller at 64 KiB / 32 KiB and replays 128 create/drop
+table pairs to force a snapshot cutover. The preload fails directory fsync
+after the exact source-log replacement rename. Unlike append faults, cutover
+failure poisons metadata and can stall replay without emitting a compute error.
+This mode requires the explicit inspection state `forkmeta_poisoned=true` and
+a published selector; a timeout or connection failure is insufficient. It
+kills computes and daemon while still armed, retains selector/immutable parts
+and source-log evidence, then reopens and requires poison to clear, materializer
+catch-up, matching committed contents and mandatory amcheck on both computes.
+This qualifies SQL recovery for this process-crash boundary, not selector loss
+or directory-entry reordering under power failure.
 
 The models cover persistent pre-syscall errors and positive short writes on page
 segments, legacy WAL-log fsync EIO and forkmeta append-log fsync EIO. They do not model torn writes after a successful full-length return,

@@ -13,7 +13,7 @@ class StorageErrorTests(unittest.TestCase):
     def test_fatal_daemon_error_is_scoped_to_metadata_replay(self):
         run = object.__new__(probe.StorageErrorRun)
         fatal = 'FATAL:  pagestore localsvc: daemon reported error for op 1'
-        for operation in ('pwrite', 'fsync', 'short-pwrite', 'wal-fsync', 'forkmeta-fsync'):
+        for operation in ('pwrite', 'fsync', 'short-pwrite', 'wal-fsync', 'forkmeta-fsync', 'metadata-dir-fsync'):
             run.fault_operation = operation
             self.assertEqual(bool(run.fault_response(fatal)), operation == 'forkmeta-fsync')
             self.assertIsNone(run.fault_response('FATAL: connection to server failed'))

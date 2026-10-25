@@ -36,6 +36,9 @@ class StorageErrorRun(driver.Run):
                        'PAGESTORE_IO_TEST_ARM': str(self.arm),
                        'PAGESTORE_IO_TEST_REPORT': str(self.report),
                        'PAGESTORE_IO_TEST_OPERATION': self.fault_operation}
+        if self.fault_operation == 'metadata-dir-fsync':
+            environment['PAGESTORE_FORKMETA_HIGH_WATER_BYTES'] = '65536'
+            environment['PAGESTORE_FORKMETA_CATCH_UP_BYTES'] = '32768'
         wrapper.write_text('#!/bin/sh\n' + '\n'.join(
             f'export {key}={shlex.quote(value)}' for key, value in environment.items()) +
             '\nexec ' + shlex.quote(str(binary)) + ' "$@"\n')
@@ -89,6 +92,11 @@ class StorageErrorRun(driver.Run):
                         "UPDATE acct SET bal=bal+1 WHERE id=2; COMMIT; "
                         "CREATE TABLE storage_error_probe AS SELECT g, md5(g::text) AS v "
                         "FROM generate_series(1,5000) g; CHECKPOINT;")
+        if self.fault_operation == 'metadata-dir-fsync':
+            self.writer.sql("DO $$ BEGIN FOR i IN 1..128 LOOP "
+                            "EXECUTE format('CREATE TABLE metadata_churn_%s (id int PRIMARY KEY)', i); "
+                            "EXECUTE format('DROP TABLE metadata_churn_%s', i); "
+                            "END LOOP; END $$; CHECKPOINT;")
         expected = self.checksums(self.writer)
         if wal_fault:
             switch = self.writer.sql('SELECT pg_switch_wal();')
@@ -121,7 +129,8 @@ class StorageErrorRun(driver.Run):
         if hit is None:
             raise driver.Failure('fault_unreached', 'no complete storage I/O fault report')
         expected_errno = {'pwrite': errno.ENOSPC, 'fsync': errno.EIO,
-                          'short-pwrite': 0, 'wal-fsync': errno.EIO, 'forkmeta-fsync': errno.EIO}[self.fault_operation]
+                          'short-pwrite': 0, 'wal-fsync': errno.EIO, 'forkmeta-fsync': errno.EIO,
+                          'metadata-dir-fsync': errno.EIO}[self.fault_operation]
         if (hit.get('operation') != self.fault_operation or hit.get('errno') != expected_errno or
                 hit.get('pid') != self.daemon.pid):
             raise driver.Failure('fault_identity', f'unexpected I/O hit: {hit}')
@@ -133,9 +142,17 @@ class StorageErrorRun(driver.Run):
         # Require the actual daemon-error response in the compute's fault window.
         fault_compute = self.writer if wal_fault else self.mat
         compute_error = None
+        publication_state = None
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             self.check_health()
+            if self.fault_operation == 'metadata-dir-fsync':
+                state = json.loads(self.inspect('gc'))
+                if state.get('forkmeta_poisoned') is True:
+                    publication_state = state
+                    break
+                time.sleep(.1)
+                continue
             text = fault_compute.log.read_bytes()[fault_offsets[fault_compute.name]:].decode(errors='replace')
             response = self.fault_response(text)
             archive_failure = (not wal_fault or
@@ -148,7 +165,7 @@ class StorageErrorRun(driver.Run):
             except (driver.SqlError, driver.subprocess.TimeoutExpired):
                 pass
             time.sleep(.1)
-        if compute_error is None:
+        if compute_error is None and publication_state is None:
             raise driver.Failure('fault_not_surfaced', 'no compute daemon-error response after I/O failure')
         if wal_fault:
             if archive_done.exists():
@@ -156,7 +173,12 @@ class StorageErrorRun(driver.Run):
             if not (self.writer.datadir / 'pg_wal' / segment).is_file():
                 raise driver.Failure('wal_retry_source_lost', 'faulted WAL missing from writer')
             self.event('wal_archive_rejected', segment=segment, retry_source_retained=True)
-        self.event('storage_fault_observed', compute_error=compute_error, **hit)
+        if publication_state is not None:
+            selector = self.store / 'forkmeta_snapshots/forkmeta_manifest_v1'
+            if not selector.is_file() or selector.stat().st_size == 0:
+                raise driver.Failure('selector_missing', 'no selected snapshot after source rewrite')
+        self.event('storage_fault_observed', compute_error=compute_error,
+                   publication_state=publication_state, **hit)
         # Stop computes immediately, then crash daemon while fault is still
         # armed. No successful segment sync is allowed to mask the error.
         for pg in self.computes():
@@ -174,20 +196,26 @@ class StorageErrorRun(driver.Run):
         evidence = self.args.root / 'passed' / str(self.seed) / ('storage-error-' + self.fault_operation)
         evidence.mkdir(parents=True, exist_ok=True)
         shutil.copy2(self.report, evidence / self.report.name)
+        if publication_state is not None:
+            shutil.copytree(self.store / 'forkmeta_snapshots', evidence / 'forkmeta_snapshots')
+            shutil.copy2(self.store / 'forkmeta', evidence / 'forkmeta')
         for pg in self.computes():
             shutil.copy2(pg.log, evidence / pg.log.name)
         shutil.copy2(self.root / 'daemon.log', evidence / 'daemon.log')
         (evidence / 'scope.json').write_text(json.dumps({
             'operation': self.fault_operation, 'hit': hit, 'compute_error': compute_error,
+            'publication_state': publication_state,
             'library_sha256': hashlib.sha256(self.library.read_bytes()).hexdigest(),
-            'model': ('pre-syscall fsync EIO on daemon forkmeta append log'
+            'model': ('post-rename store-directory fsync EIO during SQL snapshot cutover'
+                      if self.fault_operation == 'metadata-dir-fsync' else
+                      'pre-syscall fsync EIO on daemon forkmeta append log'
                       if self.fault_operation == 'forkmeta-fsync' else
                       'pre-syscall fsync EIO on daemon legacy WAL logs wal_<timeline>'
                       if self.fault_operation == 'wal-fsync' else
                       'positive short pwrite on daemon page segments'
                       if self.fault_operation == 'short-pwrite' else
                       'pre-syscall failure on daemon page-segment files only'),
-            'not_covered': ['torn writes after successful return', 'immutable WAL segment failures', 'metadata failures',
+            'not_covered': ['torn writes after successful return', 'immutable WAL segment failures', 'other metadata boundaries',
                             'slow I/O', 'power loss']},
             indent=2) + '\n')
         self.arm.unlink()
@@ -196,6 +224,11 @@ class StorageErrorRun(driver.Run):
         self.mat.start()
         self.injecting = False
         self.verify_materializer('after I/O failure and daemon crash')
+        if publication_state is not None:
+            recovered = json.loads(self.inspect('gc'))
+            if recovered.get('forkmeta_poisoned') is not False:
+                raise driver.Failure('selector_unrecovered', f'poison remains after reopen: {recovered}')
+            self.event('snapshot_selector_recovered', gc=recovered)
         if wal_fault:
             if not archive_done.exists() and (self.writer.datadir / 'pg_wal' / segment).exists():
                 raise driver.Failure('wal_retry_incomplete', 'faulted WAL still awaiting archive')
@@ -212,7 +245,7 @@ class StorageErrorRun(driver.Run):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--library', required=True, type=Path)
-    parser.add_argument('--operation', required=True, choices=('pwrite', 'fsync', 'short-pwrite', 'wal-fsync', 'forkmeta-fsync'))
+    parser.add_argument('--operation', required=True, choices=('pwrite', 'fsync', 'short-pwrite', 'wal-fsync', 'forkmeta-fsync', 'metadata-dir-fsync'))
     parser.add_argument('driver_args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     library = args.library.resolve()
