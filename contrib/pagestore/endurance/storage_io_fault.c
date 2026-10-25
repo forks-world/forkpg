@@ -40,7 +40,8 @@ initialize(void)
 		!operation || root[0] != '/' || arm[0] != '/' || report[0] != '/' ||
 		strlen(root) >= PATH_MAX || under_root(arm) || under_root(report) ||
 		(strcmp(operation, "pwrite") != 0 && strcmp(operation, "fsync") != 0 &&
-		 strcmp(operation, "short-pwrite") != 0))
+		 strcmp(operation, "short-pwrite") != 0 &&
+		 strcmp(operation, "wal-fsync") != 0))
 		_exit(125);
 }
 
@@ -53,9 +54,11 @@ inject(int fd, const char *op, const void *buffer, size_t count,
 	int saved = errno;
 	int error = strcmp(op, "pwrite") == 0 ? ENOSPC : EIO;
 	int output;
+	int wal_sync = strcmp(operation, "wal-fsync") == 0;
 	int short_write = strcmp(operation, "short-pwrite") == 0;
 
-	if ((strcmp(operation, op) != 0 && !(short_write && strcmp(op, "pwrite") == 0)) ||
+	if ((strcmp(operation, op) != 0 && !(short_write && strcmp(op, "pwrite") == 0) &&
+		 !(wal_sync && strcmp(op, "fsync") == 0)) ||
 		access(arm, F_OK) != 0)
 		goto inactive;
 	snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
@@ -63,7 +66,16 @@ inject(int fd, const char *op, const void *buffer, size_t count,
 	if (length < 0 || (size_t) length >= sizeof(path) - 1)
 		goto inactive;
 	path[length] = '\0';
-	if (!under_root(path) || strncmp(path + strlen(root), "/seg_", 5) != 0)
+	if (!under_root(path))
+		goto inactive;
+	if (wal_sync)
+	{
+		const char *name = path + strlen(root);
+		if (strncmp(name, "/wal_", 5) != 0 || name[5] == '\0' ||
+			strspn(name + 5, "0123456789") != strlen(name + 5))
+			goto inactive;
+	}
+	else if (strncmp(path + strlen(root), "/seg_", 5) != 0)
 		goto inactive;
 	/* Leave small record headers intact so SQL probes hit page payloads. */
 	if (short_write && count < 512)
