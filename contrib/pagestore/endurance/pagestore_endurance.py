@@ -200,16 +200,6 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
-def group_alive(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def unlink_shm(name: str) -> None:
     try:
         import _posixshmem                       # shm_unlink(3), wherever the object lives
@@ -414,6 +404,22 @@ class Pg:
             self.postmaster.close()
             self.postmaster = None
         self.pin_postmaster()
+
+    def crash(self) -> None:
+        """Crash only the owned postmaster; wait for its pinned children.
+
+        PostgreSQL children may have their own process groups. Numeric group
+        disappearance cannot prove that they released the compute's shared memory.
+        Keep handles on failure so ordinary cleanup can still wait for them.
+        """
+        self.expected_up = False
+        if self.postmaster is None:
+            raise Failure("cleanup_identity", f"{self.name} has no pinned postmaster for crash")
+        self.postmaster.pin_children()
+        self.postmaster.kill()
+        self.postmaster.wait_children()
+        self.postmaster.close()
+        self.postmaster = None
 
     def halt(self) -> None:
         """Immediate shutdown, escalating only through a pinned process handle.
@@ -947,11 +953,7 @@ DO $$ DECLARE r record; BEGIN
             elif event == "mat_immediate":
                 self.mat.stop("immediate"); self.mat.start()
             elif event == "mat_kill9":
-                self.mat.expected_up = False
-                pid = self.mat.pid()
-                os.kill(pid, signal.SIGKILL)
-                # its children notice and exit, which frees the shared memory a new postmaster needs
-                self.wait_for("materializer processes exit after SIGKILL", lambda: not group_alive(pid), 300)
+                self.mat.crash()
                 self.mat.start()
             elif event == "mat_checkpoint":
                 self.force_restartpoint()

@@ -1718,7 +1718,10 @@ $P -c "CREATE FUNCTION pagestore_test_control_error(regclass) RETURNS boolean
           'pagestore_test_slru_error' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_test_redo_base(integer) RETURNS boolean
        AS '$BUILD/contrib/pagestore/pagestore_mirror_error_test',
-          'pagestore_test_redo_base' LANGUAGE C STRICT;" >/dev/null
+          'pagestore_test_redo_base' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_test_recovery_read(integer) RETURNS boolean
+       AS '$BUILD/contrib/pagestore/pagestore_recovery_read_test',
+          'pagestore_test_recovery_read' LANGUAGE C STRICT;" >/dev/null
 assert "$($P -c "SELECT pagestore_test_control_error('pg_class');")" "t" \
     "control mirror failure preserves buffer-lock interrupt holdoffs and queued image"
 assert "$($P -c "SELECT pagestore_test_slru_error('pg_class');")" "t" \
@@ -1731,6 +1734,9 @@ assert "$($P -c "SELECT pagestore_test_control_error('pg_class') AND
 
 assert "$($P -c "SELECT bool_and(pagestore_test_redo_base(mode)) FROM generate_series(0,4) mode;")" "t" \
     "redo uses one index-view base/lifecycle reply, rejects I/O failure, and supports legacy daemons"
+
+assert "$($P -c "SELECT bool_and(pagestore_test_recovery_read(mode)) FROM generate_series(0,6) mode;")" "t" \
+    "startup page reads respect the durable recovery floor while metadata and pinned caps stay finite"
 
 # --- 26. pg_control mirror: control writes publish LSN-versioned store images ---
 # Every UpdateControlFile() queues the just-written image (versioned by the LSN

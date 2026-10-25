@@ -346,6 +346,7 @@ extern BlockNumber pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
 																 int timeout_ms);
 extern bool pagestore_localsvc_artifact_supersedable(bool on);
 extern bool pagestore_materializer_enabled(void);
+extern void pagestore_localsvc_set_recovery_read_floor(uint64 lsn);
 extern uint64 pagestore_localsvc_artifact_begin(uint32 klass, const PageStoreRelKey *key,
 	uint64 version, int timeout_ms);
 extern void pagestore_localsvc_artifact_commit(uint32 klass, const PageStoreRelKey *key,

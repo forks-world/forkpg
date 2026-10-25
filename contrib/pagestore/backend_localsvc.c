@@ -64,6 +64,7 @@ static int	localsvc_timeline = 0;
  */
 static char *localsvc_read_lsn_str = NULL;
 static uint64 localsvc_read_lsn = 0;
+static uint64 localsvc_recovery_read_floor;
 /* Automatic-generation artifact mode; see pagestore_localsvc_artifact_supersedable(). */
 static bool localsvc_artifact_supersedable = false;
 static bool localsvc_artifact_superseded = false;
@@ -837,7 +838,7 @@ ls_op_lsn(PsChannel *ch, bool is_unlink)
 }
 
 /* A materializer is writable, not a pinned reader, but during recovery it
- * must not resolve relation metadata or page bytes beyond the WAL record it
+ * must not resolve relation metadata beyond the WAL record it
  * is currently replaying.  Doing so exposes a future CREATE/TRUNCATE and can
  * make redo attempt an extension against the wrong fork generation. */
 static uint64
@@ -863,6 +864,27 @@ ls_read_lsn(void)
 		return (uint64) replay;
 	}
 	return 0;
+}
+
+/* Recovery can resume before the control file's consistency boundary. Keep
+ * page reads at least at that durable startup image, not at an earlier WAL
+ * record whose eligible COW image can miss pre-checkpoint changes. Once replay
+ * passes the boundary, retain ordinary finite ordering. Metadata always keeps
+ * the current-record cap; pinned readers and standby backends are unchanged. */
+void
+pagestore_localsvc_set_recovery_read_floor(uint64 lsn)
+{
+	localsvc_recovery_read_floor = lsn;
+}
+
+static uint64
+ls_page_read_lsn(void)
+{
+	uint64 cap = ls_read_lsn();
+
+	if (localsvc_read_lsn == 0 && RecoveryInProgress() && AmStartupProcess())
+		cap = Max(cap, localsvc_recovery_read_floor);
+	return cap;
 }
 
 /*
@@ -973,6 +995,7 @@ ls_read_opcode(PsChannel *ch, const PageStoreRelKey *key)
 {
 	ch->opcode = PS_OP_READV;
 	if (key->forkNum == FSM_FORKNUM && ch->req_lsn == 0 && ch->req_seq == 0 &&
+		!RecoveryInProgress() &&
 		(((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_FSM_RESET))
 		ch->opcode = PS_OP_READV_FSM;
 }
@@ -998,7 +1021,7 @@ ls_readv(const PageStoreRelKey *key, void *localreln,
 		ch->opcode = PS_OP_READV;
 		ch->blocknum = blocknum + done;
 		ch->nblocks = chunk;
-		ch->req_lsn = ls_read_lsn();
+		ch->req_lsn = ls_page_read_lsn();
 		ch->req_seq = read_seq;
 		ls_read_opcode(ch, key);
 		ls_exec(ch);
@@ -1134,7 +1157,7 @@ ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
-	ch->req_lsn = ls_read_lsn();
+	ch->req_lsn = ls_page_read_lsn();
 	ch->req_seq = read_seq;
 	ls_read_opcode(ch, key);
 	ls_exec(ch);
