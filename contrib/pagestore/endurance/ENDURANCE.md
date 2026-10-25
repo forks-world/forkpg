@@ -199,7 +199,7 @@ fault window permits the intended storage/RPC errors but still rejects traps,
 segfaults and invalid-page corruption; normal strict log checks resume before
 recovery. Passed fault reports, fault-window logs and scope/provenance remain
 under `passed/<seed>/storage-error-<operation>/` alongside the usual metrics.
-CI runs all four operations and uploads these artifacts, including failed-run logs.
+CI runs all five operations and uploads these artifacts, including failed-run logs.
 
 Use `--operation short-pwrite` in another fresh root to write and return only
 half of each requested segment write of at least 512 bytes while armed.
@@ -221,9 +221,21 @@ This mode arms before new writer commits and WAL switching. It requires an
 archiver-side daemon error, an explicit failure for the switched WAL segment,
 no `.done` marker, and retention of the local retry source before crashing. Recovery must retransmit the local WAL and catch up the materializer.
 
+Use `--operation forkmeta-fsync` in a fresh root to inject EIO at fsync of
+the exact top-level `forkmeta` append log. The SQL probe creates a table on
+the local-WAL writer, ships its WAL, and arms before materializer replay.
+The failed metadata append must surface as an explicit daemon error to compute.
+This mode also accepts the replay process promoting that error to FATAL and
+exiting with status 1; other probes retain the ERROR-only response oracle.
+Recovery must reconstruct
+the new relation and its contents and pass mandatory amcheck on both computes.
+This covers append-log file sync, including bytes written before the error;
+it does not qualify metadata rewrite/rename, directory sync, timeline logs or
+retention metadata. The fault remains armed until the daemon is killed.
+
 The models cover persistent pre-syscall errors and positive short writes on page
-segments, and legacy WAL-log fsync EIO. They do not model torn writes after a successful full-length return,
-actual full-filesystem behavior, immutable WAL-segment and metadata I/O failures,
+segments, legacy WAL-log fsync EIO and forkmeta append-log fsync EIO. They do not model torn writes after a successful full-length return,
+actual full-filesystem behavior, immutable WAL-segment and other metadata I/O failures,
 slow devices or power loss; process death leaves the kernel page cache intact.
 It is a bounded recovery probe, not arbitrary fault injection into every random
 endurance round or 72-hour storage-fault qualification. The preload library is
@@ -594,10 +606,11 @@ with indexing enabled as proof that a 72-hour run fits its space budget.
 - **The materializer supervisor.**  The driver restarts the materializer
   itself; `pagestore_materializer_supervisor` should own it.
 - **Broad storage faults.** Isolated page-segment ENOSPC and fsync EIO recovery
-  probes, positive short-write recovery and legacy WAL-log fsync EIO recovery
+  probes, positive short-write recovery, legacy WAL-log fsync EIO and forkmeta
+  append-log fsync EIO recovery
   are covered. Torn writes after a
   successful full-length return, actual full-filesystem behavior, immutable WAL-segment and
-  metadata errors, slow devices and arbitrary named fault points under mixed load remain
+  other metadata errors, slow devices and arbitrary named fault points under mixed load remain
   unqualified.
 - **Power loss.**  Process kills leave the OS page cache intact.
 - **Long-term leak verdicts.** Sampled RSS/descriptor budgets and resource peaks
