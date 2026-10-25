@@ -171,6 +171,43 @@ leak. Cache warming, shared memory, branch creation and restart generations must
 be separated before diagnosing a growth trend. Short budget probes do not
 qualify 72-hour memory stability.
 
+## Page-segment I/O error recovery
+
+On Linux, `pagestore_storage_error_test.py` runs an isolated real SQL recovery
+probe using the test-only `pagestore_storage_io_fault.so` built by Meson. It
+sets LD_PRELOAD only for its daemon wrapper, matches that test store's `seg_*`
+files by file descriptor path and arms after baseline data verification. It
+never fills the host filesystem or injects errors into the writer's local WAL.
+
+```sh
+python3 contrib/pagestore/endurance/pagestore_storage_error_test.py \
+    --library build/contrib/pagestore/pagestore_storage_io_fault.so \
+    --operation pwrite -- --build build --root /path/to/enospc-probe \
+    --seed 1 --scale 1 --clients 1 --max-branches 0 \
+    --sample-interval 1 --sync-timeout 120 \
+    --max-run-gb 3 --max-store-gb 2 --min-free-gb 5
+```
+
+Use `--operation fsync` in a separate fresh root for EIO instead of pwrite's
+ENOSPC. The probe stops materialization, commits and archives new writer data,
+then arms the segment fault and restarts materialization. It requires an actual
+injected-syscall report from the daemon and an explicit compute-side daemon
+error response. Computes stop immediately and the daemon is killed while the
+fault is still armed. After disarming/reopening, normal checksums and amcheck
+must pass and the writer must retain the expected committed contents. The
+fault window permits the intended storage/RPC errors but still rejects traps,
+segfaults and invalid-page corruption; normal strict log checks resume before
+recovery. Passed fault reports, fault-window logs and scope/provenance remain
+under `passed/<seed>/storage-error-<operation>/` alongside the usual metrics.
+CI runs both operations and uploads these artifacts, including failed-run logs.
+
+The model is a persistent pre-syscall error on page segments. It does not model
+partial writes, actual full-filesystem behavior, WAL/metadata I/O failures,
+slow devices or power loss; process death leaves the kernel page cache intact.
+It is a bounded recovery probe, not arbitrary fault injection into every random
+endurance round or 72-hour storage-fault qualification. The preload library is
+not installed as a runtime PostgreSQL module.
+
 ## Topology
 
 The provisioning mirrors `mvp_golden_test.sh` step for step, so a failure here
@@ -535,8 +572,10 @@ with indexing enabled as proof that a 72-hour run fits its space budget.
   `integration_test.sh`.
 - **The materializer supervisor.**  The driver restarts the materializer
   itself; `pagestore_materializer_supervisor` should own it.
-- **Storage faults** (disk full, write/fsync errors, slow device) and the
-  named fault points under load.
+- **Broad storage faults.** Isolated page-segment ENOSPC and fsync EIO recovery
+  probes are covered. Partial writes, actual full-filesystem behavior, WAL/metadata
+  errors, slow devices and arbitrary named fault points under mixed load remain
+  unqualified.
 - **Power loss.**  Process kills leave the OS page cache intact.
 - **Long-term leak verdicts.** Sampled RSS/descriptor budgets and resource peaks
   are enforced when configured, but steady-state leak trends across a long
