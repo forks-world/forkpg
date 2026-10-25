@@ -19,7 +19,8 @@ class SpaceBudgetTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.store = self.root / "store"
         self.store.mkdir()
-        self.args = SimpleNamespace(min_free_gb=0.001, max_run_gb=0.01, max_store_gb=0.01)
+        self.args = SimpleNamespace(min_free_gb=0.001, max_run_gb=0.01, max_store_gb=0.01,
+                                    max_rss_mb=0, max_fds=0)
 
     def test_compute_wal_trips_run_budget_while_store_is_small(self):
         wal = self.root / "writer" / "pg_wal"
@@ -63,6 +64,7 @@ class SpaceBudgetTests(unittest.TestCase):
         run = object.__new__(endurance.Run)
         run.root, run.store, run.args = self.root, self.store, self.args
         run.round = 0
+        run.stats = {}
         run.daemon = None
         run.daemon_expected_up = False
         run.async_failure = None
