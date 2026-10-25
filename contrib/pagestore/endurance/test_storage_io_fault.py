@@ -13,7 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--library', required=True, type=Path)
     args = parser.parse_args()
-    for operation in ('pwrite', 'fsync', 'short-pwrite'):
+    for operation in ('pwrite', 'fsync', 'short-pwrite', 'wal-fsync'):
         with tempfile.TemporaryDirectory(prefix='ps-io-fault-') as temp:
             root = Path(temp)
             store = root / 'store'
@@ -25,13 +25,18 @@ def main():
             code = '''import errno,json,os,sys
 from pathlib import Path
 store, arm, report, operation = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
-fd=os.open(store/'seg_00000000', os.O_CREAT|os.O_RDWR, 0o600)
-other=os.open(store/'unrelated', os.O_CREAT|os.O_RDWR, 0o600)
-outside=os.open(store.parent/'seg_other_store', os.O_CREAT|os.O_RDWR, 0o600)
+fd=os.open(store/('wal_1' if operation=='wal-fsync' else 'seg_00000000'), os.O_CREAT|os.O_RDWR, 0o600)
+other=os.open(store/('wal_invalid' if operation=='wal-fsync' else 'unrelated'), os.O_CREAT|os.O_RDWR, 0o600)
+outside=os.open(store.parent/('wal_1' if operation=='wal-fsync' else 'seg_other_store'), os.O_CREAT|os.O_RDWR, 0o600)
+controls=[]
+if operation=='wal-fsync':
+ (store/'wal_segments_1').mkdir()
+ for name in ('seg_00000000','wal_1.bak','wal_segments_1/walv1_1_00000000000000000001'):
+  controls.append(os.open(store/name,os.O_CREAT|os.O_RDWR,0o600))
 try:
  os.pwrite(fd,b'B'*8192 if operation=='short-pwrite' else b'baseline',0);os.fsync(fd)
  arm.touch()
- for target in (other,outside):
+ for target in (other,outside,*controls):
   os.pwrite(target,b'outside'*1024,0);os.fsync(target)
  assert not report.exists()
  if operation=='short-pwrite':
@@ -55,7 +60,7 @@ try:
  os.pwrite(fd,b'healthy!',0);os.fsync(fd)
  assert os.pread(fd,8,0)==b'healthy!'
 finally:
- for target in (fd,other,outside):os.close(target)
+ for target in (fd,other,outside,*controls):os.close(target)
 '''
             result = subprocess.run([sys.executable, '-c', code, str(store), str(arm), str(report), operation],
                                     env=environment, capture_output=True, text=True, timeout=10)
