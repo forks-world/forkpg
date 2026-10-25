@@ -28,6 +28,13 @@ Cleanup waits for pinned descendants before inspecting or removing shared
 resources. Failed compute cleanup is retried once; if it remains incomplete,
 the failure is recorded and the daemon/shared memory are preserved.
 
+At startup, recovery reads relation pages no earlier than the verified local
+control file's checkpoint/minRecoveryPoint boundary. Before replay reaches
+that boundary, selecting a historical image at the current record can reload
+an image missing pre-checkpoint changes. After replay passes it, the normal
+finite page horizon resumes. Relation metadata always keeps the current-record
+cap, and pinned readers/hot-standby query caps are unchanged.
+
 Put `--root` on a real filesystem.  On tmpfs every fsync is free and the run
 says nothing about the store's durability ordering.
 

@@ -41,6 +41,12 @@ pagestore_mirror_error_test = shared_module('pagestore_mirror_error_test',
 )
 test_install_libs += pagestore_mirror_error_test
 
+pagestore_recovery_read_test = shared_module('pagestore_recovery_read_test',
+  files('pagestore_recovery_read_test.c'),
+  kwargs: pg_test_mod_args,
+)
+test_install_libs += pagestore_recovery_read_test
+
 
 install_data(
   'pagestore.control',

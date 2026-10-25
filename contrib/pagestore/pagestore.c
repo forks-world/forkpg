@@ -1868,6 +1868,19 @@ pagestore_materializer_recovery_start(XLogRecPtr redo_lsn)
 	uint8		status;
 	uint64		admission_seq;
 
+	if (pagestore_route_all && pagestore_backend_name != NULL &&
+		strcmp(pagestore_backend_name, "localsvc") == 0)
+	{
+		bool crc_ok;
+		ControlFileData *control = get_controlfile(DataDir, &crc_ok);
+
+		if (!crc_ok)
+			ereport(FATAL, (errmsg("pagestore recovery control file CRC is invalid")));
+		pagestore_localsvc_set_recovery_read_floor(
+			(uint64) Max(control->minRecoveryPoint, control->checkPoint));
+		pfree(control);
+	}
+
 	if (pagestore_materializer)
 	{
 		if (XLogRecPtrIsInvalid(redo_lsn) ||
