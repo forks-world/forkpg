@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real SQL recovery after daemon-only page-segment ENOSPC / fsync EIO.
+"""Real SQL recovery after daemon-only segment ENOSPC, fsync EIO or short writes.
 
 Compile storage_io_fault.c as a Linux preload library. Arguments after -- are
 normal endurance-driver arguments; use a fresh root and explicit space budgets.
@@ -103,10 +103,15 @@ class StorageErrorRun(driver.Run):
             hit = self.read_fault_report()
         if hit is None:
             raise driver.Failure('fault_unreached', 'no complete page-segment I/O fault report')
-        expected_errno = errno.ENOSPC if self.fault_operation == 'pwrite' else errno.EIO
+        expected_errno = {'pwrite': errno.ENOSPC, 'fsync': errno.EIO,
+                          'short-pwrite': 0}[self.fault_operation]
         if (hit.get('operation') != self.fault_operation or hit.get('errno') != expected_errno or
                 hit.get('pid') != self.daemon.pid):
             raise driver.Failure('fault_identity', f'unexpected I/O hit: {hit}')
+        if self.fault_operation == 'short-pwrite' and not (
+                hit.get('requested', 0) >= 512 and
+                0 < hit.get('written', -1) < hit.get('requested', 0)):
+            raise driver.Failure('fault_identity', f'no actual positive short write: {hit}')
         # A connection failure alone is not proof that storage errors surfaced.
         # Require the actual daemon-error response in the compute's fault window.
         compute_error = None
@@ -149,8 +154,11 @@ class StorageErrorRun(driver.Run):
         (evidence / 'scope.json').write_text(json.dumps({
             'operation': self.fault_operation, 'hit': hit, 'compute_error': compute_error,
             'library_sha256': hashlib.sha256(self.library.read_bytes()).hexdigest(),
-            'model': 'pre-syscall failure on daemon page-segment files only',
-            'not_covered': ['partial writes', 'WAL/metadata failures', 'slow I/O', 'power loss']},
+            'model': ('positive short pwrite on daemon page segments'
+                      if self.fault_operation == 'short-pwrite' else
+                      'pre-syscall failure on daemon page-segment files only'),
+            'not_covered': ['torn writes after successful return', 'WAL/metadata failures',
+                            'slow I/O', 'power loss']},
             indent=2) + '\n')
         self.arm.unlink()
         self.start_daemon()
@@ -170,7 +178,7 @@ class StorageErrorRun(driver.Run):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--library', required=True, type=Path)
-    parser.add_argument('--operation', required=True, choices=('pwrite', 'fsync'))
+    parser.add_argument('--operation', required=True, choices=('pwrite', 'fsync', 'short-pwrite'))
     parser.add_argument('driver_args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     library = args.library.resolve()

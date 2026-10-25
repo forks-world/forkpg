@@ -199,10 +199,19 @@ fault window permits the intended storage/RPC errors but still rejects traps,
 segfaults and invalid-page corruption; normal strict log checks resume before
 recovery. Passed fault reports, fault-window logs and scope/provenance remain
 under `passed/<seed>/storage-error-<operation>/` alongside the usual metrics.
-CI runs both operations and uploads these artifacts, including failed-run logs.
+CI runs all three operations and uploads these artifacts, including failed-run logs.
 
-The model is a persistent pre-syscall error on page segments. It does not model
-partial writes, actual full-filesystem behavior, WAL/metadata I/O failures,
+Use `--operation short-pwrite` in another fresh root to write and return only
+half of each requested segment write of at least 512 bytes while armed.
+Small record headers pass through so the SQL probe reaches page payloads. Unlike pre-syscall errors,
+this mutates actual segment bytes. The report must prove a positive byte count
+smaller than the request; the same compute-error, crash, checksum and mandatory
+amcheck oracles apply. Scope tests also verify that the unwritten suffix keeps
+its old bytes and that unrelated paths remain unaffected.
+
+The models cover persistent pre-syscall errors and positive short writes on page
+segments. They do not model torn writes after a successful full-length return,
+actual full-filesystem behavior, WAL/metadata I/O failures,
 slow devices or power loss; process death leaves the kernel page cache intact.
 It is a bounded recovery probe, not arbitrary fault injection into every random
 endurance round or 72-hour storage-fault qualification. The preload library is
@@ -573,7 +582,8 @@ with indexing enabled as proof that a 72-hour run fits its space budget.
 - **The materializer supervisor.**  The driver restarts the materializer
   itself; `pagestore_materializer_supervisor` should own it.
 - **Broad storage faults.** Isolated page-segment ENOSPC and fsync EIO recovery
-  probes are covered. Partial writes, actual full-filesystem behavior, WAL/metadata
+  probes and positive short-write recovery are covered. Torn writes after a
+  successful full-length return, actual full-filesystem behavior, WAL/metadata
   errors, slow devices and arbitrary named fault points under mixed load remain
   unqualified.
 - **Power loss.**  Process kills leave the OS page cache intact.

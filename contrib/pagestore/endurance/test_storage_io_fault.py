@@ -13,7 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--library', required=True, type=Path)
     args = parser.parse_args()
-    for operation in ('pwrite', 'fsync'):
+    for operation in ('pwrite', 'fsync', 'short-pwrite'):
         with tempfile.TemporaryDirectory(prefix='ps-io-fault-') as temp:
             root = Path(temp)
             store = root / 'store'
@@ -29,18 +29,27 @@ fd=os.open(store/'seg_00000000', os.O_CREAT|os.O_RDWR, 0o600)
 other=os.open(store/'unrelated', os.O_CREAT|os.O_RDWR, 0o600)
 outside=os.open(store.parent/'seg_other_store', os.O_CREAT|os.O_RDWR, 0o600)
 try:
- os.pwrite(fd,b'baseline',0);os.fsync(fd)
+ os.pwrite(fd,b'B'*8192 if operation=='short-pwrite' else b'baseline',0);os.fsync(fd)
  arm.touch()
  for target in (other,outside):
-  os.pwrite(target,b'outside',0);os.fsync(target)
+  os.pwrite(target,b'outside'*1024,0);os.fsync(target)
  assert not report.exists()
+ if operation=='short-pwrite':
+  assert os.pwrite(fd,b'H'*56,8192)==56
+  assert not report.exists()
  for _ in range(2):
   try:
+   if operation=='short-pwrite':
+    assert os.pwrite(fd,b'F'*8192,0)==4096
+    assert os.pread(fd,8192,0)==b'F'*4096+b'B'*4096
+    continue
    os.pwrite(fd,b'failed',0) if operation=='pwrite' else os.fsync(fd)
   except OSError as error:
    assert error.errno == (errno.ENOSPC if operation=='pwrite' else errno.EIO)
   else: raise AssertionError('injection did not occur')
  hit=json.loads(report.read_text());assert hit['operation']==operation and hit['pid']==os.getpid()
+ if operation=='short-pwrite':
+  assert hit['errno']==0 and hit['requested']==8192 and hit['written']==4096
  if operation=='pwrite':assert os.pread(fd,8,0)==b'baseline'
  arm.unlink()
  os.pwrite(fd,b'healthy!',0);os.fsync(fd)
