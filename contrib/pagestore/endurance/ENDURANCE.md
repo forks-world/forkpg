@@ -487,6 +487,14 @@ if concurrent removal moved an entry, the existing identity search remains the
 fallback. This avoids a quadratic map scan during ordinary unchanged-map reads,
 without relying on array positions remaining stable across I/O.
 
+Exact control-note reads also filter timeline, shard and LSN-range candidates
+before copying descriptors and pinning local files. Retention scans therefore
+release only layers the lookup could actually read, rather than the whole map
+for every historical note. Historical fork-event insertion stops refolding a
+cached suffix only after an existing successor has the same size, state and
+inheritance fence; deferred batch rebuilds still fold through the tail. Neither
+optimization changes the 300-second startup or 600-second replay bounds.
+
 Same seed, scale 1, 4 clients for 20 s (~800 MB of WAL), cassert build: replay
 288 s before, 238 s after (2.8 -> 3.5 MB/s).  The index cache matters more as
 layers grow; the long runs are the measurement for that.  None of this has
