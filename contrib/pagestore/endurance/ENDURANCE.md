@@ -466,6 +466,13 @@ maintenance thread.  Three causes, in the order found:
    overlapping whole-input/whole-output page buffers; it does not establish
    a constant total-RSS bound or resolve the all-layer compaction design.
 
+WAL-index snapshot planning has a separate lifecycle cost: finite sequence
+caps require folding fork history. The replacement-base planner caches each
+exact fork/ViewCap/inherited-bound result only for its single locked plan,
+and uses the existing SET/DEAD index for death candidates instead of scanning
+PAGE-GROW history for every block. Cache allocation failure uses the ordinary
+uncached proof; no retention, visibility or timeout rule is relaxed.
+
 Same seed, scale 1, 4 clients for 20 s (~800 MB of WAL), cassert build: replay
 288 s before, 238 s after (2.8 -> 3.5 MB/s).  The index cache matters more as
 layers grow; the long runs are the measurement for that.  None of this has

@@ -17001,6 +17001,171 @@ fork_meta_required_fences(const ForkEnt *e, const uint32_t *indices,
  *         comparison below feeds `deaths[]`, never `keep[]`/`bases[]`
  *         directly.
  */
+/*
+ * A base-plan holds all shard read locks, the prune fence and map-rd.
+ * Fork events and inherited bounds cannot change within that plan. Resolve
+ * each exact view once per fork, rather than folding a long lifecycle chain
+ * twice for every indexed block. Never retain these answers across plans.
+ */
+#define WALIDX_FORK_VIEW_BUCKETS 1024
+
+typedef struct WalIdxForkView
+{
+	struct WalIdxForkView *next;
+	const ForkEnt *fork;
+	ViewCap		cap;
+	uint64_t	inherited;
+	bool		has_inherited;
+	int			state;
+	uint32_t	nblocks;
+} WalIdxForkView;
+
+typedef struct WalIdxForkViews
+{
+	WalIdxForkView *buckets[WALIDX_FORK_VIEW_BUCKETS];
+	uint64_t	evaluations;
+} WalIdxForkViews;
+
+static void
+walidx_fork_views_free(WalIdxForkViews *views)
+{
+	for (uint32_t i = 0; i < WALIDX_FORK_VIEW_BUCKETS; i++)
+	{
+		WalIdxForkView *entry = views->buckets[i];
+
+		while (entry != NULL)
+		{
+			WalIdxForkView *next = entry->next;
+
+			free(entry);
+			entry = next;
+		}
+		views->buckets[i] = NULL;
+	}
+}
+
+static int
+walidx_fork_view(WalIdxForkViews *views, const ForkEnt *fork,
+				 const ViewCap *cap, uint64_t inherited, bool has_inherited,
+				 uint32_t *nblocks)
+{
+	uint64_t	hash = ((uintptr_t) fork >> 4) ^ cap->lsn ^
+		(cap->seq >> 7) ^ (cap->strict_seq >> 17) ^ inherited;
+	uint32_t	bucket = (uint32_t) hash & (WALIDX_FORK_VIEW_BUCKETS - 1);
+	WalIdxForkView *entry;
+	int			state;
+
+	for (entry = views->buckets[bucket]; entry != NULL; entry = entry->next)
+		if (entry->fork == fork && entry->cap.lsn == cap->lsn &&
+			entry->cap.seq == cap->seq && entry->cap.strict_seq == cap->strict_seq &&
+			entry->cap.legacy == cap->legacy && entry->inherited == inherited &&
+			entry->has_inherited == has_inherited)
+		{
+			*nblocks = entry->nblocks;
+			return entry->state;
+		}
+	views->evaluations++;
+	state = fork_asof_hop(fork, cap, inherited, has_inherited, nblocks);
+	entry = malloc(sizeof(*entry));
+	if (entry != NULL)
+	{
+		entry->fork = fork;
+		entry->cap = *cap;
+		entry->inherited = inherited;
+		entry->has_inherited = has_inherited;
+		entry->state = state;
+		entry->nblocks = *nblocks;
+		entry->next = views->buckets[bucket];
+		views->buckets[bucket] = entry;
+	}
+	/* Allocation failure retains the ordinary, uncached proof. */
+	return state;
+}
+
+/* Differential and work-bound check for a plan-local cache. */
+int
+ps_test_walidx_fork_views(uint64_t seed, uint32_t niter)
+{
+	uint64_t	rng = seed ? seed : 1;
+	int			rc = 0;
+
+	for (uint32_t iter = 0; iter < niter; iter++)
+	{
+		ForkEnt		forks[2] = {{0}};
+		WalIdxForkViews views = {0};
+
+		for (uint32_t f = 0; f < 2; f++)
+		{
+			for (uint32_t i = 0; i < 64; i++)
+			{
+				uint64_t	lsn = fork_event_selftest_rand(&rng) % 16;
+				uint64_t	seq = fork_event_selftest_rand(&rng) % 32;
+				uint8_t		kind = (uint8_t) (fork_event_selftest_rand(&rng) % 3);
+
+				fork_event_add_unchecked(&forks[f], lsn, seq,
+										 (uint32_t) (fork_event_selftest_rand(&rng) % 20), kind, i % 2 != 0);
+			}
+			for (uint32_t i = 0; i < forks[f].nev; i++)
+				if (i % 5 == 0)
+					forks[f].ev[i].flags |= FEV_F_UNSTAMPED;
+			/* Exercise the finite-cap fold for either inherited range. */
+			forks[f].max_meta_seq = UINT64_MAX;
+			forks[f].max_inherited_page_seq = UINT64_MAX;
+		}
+		for (uint32_t f = 0; f < 2 && rc == 0; f++)
+			for (uint32_t variant = 0; variant < 24 && rc == 0; variant++)
+			{
+				ViewCap		cap = {12 + variant % 2,
+					variant % 3 == 0 ? UINT64_MAX : variant % 3,
+					variant % 4 == 0 ? UINT64_MAX : variant % 4,
+				variant % 2 != 0};
+				uint64_t	inherited = variant % 2 ? 8 : 0;
+				bool		has_inherited = variant % 4 != 0;
+				uint32_t	want_nb = 0;
+				int			want = brute_fork_asof_hop(&forks[f], &cap, inherited,
+													   has_inherited, &want_nb);
+				uint64_t	evaluations;
+				uint32_t	got_nb;
+
+				if (walidx_fork_view(&views, &forks[f], &cap, inherited,
+									 has_inherited, &got_nb) != want || got_nb != want_nb)
+					rc = 1;
+				evaluations = views.evaluations;
+				for (uint32_t page = 0; page < 128 && rc == 0; page++)
+					if (walidx_fork_view(&views, &forks[f], &cap, inherited,
+										 has_inherited, &got_nb) != want ||
+						got_nb != want_nb || views.evaluations != evaluations)
+						rc = 2;
+			}
+		walidx_fork_views_free(&views);
+
+		/*
+		 * A new plan after a lifecycle change must recompute, even at the
+		 * same view and fork address. The old cache must not survive the lock
+		 * scope.
+		 */
+		{
+			ViewCap		cap = {100, UINT64_MAX, UINT64_MAX, true};
+			uint32_t	got_nb;
+
+			fork_event_add_unchecked(&forks[0], 100, 100, 0, FEV_DEAD, true);
+			if (walidx_fork_view(&views, &forks[0], &cap, 0, false, &got_nb) !=
+				FORK_HOP_DEAD || got_nb != 0)
+				rc = 3;
+		}
+		walidx_fork_views_free(&views);
+		for (uint32_t f = 0; f < 2; f++)
+		{
+			free(forks[f].ev);
+			free(forks[f].def_idx);
+			free(forks[f].late_meta_idx);
+		}
+		if (rc != 0)
+			break;
+	}
+	return rc;
+}
+
 static int
 walidx_death_visible_to_fences(const ForkEnt *f, uint32_t idx,
 							   const PsHistoryFence *fences, uint32_t nfences)
@@ -17021,7 +17186,8 @@ walidx_death_visible_to_fences(const ForkEnt *f, uint32_t idx,
 
 static int
 walidx_absent_at_fences(const ForkEnt *f, uint32_t block, uint64_t horizon,
-						const PsHistoryFence *fences, uint32_t nfences)
+						const PsHistoryFence *fences, uint32_t nfences,
+						WalIdxForkViews *views)
 {
 	bool		has_B;
 	uint64_t	B = timeline_inherited_below(f->timeline, &has_B);
@@ -17034,7 +17200,7 @@ walidx_absent_at_fences(const ForkEnt *f, uint32_t block, uint64_t horizon,
 
 		if (cap.lsn != horizon || cap.seq == PS_SEQ_UNBOUNDED)
 			continue;
-		state = fork_asof_hop(f, &cap, B, has_B, &nb);
+		state = walidx_fork_view(views, f, &cap, B, has_B, &nb);
 		if (state != FORK_HOP_DEAD && (state != FORK_HOP_DEF || nb > block))
 			return 0;
 	}
@@ -17070,6 +17236,7 @@ walidx_plan_bases_build(uint32_t tl)
 	uint32_t	nhorizons = 0;
 	uint32_t	cap = 0;
 	int			rc = -1;
+	WalIdxForkViews views = {0};
 
 	walidx_plan_bases_free();
 	if (retention_effective_floor_internal(tl,
@@ -17154,13 +17321,17 @@ walidx_plan_bases_build(uint32_t tl)
 				 * to reconstruct, so every record completing before it is
 				 * covered.  Fork metadata is durable before it is visible. */
 				if (f != NULL)
-					for (uint32_t i = 0; i < f->nev; i++)
+					for (uint32_t di = 0; di < f->ndef; di++)
+					{
+						uint32_t i = f->def_idx[di];
+
 						if (f->ev[i].lsn != 0 &&
 							walidx_death_visible_to_fences(f, i, fences, nfences) &&
 							(f->ev[i].kind == FEV_DEAD ||
 							 (f->ev[i].kind == FEV_SET &&
 							  f->ev[i].nblocks <= e->block)))
 							ndeaths++;
+					}
 				if (f != NULL)
 					for (uint32_t i = 0; i < nhorizons; i++)
 					{
@@ -17176,11 +17347,11 @@ walidx_plan_bases_build(uint32_t tl)
 			   hc.strict_seq = fences[j].admission_seq;
 			 }
 						int			state = horizons[i] == 0 ? FORK_HOP_NONE :
-						fork_asof_hop(f, &hc, B, has_B, &nb);
+						walidx_fork_view(&views, f, &hc, B, has_B, &nb);
 
 						if ((state == FORK_HOP_DEAD ||
 							 (state == FORK_HOP_DEF && nb <= e->block)) &&
-							walidx_absent_at_fences(f, e->block, horizons[i], fences, nfences))
+							walidx_absent_at_fences(f, e->block, horizons[i], fences, nfences, &views))
 							ndeaths++;
 					}
 				n = p != NULL && p->nver > 0 ? (uint32_t) p->nver : 0;
@@ -17235,13 +17406,17 @@ walidx_plan_bases_build(uint32_t tl)
 				}
 				if (f != NULL)
 				{
-					for (uint32_t i = 0; i < f->nev; i++)
+					for (uint32_t di = 0; di < f->ndef; di++)
+					{
+						uint32_t i = f->def_idx[di];
+
 						if (f->ev[i].lsn != 0 &&
 							walidx_death_visible_to_fences(f, i, fences, nfences) &&
 							(f->ev[i].kind == FEV_DEAD ||
 							 (f->ev[i].kind == FEV_SET &&
 							  f->ev[i].nblocks <= e->block)))
 							deaths[ndeaths_out++] = f->ev[i].lsn;
+					}
 					for (uint32_t i = 0; i < nhorizons; i++)
 					{
 						uint32_t	nb = 0;
@@ -17256,11 +17431,11 @@ walidx_plan_bases_build(uint32_t tl)
 			   hc.strict_seq = fences[j].admission_seq;
 			 }
 						int			state = horizons[i] == 0 ? FORK_HOP_NONE :
-						fork_asof_hop(f, &hc, B, has_B, &nb);
+						walidx_fork_view(&views, f, &hc, B, has_B, &nb);
 
 						if ((state == FORK_HOP_DEAD ||
 							 (state == FORK_HOP_DEF && nb <= e->block)) &&
-							walidx_absent_at_fences(f, e->block, horizons[i], fences, nfences))
+							walidx_absent_at_fences(f, e->block, horizons[i], fences, nfences, &views))
 							deaths[ndeaths_out++] = horizons[i];
 					}
 				}
@@ -17321,6 +17496,7 @@ walidx_plan_bases_build(uint32_t tl)
 	walidx_plan_bases_valid = 1;
 	rc = 0;
 out:
+	walidx_fork_views_free(&views);
 	free(horizons);
 	free(fences);
 	if (rc != 0)

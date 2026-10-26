@@ -124,6 +124,10 @@ main(void)
 			  "plan-epoch: a non-advancing bump does not invalidate");
 	}
 
+	for (size_t i = 0; i < sizeof(seeds) / sizeof(seeds[0]); i++)
+		check(ps_test_walidx_fork_views(seeds[i], 100) == 0,
+			  "WAL-index fork views match the oracle and fold once per distinct view");
+
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }
