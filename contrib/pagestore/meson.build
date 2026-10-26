@@ -741,6 +741,19 @@ test('storage_posix_wal',
   timeout: 30,
 )
 
+# Segment descriptor pressure must not turn healthy WAL into a fatal read.
+storage_posix_fd_cache_test = executable('storage_posix_fd_cache_test',
+  files('storage_posix_fd_cache_test.c', 'storage_posix.c', 'pagestore_store_owner.c'),
+  dependencies: [dependency('threads')],
+  c_args: ['-DPAGESTORE_POSIX_FD_TEST'],
+  install: false,
+)
+test('storage_posix_fd_cache',
+  storage_posix_fd_cache_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 storage_posix_fork_owner_test = executable('storage_posix_fork_owner_test',
   files('storage_posix_fork_owner_test.c', 'storage_posix.c',
         'pagestore_store_owner.c', 'pagestore_manifest.c', 'pagestore_layer.c',
