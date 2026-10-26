@@ -8460,7 +8460,8 @@ fork_restore_later_page_growth(uint32_t timeline, const PsKey *key,
 	 * mode fork_event_add deliberately bypasses its cache-based deduplication:
 	 * the cache is rebuilt only after the entire batch, so it cannot suppress a
 	 * necessary later growth using stale values. */
-	qsort(grows, ngrows, sizeof(*grows), fork_deferred_grow_cmp);
+	if (ngrows > 1)
+		qsort(grows, ngrows, sizeof(*grows), fork_deferred_grow_cmp);
 	{
 		uint32_t out = 0;
 
