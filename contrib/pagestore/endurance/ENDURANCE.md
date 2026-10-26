@@ -459,6 +459,12 @@ maintenance thread.  Three causes, in the order found:
    outside the lock and tiered compaction (both already on the post-MVP list
    in `MVP_COMPLETION_PLAN.md`) are what would change the order of magnitude.
    Disabling segment GC (`--segment-gc 0`) made no measurable difference.
+   Payload memory is now separate from that locking/CPU cost: compaction
+   gathers source references and prunes metadata before fetching retained
+   pages, and image output/checksum verification use 256-KiB buffers. Sort
+   and version metadata still scale with record count. This removes the
+   overlapping whole-input/whole-output page buffers; it does not establish
+   a constant total-RSS bound or resolve the all-layer compaction design.
 
 Same seed, scale 1, 4 clients for 20 s (~800 MB of WAL), cassert build: replay
 288 s before, 238 s after (2.8 -> 3.5 MB/s).  The index cache matters more as

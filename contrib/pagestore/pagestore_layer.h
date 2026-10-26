@@ -165,6 +165,14 @@ extern int	ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 								 const PsImgRec *recs, uint32_t n,
 								 uint32_t page_size, PsLayerDesc *out);
 
+/* The callback supplies one page on demand; rec->page may be an opaque
+ * source reference understood only by that callback.  Metadata is sorted in
+ * memory, but page payload buffers are independent of layer size. */
+typedef int (*PsImagePageReader) (const PsImgRec *rec, void *page, void *arg);
+extern int ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
+ const PsImgRec *recs, uint32_t n, uint32_t page_size,
+ PsImagePageReader read_page, void *arg, PsLayerDesc *out);
+
 /*
  * Look up the newest version of (key, block) with lsn <= read_lsn in image
  * layer 'layer'.  On a hit copies page_size bytes into out, stores that

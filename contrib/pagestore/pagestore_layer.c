@@ -65,10 +65,9 @@ ps_layer_map_count(const PsLayerMap *map)
 
 /* FNV-1a checksum for layer integrity (not cryptographic). */
 static uint32_t
-img_crc(const void *p, size_t n)
+img_crc_extend(uint32_t h, const void *p, size_t n)
 {
 	const unsigned char *b = p;
-	uint32_t	h = 2166136261u;
 
 	for (size_t i = 0; i < n; i++)
 	{
@@ -78,6 +77,13 @@ img_crc(const void *p, size_t n)
 	return h;
 }
 
+static uint32_t
+img_crc(const void *p, size_t n)
+{
+	return img_crc_extend(2166136261u, p, n);
+}
+
+#define IMAGE_STREAM_BYTES (256 * 1024)
 static int
 key_cmp(const PsKey *a, const PsKey *b)
 {
@@ -184,35 +190,53 @@ img_local_loc(const PsLayerDesc *layer)
 	return local ? local : remote;
 }
 
+static int
+image_memory_page(const PsImgRec *rec, void *page, void *arg)
+{
+	memcpy(page, rec->page, *(uint32_t *) arg);
+	return 0;
+}
+
 int
 ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
-					 const PsImgRec *recs, uint32_t n, uint32_t page_size,
-					 PsLayerDesc *out)
+					 const PsImgRec *recs, uint32_t n, uint32_t page_size, PsLayerDesc *out)
 {
-	ImgSort    *sorted;
-	char	   *filebuf;
-	char	   *idxsec;
+	return ps_image_layer_write_stream(layer_id, timeline, recs, n, page_size,
+									   image_memory_page, &page_size, out);
+}
+
+int
+ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
+							const PsImgRec *recs, uint32_t n, uint32_t page_size,
+							PsImagePageReader read_page, void *arg, PsLayerDesc *out)
+{
+	ImgSort    *sorted = NULL;
+	unsigned char *buffer = NULL;
 	PsImgFooter foot;
 	uint64_t	data_bytes = (uint64_t) n * page_size;
 	uint64_t	idx_bytes = (uint64_t) n * sizeof(PsImgIndexEnt);
 	uint64_t	total = data_bytes + idx_bytes + sizeof(PsImgFooter);
+	uint64_t	offset = 0;
+	uint32_t	used = 0;
+	uint32_t	data_crc = 2166136261u;
+	uint32_t	index_crc = 2166136261u;
 	char		uri[PS_LAYER_URI_MAX];
 	int			rc = -1;
 
-	if (n == 0)
+	if (n == 0 || page_size == 0 || page_size > IMAGE_STREAM_BYTES ||
+		read_page == NULL || ps_layer_store->write_local_layer_at == NULL)
 		return -1;
-	sorted = malloc((size_t) n * sizeof(ImgSort));
-	filebuf = malloc((size_t) total);
-	if (!sorted || !filebuf)
+	sorted = malloc((size_t) n * sizeof(*sorted));
+	buffer = malloc(IMAGE_STREAM_BYTES);
+	if (!sorted || !buffer)
 		goto out;
-
 	for (uint32_t i = 0; i < n; i++)
 	{
+		memset(&sorted[i], 0, sizeof(sorted[i]));
 		sorted[i].ent.key = recs[i].key;
 		sorted[i].ent.block = recs[i].block;
 		sorted[i].ent.lsn = recs[i].lsn;
 		sorted[i].ent.admission_seq = recs[i].admission_seq;
-		sorted[i].ent.data_off = 0;
 		sorted[i].ent.growth_lsn = recs[i].growth_lsn;
 		sorted[i].ent.order_id = recs[i].order_id;
 		sorted[i].ent.seg_off = recs[i].seg_off;
@@ -220,34 +244,55 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 		sorted[i].ent.flags = recs[i].flags;
 		sorted[i].src = i;
 	}
-	qsort(sorted, n, sizeof(ImgSort), img_sort_cmp);
-
-	/* page data, in sorted order, back to back */
+	qsort(sorted, n, sizeof(*sorted), img_sort_cmp);
+	if (ps_layer_store->create_local_layer(layer_id, uri, sizeof(uri)) != 0)
+		goto out;
 	for (uint32_t i = 0; i < n; i++)
 	{
+		if (used + page_size > IMAGE_STREAM_BYTES)
+		{
+			if (ps_layer_store->write_local_layer_at(layer_id, offset, buffer, used) != 0)
+				goto out;
+			offset += used;
+			used = 0;
+		}
 		sorted[i].ent.data_off = (uint64_t) i * page_size;
-		memcpy(filebuf + sorted[i].ent.data_off, recs[sorted[i].src].page,
-			   page_size);
+		if (read_page(&recs[sorted[i].src], buffer + used, arg) != 0)
+			goto out;
+		data_crc = img_crc_extend(data_crc, buffer + used, page_size);
+		used += page_size;
 	}
-	/* index section */
-	idxsec = filebuf + data_bytes;
+	if (used != 0 &&
+		ps_layer_store->write_local_layer_at(layer_id, offset, buffer, used) != 0)
+		goto out;
+	offset += used;
+	used = 0;
 	for (uint32_t i = 0; i < n; i++)
-		memcpy(idxsec + (size_t) i * sizeof(PsImgIndexEnt), &sorted[i].ent,
-			   sizeof(PsImgIndexEnt));
-	/* footer */
+	{
+		if (used + sizeof(PsImgIndexEnt) > IMAGE_STREAM_BYTES)
+		{
+			if (ps_layer_store->write_local_layer_at(layer_id, offset, buffer, used) != 0)
+				goto out;
+			offset += used;
+			used = 0;
+		}
+		memcpy(buffer + used, &sorted[i].ent, sizeof(PsImgIndexEnt));
+		index_crc = img_crc_extend(index_crc, buffer + used, sizeof(PsImgIndexEnt));
+		used += sizeof(PsImgIndexEnt);
+	}
+	if (used != 0 &&
+		ps_layer_store->write_local_layer_at(layer_id, offset, buffer, used) != 0)
+		goto out;
+	offset += used;
 	memset(&foot, 0, sizeof(foot));
 	foot.magic = PS_IMG_MAGIC;
 	foot.version = PS_IMG_VERSION;
 	foot.page_size = page_size;
 	foot.nrecs = n;
 	foot.index_off = data_bytes;
-	foot.data_crc = img_crc(filebuf, (size_t) data_bytes);
-	foot.index_crc = img_crc(idxsec, (size_t) idx_bytes);
-	memcpy(filebuf + data_bytes + idx_bytes, &foot, sizeof(foot));
-
-	if (ps_layer_store->create_local_layer(layer_id, uri, sizeof(uri)) != 0)
-		goto out;
-	if (ps_layer_store->write_local_layer(layer_id, filebuf, total) != 0 ||
+	foot.data_crc = data_crc;
+	foot.index_crc = index_crc;
+	if (ps_layer_store->write_local_layer_at(layer_id, offset, &foot, sizeof(foot)) != 0 ||
 		ps_layer_store->seal_local_layer(layer_id) != 0)
 		goto out;
 
@@ -282,10 +327,9 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 
 out:
 	free(sorted);
-	free(filebuf);
+	free(buffer);
 	return rc;
 }
-
 /* ===================== delta layer file format ========================= */
 
 typedef struct DeltaSort
@@ -677,36 +721,49 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 	return 0;
 }
 
+static int
+verify_layer_data(const PsLayerDesc *layer, uint64_t bytes, uint32_t expected)
+{
+	unsigned char *buffer = malloc(IMAGE_STREAM_BYTES);
+	uint32_t	crc = 2166136261u;
+	int			rc = -1;
+
+	if (buffer == NULL)
+		return -1;
+	for (uint64_t offset = 0; offset < bytes;)
+	{
+		uint32_t	len = bytes - offset > IMAGE_STREAM_BYTES ?
+			IMAGE_STREAM_BYTES : (uint32_t) (bytes - offset);
+
+		if (ps_layer_store->read_layer_block(layer, offset, buffer, len) != 0)
+			goto out;
+		crc = img_crc_extend(crc, buffer, len);
+		offset += len;
+	}
+	rc = crc == expected ? 0 : -1;
+out:
+	free(buffer);
+	return rc;
+}
+
 int
 ps_image_layer_verify_data(const PsLayerDesc *layer, uint32_t page_size)
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsImgFooter foot;
-	void	   *data;
-	int			rc = -1;
 
 	((PsLayerDesc *) layer)->data_verified = false;
 	if (!loc || loc->size < sizeof(foot) ||
 		ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
-									 &foot, sizeof(foot)) != 0 ||
+										 &foot, sizeof(foot)) != 0 ||
 		foot.magic != PS_IMG_MAGIC ||
-		(foot.version != 2 && foot.version != 3 &&
-		 foot.version != PS_IMG_VERSION) ||
-		foot.page_size != page_size ||
-		foot.index_off > UINT32_MAX || foot.index_off > loc->size - sizeof(foot))
+		(foot.version != 2 && foot.version != 3 && foot.version != PS_IMG_VERSION) ||
+		foot.page_size != page_size || foot.index_off > loc->size - sizeof(foot))
 		return -1;
-	data = malloc((size_t) foot.index_off);
-	if (!data)
+	if (verify_layer_data(layer, foot.index_off, foot.data_crc) != 0)
 		return -1;
-	if (ps_layer_store->read_layer_block(layer, 0, data,
-									(uint32_t) foot.index_off) == 0 &&
-		img_crc(data, (size_t) foot.index_off) == foot.data_crc)
-	{
-		((PsLayerDesc *) layer)->data_verified = true;
-		rc = 0;
-	}
-	free(data);
-	return rc;
+	((PsLayerDesc *) layer)->data_verified = true;
+	return 0;
 }
 
 int
@@ -714,7 +771,6 @@ ps_delta_layer_verify_data(const PsLayerDesc *layer)
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsDeltaFooter foot;
-	void *data;
 	void *idx;
 	uint64_t idx_bytes;
 	int rc = -1;
@@ -723,7 +779,6 @@ ps_delta_layer_verify_data(const PsLayerDesc *layer)
 		ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
 								 &foot, sizeof(foot)) != 0 ||
 		foot.magic != PS_DELTA_MAGIC || foot.version != PS_DELTA_VERSION ||
-		foot.index_off > UINT32_MAX ||
 		foot.index_off > loc->size - sizeof(foot))
 		return -1;
 	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsDeltaIndexEnt);
@@ -739,14 +794,7 @@ ps_delta_layer_verify_data(const PsLayerDesc *layer)
 		return -1;
 	}
 	free(idx);
-	data = malloc((size_t) foot.index_off);
-	if (!data)
-		return -1;
-	if (ps_layer_store->read_layer_block(layer, 0, data,
-								(uint32_t) foot.index_off) == 0 &&
-		img_crc(data, (size_t) foot.index_off) == foot.data_crc)
-		rc = 0;
-	free(data);
+	rc = verify_layer_data(layer, foot.index_off, foot.data_crc);
 	return rc;
 }
 

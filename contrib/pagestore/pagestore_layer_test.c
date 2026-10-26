@@ -35,6 +35,92 @@ check(int cond, const char *msg)
 
 #define PSZ 8192
 
+/* A generated 32-MiB layer must never require whole-payload I/O. */
+static uint32_t stream_write_max;
+static uint32_t stream_read_max;
+static uint32_t stream_pages;
+static int	stream_fail_after = -1;
+
+static int
+bounded_write(uint64_t id, uint64_t off, const void *buf, uint32_t len)
+{
+	if (len > stream_write_max)
+		stream_write_max = len;
+	if (len > 256 * 1024)
+		return -1;
+	return PsLayerStoreLocal.write_local_layer_at(id, off, buf, len);
+}
+
+static int
+bounded_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
+{
+	/* Index metadata remains proportional to record count. */
+	if (off < (uint64_t) 4096 * PSZ)
+	{
+		if (len > stream_read_max)
+			stream_read_max = len;
+		if (len > 256 * 1024)
+			return -1;
+	}
+	return PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
+}
+static int
+generated_page(const PsImgRec *rec, void *page, void *arg)
+{
+	(void) arg;
+	if (stream_fail_after >= 0 && stream_pages >= (uint32_t) stream_fail_after)
+		return -1;
+	stream_pages++;
+	memset(page, (unsigned char) rec->block, PSZ);
+	return 0;
+}
+
+static void
+streaming_layer_test(void)
+{
+	PsLayerStore bounded = PsLayerStoreLocal;
+	const PsLayerStore *saved = ps_layer_store;
+	PsImgRec   *recs = calloc(4096, sizeof(*recs));
+	PsLayerDesc layer;
+	unsigned char page[PSZ];
+	PsKey		key = {1, 1, 905, 0, PS_KLASS_RELATION};
+
+	check(recs != NULL, "streaming metadata allocation");
+	if (!recs)
+		return;
+	bounded.write_local_layer_at = bounded_write;
+	bounded.read_layer_block = bounded_read;
+	ps_layer_store = &bounded;
+	for (uint32_t i = 0; i < 4096; i++)
+	{
+		recs[i].key = key;
+		recs[i].block = 4095 - i;
+		recs[i].lsn = 100;
+	}
+	check(ps_image_layer_write_stream(910, 0, recs, 4096, PSZ,
+									  generated_page, NULL, &layer) == 0,
+		  "stream generated 32-MiB image without resident input pages");
+	check(stream_pages == 4096 && stream_write_max <= 256 * 1024,
+		  "writer fetches one page per record with bounded writes");
+	check(ps_image_layer_verify_data(&layer, PSZ) == 0 &&
+		  stream_read_max <= 256 * 1024,
+		  "large layer checksum uses bounded reads");
+	for (uint32_t block = 0; block < 4096; block += 4095)
+	{
+		check(ps_image_layer_lookup(&layer, &key, block, 100, UINT64_MAX,
+									page, PSZ, NULL, NULL) == 1 &&
+			  page[0] == (unsigned char) block && page[PSZ - 1] == (unsigned char) block,
+			  "stream sorting preserves page bytes at both ends");
+	}
+	stream_pages = 0;
+	stream_fail_after = 40;
+	check(ps_image_layer_write_stream(911, 0, recs, 4096, PSZ,
+									  generated_page, NULL, &layer) != 0,
+		  "source read failure rejects partially written image");
+	stream_fail_after = -1;
+	ps_layer_store = saved;
+	free(recs);
+}
 int
 main(void)
 {
@@ -354,6 +440,7 @@ main(void)
 		ps_layer_map_free(&map);
 	}
 
+	streaming_layer_test();
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }
