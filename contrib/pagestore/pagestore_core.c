@@ -6472,7 +6472,7 @@ fork_asof_hop(const ForkEnt *e, const ViewCap *c, uint64_t B, bool has_B,
 }
 
 static void
-fork_event_cache_from(ForkEnt *e, uint32_t start)
+fork_event_cache_from_impl(ForkEnt *e, uint32_t start, bool inserted)
 {
 	uint8_t state = start == 0 ? FORK_HOP_NONE : e->ev[start - 1].cached_state;
 	uint32_t nb = start == 0 ? 0 : e->ev[start - 1].cached_nblocks;
@@ -6503,10 +6503,22 @@ fork_event_cache_from(ForkEnt *e, uint32_t start)
 			state = FORK_HOP_DEAD;
 			fence = 0;
 		}
+		/* Only a single inserted event can be pending on this path. Once an
+		 * existing successor's complete fold is unchanged, all later cached
+		 * prefixes remain valid. Batch rebuilds must always visit the tail. */
+		if (inserted && i > start && v->cached_nblocks == nb &&
+			v->cached_state == state && v->cached_fence_nblocks == fence)
+			break;
 		v->cached_nblocks = nb;
 		v->cached_state = state;
 		v->cached_fence_nblocks = fence;
 	}
+}
+
+static void
+fork_event_cache_from(ForkEnt *e, uint32_t start)
+{
+	fork_event_cache_from_impl(e, start, false);
 }
 
 /* Keep a compact index over definitive lifecycle events.  Inserts can shift
@@ -7025,7 +7037,7 @@ fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 		fork_late_meta_shift(e, i);
 	if (fork_event_cache_defer)
 		return true;
-	fork_event_cache_from(e, i);
+	fork_event_cache_from_impl(e, i, true);
 
 	/*
 	 * Maintain the newest-size scalar.  A tail insert governs directly.  A
@@ -19726,7 +19738,12 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 					  uint64_t *out_seq, unsigned char *out, int map_locked)
 {
 	unsigned char *tmp = malloc(page_size);
-	PsLayerDesc *layers;
+	typedef struct LayerReadSnapshot
+	{
+		PsLayerDesc desc;
+		uint32_t slot;
+	} LayerReadSnapshot;
+	LayerReadSnapshot *layers;
 	uint32_t nlayers;
 	int			error = 0;
 	int			found = 0;
@@ -19739,18 +19756,38 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		return 0;
 	if (!map_locked)
 		ps_lock_map_rd();
-	nlayers = ps_layer_map.nlayers;
+	/* The exact-LSN check used to run only after copying and pinning the
+	 * entire map. A retention scan repeats this for every control note;
+	 * unrelated layers must not multiply its snapshot and release work. */
+	nlayers = 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->kind == PS_LAYER_IMAGE && d->timeline == timeline &&
+			layer_matches_read_shard(d, shard) && !d->deleting &&
+			(expected_lsn == 0 ||
+			 (expected_lsn >= d->lsn_start && expected_lsn <= d->lsn_end)))
+			nlayers++;
+	}
 	layers = nlayers ? malloc((size_t) nlayers * sizeof(*layers)) : NULL;
 	if (layers != NULL)
 	{
-		memcpy(layers, ps_layer_map.layers, (size_t) nlayers * sizeof(*layers));
-		for (uint32_t i = 0; i < nlayers; i++)
-			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
-				ps_layer_map.layers[i].timeline == timeline &&
-				layer_matches_read_shard(&ps_layer_map.layers[i], shard) &&
-				!ps_layer_map.layers[i].deleting)
-				__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1,
-							   __ATOMIC_ACQ_REL);
+		uint32_t n = 0;
+
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		{
+			PsLayerDesc *d = &ps_layer_map.layers[i];
+
+			if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline ||
+				!layer_matches_read_shard(d, shard) || d->deleting ||
+				(expected_lsn != 0 &&
+				 (expected_lsn < d->lsn_start || expected_lsn > d->lsn_end)))
+				continue;
+			layers[n].desc = *d;
+			layers[n++].slot = i;
+			__atomic_add_fetch(&d->cache_readers, 1, __ATOMIC_ACQ_REL);
+		}
 	}
 	if (!map_locked)
 		ps_unlock_map();
@@ -19766,7 +19803,7 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	for (uint32_t i = 0; i < nlayers; i++)
 	{
-		PsLayerDesc *d = &layers[i];
+		PsLayerDesc *d = &layers[i].desc;
 		uint64_t	l,
 					a;
 		int			lookup;
@@ -19813,26 +19850,34 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (!map_locked)
 		ps_lock_map_wr();
 	for (uint32_t i = 0; i < nlayers; i++)
-		if (layers[i].kind == PS_LAYER_IMAGE && layers[i].timeline == timeline &&
-			layer_matches_read_shard(&layers[i], shard) && !layers[i].deleting)
-			for (uint32_t j = 0; j < ps_layer_map.nlayers; j++)
-				if (ps_layer_map.layers[j].layer_id == layers[i].layer_id)
+		if (layers[i].desc.kind == PS_LAYER_IMAGE && layers[i].desc.timeline == timeline &&
+			layer_matches_read_shard(&layers[i].desc, shard) && !layers[i].desc.deleting)
+		{
+			/* Appends/reallocation preserve snapshot slots. Match the identity
+			 * before using that slot; unrelated removals can move entries. */
+			uint32_t slot = layers[i].slot;
+			uint32_t first = slot < ps_layer_map.nlayers &&
+				ps_layer_map.layers[slot].layer_id == layers[i].desc.layer_id ? slot : 0;
+
+			for (uint32_t j = first; j < ps_layer_map.nlayers; j++)
+				if (ps_layer_map.layers[j].layer_id == layers[i].desc.layer_id)
 				{
 					__atomic_sub_fetch(&ps_layer_map.layers[j].cache_readers, 1,
 								   __ATOMIC_ACQ_REL);
 					if (map_locked)
 						break;
-					if (layers[i].data_verified)
+					if (layers[i].desc.data_verified)
 					{
 						ps_layer_map.layers[j].data_verified = true;
-						(void) layer_verified_lookup(&layers[i], 1);
+						(void) layer_verified_lookup(&layers[i].desc, 1);
 					}
 					if (tier_local_location(&ps_layer_map.layers[j]) == NULL &&
 						ps_layer_store->layer_exists_local != NULL &&
-						ps_layer_store->layer_exists_local(layers[i].layer_id) == 1)
+						ps_layer_store->layer_exists_local(layers[i].desc.layer_id) == 1)
 						ps_layer_map.layers[j].cache_resident = true;
 					break;
 				}
+		}
 	free(layers);
 	free(tmp);
 	if (found && out_lsn)
