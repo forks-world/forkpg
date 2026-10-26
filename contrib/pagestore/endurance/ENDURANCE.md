@@ -171,6 +171,14 @@ counted only once in the total. `resource_errors` records incomplete observation
 summary `stats.resource_peaks` preserves sampled maxima after successful run data
 is removed. No process is signalled by this read-only collector.
 
+The sampled aggregate FD budget is separate from each process's
+`RLIMIT_NOFILE`. A service can hit its 1024-FD soft limit while the aggregate
+is still below `--max-fds 8192`; failure to open a healthy immutable WAL file
+then appears as a refused restore. The POSIX page-segment descriptor cache is
+bounded to 64 entries across shards. Entries stay pinned through I/O, and dirty
+victims are fsynced before eviction so a later `sync()` still covers their
+writes. This bounds cached handles without increasing either FD limit.
+
 The RSS sum deliberately double-counts shared mappings across different
 processes. It is a conservative budget rather than PSS or a physical-memory
 measurement. Descriptor counts are per process, including inherited descriptors.

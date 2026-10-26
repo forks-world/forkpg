@@ -32,24 +32,36 @@
 #include "pagestore_store_owner.h"
 #include "pagestore_wal_store.h"
 
+#ifdef PAGESTORE_POSIX_FD_TEST
+extern void ps_test_posix_read_pinned(uint32_t shard, int seg);
+#endif
+
 /* bounded well under the 4096-byte path buffers so suffixes never truncate */
 static char posix_dir[2048];
 static PsStoreOwner *posix_owner;
 
 /*
- * One cached OS fd per segment shard+id (opened lazily, never closed during a
- * run).  Only the segment log keeps fds; the WAL and metadata logs open per
- * call, matching the original daemon (they are not on the hot path).
- *
- * Reads run concurrently across shard workers (the daemon holds only a shared
- * read lock), and any of them can open a segment in any storage shard, so the
- * fd-cache structures below are shared mutable state.  seg_fds_lock serializes
- * their growth and the lazy open/cache, which happen rarely (once per segment
- * file) and so are not on the hot path.
+ * Segment history can outlive thousands of files. Keep descriptors bounded,
+ * and pin entries through pread/pwrite so eviction cannot close or reuse a
+ * descriptor that another shard is still using.
  */
-static int **seg_fds;
-static int *seg_fds_caps;
-static int seg_shards_cap;
+#define POSIX_SEG_FD_CACHE_SIZE 64
+
+typedef struct PosixSegFd
+{
+	int			fd;
+	int			active;
+	uint32_t	shard;
+	int			seg;
+	uint32_t	users;
+	int			dirty;
+	uint64_t	used;
+} PosixSegFd;
+
+static PosixSegFd seg_fds[POSIX_SEG_FD_CACHE_SIZE];
+static uint64_t seg_fd_clock;
+static pthread_cond_t seg_fds_available = PTHREAD_COND_INITIALIZER;
+static int	test_fail_seg_cache_sync;
 static int test_fail_seg_writes;
 static int test_crash_after_seg_writes;
 static int test_fail_fork_meta_append_at;
@@ -135,120 +147,105 @@ seg_path(char *buf, size_t buflen, uint32_t shard, int seg)
 static void
 free_shard_caches(void)
 {
-	for (int i = 0; i < seg_shards_cap; i++)
-	{
-		int *fds = seg_fds[i];
-		int cap = seg_fds_caps[i];
-
-		if (!fds)
-			continue;
-		for (int id = 0; id < cap; id++)
-			if (fds[id] >= 0)
-				close(fds[id]);
-		free(fds);
-	}
-	free(seg_fds);
-	free(seg_fds_caps);
-	seg_fds = NULL;
-	seg_fds_caps = NULL;
-	seg_shards_cap = 0;
+	for (uint32_t i = 0; i < POSIX_SEG_FD_CACHE_SIZE; i++)
+		if (seg_fds[i].active)
+			close(seg_fds[i].fd);
+	memset(seg_fds, 0, sizeof(seg_fds));
+	seg_fd_clock = 0;
 }
 
+/*
+ * Called under the cache mutex, only for an unpinned entry. Do not lose a
+ * dirty descriptor on fsync failure: sync or the next miss must retry it.
+ * Syncing before eviction preserves sync() coverage after the fd is closed.
+ */
 static int
-ensure_shard_slot(uint32_t shard)
+seg_fd_close(PosixSegFd *entry)
 {
-	if (shard < (uint32_t) seg_shards_cap)
-		return 0;
-
-	/* expand to exactly shard+1 because shard count is tiny and bounded by config */
+	if (entry->dirty)
 	{
-		int		new_cap = (int) shard + 1;
-		int	**nfds;
-		int	*ncaps;
-
-		/*
-		 * Grow the pair one at a time, publishing each successful realloc
-		 * into its global immediately: realloc may have MOVED (and freed)
-		 * the old block even when the sibling allocation then fails, so
-		 * freeing the survivor here -- or leaving the global pointing at
-		 * the old address -- would dangle later opens/frees.
-		 */
-		nfds = realloc(seg_fds, (size_t) new_cap * sizeof(*nfds));
-		if (!nfds)
-			return -1;
-		seg_fds = nfds;
-		ncaps = realloc(seg_fds_caps, (size_t) new_cap * sizeof(*ncaps));
-		if (!ncaps)
-			return -1;			/* seg_fds grew; caps/cap count unchanged: consistent */
-		seg_fds_caps = ncaps;
-		for (int i = seg_shards_cap; i < new_cap; i++)
+		if (test_fail_seg_cache_sync > 0 && --test_fail_seg_cache_sync == 0)
 		{
-			seg_fds[i] = NULL;
-			seg_fds_caps[i] = 0;
+			errno = EIO;
+			return -1;
 		}
-		seg_shards_cap = new_cap;
+		if (fsync(entry->fd) != 0)
+			return -1;
+		entry->dirty = 0;
 	}
-	return 0;
+	entry->active = 0;
+	return close(entry->fd);
 }
 
-/* Return a cached fd for shard-local segment 'seg', opening (optionally creating)
- * it once. */
-static int
-seg_fd(uint32_t shard, int seg, int create)
+static PosixSegFd *
+seg_fd_get(uint32_t shard, int seg, int create)
 {
 	char		path[4096];
-	int		fd;
-	int		*fds;
-	int		cap;
-	int		result = -1;
+	PosixSegFd *candidate;
 
-	/*
-	 * Serialize the whole lookup/grow/open: concurrent shard workers can hit
-	 * this for any storage shard at once.  The cached fd is returned on
-	 * subsequent calls, so the lock is contended only on the first open of each
-	 * segment file.
-	 */
+	if (seg < 0)
+	{
+		errno = EINVAL;
+		return NULL;
+	}
 	pthread_mutex_lock(&seg_fds_lock);
-
-	if (ensure_shard_slot(shard) != 0)
-		goto out;
-
-	fds = seg_fds[shard];
-	cap = seg_fds_caps[shard];
-	if (!fds)
+	for (;;)
 	{
-		fds = NULL;
-		cap = 0;
-	}
-	if (seg >= cap)
-	{
-		int		new_cap = (seg + 16) * 2;
-		int		*nfds;
+		candidate = NULL;
+		for (uint32_t i = 0; i < POSIX_SEG_FD_CACHE_SIZE; i++)
+		{
+			PosixSegFd *entry = &seg_fds[i];
 
-		nfds = realloc(fds, (size_t) new_cap * sizeof(int));
-		if (!nfds)
-			goto out;
-		for (int i = cap; i < new_cap; i++)
-			nfds[i] = -1;
-		seg_fds[shard] = nfds;
-		seg_fds_caps[shard] = new_cap;
-		fds = nfds;
-	}
-	if (fds[seg] >= 0)
-	{
-		result = fds[seg];
-		goto out;
-	}
+			if (entry->active && entry->shard == shard && entry->seg == seg)
+			{
+				entry->users++;
+				entry->used = ++seg_fd_clock;
+				pthread_mutex_unlock(&seg_fds_lock);
+				return entry;
+			}
+			if (!entry->active)
+				candidate = entry;
+			else if (entry->users == 0 &&
+					 (candidate == NULL || (candidate->active && entry->used < candidate->used)))
+				candidate = entry;
+		}
+		if (candidate != NULL)
+			break;
 
+		/*
+		 * Every slot has active I/O. The I/O path releases its pin without
+		 * acquiring another cache entry, so waiting here cannot form a cycle.
+		 */
+		pthread_cond_wait(&seg_fds_available, &seg_fds_lock);
+	}
+	if (candidate->active && seg_fd_close(candidate) != 0)
+		goto fail;
 	seg_path(path, sizeof(path), shard, seg);
-	fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
-	if (fd >= 0)
-		fds[seg] = fd;
-	result = fd;
-
-out:
+	candidate->fd = open(path, O_RDWR | O_CLOEXEC | (create ? O_CREAT : 0), 0600);
+	if (candidate->fd < 0)
+		goto fail;
+	candidate->active = 1;
+	candidate->shard = shard;
+	candidate->seg = seg;
+	candidate->users = 1;
+	candidate->dirty = 0;
+	candidate->used = ++seg_fd_clock;
 	pthread_mutex_unlock(&seg_fds_lock);
-	return result;
+	return candidate;
+fail:
+	pthread_mutex_unlock(&seg_fds_lock);
+	return NULL;
+}
+
+static void
+seg_fd_put(PosixSegFd *entry, int dirty)
+{
+	pthread_mutex_lock(&seg_fds_lock);
+	if (dirty)
+		entry->dirty = 1;
+	entry->users--;
+	pthread_cond_broadcast(&seg_fds_available);
+	pthread_mutex_unlock(&seg_fds_lock);
 }
 
 static int
@@ -330,6 +327,10 @@ posix_open(const char *path, uint64_t segment_size)
 	fail_seg_size = getenv("PAGESTORE_TEST_FAIL_SEG_SIZE");
 	test_fail_seg_size = fail_seg_size ? atoi(fail_seg_size) : 0;
 	{
+		const char *value = getenv("PAGESTORE_TEST_FAIL_SEG_CACHE_SYNC");
+		test_fail_seg_cache_sync = value ? atoi(value) : 0;
+	}
+	{
 		const char *value = getenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME");
 		test_fail_fork_meta_rewrite_before_rename = value ? atoi(value) : 0;
 		value = getenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_DIR_FSYNC");
@@ -389,35 +390,34 @@ posix_sync(void)
 		return -1;
 
 	/*
-	 * Walk the shared seg-fd cache under seg_fds_lock so a concurrent shard
-	 * worker cannot lazily open a segment and realloc seg_fds[]/seg_fds_caps[]
-	 * while we iterate (with per-shard locking the caller no longer holds a
-	 * global write lock that would have excluded that).
+	 * Exclude cache replacement while syncing. A concurrent pinned writer
+	 * marks its entry dirty again when it releases the pin, so its unsynced
+	 * bytes cannot be forgotten after this barrier.
 	 */
 	pthread_mutex_lock(&seg_fds_lock);
-	for (int shard = 0; shard < seg_shards_cap; shard++)
+	for (uint32_t i = 0; i < POSIX_SEG_FD_CACHE_SIZE; i++)
 	{
-		int *fds = seg_fds[shard];
-		int cap = seg_fds_caps[shard];
+		PosixSegFd *entry = &seg_fds[i];
 
-		if (!fds)
-			continue;
-		for (int id = 0; id < cap; id++)
-			if (fds[id] >= 0 && fsync(fds[id]) != 0)
+		if (entry->active)
+		{
+			if (fsync(entry->fd) != 0)
 			{
 				rc = -1;
 				goto out;
 			}
+			entry->dirty = 0;
+		}
 	}
 out:
 	pthread_mutex_unlock(&seg_fds_lock);
 
 	/*
-	 * Segment files are created lazily with O_CREAT, so a new segment's directory
-	 * entry is not durable until the store directory itself is fsynced.  Recovery
-	 * scans the segment log by name, so persist the directory here too; otherwise a
-	 * power loss after a clean shutdown that created a new segment could drop the
-	 * name and hide acknowledged writes.
+	 * Segment files are created lazily with O_CREAT, so a new segment's
+	 * directory entry is not durable until the store directory itself is
+	 * fsynced.  Recovery scans the segment log by name, so persist the
+	 * directory here too; otherwise a power loss after a clean shutdown that
+	 * created a new segment could drop the name and hide acknowledged writes.
 	 */
 	{
 		int			dfd = open(posix_dir, O_RDONLY);
@@ -442,12 +442,29 @@ posix_seg_remove(uint32_t shard, int seg)
 
 	seg_path(path, sizeof(path), shard, seg);
 	pthread_mutex_lock(&seg_fds_lock);
-	if (shard < (uint32_t) seg_shards_cap && seg >= 0 &&
-		seg < seg_fds_caps[shard] && seg_fds[shard] &&
-		seg_fds[shard][seg] >= 0)
+	for (;;)
 	{
-		close(seg_fds[shard][seg]);
-		seg_fds[shard][seg] = -1;
+		PosixSegFd *entry = NULL;
+
+		for (uint32_t i = 0; i < POSIX_SEG_FD_CACHE_SIZE; i++)
+			if (seg_fds[i].active && seg_fds[i].shard == shard && seg_fds[i].seg == seg)
+			{
+				entry = &seg_fds[i];
+				break;
+			}
+		if (entry == NULL)
+			break;
+		if (entry->users != 0)
+		{
+			pthread_cond_wait(&seg_fds_available, &seg_fds_lock);
+			continue;
+		}
+		if (seg_fd_close(entry) != 0)
+		{
+			pthread_mutex_unlock(&seg_fds_lock);
+			return -1;
+		}
+		break;
 	}
 	if (test_fail_seg_remove_before_unlink > 0 &&
 		--test_fail_seg_remove_before_unlink == 0)
@@ -481,26 +498,31 @@ posix_seg_remove(uint32_t shard, int seg)
 
 static int
 posix_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf,
-			uint32_t len)
+				uint32_t len)
 {
-	int			fd;
+	PosixSegFd *entry;
+	ssize_t		written;
+	int			saved_errno;
 
 	if (posix_require_owner() != 0)
 		return -1;
-	fd = seg_fd(shard, seg, 1);
-
-	if (fd < 0)
+	entry = seg_fd_get(shard, seg, 1);
+	if (entry == NULL)
 		return -1;
 	if (test_fail_seg_writes > 0)
 	{
 		test_fail_seg_writes--;
+		seg_fd_put(entry, 0);
 		return -1;
 	}
-	if (pwrite(fd, buf, len, (off_t) off) != (ssize_t) len)
+	written = pwrite(entry->fd, buf, len, (off_t) off);
+	saved_errno = errno;
+	/* Even an error can follow a partial physical write. */
+	seg_fd_put(entry, 1);
+	errno = saved_errno;
+	if (written != (ssize_t) len)
 		return -1;
-	/* Standalone-test crash point: after N successful segment writes. */
-	if (test_crash_after_seg_writes > 0 &&
-		--test_crash_after_seg_writes == 0)
+	if (test_crash_after_seg_writes > 0 && --test_crash_after_seg_writes == 0)
 		_exit(86);
 	return 0;
 }
@@ -508,17 +530,23 @@ posix_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf,
 static int
 posix_seg_read(uint32_t shard, int seg, uint64_t off, void *buf, uint32_t len)
 {
-	int			fd;
+	PosixSegFd *entry;
+	ssize_t		nread;
+	int			saved_errno;
 
 	if (posix_require_owner() != 0)
 		return -1;
-	fd = seg_fd(shard, seg, 0);
-
-	if (fd < 0)
+	entry = seg_fd_get(shard, seg, 0);
+	if (entry == NULL)
 		return -1;
-	if (pread(fd, buf, len, (off_t) off) != (ssize_t) len)
-		return -1;
-	return 0;
+#ifdef PAGESTORE_POSIX_FD_TEST
+	ps_test_posix_read_pinned(shard, seg);
+#endif
+	nread = pread(entry->fd, buf, len, (off_t) off);
+	saved_errno = errno;
+	seg_fd_put(entry, 0);
+	errno = saved_errno;
+	return nread == (ssize_t) len ? 0 : -1;
 }
 
 static int64_t
