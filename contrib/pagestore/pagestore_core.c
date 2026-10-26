@@ -19815,7 +19815,13 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	for (uint32_t i = 0; i < nlayers; i++)
 		if (layers[i].kind == PS_LAYER_IMAGE && layers[i].timeline == timeline &&
 			layer_matches_read_shard(&layers[i], shard) && !layers[i].deleting)
-			for (uint32_t j = 0; j < ps_layer_map.nlayers; j++)
+		{
+			/* Appends/reallocation preserve snapshot slots. Match the identity
+			 * before using that slot; unrelated removals can move entries. */
+			uint32_t first = i < ps_layer_map.nlayers &&
+				ps_layer_map.layers[i].layer_id == layers[i].layer_id ? i : 0;
+
+			for (uint32_t j = first; j < ps_layer_map.nlayers; j++)
 				if (ps_layer_map.layers[j].layer_id == layers[i].layer_id)
 				{
 					__atomic_sub_fetch(&ps_layer_map.layers[j].cache_readers, 1,
@@ -19833,6 +19839,7 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 						ps_layer_map.layers[j].cache_resident = true;
 					break;
 				}
+		}
 	free(layers);
 	free(tmp);
 	if (found && out_lsn)
