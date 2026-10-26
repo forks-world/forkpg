@@ -222,6 +222,7 @@ ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 	uint32_t	index_crc = 2166136261u;
 	char		uri[PS_LAYER_URI_MAX];
 	int			rc = -1;
+	bool		created = false;
 
 	if (n == 0 || page_size == 0 || page_size > IMAGE_STREAM_BYTES ||
 		read_page == NULL || ps_layer_store->write_local_layer_at == NULL)
@@ -247,6 +248,7 @@ ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 	qsort(sorted, n, sizeof(*sorted), img_sort_cmp);
 	if (ps_layer_store->create_local_layer(layer_id, uri, sizeof(uri)) != 0)
 		goto out;
+	created = true;
 	for (uint32_t i = 0; i < n; i++)
 	{
 		if (used + page_size > IMAGE_STREAM_BYTES)
@@ -326,6 +328,25 @@ ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 	rc = 0;
 
 out:
+	/* Only a successful create transfers ownership of this unpublished file.
+	 * In particular, a failed O_EXCL create must not delete an existing layer.
+	 * Source reads can fail after earlier chunks reached disk; clean them now
+	 * so repeated maintenance retries do not accumulate partial replacements. */
+	if (rc != 0 && created)
+	{
+		PsLayerDesc partial = {0};
+
+		partial.layer_id = layer_id;
+		partial.kind = PS_LAYER_IMAGE;
+		partial.timeline = timeline;
+		partial.location_count = 1;
+		partial.locations[0].tier = PS_LAYER_TIER_LOCAL_HOT;
+		partial.locations[0].size = total;
+		partial.locations[0].available = true;
+		snprintf(partial.locations[0].uri, sizeof(partial.locations[0].uri),
+				 "%s", uri);
+		(void) ps_layer_store->delete_local_layer(&partial);
+	}
 	free(sorted);
 	free(buffer);
 	return rc;

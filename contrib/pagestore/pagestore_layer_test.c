@@ -117,7 +117,25 @@ streaming_layer_test(void)
 	check(ps_image_layer_write_stream(911, 0, recs, 4096, PSZ,
 									  generated_page, NULL, &layer) != 0,
 		  "source read failure rejects partially written image");
+	check(ps_layer_store->layer_exists_local(911) == 0,
+		  "source failure removes unpublished output immediately");
+	for (uint64_t id = 912; id < 916; id++)
+	{
+		stream_pages = 0;
+		check(ps_image_layer_write_stream(id, 0, recs, 4096, PSZ,
+										  generated_page, NULL, &layer) != 0 &&
+			  ps_layer_store->layer_exists_local(id) == 0,
+			  "repeated source failures do not accumulate partial layers");
+	}
 	stream_fail_after = -1;
+	check(ps_image_layer_write_stream(910, 0, recs, 4096, PSZ,
+									  generated_page, NULL, &layer) != 0 &&
+		  ps_layer_store->layer_exists_local(910) == 1,
+		  "failed create must preserve the existing layer");
+	check(ps_image_layer_write_stream(911, 0, recs, 4096, PSZ,
+									  generated_page, NULL, &layer) == 0 &&
+		  ps_image_layer_verify_data(&layer, PSZ) == 0,
+		  "retry can recreate and seal a cleaned-up output");
 	ps_layer_store = saved;
 	free(recs);
 }
