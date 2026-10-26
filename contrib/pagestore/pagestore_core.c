@@ -3746,13 +3746,32 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	return 0;
 }
 
+/*
+ * Source references survive metadata sorting/pruning. Source layers stay
+ * resident under the existing shard/map write locks.
+ */
+typedef struct CompactPageSource
+{
+	const PsLayerDesc *layer;
+	uint64_t	offset;
+} CompactPageSource;
+
+static int
+compact_read_page(const PsImgRec *rec, void *page, void *arg)
+{
+	const CompactPageSource *source = rec->page;
+
+	(void) arg;
+	return read_layer_block_refreshing(source->layer, source->offset, page, page_size);
+}
+
 static int
 compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 {
 	PsLayerDesc *old;
 	uint32_t	nold = count_image_layers(timeline, shard);
 	PsImgRec   *recs = NULL;
-	unsigned char **pages = NULL;
+	CompactPageSource **pages = NULL;
 	uint32_t	nrec = 0,
 				cap = 0,
 				npages = 0,
@@ -3830,7 +3849,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 				return 0;
 			}
 
-	/* gather every version (page bytes) from the old layers */
+	/* Gather metadata only; read retained pages on demand after pruning. */
 	for (uint32_t k = 0; k < nold; k++)
 	{
 		PsImgIndexEnt *idx;
@@ -3849,35 +3868,37 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		}
 		for (uint32_t j = 0; j < n; j++)
 		{
-			unsigned char *pg;
+			CompactPageSource *pg;
 
 			if (nrec == cap)
 			{
 				uint32_t	nc = cap ? cap * 2 : 256;
 				PsImgRec   *nr = realloc(recs, (size_t) nc * sizeof(PsImgRec));
-				unsigned char **np = realloc(pages, (size_t) nc * sizeof(*pages));
+				CompactPageSource **np;
 
-				if (!nr || !np)
+				if (!nr)
 				{
-					free(nr ? nr : recs);
-					free(np ? np : pages);
-					recs = NULL;
-					pages = NULL;
 					free(idx);
 					goto cleanup;
 				}
 				recs = nr;
+				np = realloc(pages, (size_t) nc * sizeof(*pages));
+				if (!np)
+				{
+					free(idx);
+					goto cleanup;
+				}
 				pages = np;
 				cap = nc;
 			}
-			pg = malloc(page_size);
-			if (!pg || read_layer_block_refreshing(&old[k], idx[j].data_off,
-												   pg, page_size) != 0)
+			pg = malloc(sizeof(*pg));
+			if (!pg)
 			{
-				free(pg);
 				free(idx);
 				goto cleanup;
 			}
+			pg->layer = &old[k];
+			pg->offset = idx[j].data_off;
 			recs[nrec].key = idx[j].key;
 			recs[nrec].block = idx[j].block;
 			recs[nrec].lsn = idx[j].lsn;
@@ -3928,8 +3949,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	if (nrec != 0)
 	{
 	nid = alloc_layer_id(&g_shards[shard]);
-	if (ps_image_layer_write(nid, timeline, recs, nrec, page_size,
-							 &newdesc) != 0)
+	if (ps_image_layer_write_stream(nid, timeline, recs, nrec, page_size,
+						 compact_read_page, NULL, &newdesc) != 0)
 		goto cleanup;
 	for (uint32_t k = 0; k < nold; k++)
 		if (old[k].legacy_shard_zero)
@@ -8460,7 +8481,8 @@ fork_restore_later_page_growth(uint32_t timeline, const PsKey *key,
 	 * mode fork_event_add deliberately bypasses its cache-based deduplication:
 	 * the cache is rebuilt only after the entire batch, so it cannot suppress a
 	 * necessary later growth using stale values. */
-	qsort(grows, ngrows, sizeof(*grows), fork_deferred_grow_cmp);
+	if (ngrows > 1)
+		qsort(grows, ngrows, sizeof(*grows), fork_deferred_grow_cmp);
 	{
 		uint32_t out = 0;
 

@@ -1186,6 +1186,40 @@ local_write_local_layer(uint64_t layer_id, const void *buf, uint64_t len)
 	return ps_fault_probe(PS_FAULT_POINT_IMAGE_LAYER_AFTER_WRITE) == 0 ? 0 : -1;
 }
 
+/* Chunked writers retain the create/write/seal publication protocol. */
+static int
+local_write_local_layer_at(uint64_t layer_id, uint64_t off,
+						   const void *buf, uint32_t len)
+{
+	char		path[4096];
+	int			fd;
+	uint32_t	done = 0;
+	const char *bytes = buf;
+
+	if (!local_owner_current() || off > INT64_MAX || len > INT64_MAX - off ||
+		local_layer_path(layer_id, path, sizeof(path)) != 0)
+		return -1;
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -1;
+	while (done < len)
+	{
+		ssize_t		written = pwrite(fd, bytes + done, len - done, (off_t) (off + done));
+
+		if (written < 0 && errno == EINTR)
+			continue;
+		if (written <= 0)
+		{
+			close(fd);
+			return -1;
+		}
+		done += (uint32_t) written;
+	}
+	if (close(fd) != 0)
+		return -1;
+	return ps_fault_probe(PS_FAULT_POINT_IMAGE_LAYER_AFTER_WRITE) == 0 ? 0 : -1;
+}
+
 static int
 local_seal_local_layer(uint64_t layer_id)
 {
@@ -1564,6 +1598,7 @@ const PsLayerStore PsLayerStoreLocal = {
 	.create_local_layer = local_create_local_layer,
 	.layer_exists_local = local_layer_exists,
 	.write_local_layer = local_write_local_layer,
+	.write_local_layer_at = local_write_local_layer_at,
 	.seal_local_layer = local_seal_local_layer,
 	.remote_uri = local_remote_uri,
 	.read_layer_block = local_read_layer_block,
