@@ -672,6 +672,12 @@ existing refusal behavior; data forks are not eligible for hint reset.
 
 `--max-store-gb` is a stop threshold, not a reclamation controller. Controller
 high-water/catch-up settings are supplied with repeated `--daemon-arg` options.
+After a restart without the PAGE controller, segment GC starts at the oldest
+id and checks for missing prefix files before preparing layers. The locked
+recheck still settles ambiguous removals; a segment that appears after a
+missing preflight waits for a subsequent prepared retry. This avoids scanning
+all image layers once per already-deleted segment without relaxing coverage
+verification for a segment that exists.
 Indexing is necessary for WAL reclaim but does not guarantee bounded disk:
 legacy unbounded WAL-index horizons and unversioned forks conservatively keep
 FPI-led chains. Finite index views can instead retain durable bases, releasing

@@ -4505,9 +4505,100 @@ test_timeline_seqcap_format(void)
 	remove_tree(store);
 }
 
+/* A restart can leave thousands of absent segment ids below the watermark.
+ * The first real victim must still receive normal coverage checks, including
+ * if a missing preflight observation becomes stale before the locked check. */
+static int sparse_gc_layer_reads;
+static int sparse_gc_fake_missing;
+
+static int
+sparse_gc_read_layer(const PsLayerDesc *layer, uint64_t off, void *buf,
+					 uint32_t len)
+{
+	sparse_gc_layer_reads++;
+	return PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
+}
+
+static int64_t
+sparse_gc_segment_size(uint32_t shard, int seg)
+{
+	if (seg == 1 && sparse_gc_fake_missing)
+	{
+		sparse_gc_fake_missing = 0;
+		errno = ENOENT;
+		return -1;
+	}
+	return PsStoragePosix.seg_size(shard, seg);
+}
+
+static void
+test_page_gc_missing_prefix_preflight(void)
+{
+	char store[] = "/tmp/pagestore-gc-missing-prefix-XXXXXX";
+	PsLayerStore counted_layers = PsLayerStoreLocal;
+	PsStorage stale_storage = PsStoragePosix;
+	unsigned char page[8192];
+	int removed = 0;
+
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 1;
+	compact_layers = 1000;
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open sparse page-GC fixture");
+		return;
+	}
+	check(write_timeline_layer(0, 0, 100) == 0 &&
+		  write_timeline_layer(0, 1, 200) == 0 &&
+		  write_timeline_layer(0, 2, 300) == 0 &&
+		  ps_storage->seg_size(0, 1) > 0 &&
+		  ps_storage->seg_remove(0, 0) == 0,
+		  "create covered missing prefix and later live segment");
+	close_store();
+	if (ps_core_open(store) != 0)
+	{
+		check(0, "reopen sparse page-GC fixture");
+		remove_tree(store);
+		return;
+	}
+	segment_gc_enabled = 1;
+	counted_layers.read_layer_block = sparse_gc_read_layer;
+	ps_layer_store = &counted_layers;
+	sparse_gc_layer_reads = 0;
+	check(ps_core_maintenance() == 1 && sparse_gc_layer_reads == 0,
+		  "missing covered prefix advances without reading layer data");
+
+	stale_storage.seg_size = sparse_gc_segment_size;
+	ps_storage = &stale_storage;
+	sparse_gc_fake_missing = 1;
+	sparse_gc_layer_reads = 0;
+	(void) ps_core_maintenance();
+	check(!sparse_gc_fake_missing && PsStoragePosix.seg_size(0, 1) > 0,
+		  "stale missing preflight cannot reclaim an unprepared live segment");
+	ps_storage = &PsStoragePosix;
+	sparse_gc_layer_reads = 0;
+	for (int i = 0; i < 32 && !removed; i++)
+	{
+		(void) ps_core_maintenance();
+		errno = 0;
+		removed = ps_storage->seg_size(0, 1) < 0 && errno == ENOENT;
+	}
+	check(removed && sparse_gc_layer_reads > 0,
+		  "live covered segment is prepared, verified and reclaimed on retry");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(0, 1, page) == 1 && page[100] == 0x5A,
+		  "verified layer remains readable after segment reclamation");
+	ps_layer_store = &PsLayerStoreLocal;
+	close_store();
+	segment_gc_enabled = 0;
+	remove_tree(store);
+}
+
 int
 main(void)
 {
+	test_page_gc_missing_prefix_preflight();
 	test_timeline_seqcap_format();
 	test_old_event_replay_derives_reused_parent_incarnation();
 	test_legacy_migration_and_parser_fail_closed();
