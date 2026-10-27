@@ -22676,7 +22676,8 @@ layer_growth_merge(ForkEnt *fork, LayerRecoverRec **items, uint32_t n,
 
 	if (fork->nlegacy_seq != 0 || !layer_growth_existing_valid(fork) ||
 		n > UINT32_MAX - fork->nev ||
-		(size_t) (fork->nev + n) > SIZE_MAX / sizeof(*merged))
+		((fork->nev + n) != 0 &&
+		 sizeof(*merged) > SIZE_MAX / (size_t) (fork->nev + n)))
 		return 0;
 	merged = malloc((size_t) (fork->nev + n) * sizeof(*merged));
 	if (merged == NULL)
@@ -22754,7 +22755,7 @@ layer_growth_batch(LayerRecoverRec *recs, uint32_t nrec, unsigned char *batched)
 	uint32_t count = 0;
 
 	if (fork_meta_legacy || nrec < 64 ||
-		(size_t) nrec > SIZE_MAX / sizeof(*items))
+		sizeof(*items) > SIZE_MAX / (size_t) nrec)
 		return;
 	items = malloc((size_t) nrec * sizeof(*items));
 	if (items == NULL)
