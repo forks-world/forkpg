@@ -24645,7 +24645,7 @@ verify_segment_layers_locked(uint32_t source_shard, uint32_t victim, int need_la
 }
 
 static int
-reclaim_one_segment(Shard *s)
+reclaim_one_segment(Shard *s, int layers_prepared)
 {
 	uint32_t	victim;
 	uint32_t	ns = core_shards();
@@ -24680,6 +24680,11 @@ reclaim_one_segment(Shard *s)
 	}
 	else
 		seg_bytes = (int64_t) segment_size;
+	/* A missing preflight observation may have become stale before we took
+	 * the shard lock.  Never reclaim a now-present segment without the
+	 * corresponding unlocked layer preparation; retry it next time. */
+	if (!layers_prepared)
+		return 0;
 	refs = segment_has_references(s->id, victim);
 	if (verify_segment_layers_locked(s->id, victim, refs) != 0)
 		return 0;
@@ -25351,6 +25356,9 @@ ps_core_maintenance_impl(void)
 	 * of them while any deletion awaits its filtered-rewrite phase. */
 	if (segment_gc_enabled && !timeline_delete_active() && ps_storage->seg_remove)
 	{
+		uint32_t prepared_victim[MAX_SHARDS];
+		bool layers_prepared[MAX_SHARDS] = {false};
+
 		for (uint32_t sh = 0; sh < ns; sh++)
 		{
 			uint32_t	victim = 0;
@@ -25368,13 +25376,33 @@ ps_core_maintenance_impl(void)
 				victim = g_shards[sh].gc_next_seg;
 			ps_unlock_shard(sh);
 			if (due)
-				prepare_segment_layers(sh, victim);
+			{
+				int missing = 0;
+
+				/* A deleted prefix is common after restart.  Check it before
+				 * scanning every layer; reclaim_one_segment rechecks under
+				 * shard-wr and settles ambiguous removals exactly as before. */
+				if (ps_storage->seg_size != NULL)
+				{
+					errno = 0;
+					missing = ps_storage->seg_size(sh, (int) victim) < 0 &&
+						errno == ENOENT;
+				}
+				if (!missing)
+				{
+					(void) prepare_segment_layers(sh, victim);
+					prepared_victim[sh] = victim;
+					layers_prepared[sh] = true;
+				}
+			}
 		}
 		for (uint32_t sh = 0; sh < ns; sh++)
 			ps_lock_shard_wr(sh);
 		ps_lock_map_rd();
 		for (uint32_t sh = 0; sh < ns && !found; sh++)
-			found = reclaim_one_segment(&g_shards[sh]);
+			found = reclaim_one_segment(&g_shards[sh],
+				layers_prepared[sh] && prepared_victim[sh] ==
+				g_shards[sh].gc_next_seg);
 		ps_unlock_map();
 		for (uint32_t sh = ns; sh > 0; sh--)
 			ps_unlock_shard(sh - 1);
