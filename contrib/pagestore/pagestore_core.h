@@ -208,6 +208,8 @@ extern int ps_test_fork_event_index_selftest(uint64_t seed, uint32_t nevents,
 /* Test-only: total scan/bisection steps taken by the fork-event index and
  * its fallback loops on this thread since the process started. */
 extern uint64_t ps_test_fork_event_scan_steps(void);
+/* Differential check of batched layer-recovery growth versus single inserts. */
+extern int ps_test_layer_growth_merge(uint64_t seed);
 /* Phase P1 (BRANCH_SNAPSHOT_SEQ_CAP.md S9.3) differential test: random page
  * versions and fork-event histories, checked against frozen pre-P1
  * references at PS_SEQ_UNBOUNDED (must be bit-identical) and against an

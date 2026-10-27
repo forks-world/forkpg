@@ -62,6 +62,10 @@ main(void)
 		0, 1, 2, 3, 7, 42, 1000003, 0xdeadbeefULL, 0x0ddc0ffeeULL,
 	};
 
+	for (uint64_t seed = 1; seed <= 20; seed++)
+		check(ps_test_layer_growth_merge(seed) == 0,
+			  "batch layer growth matches sequential insertion and finite views");
+
 	for (size_t i = 0; i < sizeof(seeds) / sizeof(seeds[0]); i++)
 		run_differential(seeds[i], 4000);
 

@@ -1030,9 +1030,9 @@ admission_seq_observe(uint64_t seq)
  * on the current fork-event state and re-checked right before the
  * generation switch, purely to *count* how often a late admission actually
  * landed in that window -- never to act on it.  fork_event_admit_seq_bump()
- * is called from fork_event_add()/fork_event_add_seg_marker(), the two
- * entry points every production fork-event insertion goes through (the
- * I-ALLOC audit), under the caller's existing key-shard write lock.
+ * is called by ordinary fork-event insertions and by the recovery-only
+ * layer-growth batch.  I-ALLOC holds via the key-shard write lock or the
+ * single-threaded recovery exemption.
  */
 static uint64_t fork_event_admit_seq_by_tl[MAX_TIMELINES];
 
@@ -6772,8 +6772,8 @@ fork_event_insert_pos(ForkEnt *e, uint64_t lsn, uint64_t admission_seq)
 	return i;
 }
 
-/* Debug-only (never called from a production path: it is O(N)): walk the
- * array once and confirm the invariant fork_event_insert_pos() relies on --
+/* Linear validation for the recovery batch and tests: confirm the
+ * invariant fork_event_insert_pos() relies on --
  * nondecreasing lsn; within equal lsn, nonzero admission sequences
  * nondecreasing when nlegacy_seq == 0; nlegacy_seq equal to the count of
  * zero-sequence events.  Returns 1 if the invariant holds, 0 otherwise. */
@@ -22607,6 +22607,360 @@ layer_recover_cmp(const void *pa, const void *pb)
 		(a->layer_id > b->layer_id ? 1 : 0);
 }
 
+/* The physical replay order stays in recs; this auxiliary order groups one
+ * fork's non-legacy growth by its exact version tuple.  A physical address is
+ * a stable tie breaker within the single recs array. */
+static int
+layer_growth_cmp(const void *left, const void *right)
+{
+	const LayerRecoverRec *a = *(LayerRecoverRec *const *) left;
+	const LayerRecoverRec *b = *(LayerRecoverRec *const *) right;
+	int c;
+
+	if (a->timeline != b->timeline)
+		return a->timeline < b->timeline ? -1 : 1;
+	c = memcmp(&a->ent.key, &b->ent.key, sizeof(PsKey));
+	if (c != 0)
+		return c;
+	if (a->ent.growth_lsn != b->ent.growth_lsn)
+		return a->ent.growth_lsn < b->ent.growth_lsn ? -1 : 1;
+	if (a->ent.admission_seq != b->ent.admission_seq)
+		return a->ent.admission_seq < b->ent.admission_seq ? -1 : 1;
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/* The merge rebuilds position indexes in their existing allocations.
+ * Validate their exact content and capacities before relying on them. */
+static bool
+layer_growth_existing_valid(const ForkEnt *fork)
+{
+	uint32_t nd = 0, nl = 0;
+
+	if (fork->nev > fork->evcap || (fork->nev != 0 && fork->ev == NULL) ||
+		fork->ndef > fork->defcap || fork->nlate_meta > fork->late_meta_cap ||
+		(fork->ndef != 0 && fork->def_idx == NULL) ||
+		(fork->nlate_meta != 0 && fork->late_meta_idx == NULL) ||
+		!fork_event_check_order(fork))
+		return false;
+	for (uint32_t i = 0; i < fork->nev; i++)
+	{
+		const ForkEvent *event = &fork->ev[i];
+
+		if (event->kind == FEV_SET || event->kind == FEV_DEAD)
+		{
+			if (nd >= fork->ndef || fork->def_idx[nd++] != i)
+				return false;
+		}
+		if ((event->flags & FEV_F_META) && !(event->flags & FEV_F_META_FIRST))
+		{
+			if (nl >= fork->nlate_meta || fork->late_meta_idx[nl++] != i)
+				return false;
+		}
+	}
+	return nd == fork->ndef && nl == fork->nlate_meta;
+}
+
+/* Merge only a fully checked fork group.  Existing nonzero-sequence events
+ * are already tuple sorted.  Each new tuple is unique within this batch, so
+ * the original upper-bound insertion puts it after all existing equal-tuple
+ * events.  An exact PAGE-GROW already present is the original no-op. */
+static int
+layer_growth_merge(ForkEnt *fork, LayerRecoverRec **items, uint32_t n,
+				   LayerRecoverRec *recs, unsigned char *batched)
+{
+	ForkEvent *merged;
+	uint32_t old = 0, out = 0, nd = 0, nl = 0;
+	uint64_t max_added_seq = 0;
+	uint64_t B;
+	bool has_B;
+
+	if (fork->nlegacy_seq != 0 || !layer_growth_existing_valid(fork) ||
+		n > UINT32_MAX - fork->nev ||
+		((fork->nev + n) != 0 &&
+		 sizeof(*merged) > SIZE_MAX / (size_t) (fork->nev + n)))
+		return 0;
+	merged = malloc((size_t) (fork->nev + n) * sizeof(*merged));
+	if (merged == NULL)
+		return 0;
+	B = timeline_inherited_below(fork->timeline, &has_B);
+	for (uint32_t i = 0; i < n; i++)
+	{
+		const PsImgIndexEnt *in = &items[i]->ent;
+		bool duplicate = false;
+
+		while (old < fork->nev &&
+			   (fork->ev[old].lsn < in->growth_lsn ||
+				(fork->ev[old].lsn == in->growth_lsn &&
+				 fork->ev[old].admission_seq <= in->admission_seq)))
+		{
+			const ForkEvent *v = &fork->ev[old++];
+
+			if (v->lsn == in->growth_lsn &&
+				v->admission_seq == in->admission_seq &&
+				v->kind == FEV_GROW && v->marker_kind == 0 &&
+				v->nblocks == in->block + 1 && !(v->flags & FEV_F_META))
+				duplicate = true;
+			merged[out++] = *v;
+		}
+		if (!duplicate)
+		{
+			ForkEvent v = {0};
+
+			v.lsn = in->growth_lsn;
+			v.admission_seq = in->admission_seq;
+			v.nblocks = in->block + 1;
+			v.kind = FEV_GROW;
+			merged[out++] = v;
+			if (v.admission_seq > max_added_seq)
+				max_added_seq = v.admission_seq;
+			if (has_B && v.lsn <= B &&
+				v.admission_seq > fork->max_inherited_page_seq)
+				fork->max_inherited_page_seq = v.admission_seq;
+		}
+	}
+	while (old < fork->nev)
+		merged[out++] = fork->ev[old++];
+	free(fork->ev);
+	fork->ev = merged;
+	fork->evcap = fork->nev + n;
+	fork->nev = out;
+	/* PAGE growth adds neither definitive nor META events.  Their previous
+	 * index capacities remain sufficient; only their positions can change. */
+	for (uint32_t i = 0; i < out; i++)
+	{
+		if (merged[i].kind == FEV_SET || merged[i].kind == FEV_DEAD)
+			fork->def_idx[nd++] = i;
+		if ((merged[i].flags & FEV_F_META) &&
+			!(merged[i].flags & FEV_F_META_FIRST))
+			fork->late_meta_idx[nl++] = i;
+	}
+	fork->ndef = nd;
+	fork->nlate_meta = nl;
+	fork_event_cache_from(fork, 0);
+	fork->nblocks = fork_size_asof_hop(fork, UINT64_MAX, 0);
+	if (max_added_seq != 0)
+		fork_event_admit_seq_bump(fork->timeline, max_added_seq);
+	for (uint32_t i = 0; i < n; i++)
+		batched[items[i] - recs] = 1;
+	return 1;
+}
+
+/* Preload only ordinary, unambiguous groups.  Legacy, WAL-less, ordered,
+ * zero-sequence and equal-tuple groups keep the original physical replay;
+ * allocation failure is likewise a safe fallback. */
+static void
+layer_growth_batch(LayerRecoverRec *recs, uint32_t nrec, unsigned char *batched)
+{
+	LayerRecoverRec **items;
+	uint32_t count = 0;
+
+	if (fork_meta_legacy || nrec < 64 ||
+		sizeof(*items) > SIZE_MAX / (size_t) nrec)
+		return;
+	items = malloc((size_t) nrec * sizeof(*items));
+	if (items == NULL)
+		return;
+	for (uint32_t i = 0; i < nrec; i++)
+	{
+		if (i + 1 < nrec && recs[i].ent.seg_id == recs[i + 1].ent.seg_id &&
+			recs[i].ent.seg_off == recs[i + 1].ent.seg_off)
+			continue;
+		items[count++] = &recs[i];
+	}
+	qsort(items, count, sizeof(*items), layer_growth_cmp);
+	for (uint32_t start = 0; start < count; )
+	{
+		uint32_t end = start + 1;
+		bool eligible = true;
+		ForkEnt *fork;
+
+		while (end < count && items[end]->timeline == items[start]->timeline &&
+			   key_eq(&items[end]->ent.key, &items[start]->ent.key))
+			end++;
+		if (end - start < 64)
+			eligible = false;
+		for (uint32_t i = start; i < end && eligible; i++)
+		{
+			const PsImgIndexEnt *v = &items[i]->ent;
+
+			if ((v->flags & (PS_IMG_REC_ORDERED | PS_IMG_REC_WALLESS)) ||
+				v->admission_seq == 0 || v->growth_lsn == 0 ||
+				(i > start && v->growth_lsn == items[i-1]->ent.growth_lsn &&
+				 v->admission_seq == items[i-1]->ent.admission_seq))
+				eligible = false;
+		}
+		if (eligible)
+		{
+			fork = fork_get_or_create(items[start]->timeline,
+									  &items[start]->ent.key);
+			/* I-ALLOC explicitly exempts the single-threaded recovery window. */
+			ps_assert_shard_held_for_key(&fork->key);
+			(void) layer_growth_merge(fork, items + start, end - start,
+									  recs, batched);
+		}
+		start = end;
+	}
+	free(items);
+}
+
+/* Differential test: compare the batch merge against the established
+ * insertion routine, including existing same-tuple events, META/SET/DEAD,
+ * marker indexes, cached folds, and finite as-of views. */
+int
+ps_test_layer_growth_merge(uint64_t seed)
+{
+	ForkEnt slow = {0}, fast = {0};
+	LayerRecoverRec records[256] = {0};
+	LayerRecoverRec *items[256];
+	unsigned char batched[256] = {0};
+	uint64_t rng = seed ? seed : 1;
+	int rc = 0;
+
+#define LG_CHECK(c) do { if (!(c)) { rc = __LINE__; goto done; } } while (0)
+	for (uint32_t i = 0; i < 256; i++)
+	{
+		records[i].ent.growth_lsn = 1 + fork_event_selftest_rand(&rng) % 200;
+		records[i].ent.admission_seq = 1000 + i;
+		records[i].ent.block = (uint32_t) (fork_event_selftest_rand(&rng) % 200);
+		items[i] = &records[i];
+	}
+	for (uint32_t i = 0; i < 300; i++)
+	{
+		uint64_t lsn = 1 + fork_event_selftest_rand(&rng) % 200;
+		uint64_t seq = 1 + fork_event_selftest_rand(&rng) % 800;
+		uint32_t size = (uint32_t) (fork_event_selftest_rand(&rng) % 200);
+		uint8_t kind = (uint8_t) (fork_event_selftest_rand(&rng) % 3);
+		bool meta = kind != FEV_GROW || (fork_event_selftest_rand(&rng) & 1);
+
+		(void) fork_event_add_unchecked(&slow, lsn, seq, size, kind, meta);
+		(void) fork_event_add_unchecked(&fast, lsn, seq, size, kind, meta);
+	}
+	/* Existing exact PAGE growth must be deduplicated; an existing META at
+	 * the same tuple must precede the newly inserted PAGE growth. */
+	for (uint32_t i = 0; i < 20; i++)
+	{
+		PsImgIndexEnt *v = &records[i].ent;
+		uint8_t kind = i & 1 ? FEV_SET : FEV_GROW;
+
+		(void) fork_event_add_unchecked(&slow, v->growth_lsn, v->admission_seq,
+										v->block + 1, kind, kind != FEV_GROW);
+		(void) fork_event_add_unchecked(&fast, v->growth_lsn, v->admission_seq,
+										v->block + 1, kind, kind != FEV_GROW);
+	}
+	/* Bound markers can share a tuple with an incoming PAGE record.  Their
+	 * physical order, late-META indexes and cached folds must remain intact. */
+	for (uint32_t i = 20; i < 40; i++)
+	{
+		PsImgIndexEnt *v = &records[i].ent;
+
+		fork_event_add_seg_marker_unchecked(&slow, v->growth_lsn, v->block + 1,
+										 FEV_SEG_GROW_BOUND, 10000 + i, v->admission_seq);
+		fork_event_add_seg_marker_unchecked(&fast, v->growth_lsn, v->block + 1,
+										 FEV_SEG_GROW_BOUND, 10000 + i, v->admission_seq);
+	}
+	for (uint32_t i = 0; i < 256; i++)
+		(void) fork_event_add_unchecked(&slow, records[i].ent.growth_lsn,
+										records[i].ent.admission_seq,
+										records[i].ent.block + 1, FEV_GROW, false);
+	qsort(items, 256, sizeof(*items), layer_growth_cmp);
+	LG_CHECK(layer_growth_merge(&fast, items, 256, records, batched) == 1);
+	LG_CHECK(slow.nev == fast.nev && slow.ndef == fast.ndef &&
+			 slow.nlate_meta == fast.nlate_meta && slow.nblocks == fast.nblocks &&
+			 slow.nlegacy_seq == fast.nlegacy_seq &&
+			 slow.max_meta_seq == fast.max_meta_seq &&
+			 slow.max_inherited_page_seq == fast.max_inherited_page_seq);
+	for (uint32_t i = 0; i < slow.nev; i++)
+	{
+		const ForkEvent *a = &slow.ev[i], *b = &fast.ev[i];
+
+		LG_CHECK(a->lsn == b->lsn && a->admission_seq == b->admission_seq &&
+				 a->order_id == b->order_id && a->nblocks == b->nblocks &&
+				 a->kind == b->kind && a->marker_kind == b->marker_kind &&
+				 a->flags == b->flags && a->cached_state == b->cached_state &&
+				 a->cached_nblocks == b->cached_nblocks &&
+				 a->cached_fence_nblocks == b->cached_fence_nblocks);
+	}
+	for (uint32_t i = 0; i < slow.ndef; i++)
+		LG_CHECK(slow.def_idx[i] == fast.def_idx[i]);
+	for (uint32_t i = 0; i < slow.nlate_meta; i++)
+		LG_CHECK(slow.late_meta_idx[i] == fast.late_meta_idx[i]);
+	for (uint32_t i = 0; i < 1000; i++)
+	{
+		uint64_t lsn = fork_event_selftest_rand(&rng) % 210;
+		uint64_t seq = 1 + fork_event_selftest_rand(&rng) % 1300;
+		ViewCap cap = viewcap_lsn_seq(lsn, seq);
+		uint32_t x = 0, y = 0;
+		int a = fork_asof_hop(&slow, &cap, 0, false, &x);
+		int b = fork_asof_hop(&fast, &cap, 0, false, &y);
+
+		LG_CHECK(a == b && x == y);
+		LG_CHECK(fork_inheritance_fenced(&slow, i % 200, &cap, 0, false) ==
+				 fork_inheritance_fenced(&fast, i % 200, &cap, 0, false));
+	}
+	LG_CHECK(fork_event_check_order(&fast));
+	/* Legacy histories are deliberately never merged. */
+	fast.nlegacy_seq = 1;
+	LG_CHECK(layer_growth_merge(&fast, items, 256, records, batched) == 0);
+	fast.nlegacy_seq = 0;
+	{
+		uint32_t saved = fast.evcap;
+
+		fast.evcap = 0;
+		LG_CHECK(layer_growth_merge(&fast, items, 256, records, batched) == 0);
+		fast.evcap = saved;
+	}
+	if (fast.ndef != 0)
+	{
+		uint32_t saved = fast.def_idx[0];
+
+		fast.def_idx[0] = fast.nev;
+		LG_CHECK(layer_growth_merge(&fast, items, 256, records, batched) == 0);
+		fast.def_idx[0] = saved;
+	}
+	{
+		ForkEvent saved = fast.ev[0];
+
+		fast.ev[0] = fast.ev[fast.nev - 1];
+		fast.ev[fast.nev - 1] = saved;
+		LG_CHECK(layer_growth_merge(&fast, items, 256, records, batched) == 0);
+	}
+	/* Whole groups containing nonordinary records or duplicate tuples must
+	 * fall back before any global fork state is touched. */
+	for (uint32_t kind = 0; kind < 5; kind++)
+	{
+		LayerRecoverRec fallback[64] = {0};
+		unsigned char skipped[64] = {0};
+
+		for (uint32_t i = 0; i < 64; i++)
+		{
+			fallback[i].ent.growth_lsn = i + 1;
+			fallback[i].ent.admission_seq = i + 1;
+			fallback[i].ent.seg_off = i;
+		}
+		if (kind == 0)
+			fallback[17].ent.flags = PS_IMG_REC_ORDERED;
+		else if (kind == 1)
+			fallback[17].ent.flags = PS_IMG_REC_WALLESS;
+		else if (kind == 2)
+			fallback[17].ent.admission_seq = 0;
+		else if (kind == 3)
+			fallback[17].ent.growth_lsn = 0;
+		else
+		{
+			fallback[17].ent.growth_lsn = fallback[16].ent.growth_lsn;
+			fallback[17].ent.admission_seq = fallback[16].ent.admission_seq;
+		}
+		layer_growth_batch(fallback, 64, skipped);
+		for (uint32_t i = 0; i < 64; i++)
+			LG_CHECK(!skipped[i]);
+	}
+	done:
+	free(slow.ev); free(slow.def_idx); free(slow.late_meta_idx);
+	free(fast.ev); free(fast.def_idx); free(fast.late_meta_idx);
+#undef LG_CHECK
+	return rc;
+}
+
 /*
  * Replay the index and fork-growth effects shared by layer and segment
  * input.  allow_commit_adopt gates fork_event_adopt_orphaned_commit_seg():
@@ -22684,6 +23038,7 @@ recover_layer_prefix(uint32_t shard)
 {
 	Shard	   *s = &g_shards[shard];
 	LayerRecoverRec *recs = NULL;
+	unsigned char *batched = NULL;
 	uint32_t	nrec = 0,
 				cap = 0;
 
@@ -22797,6 +23152,9 @@ recover_layer_prefix(uint32_t shard)
 		goto fail;
 	}
 	qsort(recs, nrec, sizeof(*recs), layer_recover_cmp);
+	batched = calloc(nrec, sizeof(*batched));
+	if (batched != NULL)
+		layer_growth_batch(recs, nrec, batched);
 	for (uint32_t i = 0; i < nrec; i++)
 	{
 		PsImgIndexEnt *e = &recs[i].ent;
@@ -22806,8 +23164,9 @@ recover_layer_prefix(uint32_t shard)
 			e->seg_off == recs[i + 1].ent.seg_off)
 			continue;
 		if (!replay_page_record(recs[i].timeline, &e->key, e->block, e->lsn,
-								e->admission_seq, e->growth_lsn, e->order_id,
-								e->flags,
+								e->admission_seq,
+								(batched != NULL && batched[i]) ? 0 : e->growth_lsn,
+								e->order_id, e->flags,
 								shard, -1, 0, 1))
 		{
 			/* An unmatched ordered record with no orphan-adoption match
@@ -22830,10 +23189,12 @@ recover_layer_prefix(uint32_t shard)
 			goto fail;
 		}
 	}
+	free(batched);
 	free(recs);
 	return 0;
 
 fail:
+	free(batched);
 	free(recs);
 	return -1;
 }
