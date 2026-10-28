@@ -208,6 +208,8 @@ static uint64 pagestore_retention_owner_id = 0;
 static uint32 pagestore_retention_owner_generation = 0;
 static int pagestore_materializer_max_lag_mb = 0;
 static int pagestore_wal_index_max_lag_mb = 0;
+/* Per-request bound for explicit, potentially large SLRU snapshots. */
+static int pagestore_slru_snapshot_timeout_ms = 60000;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
@@ -3476,7 +3478,7 @@ slru_publish_page(const char *slru, BlockNumber pageno, const char *page,
 
 	slru_obj_key(&key, slru);
 	pagestore_localsvc_artifact_write(PS_KLASS_SLRU, &key, pageno, page,
-		(uint64) context->cutoff, context->token, PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+		(uint64) context->cutoff, context->token, pagestore_slru_snapshot_timeout_ms);
 }
 
 typedef struct PsSlruStagePage
@@ -3531,7 +3533,7 @@ slru_publish_stage(File file, int64 pages, XLogRecPtr cutoff)
 		slru_obj_key(&key, ps_slru_dirs[i]);
 		contexts[i].cutoff = cutoff;
 		contexts[i].token = pagestore_localsvc_artifact_begin(PS_KLASS_SLRU,
-			&key, cutoff, PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+			&key, cutoff, pagestore_slru_snapshot_timeout_ms);
 	}
 
 	for (int64 i = 0; i < pages; i++)
@@ -3560,7 +3562,7 @@ slru_publish_stage(File file, int64 pages, XLogRecPtr cutoff)
 		PageStoreRelKey key;
 		slru_obj_key(&key, ps_slru_dirs[i]);
 		pagestore_localsvc_artifact_commit(PS_KLASS_SLRU, &key, cutoff,
-			contexts[i].token, counts[i], PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+			contexts[i].token, counts[i], pagestore_slru_snapshot_timeout_ms);
 	}
 
 }
@@ -3591,11 +3593,11 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 				(errmsg("pagestore.backend must be 'localsvc'")));
 	slru_obj_key(&key, slru);
 	context.token = pagestore_localsvc_artifact_begin(PS_KLASS_SLRU, &key,
-		cutoff, PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+		cutoff, pagestore_slru_snapshot_timeout_ms);
 	shipped = slru_scan_snapshot(slru, slru_publish_page, &context);
 
 	pagestore_localsvc_artifact_commit(PS_KLASS_SLRU, &key, cutoff,
-		context.token, (uint32) shipped, PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+		context.token, (uint32) shipped, pagestore_slru_snapshot_timeout_ms);
 	PG_RETURN_INT64(shipped);
 }
 
@@ -3668,7 +3670,7 @@ pagestore_capture_slru_snapshot(PG_FUNCTION_ARGS)
 				 errmsg("WAL replay changed while staging pagestore SLRU snapshot")));
 
 	slru_publish_stage(stage.file, pages, replay_before);
-	pagestore_localsvc_store_sync_timeout(PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	pagestore_localsvc_store_sync_timeout(pagestore_slru_snapshot_timeout_ms);
 	FileClose(stage.file);
 	PG_RETURN_LSN(replay_before);
 }
@@ -14672,6 +14674,13 @@ _PG_init(void)
 
 	/* let the localsvc backend define its own GUCs */
 	pagestore_localsvc_init();
+
+	DefineCustomIntVariable("pagestore.slru_snapshot_timeout",
+						"Maximum wait for each daemon request publishing an SLRU snapshot.",
+						"A timeout does not cancel a request already accepted by the daemon.",
+						&pagestore_slru_snapshot_timeout_ms,
+						60000, 1000, 3600000,
+						PGC_SUSET, GUC_UNIT_MS, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("pagestore.route_all",
 							 "Route all non-temp relation I/O through the pagestore backend.",
