@@ -411,3 +411,5 @@ This list is the spec for that feature; none of it blocks M4.
 See also: the read-path PR stack plan, the branch-PostgreSQL milestone plan (M4:
 bootable branch compute), the store-backed WAL reader (#53) this reuses, and
 [PGCONTROL_ON_STORE_DESIGN.md] for the sibling pg_control protocol.
+
+Explicit snapshot publication bounds each daemon request with `pagestore.slru_snapshot_timeout` (default 60 seconds, configurable from 1 second to 1 hour by a superuser). A timeout can leave a request executing; it does not imply cancellation or daemon failure. The setting does not alter live-mirror drain budgets or the materializer restartpoint watchdog.

@@ -694,11 +694,15 @@ $P -c "CREATE FUNCTION pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS bigint
         AS 'pagestore','pagestore_ship_slru_snapshot' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_slru_read_at(text, int, pg_lsn) RETURNS bytea
         AS 'pagestore','pagestore_slru_read_at' LANGUAGE C STRICT;" >/dev/null
+assert "$($P -c "SELECT current_setting('pagestore.slru_snapshot_timeout');")" "1min" \
+    "SLRU snapshot requests have a bounded 60 second default"
+assert "$($P -c "SELECT set_config('pagestore.slru_snapshot_timeout', '90s', false);")" "90s" \
+    "SLRU snapshot request timeout is configurable"
 $P -c "CHECKPOINT;" >/dev/null
 cutoff=$($P -c "SELECT pg_current_wal_lsn();")
 seg=$($P -c "SELECT name FROM pg_ls_dir('pg_xact') AS name ORDER BY name LIMIT 1;")
 pageno=$(( 16#$seg * 32 ))			# first page of the lowest clog segment
-shipped=$($P -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$cutoff');")
+shipped=$(PGOPTIONS="-c pagestore.slru_snapshot_timeout=90s" $P -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$cutoff');")
 if [ "${shipped:-0}" -gt 0 ]; then
 	echo "ok   - shipped $shipped clog page(s) to the store (cutoff $cutoff)"
 else
