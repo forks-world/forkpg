@@ -210,6 +210,7 @@ static int pagestore_materializer_max_lag_mb = 0;
 static int pagestore_wal_index_max_lag_mb = 0;
 /* Per-request bound for explicit, potentially large SLRU snapshots. */
 static int pagestore_slru_snapshot_timeout_ms = 60000;
+static int pagestore_startup_ancestry_timeout_ms = 60000;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
@@ -11931,7 +11932,8 @@ pagestore_bind_startup_ancestry(uint32 start_timeline,
 		seen[current] = true;
 
 		if (!pagestore_localsvc_timeline_info(current, &parent_timeline,
-											  &branch_lsn, &parent_incarnation, 5000))
+											  &branch_lsn, &parent_incarnation,
+											  pagestore_startup_ancestry_timeout_ms))
 			ereport(FATAL,
 					(errmsg("could not read exact pagestore ancestry for timeline %u",
 							current)));
@@ -14674,6 +14676,13 @@ _PG_init(void)
 
 	/* let the localsvc backend define its own GUCs */
 	pagestore_localsvc_init();
+
+	DefineCustomIntVariable("pagestore.startup_ancestry_timeout",
+						"Maximum wait for each timeline ancestry request at startup.",
+						"A timeout does not establish that the daemon has failed.",
+						&pagestore_startup_ancestry_timeout_ms,
+						60000, 1000, 3600000,
+						PGC_POSTMASTER, GUC_UNIT_MS, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("pagestore.slru_snapshot_timeout",
 						"Maximum wait for each daemon request publishing an SLRU snapshot.",
