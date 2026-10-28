@@ -3469,6 +3469,7 @@ main(int argc, char **argv)
 		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 		return failed != 0;
 	}
+	check(ps_test_walidx_raw_first() == 0, "sorted WAL dependency summary matches full scan");
 	test_finite_index_base_reclaims_raw_wal();
 	test_index_base_reclaim_conservative_fallback();
 	test_index_state_caps_ancestry();

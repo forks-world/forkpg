@@ -14527,6 +14527,8 @@ typedef struct WalIdxEnt
 	struct WalIdxItem *items;	/* ascending by LSN */
 	int			n;
 	int			cap;
+	uint64_t	bad_known_lsn;
+	bool		bad_known_present;
 } WalIdxEnt;
 
 typedef struct WalIdxItem
@@ -14535,6 +14537,116 @@ typedef struct WalIdxItem
 	uint64_t	end_lsn;
 	uint32_t	flags;
 } WalIdxItem;
+
+/* Track the earliest invalid known span as a fail-closed scan summary. */
+static void
+walidx_bad_known_consider(WalIdxEnt *entry, const WalIdxItem *item)
+{
+	if ((item->flags & PS_WAL_INDEX_FLAG_KNOWN) && item->end_lsn <= item->lsn &&
+		(!entry->bad_known_present || item->lsn < entry->bad_known_lsn))
+	{
+		entry->bad_known_lsn = item->lsn;
+		entry->bad_known_present = true;
+	}
+}
+
+/* Recompute after a prune or a same-LSN update; insertion otherwise maintains
+ * this summary incrementally.  The sorted minimum preserves fail-closed checks
+ * even when the invalid entry lies outside an ancestor's visible prefix. */
+static void
+walidx_bad_known_rebuild(WalIdxEnt *entry)
+{
+	entry->bad_known_present = false;
+	for (int i = 0; i < entry->n; i++)
+		if ((entry->items[i].flags & PS_WAL_INDEX_FLAG_KNOWN) &&
+			entry->items[i].end_lsn <= entry->items[i].lsn)
+		{
+			entry->bad_known_lsn = entry->items[i].lsn;
+			entry->bad_known_present = true;
+			break;
+		}
+}
+
+/* Return the first dependency in a sorted entry, preserving the original
+ * scan's fail-closed treatment of every visible invalid record. */
+static int
+walidx_raw_first(const WalIdxEnt *entry, uint64_t visible_cap,
+				 uint64_t store_start, const WalIdxItem **result)
+{
+	const WalIdxItem *first;
+
+	if (entry->n <= 0 || entry->items[0].lsn > visible_cap)
+		return 0;
+	if (entry->bad_known_present && entry->bad_known_lsn <= visible_cap)
+		return -1;
+	first = &entry->items[0];
+	if (first->lsn == 0 || first->lsn < store_start)
+		return -1;
+	*result = first;
+	return 1;
+}
+
+/* Differential regression for sorted entries, ancestry caps and malformed
+ * metadata, including invalid records after the minimum. */
+int
+ps_test_walidx_raw_first(void)
+{
+	WalIdxItem items[128];
+	WalIdxEnt entry = {0};
+	uint64_t rng = 37;
+
+	entry.items = items;
+	for (int trial = 0; trial < 10000; trial++)
+	{
+		uint64_t cap, start, lsn = 0;
+		const WalIdxItem *got = NULL, *expected = NULL;
+		int want = 0, actual;
+
+		rng = rng * UINT64_C(6364136223846793005) + 1;
+		entry.n = (int) (rng % 128);
+		entry.bad_known_present = false;
+		for (int i = 0; i < entry.n; i++)
+		{
+			rng = rng * UINT64_C(6364136223846793005) + 1;
+			lsn += (i == 0 && trial % 7 == 0) ? 0 : 1 + (rng % 5);
+			items[i].lsn = lsn;
+			items[i].flags = (trial % 4 != 0 && (rng & 8)) ? PS_WAL_INDEX_FLAG_KNOWN : 0;
+			items[i].end_lsn = (rng & 32) ? lsn : lsn + 1;
+			walidx_bad_known_consider(&entry, &items[i]);
+		}
+		{
+			bool present = entry.bad_known_present;
+			uint64_t bad = entry.bad_known_lsn;
+
+			walidx_bad_known_rebuild(&entry);
+			if (present != entry.bad_known_present ||
+				(present && bad != entry.bad_known_lsn))
+				return trial + 1;
+		}
+		rng = rng * UINT64_C(6364136223846793005) + 1;
+		cap = trial % 5 == 0 ? UINT64_MAX : rng % 700;
+		rng = rng * UINT64_C(6364136223846793005) + 1;
+		start = trial % 3 == 0 ? 0 : rng % 700;
+		walidx_bad_known_rebuild(&entry);
+		for (int i = 0; i < entry.n && items[i].lsn <= cap; i++)
+		{
+			if (items[i].lsn == 0 || items[i].lsn < start ||
+				((items[i].flags & PS_WAL_INDEX_FLAG_KNOWN) &&
+				 items[i].end_lsn <= items[i].lsn))
+			{
+				want = -1;
+				break;
+			}
+			if (expected == NULL)
+				expected = &items[i];
+			want = 1;
+		}
+		actual = walidx_raw_first(&entry, cap, start, &got);
+		if (actual != want || (actual == 1 && got != expected))
+			return trial + 1;
+	}
+	return 0;
+}
 
 /* Forward declaration: defined later in this file (the shard-indexed
  * WAL-index lookup), but needed by the reclaimer's retirement-evidence
@@ -14683,45 +14795,45 @@ wal_reclaim_raw_dependency_floor(uint32_t timeline, uint64_t store_start,
 		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
 			for (WalIdxEnt *entry = g_shards[shard].walidx[bucket];
 				 entry != NULL; entry = entry->next)
-				if (entry->n != 0)
+				if (entry->n > 0)
 				{
-					for (int i = 0; i < entry->n; i++)
-					{
-						WalIdxItem *item = &entry->items[i];
-						uint64_t projected = item->lsn;
+					uint64_t visible_cap = UINT64_MAX;
 
-						/* Only an ancestry-visible child item consumes raw WAL on
-						 * this timeline.  A child-local item after its fork point
-						 * remains on the child's own WAL store. */
-						if (!retention_project_lsn(entry->timeline, timeline,
-												  &projected) || projected != item->lsn)
-							continue;
-						/* A zero/legacy LSN cannot identify a safe raw-WAL
-						 * dependency.  Unknown metadata is retained at its LSN. */
-						if (item->lsn == 0 || item->lsn < store_start)
-							return -1;
-						if ((item->flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
-							 item->end_lsn <= item->lsn)
-							return -1;
-						if (floor == 0 || item->lsn < floor)
+					const WalIdxItem *item;
+					int status;
+
+					if (!retention_project_lsn(entry->timeline, timeline, &visible_cap))
+						continue;
+					status = walidx_raw_first(entry, visible_cap, store_start, &item);
+					if (status < 0)
+						return -1;
+					if (status == 0)
+						continue;
+					/* A zero/legacy LSN cannot identify a safe raw-WAL
+					 * dependency.  Unknown metadata is retained at its LSN. */
+					if (item->lsn == 0 || item->lsn < store_start)
+						return -1;
+					if ((item->flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
+						 item->end_lsn <= item->lsn)
+						return -1;
+					if (floor == 0 || item->lsn < floor)
+					{
+						floor = item->lsn;
+						wn = 0;
+						overflow = 0;
+					}
+					if (watch_out != NULL && item->lsn == floor)
+					{
+						if (wn < WAL_RECLAIM_WATCH_MAX)
 						{
-							floor = item->lsn;
-							wn = 0;
-							overflow = 0;
+							memset(&watch_out[wn], 0, sizeof(watch_out[wn]));
+							watch_out[wn].key = entry->key;
+							watch_out[wn].block = entry->block;
+							watch_out[wn].lo = item->end_lsn;
+							wn++;
 						}
-						if (watch_out != NULL && item->lsn == floor)
-						{
-							if (wn < WAL_RECLAIM_WATCH_MAX)
-							{
-								memset(&watch_out[wn], 0, sizeof(watch_out[wn]));
-								watch_out[wn].key = entry->key;
-								watch_out[wn].block = entry->block;
-								watch_out[wn].lo = item->end_lsn;
-								wn++;
-							}
-							else
-								overflow = 1;
-						}
+						else
+							overflow = 1;
 					}
 				}
 	*floor_out = floor;
@@ -16522,9 +16634,17 @@ walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn,
 
 		if (i < e->n && e->items[i].lsn == lsn)
 		{
+			bool was_bad = (e->items[i].flags & PS_WAL_INDEX_FLAG_KNOWN) &&
+				e->items[i].end_lsn <= lsn;
+
 			e->items[i].flags |= flags;
 			if (end_lsn != 0)
 				e->items[i].end_lsn = end_lsn;
+			if (was_bad && e->bad_known_present && e->bad_known_lsn == lsn &&
+				e->items[i].end_lsn > lsn)
+				walidx_bad_known_rebuild(e);
+			else
+				walidx_bad_known_consider(e, &e->items[i]);
 			return 0;
 		}
 		memmove(&e->items[i + 1], &e->items[i],
@@ -16533,6 +16653,7 @@ walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn,
 		e->items[i].end_lsn = end_lsn;
 		e->items[i].flags = flags;
 		e->n++;
+		walidx_bad_known_consider(e, &e->items[i]);
 	}
 	return 0;
 }
@@ -17785,6 +17906,7 @@ walidx_prune_memory(uint32_t tl, uint64_t cutoff, const uint64_t *horizons,
 						if (keep[i])
 							e->items[out++] = e->items[i];
 					e->n = out;
+					walidx_bad_known_rebuild(e);
 					free(keep);
 				}
 	}
