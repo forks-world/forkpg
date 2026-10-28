@@ -25449,6 +25449,10 @@ gc_confirm_local(uint32_t shard, const GcVerifiedSet *set, int need_layer)
 		{
 			found = true;
 			layer_verified_forget(d->layer_id);
+			/* The checked file is still the live local copy.  Preserve the
+			 * verification just as the locked verifier did, so the next
+			 * foreground lookup does not checksum the whole layer again. */
+			d->data_verified = true;
 		}
 	}
 	return count != set->count || (need_layer && !found) ? -1 : 0;

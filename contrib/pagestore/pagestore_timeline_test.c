@@ -4593,6 +4593,7 @@ test_page_gc_missing_prefix_preflight(void)
 		  "local GC preflight validates unchanged covered layers");
 	{
 		char path[4096] = "";
+		uint32_t covered_layer = UINT32_MAX;
 		for (uint32_t i = 0; i < ps_layer_map.nlayers && !path[0]; i++)
 		{
 			PsImgIndexEnt *index = NULL;
@@ -4602,11 +4603,19 @@ test_page_gc_missing_prefix_preflight(void)
 					if ((index[j].flags & PS_IMG_REC_SEG_VALID) && index[j].seg_id == 1)
 					{
 						snprintf(path, sizeof(path), "%s", ps_layer_map.layers[i].locations[0].uri);
+						covered_layer = i;
 						break;
 					}
 			free(index);
 		}
 		check(path[0] != '\0', "locate layer covering segment 1");
+		if (covered_layer != UINT32_MAX)
+		{
+			ps_layer_map.layers[covered_layer].data_verified = false;
+			check(ps_test_gc_verified_local(0, 1, NULL, NULL) == 0 &&
+				  ps_layer_map.layers[covered_layer].data_verified,
+				  "successful GC verification is reused by foreground reads");
+		}
 		check(ps_test_gc_verified_local(0, 1, change_gc_layer, path) != 0,
 			  "local GC rejects a layer changed after verification");
 		check(ps_test_gc_verified_local(0, 1, NULL, NULL) != 0,
