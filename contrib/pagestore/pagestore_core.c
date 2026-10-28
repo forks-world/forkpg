@@ -25302,6 +25302,179 @@ segment_has_references(uint32_t source_shard, uint32_t victim)
 	return 0;
 }
 
+/* A local GC preflight is usable only if every layer and physical file is
+ * unchanged when all shard locks and the map lock have been reacquired. */
+typedef struct GcVerifiedLayer
+{
+	PsLayerDesc desc;
+	struct stat identity;
+	bool covers;
+} GcVerifiedLayer;
+
+typedef struct GcVerifiedSet
+{
+	GcVerifiedLayer *layers;
+	uint32_t count;
+	bool ready;
+} GcVerifiedSet;
+
+static bool
+gc_same_file(const struct stat *a, const struct stat *b)
+{
+#ifdef __APPLE__
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+		a->st_size == b->st_size &&
+		a->st_mtimespec.tv_sec == b->st_mtimespec.tv_sec &&
+		a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec &&
+		a->st_ctimespec.tv_sec == b->st_ctimespec.tv_sec &&
+		a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec;
+#else
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+		a->st_size == b->st_size &&
+		a->st_mtim.tv_sec == b->st_mtim.tv_sec &&
+		a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+		a->st_ctim.tv_sec == b->st_ctim.tv_sec &&
+		a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+#endif
+}
+
+/* Return false for unsupported stores or any stale/corrupt observation.
+ * In that case the caller retains the original locked verification path. */
+static bool
+gc_prepare_local(uint32_t shard, uint32_t victim, GcVerifiedSet *set)
+{
+	uint32_t count = 0;
+	bool ok = false;
+
+	if (ps_layer_store != &PsLayerStoreLocal)
+		return false;
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		if (ps_timeline_live(d->timeline) && d->kind == PS_LAYER_IMAGE &&
+			!d->deleting && layer_shard_from_id(d->layer_id) == shard)
+			count++;
+	}
+	set->layers = count ? calloc(count, sizeof(*set->layers)) : NULL;
+	if (count && !set->layers)
+	{
+		ps_unlock_map();
+		return false;
+	}
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		if (ps_timeline_live(d->timeline) && d->kind == PS_LAYER_IMAGE &&
+			!d->deleting && layer_shard_from_id(d->layer_id) == shard)
+			set->layers[set->count++].desc = *d;
+	}
+	ps_unlock_map();
+	for (uint32_t i = 0; i < set->count; i++)
+	{
+		GcVerifiedLayer *v = &set->layers[i];
+		const PsLayerLocation *loc = tier_local_location(&v->desc);
+		PsImgIndexEnt *idx = NULL;
+		uint32_t n = 0;
+		struct stat after, path;
+		int fd;
+
+		if (!loc || !loc->uri[0] || (fd = open(loc->uri, O_RDONLY)) < 0)
+			goto out;
+		if (fstat(fd, &v->identity) != 0 || !S_ISREG(v->identity.st_mode) ||
+			v->identity.st_size < 0 || (uint64_t) v->identity.st_size != loc->size ||
+			ps_image_layer_read_index_fd(&v->desc, fd, &idx, &n) != 0)
+		{
+			close(fd);
+			free(idx);
+			goto out;
+		}
+		for (uint32_t j = 0; j < n; j++)
+			if ((idx[j].flags & PS_IMG_REC_SEG_VALID) && idx[j].seg_id == victim)
+			{ v->covers = true; break; }
+		free(idx);
+		if ((v->covers && ps_image_layer_verify_fd(fd, loc->size, page_size) != 0) ||
+			fstat(fd, &after) != 0 || stat(loc->uri, &path) != 0 ||
+			!gc_same_file(&v->identity, &after) || !gc_same_file(&after, &path))
+		{
+			close(fd);
+			goto out;
+		}
+		close(fd);
+	}
+	set->ready = ok = true;
+out:
+	if (!ok)
+	{
+		free(set->layers);
+		set->layers = NULL;
+		set->count = 0;
+	}
+	return ok;
+}
+
+static int
+gc_confirm_local(uint32_t shard, const GcVerifiedSet *set, int need_layer)
+{
+	uint32_t count = 0;
+	bool found = false;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		const PsLayerLocation *loc;
+		const GcVerifiedLayer *v = NULL;
+		struct stat now;
+		if (!ps_timeline_live(d->timeline) || d->kind != PS_LAYER_IMAGE ||
+			d->deleting || layer_shard_from_id(d->layer_id) != shard)
+			continue;
+		count++;
+		for (uint32_t j = 0; j < set->count; j++)
+			if (set->layers[j].desc.layer_id == d->layer_id)
+			{ v = &set->layers[j]; break; }
+		loc = tier_local_location(d);
+		if (!v || !loc || d->timeline != v->desc.timeline)
+			return -1;
+		{
+			const PsLayerLocation *old = tier_local_location(&v->desc);
+			if (!old || strcmp(old->uri, loc->uri) || old->size != loc->size ||
+				old->generation != loc->generation || stat(loc->uri, &now) != 0 ||
+				!gc_same_file(&v->identity, &now))
+			{
+				layer_verified_forget(d->layer_id);
+				d->data_verified = false;
+				return -1;
+			}
+		}
+		if (v->covers)
+		{
+			found = true;
+			layer_verified_forget(d->layer_id);
+			/* The checked file is still the live local copy.  Preserve the
+			 * verification just as the locked verifier did, so the next
+			 * foreground lookup does not checksum the whole layer again. */
+			d->data_verified = true;
+		}
+	}
+	return count != set->count || (need_layer && !found) ? -1 : 0;
+}
+
+int
+ps_test_gc_verified_local(uint32_t shard, uint32_t victim,
+						  void (*interpose)(void *), void *arg)
+{
+	GcVerifiedSet set = {0};
+	int rc;
+	if (!gc_prepare_local(shard, victim, &set))
+		return -1;
+	if (interpose)
+		interpose(arg);
+	ps_lock_map_rd();
+	rc = gc_confirm_local(shard, &set, 1);
+	ps_unlock_map();
+	free(set.layers);
+	return rc;
+}
+
 static int
 prepare_segment_layers(uint32_t source_shard, uint32_t victim)
 {
@@ -25415,7 +25588,7 @@ verify_segment_layers_locked(uint32_t source_shard, uint32_t victim, int need_la
 }
 
 static int
-reclaim_one_segment(Shard *s, int layers_prepared)
+reclaim_one_segment(Shard *s, int layers_prepared, const GcVerifiedSet *verified)
 {
 	uint32_t	victim;
 	uint32_t	ns = core_shards();
@@ -25456,7 +25629,8 @@ reclaim_one_segment(Shard *s, int layers_prepared)
 	if (!layers_prepared)
 		return 0;
 	refs = segment_has_references(s->id, victim);
-	if (verify_segment_layers_locked(s->id, victim, refs) != 0)
+	if ((verified && verified->ready ? gc_confirm_local(s->id, verified, refs) :
+		 verify_segment_layers_locked(s->id, victim, refs)) != 0)
 		return 0;
 	for (uint32_t sh = 0; sh < ns; sh++)
 		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
@@ -26128,6 +26302,7 @@ ps_core_maintenance_impl(void)
 	{
 		uint32_t prepared_victim[MAX_SHARDS];
 		bool layers_prepared[MAX_SHARDS] = {false};
+		GcVerifiedSet verified[MAX_SHARDS] = {{0}};
 
 		for (uint32_t sh = 0; sh < ns; sh++)
 		{
@@ -26160,7 +26335,8 @@ ps_core_maintenance_impl(void)
 				}
 				if (!missing)
 				{
-					(void) prepare_segment_layers(sh, victim);
+					if (!gc_prepare_local(sh, victim, &verified[sh]))
+						(void) prepare_segment_layers(sh, victim);
 					prepared_victim[sh] = victim;
 					layers_prepared[sh] = true;
 				}
@@ -26172,10 +26348,12 @@ ps_core_maintenance_impl(void)
 		for (uint32_t sh = 0; sh < ns && !found; sh++)
 			found = reclaim_one_segment(&g_shards[sh],
 				layers_prepared[sh] && prepared_victim[sh] ==
-				g_shards[sh].gc_next_seg);
+				g_shards[sh].gc_next_seg, &verified[sh]);
 		ps_unlock_map();
 		for (uint32_t sh = ns; sh > 0; sh--)
 			ps_unlock_shard(sh - 1);
+		for (uint32_t sh = 0; sh < ns; sh++)
+			free(verified[sh].layers);
 		if (found)
 			return 1;
 	}

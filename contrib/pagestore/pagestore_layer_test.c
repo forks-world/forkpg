@@ -379,11 +379,21 @@ main(void)
 			  "corrupt image bytes after cached verification");
 		check(ps_image_layer_verify_data(&d, psz) != 0,
 			  "forced data verification detects post-read corruption");
+		fd = open(d.locations[0].uri, O_RDONLY);
+		check(fd >= 0 && ps_image_layer_verify_fd(fd, d.locations[0].size, psz) != 0,
+			  "single-file verification detects corrupted data");
+		if (fd >= 0)
+			close(fd);
 		check(!d.data_verified, "failed forced verification clears cached success");
 		fd = open(d.locations[0].uri, O_WRONLY);
 		check(fd >= 0 && pwrite(fd, &good, 1, 0) == 1 && close(fd) == 0 &&
 			  ps_image_layer_verify_data(&d, psz) == 0,
 			  "restored image bytes pass forced verification");
+		fd = open(d.locations[0].uri, O_RDONLY);
+		check(fd >= 0 && ps_image_layer_verify_fd(fd, d.locations[0].size, psz) == 0,
+			  "single-file verification accepts restored data");
+		if (fd >= 0)
+			close(fd);
 	}
 
 	/* Lookups go through a cached, binary-searched index: many keys written
