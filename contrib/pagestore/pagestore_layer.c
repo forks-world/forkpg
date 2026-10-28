@@ -687,11 +687,14 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 		idx_bytes != loc->size - sizeof(foot) - foot.index_off ||
 		idx_bytes > UINT32_MAX)
 		return -1;
-	disk = malloc((size_t) idx_bytes);
 	idx = malloc((size_t) foot.nrecs * sizeof(PsImgIndexEnt));
+	/* The current on-disk entries already have the in-memory layout.  Read
+	 * them directly into the result; older formats still need conversion. */
+	disk = foot.version == PS_IMG_VERSION ? idx : malloc((size_t) idx_bytes);
 	if (!disk || !idx)
 	{
-		free(disk);
+		if (disk != idx)
+			free(disk);
 		free(idx);
 		return -1;
 	}
@@ -699,7 +702,8 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 										 (uint32_t) idx_bytes) != 0 ||
 		img_crc(disk, (size_t) idx_bytes) != foot.index_crc)
 	{
-		free(disk);
+		if (disk != idx)
+			free(disk);
 		free(idx);
 		return -1;
 	}
@@ -734,9 +738,8 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 			idx[i].flags = old[i].flags;
 		}
 	}
-	else
-		memcpy(idx, disk, (size_t) idx_bytes);
-	free(disk);
+	if (disk != idx)
+		free(disk);
 	*out = idx;
 	*n = foot.nrecs;
 	return 0;
