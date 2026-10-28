@@ -4532,6 +4532,32 @@ sparse_gc_segment_size(uint32_t shard, int seg)
 }
 
 static void
+change_gc_layer(void *arg)
+{
+	char *path = arg;
+	unsigned char byte;
+	int fd = open(path, O_RDWR);
+	if (fd >= 0)
+	{
+		if (pread(fd, &byte, 1, 0) == 1)
+		{
+			byte ^= 0xff;
+			(void) pwrite(fd, &byte, 1, 0);
+		}
+		close(fd);
+	}
+}
+
+static void
+change_gc_layer_set(void *arg)
+{
+	(void) arg;
+	ps_lock_map_wr();
+	ps_layer_map.layers[0].deleting = true;
+	ps_unlock_map();
+}
+
+static void
 test_page_gc_missing_prefix_preflight(void)
 {
 	char store[] = "/tmp/pagestore-gc-missing-prefix-XXXXXX";
@@ -4563,6 +4589,37 @@ test_page_gc_missing_prefix_preflight(void)
 		return;
 	}
 	segment_gc_enabled = 1;
+	check(ps_test_gc_verified_local(0, 1, NULL, NULL) == 0,
+		  "local GC preflight validates unchanged covered layers");
+	{
+		char path[4096] = "";
+		for (uint32_t i = 0; i < ps_layer_map.nlayers && !path[0]; i++)
+		{
+			PsImgIndexEnt *index = NULL;
+			uint32_t n = 0;
+			if (ps_image_layer_read_index(&ps_layer_map.layers[i], &index, &n) == 0)
+				for (uint32_t j = 0; j < n; j++)
+					if ((index[j].flags & PS_IMG_REC_SEG_VALID) && index[j].seg_id == 1)
+					{
+						snprintf(path, sizeof(path), "%s", ps_layer_map.layers[i].locations[0].uri);
+						break;
+					}
+			free(index);
+		}
+		check(path[0] != '\0', "locate layer covering segment 1");
+		check(ps_test_gc_verified_local(0, 1, change_gc_layer, path) != 0,
+			  "local GC rejects a layer changed after verification");
+		check(ps_test_gc_verified_local(0, 1, NULL, NULL) != 0,
+			  "local GC rejects corruption present before preflight");
+		change_gc_layer(path);
+		check(ps_test_gc_verified_local(0, 1, NULL, NULL) == 0,
+			  "restored layer can be verified again");
+		check(ps_test_gc_verified_local(0, 1, change_gc_layer_set, NULL) != 0,
+			  "local GC rejects a changed live layer set");
+		ps_lock_map_wr();
+		ps_layer_map.layers[0].deleting = false;
+		ps_unlock_map();
+	}
 	counted_layers.read_layer_block = sparse_gc_read_layer;
 	ps_layer_store = &counted_layers;
 	sparse_gc_layer_reads = 0;

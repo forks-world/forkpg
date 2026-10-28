@@ -5,7 +5,9 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -658,8 +660,33 @@ out:
 	return rc;
 }
 
-int
-ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
+static int
+image_fd_read(int fd, uint64_t off, void *buf, uint32_t len)
+{
+	uint32_t done = 0;
+	if (off > INT64_MAX || len > INT64_MAX - off)
+		return -1;
+	while (done < len)
+	{
+		ssize_t n = pread(fd, (char *) buf + done, len - done, (off_t) (off + done));
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return -1;
+		done += (uint32_t) n;
+	}
+	return 0;
+}
+
+static int
+image_index_read(const PsLayerDesc *layer, int fd, uint64_t off, void *buf, uint32_t len)
+{
+	return fd >= 0 ? image_fd_read(fd, off, buf, len) :
+		ps_layer_store->read_layer_block(layer, off, buf, len);
+}
+
+static int
+image_read_index_impl(const PsLayerDesc *layer, int fd, PsImgIndexEnt **out,
 						  uint32_t *n)
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
@@ -673,7 +700,7 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 	*n = 0;
 	if (!loc || loc->size < sizeof(PsImgFooter))
 		return -1;
-	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
+	if (image_index_read(layer, fd, loc->size - sizeof(foot),
 									 &foot, sizeof(foot)) != 0)
 		return -1;
 	if (foot.magic != PS_IMG_MAGIC ||
@@ -698,7 +725,7 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 		free(idx);
 		return -1;
 	}
-	if (ps_layer_store->read_layer_block(layer, foot.index_off, disk,
+	if (image_index_read(layer, fd, foot.index_off, disk,
 										 (uint32_t) idx_bytes) != 0 ||
 		img_crc(disk, (size_t) idx_bytes) != foot.index_crc)
 	{
@@ -745,6 +772,18 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 	return 0;
 }
 
+int
+ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out, uint32_t *n)
+{
+	return image_read_index_impl(layer, -1, out, n);
+}
+
+int
+ps_image_layer_read_index_fd(const PsLayerDesc *layer, int fd, PsImgIndexEnt **out, uint32_t *n)
+{
+	return image_read_index_impl(layer, fd, out, n);
+}
+
 static int
 verify_layer_data(const PsLayerDesc *layer, uint64_t bytes, uint32_t expected)
 {
@@ -768,6 +807,41 @@ verify_layer_data(const PsLayerDesc *layer, uint64_t bytes, uint32_t expected)
 out:
 	free(buffer);
 	return rc;
+}
+
+/* Verify data through one already-open immutable file, without reopening its
+ * pathname between chunks.  Its caller must check that the file did not change. */
+int
+ps_image_layer_verify_fd(int fd, uint64_t size, uint32_t page_size)
+{
+	PsImgFooter foot;
+	unsigned char *buffer;
+	uint32_t crc = 2166136261u;
+	uint64_t offset = 0;
+
+	if (size < sizeof(foot) || size > INT64_MAX ||
+		image_fd_read(fd, size - sizeof(foot), &foot, sizeof(foot)) != 0 ||
+		foot.magic != PS_IMG_MAGIC ||
+		(foot.version != 2 && foot.version != 3 && foot.version != PS_IMG_VERSION) ||
+		foot.page_size != page_size || foot.index_off > size - sizeof(foot))
+		return -1;
+	buffer = malloc(IMAGE_STREAM_BYTES);
+	if (!buffer)
+		return -1;
+	while (offset < foot.index_off)
+	{
+		uint32_t len = foot.index_off - offset > IMAGE_STREAM_BYTES ?
+			IMAGE_STREAM_BYTES : (uint32_t) (foot.index_off - offset);
+		if (image_fd_read(fd, offset, buffer, len) != 0)
+		{
+			free(buffer);
+			return -1;
+		}
+		crc = img_crc_extend(crc, buffer, len);
+		offset += len;
+	}
+	free(buffer);
+	return crc == foot.data_crc ? 0 : -1;
 }
 
 int
