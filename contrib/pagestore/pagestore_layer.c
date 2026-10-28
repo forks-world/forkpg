@@ -835,6 +835,7 @@ ps_delta_layer_verify_data(const PsLayerDesc *layer)
  */
 #define PS_IMG_IDX_CACHE_SLOTS	128
 #define PS_IMG_IDX_CACHE_BYTES	((size_t) 256 << 20)
+#define PS_IMG_IDX_LARGE_BYTES	((size_t) 64 << 10)
 
 typedef struct ImgIdxCacheEnt
 {
@@ -921,11 +922,27 @@ img_idx_cache_reserve_locked(size_t bytes)
 
 		for (int i = 0; i < PS_IMG_IDX_CACHE_SLOTS; i++)
 		{
-			if (img_idx_cache[i] == NULL)
+			ImgIdxCacheEnt *entry = img_idx_cache[i];
+			bool prefer_small;
+
+			if (entry == NULL)
+			{
 				free_slot = i;
-			else if (img_idx_cache[i]->refs == 0 &&
-					 (victim < 0 ||
-					  img_idx_cache[i]->last_use < img_idx_cache[victim]->last_use))
+				continue;
+			}
+			if (entry->refs != 0)
+				continue;
+			/* Under slot pressure, retain expensive indexes while cheap
+			 * small indexes cycle.  Under byte pressure use ordinary LRU:
+			 * keeping a big entry could otherwise evict every small one. */
+			prefer_small = img_idx_cache_bytes + bytes <= PS_IMG_IDX_CACHE_BYTES;
+			if (victim < 0 ||
+				(prefer_small && entry->bytes < PS_IMG_IDX_LARGE_BYTES &&
+				 img_idx_cache[victim]->bytes >= PS_IMG_IDX_LARGE_BYTES) ||
+				((!prefer_small ||
+				  (entry->bytes < PS_IMG_IDX_LARGE_BYTES) ==
+				  (img_idx_cache[victim]->bytes < PS_IMG_IDX_LARGE_BYTES)) &&
+				 entry->last_use < img_idx_cache[victim]->last_use))
 				victim = i;
 		}
 		if (free_slot >= 0 &&

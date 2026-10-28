@@ -139,6 +139,62 @@ streaming_layer_test(void)
 	ps_layer_store = saved;
 	free(recs);
 }
+
+/* A sweep of tiny layers must not evict an expensive large index merely
+ * because the fixed number of cache slots filled up. */
+static unsigned large_index_reads;
+
+static int
+counted_index_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
+{
+	if (layer->layer_id == 30000 && off == (uint64_t) 1024 * PSZ &&
+		len == 1024 * sizeof(PsImgIndexEnt))
+		large_index_reads++;
+	return PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
+}
+
+static void
+index_cache_pressure_test(void)
+{
+	PsLayerStore counted = PsLayerStoreLocal;
+	const PsLayerStore *saved = ps_layer_store;
+	PsImgRec *recs = calloc(1024, sizeof(*recs));
+	PsLayerDesc large, small;
+	PsKey key = {1, 1, 30000, 0, PS_KLASS_RELATION};
+	unsigned char page[PSZ] = {0};
+	int ok = 1;
+
+	check(recs != NULL, "allocate cache pressure fixture");
+	if (recs == NULL)
+		return;
+	ps_image_layer_cache_reset();
+	counted.read_layer_block = counted_index_read;
+	ps_layer_store = &counted;
+	for (uint32_t i = 0; i < 1024; i++)
+	{
+		recs[i].key = key;
+		recs[i].block = i;
+		recs[i].lsn = 100;
+		recs[i].page = page;
+	}
+	if (ps_image_layer_write(30000, 0, recs, 1024, PSZ, &large) != 0 ||
+		ps_image_layer_lookup(&large, &key, 0, 100, 0, page, PSZ, NULL, NULL) != 1)
+		ok = 0;
+	for (uint64_t id = 30001; id <= 30130 && ok; id++)
+	{
+		if (ps_image_layer_write(id, 0, recs, 1, PSZ, &small) != 0 ||
+			ps_image_layer_lookup(&small, &key, 0, 100, 0, page, PSZ, NULL, NULL) != 1)
+			ok = 0;
+	}
+	if (ok && ps_image_layer_lookup(&large, &key, 0, 100, 0, page, PSZ, NULL, NULL) != 1)
+		ok = 0;
+	check(ok, "large and small layers remain readable through cache pressure");
+	check(large_index_reads == 1, "small-index churn retains the large verified index");
+	ps_image_layer_cache_reset();
+	ps_layer_store = saved;
+	free(recs);
+}
+
 int
 main(void)
 {
@@ -459,6 +515,7 @@ main(void)
 	}
 
 	streaming_layer_test();
+	index_cache_pressure_test();
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }
