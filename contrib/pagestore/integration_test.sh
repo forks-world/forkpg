@@ -1723,6 +1723,9 @@ $P -c "CREATE FUNCTION pagestore_test_control_error(regclass) RETURNS boolean
        CREATE FUNCTION pagestore_test_redo_base(integer) RETURNS boolean
        AS '$BUILD/contrib/pagestore/pagestore_mirror_error_test',
           'pagestore_test_redo_base' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_test_recovery_write_flag() RETURNS boolean
+        AS '$BUILD/contrib/pagestore/pagestore_recovery_read_test',
+          'pagestore_test_recovery_write_flag' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_test_recovery_read(integer) RETURNS boolean
        AS '$BUILD/contrib/pagestore/pagestore_recovery_read_test',
           'pagestore_test_recovery_read' LANGUAGE C STRICT;" >/dev/null
@@ -1739,6 +1742,8 @@ assert "$($P -c "SELECT pagestore_test_control_error('pg_class') AND
 assert "$($P -c "SELECT bool_and(pagestore_test_redo_base(mode)) FROM generate_series(0,4) mode;")" "t" \
     "redo uses one index-view base/lifecycle reply, rejects I/O failure, and supports legacy daemons"
 
+assert "$($P -c "SELECT pagestore_test_recovery_write_flag();")" "t" \
+    "recovery writes identify active replay separately from promotion"
 assert "$($P -c "SELECT bool_and(pagestore_test_recovery_read(mode)) FROM generate_series(0,6) mode;")" "t" \
     "startup page reads respect the durable recovery floor while metadata and pinned caps stay finite"
 

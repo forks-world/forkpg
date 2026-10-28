@@ -367,7 +367,7 @@ append_relation_recovery_timeline_tag(uint32_t timeline, const PsKey *key,
 	page[128] = tag;
 	ps_admission_read_lock();
 	ps_lock_shard_wr(ps_shard_of(key));
-	rc = ps_artifact_write_recovery(timeline, key, block, page, 0, 0, seq, NULL);
+	rc = ps_artifact_write_recovery(timeline, key, block, page, lsn, 0, seq, NULL);
 	ps_unlock_shard(ps_shard_of(key));
 	ps_admission_read_unlock();
 	return rc;
@@ -2256,6 +2256,8 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 	PsKey key = {6, 6, 31, 1, PS_KLASS_RELATION};
 	PsKey floor_key = {6, 6, 33, 1, PS_KLASS_RELATION};
 	PsKey rec_key = {6, 6, 45, 1, PS_KLASS_RELATION};
+	PsKey rec_order_key = {6, 6, 46, 1, PS_KLASS_RELATION};
+	PsKey rec_equal_key = {6, 6, 47, 1, PS_KLASS_RELATION};
 	PsKey pin_key = {6, 6, 32, 0, PS_KLASS_RELATION};
 	PsRetentionPin pin;
 	TestSnapshotHeader hdr;
@@ -2285,6 +2287,14 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 								 100 + timeline, 0, 0, 0, NULL) &&
 		  append_relation_timeline(timeline, &rec_key, 0, lsn, page, NULL) == 0,
 		  "E6 create the recovery-flush fork before the cutoff");
+	if (timeline == 0 && !walless)
+		check(meta_request_timeline(timeline, PS_OP_CREATE, &rec_order_key, 100, 0, 0, 0, NULL) &&
+			  append_relation_timeline(timeline, &rec_order_key, 0, 100, page, NULL) == 0,
+			  "create recovery ordering fork before metadata cutoff");
+	if (timeline == 0 && !walless)
+		check(meta_request_timeline(timeline, PS_OP_CREATE, &rec_equal_key, 100, 0, 0, 0, NULL) &&
+			  append_relation_timeline(timeline, &rec_equal_key, 0, 100, page, NULL) == 0,
+			  "create same-LSN recovery fork before metadata cutoff");
 	memset(&pin, 0, sizeof(pin));
 	pin.owner_kind = 1;
 	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
@@ -2349,6 +2359,28 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 		check(drc == 0 && drr == 1 && dtag == 0x7b &&
 			  dcut == 1 && dctag == (unsigned char) (timeline + 0x20),
 			  "E6 recovery flush is ordered after the durable forkmeta cutoff");
+		if (timeline == 0)
+		{
+			check(append_relation_timeline_tag(timeline, &rec_order_key, 2, 400, page, 0x7d, NULL) == 0 &&
+				  meta_request_timeline(timeline, PS_OP_TRUNCATE, &rec_order_key, 425, 0, 1, 0, NULL) &&
+				  append_relation_timeline_tag(timeline, &rec_order_key, 0, 500, page, 0x7f, NULL) == 0,
+				  "create stale page and truncate before later fork activity");
+			check(append_relation_recovery_timeline_tag(timeline, &rec_order_key, 2, 400, page, 0x70, NULL) != 0,
+				  "stale pre-truncate recovery page fails closed when bytes differ");
+			check(append_relation_recovery_timeline_tag(timeline, &rec_order_key, 2, 400, page, 0x7d, NULL) == 0 &&
+				  append_relation_timeline_tag(timeline, &rec_order_key, 2, 450, page, 0x7e, NULL) == 0 &&
+				  read_resolve(timeline, &rec_order_key, 2, UINT64_MAX, 0, page, NULL) == 1 &&
+				  page[128] == 0x7e,
+				  "stale pre-truncate recovery flush cannot mask later WAL page");
+			check(append_relation_timeline_tag(timeline, &rec_equal_key, 2, 400, page, 0x6d, NULL) == 0 &&
+				  meta_request_timeline(timeline, PS_OP_TRUNCATE, &rec_equal_key, 400, 0, 1, 0, NULL) &&
+				  append_relation_timeline_tag(timeline, &rec_equal_key, 0, 500, page, 0x6f, NULL) == 0 &&
+				  append_relation_recovery_timeline_tag(timeline, &rec_equal_key, 2, 400, page, 0x6d, NULL) == 0 &&
+				  append_relation_timeline_tag(timeline, &rec_equal_key, 2, 450, page, 0x6e, NULL) == 0 &&
+				  read_resolve(timeline, &rec_equal_key, 2, UINT64_MAX, 0, page, NULL) == 1 &&
+				  page[128] == 0x6e,
+				  "same-LSN truncate orders the original page before the stale flush");
+		}
 	}
 	{
 		/* The FSM/VM shape: rewrite a block that is already addressable, with a
@@ -2415,6 +2447,10 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 			  read_resolve(timeline, &floor_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
 			  page[128] == 0x74,
 			  "E6 ordered bytes and size survive repeated reopen");
+		if (timeline == 0 && !walless)
+			check(read_resolve(timeline, &rec_order_key, 2, UINT64_MAX, 0, page, NULL) == 1 &&
+				  page[128] == 0x7e,
+				  "later WAL page survives recovery and metadata cutover");
 		if (timeline)
 			check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 0 &&
 				  meta_request(PS_OP_NBLOCKS, &key, 0, 0, 0, 0, &reply) && reply.result == 0,
