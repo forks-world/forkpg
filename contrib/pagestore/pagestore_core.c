@@ -19407,6 +19407,57 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	hdr.len = page_size;
 
+	/* A recovery checkpointer can flush a buffer from before a truncate
+	 * after the store has already learned that truncate from later replay.
+	 * During active WAL recovery, promoting those stale bytes past the
+	 * truncate resurrects them and can
+	 * mask a later WAL page.  Suppress only an exact, already stored copy;
+	 * when that cannot be established, refuse instead of guessing. */
+	if (key->klass == PS_KLASS_RELATION && floor_mode == 1 && version != 0 &&
+		hdr.lsn != 0 && fe && fe->last_def_lsn >= hdr.lsn)
+	{
+		PageVer candidate = {0};
+		ViewCap newest = viewcap_from_request(UINT64_MAX, 0);
+		PageEnt *entry = page_find(timeline, key, block);
+		PageVer *old = entry ? page_visible(entry, hdr.lsn, 0) : NULL;
+
+		candidate.lsn = hdr.lsn;
+		/* A same-LSN truncate is ordered against the original stored page,
+		 * not the admission sequence of this late duplicate. */
+		candidate.admission_seq = old && old->lsn == hdr.lsn ?
+			old->admission_seq : admission_seq;
+		if (fork_page_invalidated(fe, block, &candidate, &newest, 0, false))
+		{
+			unsigned char *bytes = malloc(page_size);
+			int found = 0;
+
+			if (old && old->lsn == hdr.lsn && bytes)
+			{
+				if (old->seg >= 0 && read_version(old, bytes) == 0)
+					found = 1;
+				else
+				{
+					uint64_t resolved = 0, resolved_seq = 0;
+					ps_lock_map_rd();
+					found = layer_map_lookup_locked(timeline, key, block, hdr.lsn,
+						old->admission_seq, hdr.lsn, &resolved, &resolved_seq, bytes) == 1 &&
+						resolved == hdr.lsn && resolved_seq == old->admission_seq;
+					ps_unlock_map();
+				}
+			}
+			if (found && memcmp(page, bytes, page_size) == 0)
+			{
+				free(bytes);
+				if (out_admission_seq)
+					*out_admission_seq = 0;
+				return 0;
+			}
+			free(bytes);
+			*outcome = PS_APPEND_REFUSED_INVALID;
+			return -1;
+		}
+	}
+
 	/*
 	 * Materializer recovery flush.  Do not use the live replay head as the
 	 * write position: a checkpointer can flush a page dirtied at P long after

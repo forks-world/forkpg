@@ -819,6 +819,11 @@ ls_recovery_floor(PsChannel *ch)
 	 */
 	ch->req_floor_lsn = 0;
 	ch->is_redo = pagestore_materializer_enabled() ? PS_WRITE_REPLAY_FLOOR : 0;
+	/* req_lsn is not a version for relation writes.  Convey whether this
+	 * flush belongs to active recovery, without using it as the page LSN.
+	 * In particular, post-promotion writes must retain copy/regrowth semantics. */
+	ch->req_lsn = ch->is_redo && RecoveryInProgress() ?
+		(uint64) GetXLogReplayRecPtr(NULL) : 0;
 }
 
 static void

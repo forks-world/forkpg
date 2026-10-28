@@ -19,12 +19,38 @@ static XLogRecPtr test_completed;
 
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pagestore_test_recovery_read);
+PG_FUNCTION_INFO_V1(pagestore_test_recovery_write_flag);
+
+static bool test_materializer;
 
 /* The private test backend is never initialized or used for materialization. */
 bool
 pagestore_materializer_enabled(void)
 {
-	return false;
+	return test_materializer;
+}
+
+Datum
+pagestore_test_recovery_write_flag(PG_FUNCTION_ARGS)
+{
+	PsChannel ch = {0};
+	bool ok;
+
+	test_materializer = true;
+	test_recovery = true;
+	test_completed = 100;
+	ls_recovery_floor(&ch);
+	ok = ch.is_redo == PS_WRITE_REPLAY_FLOOR && ch.req_lsn == 100 &&
+		ch.req_floor_lsn == 0;
+	test_recovery = false;
+	ls_recovery_floor(&ch);
+	ok = ok && ch.is_redo == PS_WRITE_REPLAY_FLOOR && ch.req_lsn == 0;
+	test_materializer = false;
+	test_recovery = true;
+	ls_recovery_floor(&ch);
+	ok = ok && ch.is_redo == 0 && ch.req_lsn == 0;
+	test_recovery = false;
+	PG_RETURN_BOOL(ok);
 }
 
 Datum

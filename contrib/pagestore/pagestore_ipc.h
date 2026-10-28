@@ -30,7 +30,10 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		51	/* 51: finite index views can depend on retained
+#define PS_SHM_VERSION		52	/* 52: recovery writes carry the active replay
+								 * position in req_lsn, enabling safe stale-page
+								 * suppression; mixed versions must not attach.
+								 * 51: finite index views can depend on retained
 								 * bases/lifecycle via WAL_BASE_STATE after FPI
 								 * retirement; old readers must fail the handshake.
 								 * 50: PS_WRITE_REPLAY_FLOOR semantics for relation
@@ -364,9 +367,9 @@ typedef struct PsWalIndexEntry
 #define PS_WAL_BASE_VIEW_UNREGISTERED 1u
 #define PS_BARRIER_REGISTER UINT32_C(0x50494e35)
 #define PS_ARTIFACT_BEGIN_CAPPED_READ UINT32_C(0x43415035)
-/* WRITEV/EXTEND: req_floor_lsn is a real-time recovery floor, not stale data.
- * The materializer sets this on checkpoint flushes; all other clients leave
- * is_redo zero, so an uninitialized req_floor_lsn is never interpreted. */
+/* WRITEV/EXTEND: the materializer marks recovery-floor writes with this value.
+ * For relation pages req_lsn is the current replay position while recovery is
+ * active, or zero after promotion; it is not the page version. */
 #define PS_WRITE_REPLAY_FLOOR UINT32_C(0x52464c52)
 
 /* Retention owners are intentionally few: structural branch pins are derived
