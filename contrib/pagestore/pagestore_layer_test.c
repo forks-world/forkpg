@@ -195,6 +195,43 @@ index_cache_pressure_test(void)
 	free(recs);
 }
 
+/* The current-format index need not allocate a second full-size copy. */
+static void *index_read_destination;
+
+static int
+capture_index_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
+{
+	if (layer->layer_id == 30131 && off == PSZ && len == sizeof(PsImgIndexEnt))
+		index_read_destination = buf;
+	return PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
+}
+
+static void
+index_direct_read_test(void)
+{
+	PsLayerStore counted = PsLayerStoreLocal;
+	const PsLayerStore *saved = ps_layer_store;
+	PsKey key = {1, 1, 30131, 0, PS_KLASS_RELATION};
+	unsigned char page[PSZ] = {0};
+	PsImgRec rec = {.key = key, .block = 0, .lsn = 100, .page = page};
+	PsLayerDesc layer;
+	PsImgIndexEnt *index = NULL;
+	uint32_t n = 0;
+	int rc;
+
+	counted.read_layer_block = capture_index_read;
+	ps_layer_store = &counted;
+	index_read_destination = NULL;
+	rc = ps_image_layer_write(30131, 0, &rec, 1, PSZ, &layer);
+	if (rc == 0)
+		rc = ps_image_layer_read_index(&layer, &index, &n);
+	check(rc == 0 && n == 1 && index == index_read_destination &&
+		  index->key.relNumber == key.relNumber,
+		  "current index is read and verified directly into the result buffer");
+	free(index);
+	ps_layer_store = saved;
+}
+
 int
 main(void)
 {
@@ -516,6 +553,7 @@ main(void)
 
 	streaming_layer_test();
 	index_cache_pressure_test();
+	index_direct_read_test();
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }

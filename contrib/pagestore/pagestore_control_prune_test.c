@@ -23,6 +23,8 @@
 
 #include "pagestore_artifact_format.h"
 #include "pagestore_core.h"
+#include "pagestore_layer.h"
+#include "pagestore_layer_store.h"
 
 static int checks;
 static int failed;
@@ -1176,9 +1178,74 @@ test_independent_blocks_keep_their_newest(void)
 	remove_tree(store);
 }
 
+static uint32_t compact_test_reads;
+static bool compact_test_fail_bulk;
+
+static int
+compact_counted_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
+{
+	compact_test_reads++;
+	if (compact_test_fail_bulk && len > page_size)
+		return -1;
+	return PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
+}
+
+static void
+test_compaction_source_read_batch(void)
+{
+	char store[] = "/tmp/pagestore-compact-read-XXXXXX";
+	PsLayerStore counted = PsLayerStoreLocal;
+	PsImgRec recs[32] = {0};
+	unsigned char pages[32][8192];
+	unsigned char *out = malloc(sizeof(pages));
+	PsLayerDesc layer;
+	PsKey key = {1, 1, 31000, 0, PS_KLASS_RELATION};
+	int rc;
+
+	configure_core(0);
+	if (out == NULL || mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open compaction source-read fixture");
+		free(out);
+		return;
+	}
+	for (uint32_t i = 0; i < 32; i++)
+	{
+		memset(pages[i], (int) i, sizeof(pages[i]));
+		recs[i] = (PsImgRec) {.key = key, .block = i, .lsn = 100, .page = pages[i]};
+	}
+	rc = ps_image_layer_write(31000, 0, recs, 32, page_size, &layer);
+	check(rc == 0, "create contiguous compaction source layer");
+	if (rc != 0)
+	{
+		close_store();
+		remove_tree(store);
+		free(out);
+		return;
+	}
+	counted.read_layer_block = compact_counted_read;
+	ps_layer_store = &counted;
+	compact_test_reads = 0;
+	compact_test_fail_bulk = false;
+	rc = ps_test_compact_read_batch(&layer, 32, out);
+	check(rc == 0 && memcmp(out, pages, sizeof(pages)) == 0 && compact_test_reads == 1,
+		  "adjacent compaction pages share a verified source read");
+	compact_test_reads = 0;
+	compact_test_fail_bulk = true;
+	rc = ps_test_compact_read_batch(&layer, 32, out);
+	check(rc == 0 && memcmp(out, pages, sizeof(pages)) == 0 && compact_test_reads >= 32,
+		  "failed bulk reads fall back to individual source reads");
+	ps_layer_store = &PsLayerStoreLocal;
+	close_store();
+	remove_tree(store);
+	free(out);
+}
+
 int
 main(void)
 {
+	test_compaction_source_read_batch();
+	check(ps_test_control_fence_selections() == 0, "cached control fence selections match the original planner");
 	test_floor_retires_older_checkpoints();
 	test_note_identity_trailer();
 	test_reader_pin_retains_its_checkpoint();

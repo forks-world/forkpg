@@ -909,10 +909,13 @@ static int control_chain_plan(uint32_t timeline, const PsKey *key,
 							  const PsHistoryFence *fences, uint32_t nfences,
 							  PsControlChainPlan *plan);
 struct PageEnt;
+static PageVer **control_fence_selections(const struct PageEnt *entry,
+												 const PsHistoryFence *fences, uint32_t nfences);
 static int control_chain_keeps(const PsControlChainPlan *plan,
 							   const struct PageEnt *entry, uint32_t block,
 							   const PsPruneVersion *v,
-							   const PsHistoryFence *fences, uint32_t nfences);
+							   const PsHistoryFence *fences, uint32_t nfences,
+							   PageVer *const *selections);
 static struct PageEnt *page_find(uint32_t timeline, const PsKey *key, uint32_t block);
 static int prune_version_cmp(const void *va, const void *vb);
 struct PageVer;
@@ -3669,12 +3672,19 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				const struct PageEnt *entry = page_find(timeline,
 														&order[first].key,
 														order[first].block);
+				PageVer **selections = NULL;
 
+				if (entry != NULL && order[first].block != PS_CONTROL_IMAGE_BLOCK &&
+					order[first].block < PS_CONTROL_PAIRED_BLOCKS)
+					selections = control_fence_selections(entry, control_fences,
+														 ncontrol_fences);
 				for (uint32_t i = first; i < end; i++)
 					keep[i - first] = control_chain_keeps(&plan, entry,
 														  order[first].block,
 													  &order[i].version,
-													  control_fences, ncontrol_fences);
+																  control_fences, ncontrol_fences,
+																  selections);
+				free(selections);
 			}
 			free(plan.chain);
 			free(plan.kept);
@@ -3756,13 +3766,99 @@ typedef struct CompactPageSource
 	uint64_t	offset;
 } CompactPageSource;
 
+#define COMPACT_READ_SLOTS 8
+#define COMPACT_READ_BYTES (256 * 1024)
+
+typedef struct CompactReadSlot
+{
+	uint64_t layer_id;
+	uint64_t offset;
+	uint64_t last_use;
+	uint32_t len;
+	unsigned char *bytes;
+	bool valid;
+} CompactReadSlot;
+
+typedef struct CompactReadCache
+{
+	CompactReadSlot slots[COMPACT_READ_SLOTS];
+	uint64_t clock;
+} CompactReadCache;
+
 static int
 compact_read_page(const PsImgRec *rec, void *page, void *arg)
 {
 	const CompactPageSource *source = rec->page;
+	CompactReadCache *cache = arg;
+	const PsLayerLocation *loc = tier_local_location(source->layer);
+	uint64_t aligned = source->offset - source->offset % COMPACT_READ_BYTES;
+	uint64_t in_chunk = source->offset - aligned;
+	CompactReadSlot *slot = NULL;
+	uint32_t len;
 
-	(void) arg;
-	return read_layer_block_refreshing(source->layer, source->offset, page, page_size);
+	if (loc == NULL)
+		loc = tier_remote_location(source->layer);
+	if (cache == NULL || loc == NULL || page_size > COMPACT_READ_BYTES ||
+		aligned >= loc->size || in_chunk + page_size > COMPACT_READ_BYTES ||
+		source->offset > loc->size || page_size > loc->size - source->offset)
+		return read_layer_block_refreshing(source->layer, source->offset, page, page_size);
+	len = loc->size - aligned < COMPACT_READ_BYTES ?
+		(uint32_t) (loc->size - aligned) : COMPACT_READ_BYTES;
+	if (in_chunk + page_size > len)
+		return read_layer_block_refreshing(source->layer, source->offset, page, page_size);
+	for (int i = 0; i < COMPACT_READ_SLOTS; i++)
+	{
+		CompactReadSlot *candidate = &cache->slots[i];
+
+		if (candidate->valid && candidate->layer_id == source->layer->layer_id &&
+			candidate->offset == aligned && candidate->len == len)
+		{
+			candidate->last_use = ++cache->clock;
+			memcpy(page, candidate->bytes + in_chunk, page_size);
+			return 0;
+		}
+		if (slot == NULL || !candidate->valid ||
+			(slot->valid && candidate->last_use < slot->last_use))
+			slot = candidate;
+	}
+	if (slot->bytes == NULL)
+		slot->bytes = malloc(COMPACT_READ_BYTES);
+	if (slot->bytes == NULL)
+		return read_layer_block_refreshing(source->layer, source->offset, page, page_size);
+	slot->valid = false;
+	if (read_layer_block_refreshing(source->layer, aligned, slot->bytes, len) != 0)
+		return read_layer_block_refreshing(source->layer, source->offset, page, page_size);
+	slot->layer_id = source->layer->layer_id;
+	slot->offset = aligned;
+	slot->len = len;
+	slot->last_use = ++cache->clock;
+	slot->valid = true;
+	memcpy(page, slot->bytes + in_chunk, page_size);
+	return 0;
+}
+
+/* Test seam for source reads; callers own the provider and result buffer. */
+int
+ps_test_compact_read_batch(const PsLayerDesc *layer, uint32_t npages,
+						   unsigned char *out)
+{
+	CompactReadCache cache = {0};
+	CompactPageSource source = {.layer = layer};
+	PsImgRec rec = {.page = &source};
+	int rc = 0;
+
+	for (uint32_t i = 0; i < npages; i++)
+	{
+		source.offset = (uint64_t) i * page_size;
+		if (compact_read_page(&rec, out + (size_t) i * page_size, &cache) != 0)
+		{
+			rc = -1;
+			break;
+		}
+	}
+	for (int i = 0; i < COMPACT_READ_SLOTS; i++)
+		free(cache.slots[i].bytes);
+	return rc;
 }
 
 static int
@@ -3781,6 +3877,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	PsLayerLocation remote;
 	PsImgRec   *dropped = NULL;
 	uint32_t	ndropped = 0;
+	CompactReadCache read_cache = {0};
 	uint64_t	frontier_seq;
 	int			rc = -1;
 
@@ -3950,7 +4047,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	{
 	nid = alloc_layer_id(&g_shards[shard]);
 	if (ps_image_layer_write_stream(nid, timeline, recs, nrec, page_size,
-						 compact_read_page, NULL, &newdesc) != 0)
+						 compact_read_page, &read_cache, &newdesc) != 0)
 		goto cleanup;
 	for (uint32_t k = 0; k < nold; k++)
 		if (old[k].legacy_shard_zero)
@@ -4088,6 +4185,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	rc = 1;
 
 cleanup:
+	for (int i = 0; i < COMPACT_READ_SLOTS; i++)
+		free(read_cache.slots[i].bytes);
 	for (uint32_t j = 0; j < npages; j++)
 		free(pages[j]);
 	free(recs);
@@ -21102,8 +21201,128 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
  * retained LSN is kept, so retries cannot accumulate.  Caller holds the
  * shard write lock.
  */
+/* These selections depend only on the page and fences, not the version being
+ * classified.  Allocation failure falls back to the original per-version path. */
+static PageVer **
+control_fence_selections(const PageEnt *entry, const PsHistoryFence *fences,
+						 uint32_t nfences)
+{
+	PageVer **selections;
+	bool has_B;
+	uint64_t B;
+
+	if (nfences == 0 || sizeof(*selections) > SIZE_MAX / nfences)
+		return NULL;
+	selections = calloc(nfences, sizeof(*selections));
+	if (selections == NULL)
+		return NULL;
+	B = timeline_inherited_below(entry->timeline, &has_B);
+	for (uint32_t i = 0; i < nfences; i++)
+	{
+		ViewCap cap = {fences[i].lsn, fences[i].seq,
+			fences[i].admission_seq, false};
+
+		if (cap.seq != PS_SEQ_UNBOUNDED)
+			selections[i] = page_select(entry, &cap, B, has_B);
+	}
+	return selections;
+}
+
 static int
 control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
+					uint32_t block, const PsPruneVersion *v,
+					const PsHistoryFence *fences, uint32_t nfences,
+					PageVer *const *selections)
+{
+	int			lsn_retained = 0;
+
+	if (!plan->valid)
+		return 1;
+	/* A finite branch can retain several identities at the same LSN.
+	 * Without a positional consumer, duplicate checkpoint retries still
+	 * collapse to the newest authoritative image. Paired blocks also keep
+	 * the selected note/fence and its minimum-sequence closure. */
+	for (uint32_t i = 0; i < plan->nkept; i++)
+		if (plan->kept[i].lsn == v->lsn)
+		{
+			lsn_retained = 1;
+		}
+	if (block == PS_CONTROL_IMAGE_BLOCK || block >= PS_CONTROL_PAIRED_BLOCKS)
+	{
+		uint64_t newest = 0;
+		bool exact = false;
+		bool positional = false;
+		for (uint32_t i = 0; i < plan->nkept; i++)
+			if (plan->kept[i].lsn == v->lsn)
+			{
+				if (plan->kept[i].admission_seq > newest)
+					newest = plan->kept[i].admission_seq;
+				if (plan->kept[i].admission_seq == v->admission_seq)
+					exact = true;
+			}
+		for (uint32_t i = 0; i < nfences; i++)
+			if (fences[i].seq != PS_SEQ_UNBOUNDED && v->lsn <= fences[i].lsn)
+				positional = true;
+		return exact && (positional || newest == v->admission_seq);
+	}
+	if (lsn_retained && entry != NULL && nfences != 0)
+	{
+		bool has_B;
+		uint64_t B = timeline_inherited_below(entry->timeline, &has_B);
+		bool minimum = true;
+
+		/* Minimum sequence is a property of the version, not the fence. */
+		for (int j = 0; j < entry->nver; j++)
+			if (entry->vers[j].lsn == v->lsn &&
+				entry->vers[j].admission_seq < v->admission_seq)
+			{
+				minimum = false;
+				break;
+			}
+		for (uint32_t i = 0; i < nfences; i++)
+		{
+			ViewCap cap = {fences[i].lsn, fences[i].seq, fences[i].admission_seq, false};
+			PageVer *selected;
+			if (cap.seq == PS_SEQ_UNBOUNDED || v->lsn > cap.lsn)
+				continue;
+			if (minimum && (!has_B || v->lsn > B))
+				return 1; /* position closure for paired note/fence blocks */
+			selected = selections != NULL ? selections[i] :
+				page_select(entry, &cap, B, has_B);
+			if (selected && selected->lsn == v->lsn &&
+				selected->admission_seq == v->admission_seq)
+				return 1;
+		}
+	}
+	if (!lsn_retained)
+	{
+		int			in_flight = 0;
+
+		for (uint32_t i = 0; i < plan->nchain; i++)
+			if (plan->chain[i].lsn == v->lsn)
+				return 0;		/* durable image planned away */
+		for (uint32_t i = 0; i < plan->npending && !in_flight; i++)
+			if (plan->pending[i] == v->lsn)
+				in_flight = 1;	/* image written, not durably covered yet */
+		if (!in_flight && v->lsn <= plan->image_max_lsn)
+			return 0;			/* image already pruned */
+		/* image on its way: one copy of the note waits for it, below */
+	}
+	/* Newest durably covered copy of this LSN across the block's chain: a
+	 * mirror that timed out after the note and retried appended the same
+	 * bytes again under a new sequence, whether or not its image has
+	 * arrived yet, and only the newest copy needs to survive. */
+	if (entry != NULL)
+		for (int i = 0; i < entry->nver; i++)
+			if (entry->vers[i].lsn == v->lsn &&
+				entry->vers[i].admission_seq > v->admission_seq &&
+				walidx_base_version_durable(&entry->vers[i]))
+				return 0;
+	return 1;
+}
+
+static int
+control_chain_keeps_reference(const PsControlChainPlan *plan, const PageEnt *entry,
 					uint32_t block, const PsPruneVersion *v,
 					const PsHistoryFence *fences, uint32_t nfences)
 {
@@ -21186,6 +21405,74 @@ control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
 				walidx_base_version_durable(&entry->vers[i]))
 				return 0;
 	return 1;
+}
+
+
+/* Differential coverage for finite fences, duplicate versions and retries. */
+int
+ps_test_control_fence_selections(void)
+{
+	PageVer versions[24];
+	PsPruneVersion kept[24], chain[24];
+	uint64_t pending[24];
+	PsHistoryFence fences[12];
+	PageEnt entry = {0};
+	PsControlChainPlan plan = {0};
+	uint64_t rng = 19;
+
+	entry.timeline = 0;
+	entry.vers = versions;
+	entry.nver = 24;
+	plan.valid = 1;
+	plan.kept = kept;
+	plan.chain = chain;
+	plan.pending = pending;
+	for (int trial = 0; trial < 200; trial++)
+	{
+		PageVer **selected;
+
+		for (int i = 0; i < 24; i++)
+		{
+			rng = rng * UINT64_C(6364136223846793005) + 1;
+			versions[i] = (PageVer) {.lsn = 1 + ((rng >> 8) % 30),
+				.admission_seq = (rng >> 20) % 40, .seg = -1};
+			kept[i] = (PsPruneVersion) {versions[i].lsn, versions[i].admission_seq};
+			chain[i] = kept[i];
+			pending[i] = versions[i].lsn;
+		}
+		plan.nkept = (uint32_t) (trial % 25);
+		plan.nchain = (uint32_t) ((trial * 3) % 25);
+		plan.npending = (uint32_t) ((trial * 7) % 25);
+		plan.image_max_lsn = 20;
+		for (int i = 0; i < 12; i++)
+		{
+			rng = rng * UINT64_C(6364136223846793005) + 1;
+			fences[i] = (PsHistoryFence) {1 + ((rng >> 8) % 30),
+				(rng & 8) ? PS_SEQ_UNBOUNDED : (rng >> 16) % 40,
+				(rng & 16) ? PS_SEQ_UNBOUNDED : (rng >> 24) % 40};
+		}
+		selected = control_fence_selections(&entry, fences, 12);
+		if (selected == NULL)
+			return -1;
+		for (uint32_t block = 0; block <= PS_CONTROL_PAIRED_BLOCKS; block++)
+			for (int i = 0; i < 24; i++)
+			{
+				PsPruneVersion v = {versions[i].lsn, versions[i].admission_seq};
+				int expected = control_chain_keeps_reference(&plan, &entry, block,
+														 &v, fences, 12);
+
+				if (control_chain_keeps(&plan, &entry, block, &v, fences, 12,
+										selected) != expected ||
+					control_chain_keeps(&plan, &entry, block, &v, fences, 12,
+										NULL) != expected)
+				{
+					free(selected);
+					return trial + 1;
+				}
+			}
+		free(selected);
+	}
+	return 0;
 }
 
 /*
