@@ -3973,7 +3973,7 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard,
 	{
 		/* On -2, the helper explicitly reports an uncertain or failed cleanup. */
 		ambiguous = prepare_rc == -2;
-		if (prepare_rc == 0)
+		if (prepare_rc == 0 || prepare_rc == -3)
 			g_shards[shard].staged_compaction_retries = 1;
 		goto done;
 	}

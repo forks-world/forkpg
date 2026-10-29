@@ -1268,7 +1268,10 @@ ps_image_compaction_prepare_counted(const PsLayerDesc *layers, uint32_t count,
 		if (used == PS_IMAGE_BATCH_MAX_RECORDS || (next == 0 && used != 0))
 		{
 			if (written == capacity)
+			{
+				rc = -3; /* bounded output capacity exhausted */
 				goto out;
+			}
 			if (ps_image_layer_write_sorted_batch(output_ids[written], layers[0].timeline,
 					batch, used, page_size, image_prepare_read_page, &page_size,
 					&outputs[written]) != 0)

@@ -267,8 +267,9 @@ extern int ps_image_index_visit_groups(const PsLayerDesc *layers, uint32_t count
  * and output arrays must not overlap.
  * Output IDs must be strictly increasing and greater than every source ID.
  * 0 means every output is sealed and *noutputs describes them;
- * -1 means failure with no known remaining outputs; -2 means cleanup or a
- * failed create/write needs reconciliation. On -2, outputs[0..*noutputs)
+ * -1 means failure with no known remaining outputs; -3 means the output
+ * capacity was exhausted and all staged files were cleaned; -2 means cleanup
+ * or a failed create/write needs reconciliation. On -2, outputs[0..*noutputs)
  * are sealed files whose cleanup failed; *uncertain_id is the attempted ID
  * whose create/write outcome could not be established (0 if none). Never
  * publish a partial result. Exact duplicate identities are collapsed to the

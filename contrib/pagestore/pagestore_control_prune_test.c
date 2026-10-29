@@ -402,6 +402,74 @@ test_bounded_compaction_maintenance(void)
 	remove_tree(store);
 }
 
+static int
+read_fixture_page(const PsImgRec *rec, void *out, void *arg)
+{
+	(void) arg;
+	memcpy(out, rec->page, 8192);
+	return 0;
+}
+
+static void
+test_bounded_shared_payload_capacity_fallback(void)
+{
+	char store[] = "/tmp/pagestore-bounded-capacity-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsImgRec *recs = calloc(1100, sizeof(*recs));
+	PsLayerDesc first, second;
+	unsigned char page[8192] = {0};
+	uint64_t before;
+	uint32_t live = 0, nentries = 0;
+	int ok = recs != NULL;
+
+	configure_core(1);
+	compact_layers = 1;
+	check(ok && mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open shared-payload capacity store");
+	if (!ok)
+		return;
+	for (uint32_t i = 0; i < 1100; i++)
+	{
+		recs[i].key = key;
+		recs[i].lsn = 100;
+		recs[i].admission_seq = i + 1;
+		recs[i].page = page;
+	}
+	ok = ps_image_layer_write_compaction_stream(1, 0, recs, 1100, 8192,
+			read_fixture_page, NULL, &first) == 0;
+	recs[0].block = 1;
+	recs[0].admission_seq = 1101;
+	ok = ok && ps_image_layer_write_compaction_stream(2, 0, recs, 1, 8192,
+			read_fixture_page, NULL, &second) == 0;
+	ps_lock_map_wr();
+	ok = ok && ps_manifest_add_layer(&first) == 0 && ps_manifest_add_layer(&second) == 0;
+	ps_unlock_map();
+	check(ok && first.locations[0].size < 2 * 1024 * 1024,
+		  "seed more than one batch of logical versions in small shared-payload inputs");
+	close_store();
+	check(ok && ps_core_open(store) == 0, "recover shared-payload capacity store");
+	before = ps_test_bounded_compaction_count();
+	run_maintenance(64);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+		{
+			PsImgIndexEnt *index = NULL;
+			uint32_t n = 0;
+
+			live++;
+			if (ps_image_layer_read_index(&ps_layer_map.layers[i], &index, &n) == 0)
+				nentries += n;
+			free(index);
+		}
+	ps_unlock_map();
+	check(ps_test_bounded_compaction_count() > before && live == 1 && nentries == 1101,
+		  "capacity exhaustion falls back and preserves all logical versions");
+	close_store();
+	free(recs);
+	remove_tree(store);
+}
+
 typedef struct BoundedConflictProbe
 {
 	int called;
@@ -1646,6 +1714,7 @@ int
 main(void)
 {
 	test_bounded_compaction_maintenance();
+	test_bounded_shared_payload_capacity_fallback();
 	test_bounded_compaction_concurrent_write();
 	test_staged_compaction_rejects_concurrent_write(1);
 	test_staged_compaction_rejects_concurrent_write(2);

@@ -406,7 +406,7 @@ streaming_layer_test(void)
 		uncertain = 0;
 		noutputs = 0;
 		check(ps_image_compaction_prepare(&layer, 1, ids, 1, PSZ, outputs,
-											  &noutputs, &uncertain) == -1 &&
+											  &noutputs, &uncertain) == -3 &&
 			  noutputs == 0 && uncertain == 0 &&
 			  ps_layer_store->layer_exists_local(ids[0]) == 0,
 			  "capacity exhaustion cleans every sealed output");

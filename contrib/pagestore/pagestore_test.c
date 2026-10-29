@@ -2816,6 +2816,32 @@ wait_for_pruning_compaction(const char *shm, uint32_t rel,
 }
 
 static int
+page_frontier_reached(const char *store, uint64_t lsn)
+{
+	char path[512];
+	struct {
+		uint32_t magic, version;
+		struct { uint64_t incarnation, lsn, seq; } root[2];
+	} header;
+	FILE *file;
+	int read_ok;
+
+	snprintf(path, sizeof(path), "%s/page-prune.frontiers", store);
+	file = fopen(path, "rb");
+	if (file == NULL)
+		return 0;
+	read_ok = fread(&header, sizeof(header), 1, file) == 1;
+	fclose(file);
+	if (!read_ok || header.magic != 0x46504750U || header.version != 3)
+		return 0;
+	for (int i = 0; i < 2; i++)
+		if (header.root[i].incarnation != 0 && header.root[i].lsn >= lsn &&
+			header.root[i].seq > 1)
+			return 1;
+	return 0;
+}
+
+static int
 wait_for_accounted_pruning_metrics(const char *shm, uint64_t minimum,
 								   uint64_t *compactions, uint64_t *scanned,
 								   uint64_t *kept, uint64_t *deleted)
@@ -3053,6 +3079,12 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_write_one(rel + 4, 0, 0, page);
 	fill_page(page, ps, 2000, 0xA2);
 	op_write_one(rel + 4, 0, 0, page);
+	/* Flush this relation's shard even when it differs from rel's shard. */
+	for (uint32_t block = 1; block <= 8; block++)
+	{
+		fill_page(page, ps, 13000 + block, (unsigned char) block);
+		op_write_one(rel + 4, 0, block, page);
+	}
 	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 29201, 1,
 					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 12000) == PS_STATUS_OK,
 		  "a durable replacement cutoff protects current page history");
@@ -3105,6 +3137,10 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		check(ch->status == PS_STATUS_OK && ch->result == 0,
 			  "live page index forgets history removed by compaction");
 	}
+	for (int i = 0; i < 1000 && !page_frontier_reached(store, 12000); i++)
+		usleep(10000);
+	check(page_frontier_reached(store, 12000),
+		  "page reclamation frontier reaches replacement cutoff before restart");
 	client_detach();
 	stop_daemon(pid);
 	ps_shm_unlink(shm);
