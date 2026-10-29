@@ -11,6 +11,10 @@ The pull cursor and index merge are also building blocks: the merge limits
 fan-in to 64 and emits equal identities in ascending layer-ID order. The caller
 must consume it to successful completion before publishing staged output. Stores
 with more inputs require a separate bounded multi-pass plan.
+Intermediate runs must retain each record's original source-layer precedence;
+assigning temporary runs new layer IDs and then using those IDs as tie breakers
+would change the winner for equal legacy identities. This provenance is merge
+metadata, not permission to make an intermediate run visible in the manifest.
 
 ## Boundaries
 
