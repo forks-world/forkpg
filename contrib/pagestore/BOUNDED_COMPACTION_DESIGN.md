@@ -7,6 +7,10 @@ already implemented.
 The index visitor added with this design is a bounded-memory building block;
 it is not yet used by compaction and does not implement the merge or publication
 protocol. Its callbacks must not commit effects until the visitor returns success.
+The pull cursor and index merge are also building blocks: the merge limits
+fan-in to 64 and emits equal identities in ascending layer-ID order. The caller
+must consume it to successful completion before publishing staged output. Stores
+with more inputs require a separate bounded multi-pass plan.
 
 ## Boundaries
 

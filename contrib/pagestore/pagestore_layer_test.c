@@ -92,6 +92,8 @@ legacy_index_visitor_test(void)
 		size_t len = version == 2 ? sizeof(v2) : sizeof(v3);
 		uint32_t crc = 2166136261u;
 		PsImgIndexEnt *expected = NULL, *cursor;
+		PsImageIndexCursor *pull = NULL;
+		PsImgIndexEnt actual;
 		uint32_t count = 0;
 
 		memcpy(legacy_file, data, len);
@@ -113,7 +115,45 @@ legacy_index_visitor_test(void)
 		check(expected != NULL && ps_image_layer_visit_index(&layer,
 							 compare_legacy_index, &cursor) == 0 && cursor == expected + 1,
 			  "bounded visitor matches legacy index conversion");
+		check(expected != NULL && ps_image_index_cursor_open(&layer, &pull) == 0 &&
+			  ps_image_index_cursor_next(pull, &actual) == 1 &&
+			  memcmp(&actual, expected, sizeof(actual)) == 0 &&
+			  ps_image_index_cursor_next(pull, &actual) == 0,
+			  "bounded cursor matches legacy index conversion");
+		ps_image_index_cursor_close(pull);
 		free(expected);
+	}
+	{
+		LegacyIndexV2 unsorted[2] = {v2, v2};
+		PsImageIndexCursor *pull = NULL;
+		PsImageIndexMerge *merge = NULL;
+		PsImgIndexEnt entry;
+		uint64_t source = 0;
+		uint32_t crc = 2166136261u;
+
+		unsorted[1].block = unsorted[0].block - 1;
+		memcpy(legacy_file, unsorted, sizeof(unsorted));
+		for (size_t i = 0; i < sizeof(unsorted); i++)
+			crc = (crc ^ legacy_file[i]) * 16777619u;
+		memset(&foot, 0, sizeof(foot));
+		foot.magic = PS_IMG_MAGIC; foot.version = 2;
+		foot.nrecs = 2; foot.index_crc = crc;
+		memcpy(legacy_file + sizeof(unsorted), &foot, sizeof(foot));
+		legacy_file_size = sizeof(unsorted) + sizeof(foot);
+		layer.locations[0].size = legacy_file_size;
+		check(ps_image_index_cursor_open(&layer, &pull) == 0 &&
+			  ps_image_index_cursor_next(pull, &entry) == 1 &&
+			  ps_image_index_cursor_next(pull, &entry) == -1 &&
+			  ps_image_index_cursor_next(pull, &entry) == -1,
+			  "unsorted legacy input fails closed and stays failed");
+		ps_image_index_cursor_close(pull);
+		layer.kind = PS_LAYER_IMAGE;
+		layer.layer_id = 1;
+		check(ps_image_index_merge_open(&layer, 1, &merge) == 0 &&
+			  ps_image_index_merge_next(merge, &entry, &source) == -1 &&
+			  ps_image_index_merge_next(merge, &entry, &source) == -1,
+			  "merge fails closed on an unsorted input");
+		ps_image_index_merge_close(merge);
 	}
 	ps_layer_store = saved;
 }
@@ -137,7 +177,7 @@ visitor_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
 	{
 		visitor_first_chunk_reads++;
 		if (rc == 0 && (visitor_corrupt == 1 ||
-			(visitor_corrupt == 2 && visitor_first_chunk_reads == 2)))
+			(visitor_corrupt >= 2 && visitor_first_chunk_reads == visitor_corrupt)))
 			((unsigned char *) buf)[0] ^= 1;
 	}
 	return rc;
@@ -229,11 +269,24 @@ streaming_layer_test(void)
 		  "large layer checksum uses bounded reads");
 	{
 		uint32_t count = 0;
+		PsImageIndexCursor *cursor = NULL;
+		PsImgIndexEnt entry;
+		int cursor_rc = -1;
 		bounded.read_layer_block = visitor_read;
 		visitor_read_max = 0;
 		check(ps_image_layer_visit_index(&layer, visit_stream_index, &count) == 0 &&
 			  count == 4096 && visitor_read_max <= 64 * 1024,
 			  "index visitor returns sorted entries using bounded reads");
+		count = 0;
+		check(ps_image_index_cursor_open(&layer, &cursor) == 0,
+			  "open bounded sorted index cursor");
+		if (cursor != NULL)
+			while ((cursor_rc = ps_image_index_cursor_next(cursor, &entry)) == 1)
+				if (visit_stream_index(&entry, &count) != 0)
+					break;
+		check(cursor_rc == 0 && count == 4096 && visitor_read_max <= 64 * 1024,
+			  "cursor yields ordered records with bounded reads and final validation");
+		ps_image_index_cursor_close(cursor);
 		visitor_corrupt = 1;
 		visitor_first_chunk_reads = 0;
 		count = 0;
@@ -244,6 +297,17 @@ streaming_layer_test(void)
 		count = 0;
 		check(ps_image_layer_visit_index(&layer, visit_stream_index, &count) != 0,
 			  "index changes during traversal are rejected");
+		visitor_corrupt = 0;
+		visitor_first_chunk_reads = 0;
+		visitor_corrupt = 3;
+		cursor = NULL;
+		cursor_rc = -1;
+		if (ps_image_index_cursor_open(&layer, &cursor) == 0)
+			while ((cursor_rc = ps_image_index_cursor_next(cursor, &entry)) == 1)
+				;
+		check(cursor != NULL && cursor_rc == -1,
+			  "cursor rejects changes after its precheck");
+		ps_image_index_cursor_close(cursor);
 		visitor_corrupt = 0;
 		count = 0;
 		check(ps_image_layer_visit_index(&layer, reject_stream_index, &count) != 0 &&
@@ -377,6 +441,47 @@ index_direct_read_test(void)
 	ps_layer_store = saved;
 }
 
+static void
+bounded_merge_test(void)
+{
+	PsKey key = {1, 1, 955, 0, PS_KLASS_RELATION};
+	unsigned char pages[3][PSZ] = {{0}};
+	PsLayerDesc layers[3];
+	PsImgRec rec = {.key = key, .block = 0, .lsn = 100};
+	PsImageIndexMerge *merge = NULL;
+	PsImgIndexEnt entry;
+	unsigned char out[PSZ];
+	uint64_t id = 0;
+	int ok = 1;
+
+	for (int i = 0; i < 3; i++)
+	{
+		pages[i][0] = (unsigned char) i;
+		rec.page = pages[i];
+		if (ps_image_layer_write(995 + i, 0, &rec, 1, PSZ, &layers[2 - i]) != 0)
+			ok = 0;
+	}
+	check(ok && ps_image_index_merge_open(layers, 3, &merge) == 0,
+		  "open bounded merge with reverse-ordered layers");
+	for (uint64_t expected = 995; expected < 998; expected++)
+		check(merge != NULL && ps_image_index_merge_next(merge, &entry, &id) == 1 &&
+			  id == expected && entry.lsn == 100 && entry.admission_seq == 0 &&
+			  ps_image_layer_lookup(&layers[997 - expected], &key, 0, 100, 0,
+									out, PSZ, NULL, NULL) == 1 &&
+			  out[0] == (unsigned char) (expected - 995),
+			  "equal legacy identities follow layer-ID precedence with source bytes");
+	check(merge != NULL && ps_image_index_merge_next(merge, &entry, &id) == 0,
+		  "bounded merge verifies and completes every input");
+	ps_image_index_merge_close(merge);
+	merge = NULL;
+	layers[1] = layers[0];
+	check(ps_image_index_merge_open(layers, 3, &merge) != 0 && merge == NULL,
+		  "bounded merge rejects duplicate source IDs");
+	check(ps_image_index_merge_open(layers, PS_IMAGE_MERGE_MAX_INPUTS + 1,
+									&merge) != 0 && merge == NULL,
+		  "bounded merge enforces its fan-in limit");
+}
+
 int
 main(void)
 {
@@ -396,6 +501,7 @@ main(void)
 		return 2;
 	}
 	legacy_index_visitor_test();
+	bounded_merge_test();
 
 	/* Upgraded stores retain sequence-zero tuples alongside same-LSN rewrites.
 	 * Exact reads must find the old identity, including when another layer

@@ -204,6 +204,24 @@ extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
 typedef int (*PsImageIndexVisitor)(const PsImgIndexEnt *entry, void *arg);
 extern int ps_image_layer_visit_index(const PsLayerDesc *layer,
 									  PsImageIndexVisitor visit, void *arg);
+/* Pull sorted entries from an immutable, caller-pinned layer. next returns 1
+ * for an entry, 0 only after final checksum validation, and -1 on error.
+ * Results must not be published before 0. Close releases cursor memory. */
+typedef struct PsImageIndexCursor PsImageIndexCursor;
+extern int ps_image_index_cursor_open(const PsLayerDesc *layer,
+									   PsImageIndexCursor **out);
+extern int ps_image_index_cursor_next(PsImageIndexCursor *cursor,
+									   PsImgIndexEnt *entry);
+extern void ps_image_index_cursor_close(PsImageIndexCursor *cursor);
+/* Bounded fan-in. Identical versions are emitted in ascending source-layer
+ * order, so the last copy matches the read path's layer-ID tie break. */
+#define PS_IMAGE_MERGE_MAX_INPUTS 64
+typedef struct PsImageIndexMerge PsImageIndexMerge;
+extern int ps_image_index_merge_open(const PsLayerDesc *layers, uint32_t count,
+									  PsImageIndexMerge **out);
+extern int ps_image_index_merge_next(PsImageIndexMerge *merge,
+									  PsImgIndexEnt *entry, uint64_t *layer_id);
+extern void ps_image_index_merge_close(PsImageIndexMerge *merge);
 /* Force a fresh data-section checksum verification (ignores cached state). */
 /* Empty the process-wide image index cache; the layer store calls it on close. */
 extern void ps_image_layer_cache_reset(void);

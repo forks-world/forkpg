@@ -685,11 +685,35 @@ image_index_read(const PsLayerDesc *layer, int fd, uint64_t off, void *buf, uint
 		ps_layer_store->read_layer_block(layer, off, buf, len);
 }
 
+static void
+image_index_decode(uint32_t version, const unsigned char *src, PsImgIndexEnt *entry)
+{
+	memset(entry, 0, sizeof(*entry));
+	if (version == 2)
+	{
+		PsImgIndexEntV2 old;
+		memcpy(&old, src, sizeof(old));
+		entry->key = old.key; entry->block = old.block;
+		entry->lsn = old.lsn; entry->data_off = old.data_off;
+	}
+	else if (version == 3)
+	{
+		PsImgIndexEntV3 old;
+		memcpy(&old, src, sizeof(old));
+		entry->key = old.key; entry->block = old.block;
+		entry->lsn = old.lsn; entry->data_off = old.data_off;
+		entry->growth_lsn = old.growth_lsn; entry->order_id = old.order_id;
+		entry->seg_off = old.seg_off; entry->seg_id = old.seg_id; entry->flags = old.flags;
+	}
+	else
+		memcpy(entry, src, sizeof(*entry));
+}
+
 int
 ps_image_layer_visit_index(const PsLayerDesc *layer, PsImageIndexVisitor visit,
 						   void *arg)
 {
-	const PsLayerLocation *loc = img_local_loc(layer);
+	const PsLayerLocation *loc = layer != NULL ? img_local_loc(layer) : NULL;
 	PsImgFooter foot;
 	unsigned char *buf;
 	size_t ent_size;
@@ -733,25 +757,7 @@ ps_image_layer_visit_index(const PsLayerDesc *layer, PsImageIndexVisitor visit,
 				for (uint32_t i = 0; i < count; i++)
 				{
 					PsImgIndexEnt entry;
-					memset(&entry, 0, sizeof(entry));
-					if (foot.version == 2)
-					{
-						PsImgIndexEntV2 old;
-						memcpy(&old, buf + i * ent_size, sizeof(old));
-						entry.key = old.key; entry.block = old.block;
-						entry.lsn = old.lsn; entry.data_off = old.data_off;
-					}
-					else if (foot.version == 3)
-					{
-						PsImgIndexEntV3 old;
-						memcpy(&old, buf + i * ent_size, sizeof(old));
-						entry.key = old.key; entry.block = old.block;
-						entry.lsn = old.lsn; entry.data_off = old.data_off;
-						entry.growth_lsn = old.growth_lsn; entry.order_id = old.order_id;
-						entry.seg_off = old.seg_off; entry.seg_id = old.seg_id; entry.flags = old.flags;
-					}
-					else
-						memcpy(&entry, buf + i * ent_size, sizeof(entry));
+					image_index_decode(foot.version, buf + i * ent_size, &entry);
 					if (visit(&entry, arg) != 0)
 						goto out;
 				}
@@ -764,6 +770,233 @@ ps_image_layer_visit_index(const PsLayerDesc *layer, PsImageIndexVisitor visit,
 out:
 	free(buf);
 	return rc;
+}
+
+struct PsImageIndexCursor
+{
+	PsLayerDesc layer;
+	PsImgFooter foot;
+	PsImgIndexEnt previous;
+	unsigned char *buffer;
+	size_t ent_size;
+	uint32_t per_chunk, next, loaded, chunk_first, crc;
+	int have_previous, failed;
+};
+
+static int
+image_cursor_precheck(const PsImgIndexEnt *entry, void *arg)
+{
+	(void) entry;
+	(void) arg;
+	return 0;
+}
+
+int
+ps_image_index_cursor_open(const PsLayerDesc *layer, PsImageIndexCursor **out)
+{
+	const PsLayerLocation *loc;
+	PsImageIndexCursor *cursor;
+	uint64_t bytes;
+
+	if (out == NULL || layer == NULL)
+		return -1;
+	*out = NULL;
+	if (ps_image_layer_visit_index(layer, image_cursor_precheck, NULL) != 0)
+		return -1;
+	loc = img_local_loc(layer);
+	if (loc == NULL || loc->size < sizeof(PsImgFooter))
+		return -1;
+	cursor = calloc(1, sizeof(*cursor));
+	if (cursor == NULL)
+		return -1;
+	cursor->layer = *layer;
+	if (image_index_read(layer, -1, loc->size - sizeof(cursor->foot),
+						 &cursor->foot, sizeof(cursor->foot)) != 0 ||
+		cursor->foot.magic != PS_IMG_MAGIC || cursor->foot.nrecs == 0 ||
+		(cursor->foot.version != 2 && cursor->foot.version != 3 &&
+		 cursor->foot.version != PS_IMG_VERSION))
+		goto fail;
+	cursor->ent_size = cursor->foot.version == 2 ? sizeof(PsImgIndexEntV2) :
+		cursor->foot.version == 3 ? sizeof(PsImgIndexEntV3) : sizeof(PsImgIndexEnt);
+	bytes = (uint64_t) cursor->foot.nrecs * cursor->ent_size;
+	if (cursor->foot.index_off > loc->size - sizeof(cursor->foot) ||
+		bytes != loc->size - sizeof(cursor->foot) - cursor->foot.index_off)
+		goto fail;
+	cursor->per_chunk = (64 * 1024) / cursor->ent_size;
+	cursor->buffer = malloc(cursor->per_chunk * cursor->ent_size);
+	if (cursor->buffer == NULL)
+		goto fail;
+	cursor->crc = 2166136261u;
+	*out = cursor;
+	return 0;
+fail:
+	free(cursor);
+	return -1;
+}
+
+int
+ps_image_index_cursor_next(PsImageIndexCursor *cursor, PsImgIndexEnt *entry)
+{
+	int c;
+
+	if (cursor == NULL || entry == NULL || cursor->failed)
+		return -1;
+	if (cursor->next == cursor->foot.nrecs)
+	{
+		if (cursor->crc != cursor->foot.index_crc)
+		{
+			cursor->failed = 1;
+			return -1;
+		}
+		return 0;
+	}
+	if (cursor->next == cursor->loaded)
+	{
+		uint32_t count = cursor->foot.nrecs - cursor->next;
+		uint32_t len;
+		if (count > cursor->per_chunk)
+			count = cursor->per_chunk;
+		len = count * cursor->ent_size;
+		if (image_index_read(&cursor->layer, -1,
+				cursor->foot.index_off + (uint64_t) cursor->next * cursor->ent_size,
+				cursor->buffer, len) != 0)
+		{
+			cursor->failed = 1;
+			return -1;
+		}
+		cursor->crc = img_crc_extend(cursor->crc, cursor->buffer, len);
+		cursor->chunk_first = cursor->next;
+		cursor->loaded = cursor->next + count;
+	}
+	image_index_decode(cursor->foot.version,
+		cursor->buffer + (cursor->next - cursor->chunk_first) * cursor->ent_size, entry);
+	c = cursor->have_previous ? key_cmp(&cursor->previous.key, &entry->key) : 0;
+	if (cursor->have_previous && (c > 0 || (c == 0 &&
+		(cursor->previous.block > entry->block ||
+		 (cursor->previous.block == entry->block &&
+		  (cursor->previous.lsn > entry->lsn ||
+		   (cursor->previous.lsn == entry->lsn &&
+			cursor->previous.admission_seq > entry->admission_seq)))))))
+	{
+		cursor->failed = 1;
+		return -1;
+	}
+	cursor->previous = *entry;
+	cursor->have_previous = 1;
+	cursor->next++;
+	return 1;
+}
+
+void
+ps_image_index_cursor_close(PsImageIndexCursor *cursor)
+{
+	if (cursor != NULL)
+	{
+		free(cursor->buffer);
+		free(cursor);
+	}
+}
+
+struct PsImageIndexMerge
+{
+	PsImageIndexCursor *cursors[PS_IMAGE_MERGE_MAX_INPUTS];
+	PsImgIndexEnt heads[PS_IMAGE_MERGE_MAX_INPUTS];
+	uint64_t layer_ids[PS_IMAGE_MERGE_MAX_INPUTS];
+	unsigned char active[PS_IMAGE_MERGE_MAX_INPUTS];
+	uint32_t count;
+	int failed;
+};
+
+void
+ps_image_index_merge_close(PsImageIndexMerge *merge)
+{
+	if (merge != NULL)
+	{
+		for (uint32_t i = 0; i < merge->count; i++)
+			ps_image_index_cursor_close(merge->cursors[i]);
+		free(merge);
+	}
+}
+
+int
+ps_image_index_merge_open(const PsLayerDesc *layers, uint32_t count,
+						  PsImageIndexMerge **out)
+{
+	PsImageIndexMerge *merge;
+
+	if (out == NULL)
+		return -1;
+	*out = NULL;
+	if (layers == NULL || count == 0 || count > PS_IMAGE_MERGE_MAX_INPUTS)
+		return -1;
+	merge = calloc(1, sizeof(*merge));
+	if (merge == NULL)
+		return -1;
+	merge->count = count;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		int rc;
+		if (layers[i].kind != PS_LAYER_IMAGE || layers[i].deleting ||
+			layers[i].timeline != layers[0].timeline)
+			goto fail;
+		for (uint32_t j = 0; j < i; j++)
+			if (layers[j].layer_id == layers[i].layer_id)
+				goto fail;
+		merge->layer_ids[i] = layers[i].layer_id;
+		if (ps_image_index_cursor_open(&layers[i], &merge->cursors[i]) != 0)
+			goto fail;
+		rc = ps_image_index_cursor_next(merge->cursors[i], &merge->heads[i]);
+		if (rc < 0)
+			goto fail;
+		merge->active[i] = rc == 1;
+	}
+	*out = merge;
+	return 0;
+fail:
+	ps_image_index_merge_close(merge);
+	return -1;
+}
+
+int
+ps_image_index_merge_next(PsImageIndexMerge *merge, PsImgIndexEnt *entry,
+						  uint64_t *layer_id)
+{
+	uint32_t best = UINT32_MAX;
+
+	if (merge == NULL || entry == NULL || layer_id == NULL || merge->failed)
+		return -1;
+	for (uint32_t i = 0; i < merge->count; i++)
+	{
+		ImgSort a, b;
+		int cmp;
+		if (!merge->active[i])
+			continue;
+		if (best == UINT32_MAX)
+		{
+			best = i;
+			continue;
+		}
+		memset(&a, 0, sizeof(a));
+		memset(&b, 0, sizeof(b));
+		a.ent = merge->heads[i]; b.ent = merge->heads[best];
+		cmp = img_sort_cmp(&a, &b);
+		if (cmp < 0 || (cmp == 0 && merge->layer_ids[i] < merge->layer_ids[best]))
+			best = i;
+	}
+	if (best == UINT32_MAX)
+		return 0;
+	*entry = merge->heads[best];
+	*layer_id = merge->layer_ids[best];
+	{
+		int rc = ps_image_index_cursor_next(merge->cursors[best], &merge->heads[best]);
+		if (rc < 0)
+		{
+			merge->failed = 1;
+			return -1;
+		}
+		merge->active[best] = rc == 1;
+	}
+	return 1;
 }
 
 static int
