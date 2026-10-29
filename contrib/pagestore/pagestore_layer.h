@@ -173,6 +173,15 @@ extern int ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
  const PsImgRec *recs, uint32_t n, uint32_t page_size,
  PsImagePageReader read_page, void *arg, PsLayerDesc *out);
 
+/* One independently sealed, unpublished output batch. Metadata must already
+ * be sorted by key, block, LSN and admission sequence.  The explicit record
+ * limit bounds writer memory and output size to n * (page_size + index entry)
+ * plus a footer.  Publishing and retiring sources remain the caller's job. */
+#define PS_IMAGE_BATCH_MAX_RECORDS 1024
+extern int ps_image_layer_write_sorted_batch(uint64_t layer_id, uint32_t timeline,
+ const PsImgRec *recs, uint32_t n, uint32_t page_size,
+ PsImagePageReader read_page, void *arg, PsLayerDesc *out);
+
 /*
  * Look up the newest version of (key, block) with lsn <= read_lsn in image
  * layer 'layer'.  On a hit copies page_size bytes into out, stores that

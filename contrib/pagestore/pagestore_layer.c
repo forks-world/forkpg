@@ -208,6 +208,29 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 }
 
 int
+ps_image_layer_write_sorted_batch(uint64_t layer_id, uint32_t timeline,
+								  const PsImgRec *recs, uint32_t n, uint32_t page_size,
+								  PsImagePageReader read_page, void *arg, PsLayerDesc *out)
+{
+	if (recs == NULL || out == NULL || n == 0 || n > PS_IMAGE_BATCH_MAX_RECORDS)
+		return -1;
+	for (uint32_t i = 1; i < n; i++)
+	{
+		int c = key_cmp(&recs[i - 1].key, &recs[i].key);
+
+		if (c > 0 || (c == 0 &&
+			(recs[i - 1].block > recs[i].block ||
+			 (recs[i - 1].block == recs[i].block &&
+			  (recs[i - 1].lsn > recs[i].lsn ||
+			   (recs[i - 1].lsn == recs[i].lsn &&
+				recs[i - 1].admission_seq > recs[i].admission_seq))))))
+			return -1;
+	}
+	return ps_image_layer_write_stream(layer_id, timeline, recs, n, page_size,
+									   read_page, arg, out);
+}
+
+int
 ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 							const PsImgRec *recs, uint32_t n, uint32_t page_size,
 							PsImagePageReader read_page, void *arg, PsLayerDesc *out)

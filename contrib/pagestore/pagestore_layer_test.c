@@ -441,6 +441,20 @@ index_direct_read_test(void)
 	ps_layer_store = saved;
 }
 
+typedef struct BatchSource
+{
+	const PsLayerDesc *layer;
+	uint64_t offset;
+} BatchSource;
+
+static int
+read_batch_source(const PsImgRec *rec, void *page, void *arg)
+{
+	const BatchSource *source = rec->page;
+	(void) arg;
+	return ps_layer_store->read_layer_block(source->layer, source->offset, page, PSZ);
+}
+
 static void
 bounded_merge_test(void)
 {
@@ -451,6 +465,9 @@ bounded_merge_test(void)
 	PsImageIndexMerge *merge = NULL;
 	PsImgIndexEnt entry;
 	unsigned char out[PSZ];
+	BatchSource sources[3];
+	PsImgRec output[3];
+	PsLayerDesc replacement;
 	uint64_t id = 0;
 	int ok = 1;
 
@@ -463,16 +480,37 @@ bounded_merge_test(void)
 	}
 	check(ok && ps_image_index_merge_open(layers, 3, &merge) == 0,
 		  "open bounded merge with reverse-ordered layers");
+	memset(output, 0, sizeof(output));
+	memset(sources, 0, sizeof(sources));
 	for (uint64_t expected = 995; expected < 998; expected++)
+	{
 		check(merge != NULL && ps_image_index_merge_next(merge, &entry, &id) == 1 &&
 			  id == expected && entry.lsn == 100 && entry.admission_seq == 0 &&
 			  ps_image_layer_lookup(&layers[997 - expected], &key, 0, 100, 0,
 									out, PSZ, NULL, NULL) == 1 &&
 			  out[0] == (unsigned char) (expected - 995),
 			  "equal legacy identities follow layer-ID precedence with source bytes");
+		sources[expected - 995].layer = &layers[997 - expected];
+		sources[expected - 995].offset = entry.data_off;
+		output[expected - 995].key = entry.key;
+		output[expected - 995].block = entry.block;
+		output[expected - 995].lsn = entry.lsn;
+		output[expected - 995].admission_seq = entry.admission_seq;
+		output[expected - 995].growth_lsn = entry.growth_lsn;
+		output[expected - 995].order_id = entry.order_id;
+		output[expected - 995].seg_off = entry.seg_off;
+		output[expected - 995].seg_id = entry.seg_id;
+		output[expected - 995].flags = entry.flags;
+		output[expected - 995].page = &sources[expected - 995];
+	}
 	check(merge != NULL && ps_image_index_merge_next(merge, &entry, &id) == 0,
 		  "bounded merge verifies and completes every input");
 	ps_image_index_merge_close(merge);
+	check(ps_image_layer_write_sorted_batch(1000, 0, output, 3, PSZ,
+			read_batch_source, NULL, &replacement) == 0 &&
+		  ps_image_layer_lookup_exact(&replacement, &key, 0, 100, 0,
+								out, PSZ, NULL, NULL) == 1 && out[0] == 2,
+		  "bounded output preserves the newest legacy source on an exact tie");
 	merge = NULL;
 	layers[1] = layers[0];
 	check(ps_image_index_merge_open(layers, 3, &merge) != 0 && merge == NULL,
@@ -480,6 +518,56 @@ bounded_merge_test(void)
 	check(ps_image_index_merge_open(layers, PS_IMAGE_MERGE_MAX_INPUTS + 1,
 									&merge) != 0 && merge == NULL,
 		  "bounded merge enforces its fan-in limit");
+}
+
+static void
+bounded_sorted_batch_test(void)
+{
+	PsImgRec *recs = calloc(PS_IMAGE_BATCH_MAX_RECORDS + 1, sizeof(*recs));
+	PsLayerDesc layer;
+	PsImgIndexEnt *index = NULL;
+	PsKey key = {1, 1, 956, 0, PS_KLASS_RELATION};
+	uint32_t nindex = 0;
+
+	check(recs != NULL, "allocate bounded batch input");
+	if (recs == NULL)
+		return;
+	for (uint32_t i = 0; i <= PS_IMAGE_BATCH_MAX_RECORDS; i++)
+	{
+		recs[i].key = key;
+		recs[i].block = i;
+		recs[i].lsn = 100;
+	}
+	stream_pages = 0;
+	stream_fail_after = -1;
+	check(ps_image_layer_write_sorted_batch(998, 0, recs,
+			PS_IMAGE_BATCH_MAX_RECORDS, PSZ, generated_page, NULL, &layer) == 0 &&
+		  stream_pages == PS_IMAGE_BATCH_MAX_RECORDS &&
+		  layer.locations[0].size == (uint64_t) PS_IMAGE_BATCH_MAX_RECORDS *
+			(PSZ + sizeof(PsImgIndexEnt)) + sizeof(PsImgFooter) &&
+		  ps_image_layer_read_index(&layer, &index, &nindex) == 0 &&
+		  nindex == PS_IMAGE_BATCH_MAX_RECORDS && index[nindex - 1].block == nindex - 1,
+		  "sorted batch writes one bounded complete layer");
+	free(index);
+	stream_pages = 0;
+	check(ps_image_layer_write_sorted_batch(999, 0, recs,
+			PS_IMAGE_BATCH_MAX_RECORDS + 1, PSZ, generated_page, NULL, &layer) != 0 &&
+		  stream_pages == 0 && ps_layer_store->layer_exists_local(999) == 0,
+		  "oversized batch is rejected before output creation");
+	recs[0].block = 2;
+	check(ps_image_layer_write_sorted_batch(999, 0, recs, 2, PSZ,
+			generated_page, NULL, &layer) != 0 &&
+		  stream_pages == 0 && ps_layer_store->layer_exists_local(999) == 0,
+		  "unsorted batch is rejected before output creation");
+	recs[0].block = 0;
+	stream_fail_after = 40;
+	check(ps_image_layer_write_sorted_batch(999, 0, recs, 100, PSZ,
+			generated_page, NULL, &layer) != 0 &&
+		  ps_layer_store->layer_exists_local(999) == 0,
+		  "failed batch removes unpublished output");
+	stream_fail_after = -1;
+	stream_pages = 0;
+	free(recs);
 }
 
 int
@@ -502,6 +590,7 @@ main(void)
 	}
 	legacy_index_visitor_test();
 	bounded_merge_test();
+	bounded_sorted_batch_test();
 
 	/* Upgraded stores retain sequence-zero tuples alongside same-LSN rewrites.
 	 * Exact reads must find the old identity, including when another layer

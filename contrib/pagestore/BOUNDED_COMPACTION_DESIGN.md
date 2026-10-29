@@ -15,6 +15,9 @@ Intermediate runs must retain each record's original source-layer precedence;
 assigning temporary runs new layer IDs and then using those IDs as tie breakers
 would change the winner for equal legacy identities. This provenance is merge
 metadata, not permission to make an intermediate run visible in the manifest.
+The sorted-batch writer bounds each output to 1024 records and seals it without
+publishing it. It is a primitive, not a transaction: it does not bind multiple
+outputs to their sources, persist merge progress, or make source deletion safe.
 
 ## Boundaries
 
