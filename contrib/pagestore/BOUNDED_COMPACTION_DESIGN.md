@@ -32,6 +32,9 @@ and page bytes against all prepared outputs with bounded memory. Its success is
 only a precondition: caller-owned pins, state validation, durability, publication
 and source retirement are still required. It currently verifies local sources
 and outputs only and supports at most 64 of each.
+Both preparation and coverage verification reject legacy shard-zero descriptors:
+their keys may belong to multiple shards, and ordinary shard-local output
+would not preserve the legacy routing contract.
 
 ## Boundaries
 

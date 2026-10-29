@@ -1087,7 +1087,10 @@ ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 		return -1;
 	for (uint32_t i = 0; i < count; i++)
 	{
-		if ((layers[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+		/* Legacy shard-zero layers may hold keys for every shard.  A normal
+		 * shard-local output cannot represent their routing provenance. */
+		if (layers[i].legacy_shard_zero ||
+			(layers[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
 			(layers[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT))
 			return -1;
 		if (layers[i].layer_id > max_id)
@@ -1231,7 +1234,8 @@ ps_image_compaction_verify_coverage(const PsLayerDesc *inputs, uint32_t ninputs,
 		return -1;
 	for (uint32_t i = 0; i < ninputs; i++)
 	{
-		if ((inputs[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+		if (inputs[i].legacy_shard_zero ||
+			(inputs[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
 			(inputs[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) ||
 			image_compaction_data_end(&inputs[i], page_size, &src_ends[i]) != 0)
 			return -1;
@@ -1239,7 +1243,8 @@ ps_image_compaction_verify_coverage(const PsLayerDesc *inputs, uint32_t ninputs,
 			max_id = inputs[i].layer_id;
 	}
 	for (uint32_t i = 0; i < noutputs; i++)
-		if (outputs[i].timeline != inputs[0].timeline || outputs[i].layer_id <= max_id ||
+		if (outputs[i].legacy_shard_zero || outputs[i].timeline != inputs[0].timeline ||
+			outputs[i].layer_id <= max_id ||
 			(outputs[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
 			(inputs[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) ||
 			(i != 0 && outputs[i].layer_id <= outputs[i - 1].layer_id) ||

@@ -292,8 +292,14 @@ streaming_layer_test(void)
 		uint32_t noutputs = 0;
 		PsLayerDesc outputs[4];
 		PsLayerDesc mixed[2] = {layer, layer};
+		PsLayerDesc legacy_layer = layer;
 		int rc;
 
+		legacy_layer.legacy_shard_zero = true;
+		check(ps_image_compaction_prepare(&legacy_layer, 1, ids, 4, PSZ, outputs,
+											  &noutputs, &uncertain) == -1 &&
+			  noutputs == 0 && uncertain == 0,
+			  "preparation rejects mixed-shard legacy sources");
 		mixed[1].layer_id |= UINT64_C(1) << PS_IMAGE_LAYER_SHARD_SHIFT;
 		check(ps_image_compaction_prepare(mixed, 2, ids, 4, PSZ, outputs,
 											  &noutputs, &uncertain) == -1 &&
@@ -308,6 +314,17 @@ streaming_layer_test(void)
 
 		check(rc == 0 && noutputs == 4 && uncertain == 0,
 			  "large source prepares four bounded unpublished outputs");
+		if (noutputs == 4)
+		{
+			PsLayerDesc legacy_outputs[4];
+			memcpy(legacy_outputs, outputs, sizeof(legacy_outputs));
+			legacy_outputs[0].legacy_shard_zero = true;
+			check(ps_image_compaction_verify_coverage(&layer, 1, legacy_outputs, 4,
+												  PSZ) != 0 &&
+				  ps_image_compaction_verify_coverage(&legacy_layer, 1, outputs, 4,
+												  PSZ) != 0,
+				  "coverage rejects mixed-shard legacy sources and outputs");
+		}
 		for (uint32_t i = 0; i < noutputs; i++)
 		{
 			uint32_t block = i * PS_IMAGE_BATCH_MAX_RECORDS;

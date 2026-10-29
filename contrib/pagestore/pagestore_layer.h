@@ -237,7 +237,8 @@ extern void ps_image_index_merge_close(PsImageIndexMerge *merge);
 /* The high 16 layer-ID bits encode the shard; the lower 48 are local IDs. */
 #define PS_IMAGE_LAYER_SHARD_SHIFT 48
 /* Prepare at most 64 unpublished output layers from caller-pinned local
- * sources. The input and output arrays must not overlap.
+ * sources. Legacy shard-zero sources are unsupported and rejected. The input
+ * and output arrays must not overlap.
  * Output IDs must be strictly increasing and greater than every source ID.
  * 0 means every output is sealed and *noutputs describes them;
  * -1 means failure with no known remaining outputs; -2 means cleanup or a
@@ -255,7 +256,8 @@ extern int ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count
 /* Compare the complete logical version set and page bytes against prepared
  * outputs. All inputs and outputs must remain immutable and pinned for the
  * whole call. Success alone is not authority to publish or retire a source:
- * the caller must separately fence concurrent state and ensure durability. */
+ * the caller must separately fence concurrent state and ensure durability.
+ * Legacy shard-zero inputs and outputs are unsupported and rejected. */
 extern int ps_image_compaction_verify_coverage(const PsLayerDesc *inputs,
 	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs,
 	uint32_t page_size);
