@@ -252,6 +252,13 @@ extern int ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count
 									  const uint64_t *output_ids, uint32_t capacity,
 									  uint32_t page_size, PsLayerDesc *outputs,
 									  uint32_t *noutputs, uint64_t *uncertain_id);
+/* Compare the complete logical version set and page bytes against prepared
+ * outputs. All inputs and outputs must remain immutable and pinned for the
+ * whole call. Success alone is not authority to publish or retire a source:
+ * the caller must separately fence concurrent state and ensure durability. */
+extern int ps_image_compaction_verify_coverage(const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs,
+	uint32_t page_size);
 /* Force a fresh data-section checksum verification (ignores cached state). */
 /* Empty the process-wide image index cache; the layer store calls it on close. */
 extern void ps_image_layer_cache_reset(void);

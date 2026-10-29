@@ -27,6 +27,11 @@ source in read-precedence order before cutting an output batch. This ensures
 that one identity cannot be split into an older output and a newer source;
 it does not validate concurrent arrivals, make outputs atomic, or authorize
 source deletion.
+The coverage checker compares every winning source identity, recovery metadata
+and page bytes against all prepared outputs with bounded memory. Its success is
+only a precondition: caller-owned pins, state validation, durability, publication
+and source retirement are still required. It currently verifies local sources
+and outputs only and supports at most 64 of each.
 
 ## Boundaries
 

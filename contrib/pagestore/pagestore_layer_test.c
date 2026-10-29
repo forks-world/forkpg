@@ -705,6 +705,16 @@ prepared_batch_boundary_test(void)
 	{
 		PsImgIndexEnt *index = NULL;
 		uint32_t nindex = 0;
+		PsLayerDesc wrong;
+		PsImgRec wrong_rec = {.key = key, .block = 0, .lsn = 100, .page = older};
+
+		check(ps_image_compaction_verify_coverage(inputs, 2, outputs, 1, PSZ) == 0,
+			  "coverage verifies the winning legacy duplicate");
+		check(ps_image_layer_write(1304, 0, &wrong_rec, 1, PSZ, &wrong) == 0 &&
+			  ps_image_compaction_verify_coverage(inputs, 2, &wrong, 1, PSZ) != 0,
+			  "coverage rejects correct identity with the wrong source bytes");
+		check(ps_layer_store->delete_local_layer(&wrong) == 0,
+			  "remove wrong-coverage fixture");
 		check(ps_image_layer_lookup_exact(&outputs[0], &key, 0, 100, 0,
 										result, PSZ, NULL, NULL) == 1 && result[0] == 2 &&
 			  ps_image_layer_read_index(&outputs[0], &index, &nindex) == 0 && nindex == 1,
@@ -735,6 +745,9 @@ prepared_batch_boundary_test(void)
 		  "prepare two batches with a duplicate at the first boundary");
 	if (noutputs == 2)
 	{
+		check(ps_image_compaction_verify_coverage(inputs, 2, outputs, 2, PSZ) == 0 &&
+			  ps_image_compaction_verify_coverage(inputs, 2, outputs, 1, PSZ) != 0,
+			  "coverage requires every output batch");
 		check(ps_image_layer_lookup_exact(&outputs[0], &key,
 							 PS_IMAGE_BATCH_MAX_RECORDS - 1, 100, 0, result,
 							 PSZ, NULL, NULL) == 1 && result[0] == 2 &&
@@ -770,6 +783,8 @@ prepared_finite_sequence_test(void)
 		  "prepare equal-LSN distinct admission sequences");
 	if (noutputs == 1)
 	{
+		check(ps_image_compaction_verify_coverage(inputs, 2, &output, 1, PSZ) == 0,
+			  "coverage verifies all finite sequence versions");
 		check(ps_image_layer_lookup_exact(&output, &key, 0, 100, 0, page, PSZ,
 												NULL, NULL) == 1 && page[0] == 3 &&
 			  ps_image_layer_lookup_exact(&output, &key, 0, 100, 8, page, PSZ,
