@@ -45,6 +45,14 @@ extern int ps_manifest_add_new_layer(const PsLayerDesc *desc);
 extern int ps_manifest_publish_image_batch(const PsLayerDesc *inputs,
 	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs,
 	uint32_t batch_index);
+/* Retire one source in order after all output ADDs are durable and coverage
+ * is verified. Caller owns pins on all inputs, reserves output IDs, and holds
+ * the map and writer/lifecycle fences while validating timeline state. A failed
+ * append may be durable: stop and recover by replay, never delete on failure.
+ * This writes one record, but its fsync has no time bound. */
+extern int ps_manifest_retire_image_source(const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs,
+	uint32_t source_index);
 extern int	ps_manifest_set_remote_location(uint64_t layer_id,
 											const PsLayerLocation *location);
 extern int	ps_manifest_set_remote_durable(uint64_t layer_id,

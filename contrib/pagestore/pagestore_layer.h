@@ -270,6 +270,15 @@ extern int ps_image_compaction_verify_coverage(const PsLayerDesc *inputs,
 extern int ps_image_compaction_snapshot_valid(const PsLayerMap *map,
 	const PsLayerDesc *inputs, uint32_t ninputs,
 	const PsLayerDesc *outputs, uint32_t noutputs);
+/* Validate a pinned, partially retired input set and all published outputs.
+ * The caller must hold its own pin on every input throughout retirement; a
+ * nonzero reader count alone does not establish ownership. It must also hold
+ * the map lock and writer/lifecycle fences and independently ensure coverage,
+ * output durability and timeline validity. Remote-durable inputs are rejected.
+ * After process restart, replan instead of resuming this in-memory snapshot. */
+extern int ps_image_compaction_retirement_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t retired_prefix);
 /* Force a fresh data-section checksum verification (ignores cached state). */
 /* Empty the process-wide image index cache; the layer store calls it on close. */
 extern void ps_image_layer_cache_reset(void);

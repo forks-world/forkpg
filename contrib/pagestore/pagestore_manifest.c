@@ -1052,6 +1052,17 @@ ps_manifest_publish_image_batch(const PsLayerDesc *inputs, uint32_t ninputs,
 }
 
 int
+ps_manifest_retire_image_source(const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	uint32_t source_index)
+{
+	if (!ps_image_compaction_retirement_valid(&ps_layer_map, inputs, ninputs,
+	outputs, noutputs, source_index))
+		return -1;
+	return ps_manifest_mark_delete(inputs[source_index].layer_id);
+}
+
+int
 ps_manifest_set_remote_location(uint64_t layer_id,
 								const PsLayerLocation *location)
 {

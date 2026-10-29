@@ -351,6 +351,27 @@ streaming_layer_test(void)
 			present[1].timeline++;
 			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 0,
 				  "output ID collision on another timeline is rejected");
+			{
+				PsLayerDesc entries[5], remote = layer;
+				PsLayerMap retirement = {.layers = entries, .nlayers = 5, .capacity = 5};
+
+				entries[0] = layer;
+				memcpy(&entries[1], outputs, sizeof(legacy_outputs));
+				entries[0].cache_readers = 0;
+				check(!ps_image_compaction_retirement_valid(&retirement, &layer, 1, outputs, 4, 0),
+					  "retirement rejects an unpinned source");
+				entries[0].cache_readers = 1;
+				check(ps_image_compaction_retirement_valid(&retirement, &layer, 1, outputs, 4, 0),
+					  "retirement accepts complete outputs and pinned source");
+				retirement.nlayers--;
+				check(!ps_image_compaction_retirement_valid(&retirement, &layer, 1, outputs, 4, 0),
+					  "retirement rejects missing output");
+				retirement.nlayers++;
+				remote.remote_durable = true;
+				entries[0].remote_durable = true;
+				check(!ps_image_compaction_retirement_valid(&retirement, &remote, 1, outputs, 4, 0),
+					  "retirement rejects remote-durable inputs");
+			}
 			memcpy(legacy_outputs, outputs, sizeof(legacy_outputs));
 			legacy_outputs[0].legacy_shard_zero = true;
 			check(ps_image_compaction_verify_coverage(&layer, 1, legacy_outputs, 4,

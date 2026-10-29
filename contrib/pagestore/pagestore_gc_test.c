@@ -63,6 +63,19 @@ find_layer(uint64_t id)
 	return NULL;
 }
 
+static int
+pin_test_sources(const PsLayerDesc *inputs, uint32_t ninputs)
+{
+	for (uint32_t i = 0; i < ninputs; i++)
+	{
+		PsLayerDesc *layer = find_layer(inputs[i].layer_id);
+		if (layer == NULL)
+			return 0;
+		layer->cache_readers++;
+	}
+	return 1;
+}
+
 /* Resolve the same exact version from live layers using the production
  * layer-ID tie break. The manifest here is quiescent. */
 static int
@@ -319,6 +332,8 @@ test_partial_batch_publication_restart(void)
 			ps_manifest_replay(&ps_layer_map) == 0 &&
 			ps_manifest_publish_image_batch(captured, ncaptured, outputs, 2, 0) == 0 &&
 			ps_manifest_publish_image_batch(captured, ncaptured, outputs, 2, 1) == 0 &&
+			pin_test_sources(captured, ncaptured) &&
+			ps_manifest_retire_image_source(captured, ncaptured, outputs, 2, 1) != 0 &&
 			snprintf(path, sizeof(path), "%s/layers.manifest", dir) > 0 &&
 			stat(path, &before) == 0 && getrlimit(RLIMIT_FSIZE, &saved) == 0;
 		if (child_ok)
@@ -327,9 +342,10 @@ test_partial_batch_publication_restart(void)
 			limit.rlim_cur = (rlim_t) before.st_size + 8;
 			signal(SIGXFSZ, SIG_IGN);
 			child_ok = setrlimit(RLIMIT_FSIZE, &limit) == 0 &&
-				ps_manifest_mark_delete(inputs[0].layer_id) != 0 &&
+				ps_manifest_retire_image_source(captured, ncaptured, outputs, 2, 0) != 0 &&
 				ps_manifest_poisoned();
 			child_ok = setrlimit(RLIMIT_FSIZE, &saved) == 0 && child_ok &&
+				ps_manifest_retire_image_source(captured, ncaptured, outputs, 2, 1) != 0 &&
 				ps_manifest_mark_delete(inputs[1].layer_id) != 0;
 		}
 		_exit(child_ok ? 0 : 1);
@@ -360,7 +376,10 @@ test_partial_batch_publication_restart(void)
 	{
 		int child_ok = ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
 			ps_manifest_replay(&ps_layer_map) == 0 &&
-			ps_manifest_mark_delete(inputs[0].layer_id) == 0;
+			pin_test_sources(captured, ncaptured) &&
+			ps_manifest_retire_image_source(captured, ncaptured, outputs, 2, 0) == 0 &&
+			ps_manifest_retire_image_source(captured, ncaptured, outputs, 2, 0) != 0 &&
+			ps_manifest_retire_image_source(captured, ncaptured, outputs, 2, 1) == 0;
 		_exit(child_ok ? 0 : 1);
 	}
 	if (child < 0 || waitpid(child, &status, 0) != child ||
@@ -373,7 +392,7 @@ test_partial_batch_publication_restart(void)
 		  ps_manifest_replay(&ps_layer_map) == 0,
 		  "replay after process exits during source retirement");
 	check(find_layer(1) != NULL && find_layer(1)->deleting &&
-		  find_layer(2) != NULL && !find_layer(2)->deleting &&
+		  find_layer(2) != NULL && find_layer(2)->deleting &&
 		  find_layer(8) != NULL && find_layer(9) != NULL,
 		  "source tombstone follows both durable output ADDs");
 	check(read_live_exact(&key, 0, page) == 1 && page[0] == 1 &&
@@ -383,7 +402,7 @@ test_partial_batch_publication_restart(void)
 	check(read_live_latest(&key, PS_IMAGE_BATCH_MAX_RECORDS - 1, page) == 1 && page[0] == 3,
 		  "source retirement retains the later finite-sequence write");
 	gc_resume_like();
-	check(find_layer(1) == NULL && find_layer(2) != NULL &&
+	check(find_layer(1) == NULL && find_layer(2) == NULL &&
 		  read_live_exact(&key, 0, page) == 1 && page[0] == 1,
 		  "GC can complete the tombstone while replacement stays readable");
 	{

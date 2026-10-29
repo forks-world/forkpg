@@ -1240,23 +1240,26 @@ image_snapshot_descriptor_equal(const PsLayerDesc *a, const PsLayerDesc *b)
 	return 1;
 }
 
-int
-ps_image_compaction_snapshot_valid(const PsLayerMap *map,
+static int
+image_compaction_snapshot_valid(const PsLayerMap *map,
 								   const PsLayerDesc *inputs, uint32_t ninputs,
-								   const PsLayerDesc *outputs, uint32_t noutputs)
+								   const PsLayerDesc *outputs, uint32_t noutputs,
+	uint32_t retired_prefix, int retiring)
 {
 	uint64_t max_id = 0;
-	uint32_t seen_inputs = 0;
+	uint32_t seen_inputs = 0, seen_outputs = 0;
 	uint64_t seen_input_bits = 0, seen_output_bits = 0;
 
 	if (map == NULL || (map->nlayers != 0 && map->layers == NULL) ||
 		inputs == NULL || outputs == NULL || ninputs == 0 ||
 		noutputs == 0 || ninputs > PS_IMAGE_MERGE_MAX_INPUTS ||
-		noutputs > PS_IMAGE_PREPARE_MAX_OUTPUTS)
+		noutputs > PS_IMAGE_PREPARE_MAX_OUTPUTS ||
+		(retiring && retired_prefix >= ninputs))
 		return 0;
 	for (uint32_t i = 0; i < ninputs; i++)
 	{
 		if (inputs[i].kind != PS_LAYER_IMAGE || inputs[i].deleting ||
+			(retiring && inputs[i].remote_durable) ||
 			inputs[i].location_count == 0 || inputs[i].location_count > PS_LAYER_MAX_LOCATIONS ||
 			inputs[i].legacy_shard_zero || inputs[i].timeline != inputs[0].timeline ||
 			(inputs[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
@@ -1297,8 +1300,12 @@ ps_image_compaction_snapshot_valid(const PsLayerMap *map,
 		for (uint32_t j = 0; j < ninputs; j++)
 			if (current->layer_id == inputs[j].layer_id)
 			{
+				PsLayerDesc expected = inputs[j];
+
+				expected.deleting = retiring && j < retired_prefix;
 				if ((seen_input_bits & (UINT64_C(1) << j)) != 0 ||
-					!image_snapshot_descriptor_equal(current, &inputs[j]))
+					(retiring && current->cache_readers == 0) ||
+					!image_snapshot_descriptor_equal(current, &expected))
 					return 0;
 				seen_input_bits |= UINT64_C(1) << j;
 				seen_inputs++;
@@ -1314,13 +1321,32 @@ ps_image_compaction_snapshot_valid(const PsLayerMap *map,
 					!image_snapshot_descriptor_equal(current, &outputs[j]))
 					return 0;
 				seen_output_bits |= UINT64_C(1) << j;
+				seen_outputs++;
 				matched = 1;
 				break;
 			}
 		if (!matched && !current->deleting)
 			return 0;
 	}
-	return seen_inputs == ninputs;
+	return seen_inputs == ninputs && (!retiring || seen_outputs == noutputs);
+}
+
+int
+ps_image_compaction_snapshot_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs)
+{
+	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs, 0, 0);
+}
+
+int
+ps_image_compaction_retirement_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	uint32_t retired_prefix)
+{
+	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs,
+	retired_prefix, 1);
 }
 
 int
