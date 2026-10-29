@@ -686,6 +686,90 @@ visit_relation_plan(const PsImageGroupEntry *entries, uint32_t count,
 }
 
 static void
+resumable_relation_plan_test(void)
+{
+	PsKey key = {1, 1, 956, 0, PS_KLASS_RELATION};
+	unsigned char page[PSZ] = {0};
+	PsImgRec recs[3], big[5];
+	PsLayerDesc layer, mixed, oversized;
+	PsCompactionRelationPlan *plan = NULL;
+	PsViewFence fence = {200, 1, PS_PRUNE_SEQ_UNBOUNDED};
+	RelationPlanProbe probe = {0};
+	uint32_t visited = 99;
+	int ok;
+
+	memset(recs, 0, sizeof(recs));
+	for (uint32_t i = 0; i < 3; i++)
+	{
+		recs[i].key = key;
+		recs[i].block = i == 2 ? 1 : 0;
+		recs[i].lsn = 100;
+		recs[i].admission_seq = i + 1;
+		recs[i].page = page;
+	}
+	ok = ps_image_layer_write(30984, 0, recs, 3, PSZ, &layer) == 0;
+	check(ok && ps_compaction_relation_plan_open(&layer, 1, 2,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0, &plan) == 0,
+		  "open resumable relation plan");
+	fence.seq = 2; /* The plan must use the copied fence, not this mutation. */
+	check(plan && ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 1 && visited == 1 && probe.count == 2 &&
+		  probe.keep[0] && probe.keep[1] && probe.closure[0],
+		  "one-step budget retains copied finite fence and leaves a next group");
+	memset(&probe, 0, sizeof(probe));
+	check(ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 0 && visited == 1 && probe.count == 1 &&
+		  probe.ids[0] == 30984,
+		  "next step completes exactly the remaining group");
+	check(ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 0 && visited == 0,
+		  "completed plan stays complete without another callback");
+	ps_compaction_relation_plan_close(plan);
+	plan = NULL;
+	recs[2].key.klass = PS_KLASS_CONTROL;
+	check(ps_image_layer_write(30985, 0, recs, 3, PSZ, &mixed) == 0 &&
+		  ps_compaction_relation_plan_open(&mixed, 1, 2,
+			(PsPruneFence) {150, UINT64_MAX}, NULL, 0, 0, 0, &plan) == 0,
+		  "open plan with a later unsupported group");
+	memset(&probe, 0, sizeof(probe));
+	check(plan && ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 1 && visited == 1,
+		  "first group is staged before the later unsupported group");
+	memset(&probe, 0, sizeof(probe));
+	check(ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == -1 && visited == 0 && probe.calls == 0 &&
+		  ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == -1,
+		  "later unsupported group invalidates all staged work and fails permanently");
+	ps_compaction_relation_plan_close(plan);
+	plan = NULL;
+	memset(big, 0, sizeof(big));
+	for (uint32_t i = 0; i < 5; i++)
+	{
+		big[i].key = key;
+		big[i].block = i < 2 ? 0 : 1;
+		big[i].lsn = 100 + i;
+		big[i].admission_seq = i + 1;
+		big[i].page = page;
+	}
+	check(ps_image_layer_write(30986, 0, big, 5, PSZ, &oversized) == 0 &&
+		  ps_compaction_relation_plan_open(&oversized, 1, 2,
+			(PsPruneFence) {150, UINT64_MAX}, NULL, 0, 0, 0, &plan) == 0,
+		  "open plan with later oversized history");
+	memset(&probe, 0, sizeof(probe));
+	check(plan && ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 1 && visited == 1,
+		  "stage complete group before oversized history");
+	memset(&probe, 0, sizeof(probe));
+	check(ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == -2 && visited == 0 && probe.calls == 0 &&
+		  ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == -1,
+		  "later oversized history fails closed and invalidates the plan");
+	ps_compaction_relation_plan_close(plan);
+}
+
+static void
 bounded_relation_plan_test(void)
 {
 	PsKey key = {1, 1, 954, 0, PS_KLASS_RELATION};
@@ -1122,6 +1206,7 @@ main(void)
 	}
 	legacy_index_visitor_test();
 	bounded_relation_plan_test();
+	resumable_relation_plan_test();
 	bounded_merge_test();
 	bounded_shared_payload_test();
 	bounded_sorted_batch_test();
