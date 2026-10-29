@@ -15,6 +15,7 @@
 #include "pagestore_fault.h"
 #include "pagestore_forkmeta_snapshot.h"
 #include "pagestore_manifest.h"
+#include "pagestore_layer.h"
 #include "pagestore_prune.h"
 #include "pagestore_retention.h"
 
@@ -5629,6 +5630,167 @@ finite_test_control_pair(uint64_t version, uint64_t redo, unsigned char tag)
 	return ok;
 }
 
+static int
+live_layer_has_version(const PsKey *key, uint32_t block, uint64_t lsn, uint64_t seq)
+{
+	int found = 0, failed = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *layer = &ps_layer_map.layers[i];
+		PsImgIndexEnt *index = NULL;
+		uint32_t n = 0;
+
+		if (layer->kind != PS_LAYER_IMAGE || layer->deleting || layer->timeline != 0)
+			continue;
+		if (ps_image_layer_read_index(layer, &index, &n) != 0)
+		{
+			failed = 1;
+			break;
+		}
+		for (uint32_t j = 0; j < n; j++)
+			if (index[j].key.spcOid == key->spcOid && index[j].key.dbOid == key->dbOid &&
+				index[j].key.relNumber == key->relNumber && index[j].key.forkNum == key->forkNum &&
+				index[j].key.klass == key->klass && index[j].block == block &&
+				index[j].lsn == lsn && index[j].admission_seq == seq)
+				found = 1;
+		free(index);
+	}
+	ps_unlock_map();
+	return failed ? -1 : found;
+}
+
+/* At one position a truncate can invalidate the first arrival while a later
+ * same-LSN write is visible. Closure must retain that first arrival too. */
+static void
+test_closure_with_same_lsn_invalidation(void)
+{
+	char store[] = "/tmp/pagestore-closure-invalidation.XXXXXX";
+	char frontier[1024];
+	PsKey key = {1, 1, 32990, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	PsRetentionPin pin = {0};
+	PsChannel ch = {0};
+	uint64_t first = 0, last = 0, ignored = 0;
+
+	check(mkdtemp(store) != NULL, "create closure invalidation store");
+	snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	flush_pages = 1;
+	compact_layers = 0;
+	check(ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &key, 90, 0, 0, 0, NULL) &&
+		  append_relation_tag(&key, 0, 100, page, 0x11, &first) == 0 &&
+		  meta_request(PS_OP_TRUNCATE, &key, 100, 0, 0, 0, NULL) &&
+		  append_relation_tag(&key, 0, 100, page, 0x22, &last) == 0 && first < last,
+		  "create first arrival, same-LSN invalidation and later rewrite");
+	ch.opcode = PS_OP_CREATE_BRANCH;
+	ch.timeline = 1;
+	ch.parent_timeline = 0;
+	ch.req_lsn = 200;
+	ch.is_redo = PS_BRANCH_R2_PROVEN;
+	ps_admission_read_lock();
+	ps_lock_shard_wr(0);
+	ps_lock_map_wr();
+	ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_unlock_shard(0);
+	ps_admission_read_unlock();
+	check(ch.status == PS_STATUS_OK &&
+		  ch.result == (PS_BRANCH_RESULT_NEW | PS_BRANCH_RESULT_FINITE),
+		  "register a finite branch after the visible rewrite");
+	check(append_relation(&key, 1, 300, page, &ignored) == 0 &&
+		  append_relation(&key, 1, 500, page, &ignored) == 0,
+		  "advance root history above the branch");
+	pin.timeline = 0;
+	pin.owner_kind = PS_RETENTION_OWNER_CONFIGURED;
+	pin.owner_id = 32990;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 500;
+	pin.admission_seq = ignored;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1), "compact past the invalidated first arrival");
+	check(live_layer_has_version(&key, 0, 100, first) == 1 &&
+		  live_layer_has_version(&key, 0, 100, last) == 1,
+		  "visible later sibling retains the invalidated first-arrival identity");
+	check(read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 1 && page[128] == 0x22,
+		  "finite branch reads the visible same-LSN rewrite");
+	close_runtime();
+	check(ps_core_open(store) == 0 && live_layer_has_version(&key, 0, 100, first) == 1 &&
+		  live_layer_has_version(&key, 0, 100, last) == 1 &&
+		  read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 1 && page[128] == 0x22,
+		  "first-arrival identity and visible rewrite survive recovery");
+	close_runtime();
+	remove_tree(store);
+}
+
+/* A later same-position arrival must not become a synthetic first arrival
+ * merely because compaction retired the original invalidated version. */
+static void
+test_invalidated_first_arrival_then_late_rewrite(void)
+{
+	char store[] = "/tmp/pagestore-closure-late.XXXXXX";
+	char frontier[1024];
+	PsKey key = {1, 1, 32991, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	PsRetentionPin pin = {0};
+	PsChannel ch = {0};
+	uint64_t first = 0, late = 0, ignored = 0;
+
+	check(mkdtemp(store) != NULL, "create invalidated first-arrival store");
+	snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	flush_pages = 1;
+	compact_layers = 0;
+	check(ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &key, 90, 0, 0, 0, NULL) &&
+		  append_relation_tag(&key, 0, 100, page, 0x11, &first) == 0 &&
+		  meta_request(PS_OP_TRUNCATE, &key, 100, 0, 0, 0, NULL) &&
+		  meta_request(PS_OP_ZEROEXTEND, &key, 110, 0, 1, 0, NULL),
+		  "invalidate the first arrival and regrow an empty block");
+	ch.opcode = PS_OP_CREATE_BRANCH;
+	ch.timeline = 1;
+	ch.parent_timeline = 0;
+	ch.req_lsn = 200;
+	ch.is_redo = PS_BRANCH_R2_PROVEN;
+	ps_admission_read_lock();
+	ps_lock_shard_wr(0);
+	ps_lock_map_wr();
+	ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_unlock_shard(0);
+	ps_admission_read_unlock();
+	check(ch.status == PS_STATUS_OK &&
+		  ch.result == (PS_BRANCH_RESULT_NEW | PS_BRANCH_RESULT_FINITE),
+		  "register a finite branch after the invalidation");
+	check(read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 0,
+		  "branch sees no bytes at the invalidated position");
+	check(append_relation(&key, 1, 300, page, &ignored) == 0 &&
+		  append_relation(&key, 1, 500, page, &ignored) == 0,
+		  "advance root history past the branch");
+	pin.timeline = 0;
+	pin.owner_kind = PS_RETENTION_OWNER_CONFIGURED;
+	pin.owner_id = 32991;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 500;
+	pin.admission_seq = ignored;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1), "compact the invalidated position");
+	check(live_layer_has_version(&key, 0, 100, first) == 1,
+		  "compaction retains the hidden first-arrival identity for the finite branch");
+	check(append_relation_tag(&key, 0, 100, page, 0x22, &late) == 0 && first < late,
+		  "append a same-LSN rewrite after compaction");
+	check(read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 0,
+		  "late rewrite remains hidden from the finite branch after compaction");
+	close_runtime();
+	check(ps_core_open(store) == 0 &&
+		  read_resolve(1, &key, 0, UINT64_MAX, 0, page, NULL) == 0,
+		  "late rewrite remains hidden after restart");
+	close_runtime();
+	remove_tree(store);
+}
+
 /* Production branch caps must survive page and forkmeta reclamation together. */
 static void
 test_finite_branch_cutovers(void)
@@ -6459,6 +6621,8 @@ main(void)
 	test_deletion_filtered_forkmeta_commit_shape();
 	test_reclaimed_ordered_markers_pruned();
 	test_inert_markers_compacted_after_cutover();
+	test_invalidated_first_arrival_then_late_rewrite();
+	test_closure_with_same_lsn_invalidation();
 	test_finite_branch_cutovers();
 	test_inert_markers_kept_when_retained();
 	test_inert_markers_kept_on_preserve_survivors();

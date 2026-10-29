@@ -1331,8 +1331,15 @@ moving a write to R+1.
 WAL-index commits sample S_H while holding all shard locks in ascending order.
 WIPG v2 and WISD v4 persist finite horizons, including a consistent sample across
 snapshot shards. Replacement bases, death folds and forkmeta cutovers use full
-projected caps. Page closure preserves the selected visible identity at each
-retained position, while allowing fully invalidated positions to retire.
+projected caps. Page closure preserves first-arrival identities required by
+finite views, even when their bytes are currently hidden by a fork event. The
+relation-page invalidation filter must not discard a closure-protected entry.
+An end-to-end regression covers a truncate and regrowth followed by a finite
+branch, compaction, and a late same-LSN rewrite; without the protection the
+rewrite incorrectly appears in that branch, including after restart. This
+supersedes the earlier P5 claim that fully invalidated positions can always
+retire. Keeping the page data for an identity can defer reclaim until no finite
+fence requires it; compact persistent identity records are future work.
 
 Artifact BEGIN registers an in-flight `(C,token)` control cap, and the producer
 reads CONTROL with that cap before publishing data. COMMIT retains the cap,

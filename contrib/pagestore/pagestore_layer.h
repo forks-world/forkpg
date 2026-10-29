@@ -101,7 +101,7 @@ extern uint32_t ps_layer_map_count(const PsLayerMap *map);
  * Image layer file format (phase 2).
  *
  * An image layer is an immutable file holding full-page versions:
- *     [ page data : nrecs * page_size, back to back ]
+ *     [ page data : full pages, back to back; identical pages may share offsets ]
  *     [ index     : nrecs * PsImgIndexEnt, sorted by (key, block, lsn) ]
  *     [ footer    : PsImgFooter, fixed-size trailer at end of file ]
  * It stores *multiple versions* per (key, block) (keyed by page_lsn), so a read
@@ -173,6 +173,23 @@ extern int ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
  const PsImgRec *recs, uint32_t n, uint32_t page_size,
  PsImagePageReader read_page, void *arg, PsLayerDesc *out);
 
+/* Compaction variant shares adjacent byte-identical payloads while retaining
+ * each version's index identity. Callers provide the same lifetime and
+ * publication guarantees as for the ordinary streaming writer. */
+extern int ps_image_layer_write_compaction_stream(uint64_t layer_id, uint32_t timeline,
+	const PsImgRec *recs, uint32_t n, uint32_t page_size,
+	PsImagePageReader read_page, void *arg, PsLayerDesc *out);
+
+/* One independently sealed, unpublished output batch. Metadata must already
+ * be sorted by key, block, LSN and admission sequence.  The explicit record
+ * limit bounds writer memory and output size to n * (page_size + index entry)
+ * plus a footer. Adjacent identical page payloads share one data offset; their
+ * distinct version identities and recovery metadata remain in the index.  Publishing and retiring sources remain the caller's job. */
+#define PS_IMAGE_BATCH_MAX_RECORDS 1024
+extern int ps_image_layer_write_sorted_batch(uint64_t layer_id, uint32_t timeline,
+ const PsImgRec *recs, uint32_t n, uint32_t page_size,
+ PsImagePageReader read_page, void *arg, PsLayerDesc *out);
+
 /*
  * Look up the newest version of (key, block) with lsn <= read_lsn in image
  * layer 'layer'.  On a hit copies page_size bytes into out, stores that
@@ -198,6 +215,103 @@ extern int ps_image_layer_lookup_exact(const PsLayerDesc *layer, const PsKey *ke
  */
 extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
 									  PsImgIndexEnt **out, uint32_t *n);
+/* Bounded index traversal.  The entry pointer is valid only during the call.
+ * Callbacks must stage their effects until success: a later I/O or checksum
+ * error invalidates every previously visited entry. */
+typedef int (*PsImageIndexVisitor)(const PsImgIndexEnt *entry, void *arg);
+extern int ps_image_layer_visit_index(const PsLayerDesc *layer,
+									  PsImageIndexVisitor visit, void *arg);
+/* Pull sorted entries from an immutable, caller-pinned layer. next returns 1
+ * for an entry, 0 only after final checksum validation, and -1 on error.
+ * Results must not be published before 0. Close releases cursor memory. */
+typedef struct PsImageIndexCursor PsImageIndexCursor;
+extern int ps_image_index_cursor_open(const PsLayerDesc *layer,
+									   PsImageIndexCursor **out);
+extern int ps_image_index_cursor_next(PsImageIndexCursor *cursor,
+									   PsImgIndexEnt *entry);
+extern void ps_image_index_cursor_close(PsImageIndexCursor *cursor);
+/* Bounded fan-in for caller-pinned image layers on one timeline. Identical
+ * versions are emitted in ascending source-layer order, so the last copy
+ * matches the read path's layer-ID tie break.  As with a cursor, staged
+ * results are valid only if next reaches 0; close alone does not verify them. */
+#define PS_IMAGE_MERGE_MAX_INPUTS 64
+typedef struct PsImageIndexMerge PsImageIndexMerge;
+extern int ps_image_index_merge_open(const PsLayerDesc *layers, uint32_t count,
+									  PsImageIndexMerge **out);
+extern int ps_image_index_merge_next(PsImageIndexMerge *merge,
+									  PsImgIndexEnt *entry, uint64_t *layer_id);
+extern void ps_image_index_merge_close(PsImageIndexMerge *merge);
+
+/* Visit complete (key, block) version groups in merge order, including
+ * duplicate identities and source IDs. Groups are bounded by max_group
+ * (1..PS_IMAGE_GROUP_MAX_VERSIONS). Return -2 if a group exceeds that limit,
+ * -1 on I/O, ordering, allocation or callback failure, and 0 on success.
+ * Callback data is transient. All effects must remain staged until the whole
+ * traversal succeeds: even earlier groups are invalid on a later failure.
+ * Inputs must remain immutable and pinned throughout the traversal. */
+#define PS_IMAGE_GROUP_MAX_VERSIONS 1024
+typedef struct PsImageGroupEntry
+{
+	PsImgIndexEnt entry;
+	uint64_t layer_id;
+} PsImageGroupEntry;
+typedef int (*PsImageGroupVisitor)(const PsImageGroupEntry *entries,
+	uint32_t count, void *arg);
+extern int ps_image_index_visit_groups(const PsLayerDesc *layers, uint32_t count,
+	uint32_t max_group, PsImageGroupVisitor visit, void *arg);
+
+/* The high 16 layer-ID bits encode the shard; the lower 48 are local IDs. */
+#define PS_IMAGE_LAYER_SHARD_SHIFT 48
+/* Prepare at most 64 unpublished output layers from caller-pinned local
+ * sources. Legacy shard-zero sources are unsupported and rejected. The input
+ * and output arrays must not overlap.
+ * Output IDs must be strictly increasing and greater than every source ID.
+ * 0 means every output is sealed and *noutputs describes them;
+ * -1 means failure with no known remaining outputs; -3 means the output
+ * capacity was exhausted and all staged files were cleaned; -2 means cleanup
+ * or a failed create/write needs reconciliation. On -2, outputs[0..*noutputs)
+ * are sealed files whose cleanup failed; *uncertain_id is the attempted ID
+ * whose create/write outcome could not be established (0 if none). Never
+ * publish a partial result. Exact duplicate identities are collapsed to the
+ * winning source; distinct logical versions are retained. This API does not
+ * persist a transaction. */
+#define PS_IMAGE_PREPARE_MAX_OUTPUTS 64
+extern int ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
+									  const uint64_t *output_ids, uint32_t capacity,
+									  uint32_t page_size, PsLayerDesc *outputs,
+									  uint32_t *noutputs, uint64_t *uncertain_id);
+/* As above, also report input entries and unique retained identities on
+ * success. Counts are zero on failure and do not authorize publication. */
+extern int ps_image_compaction_prepare_counted(const PsLayerDesc *layers,
+	uint32_t count, const uint64_t *output_ids, uint32_t capacity,
+	uint32_t page_size, PsLayerDesc *outputs, uint32_t *noutputs,
+	uint64_t *uncertain_id, uint64_t *scanned_out, uint64_t *kept_out);
+/* Compare the complete logical version set and page bytes against prepared
+ * outputs. All inputs and outputs must remain immutable and pinned for the
+ * whole call. Success alone is not authority to publish or retire a source:
+ * the caller must separately fence concurrent state and ensure durability.
+ * Legacy shard-zero inputs and outputs are unsupported and rejected. */
+extern int ps_image_compaction_verify_coverage(const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs,
+	uint32_t page_size);
+/* Check that the current map still contains exactly the captured input set
+ * plus any already-published outputs. Returns 1 when it matches, 0 otherwise.
+ * Caller must hold the map lock and fence relevant writers and lifecycle
+ * changes; output IDs must have been reserved so later layer allocations
+ * cannot reuse them or sort before them. This check does not itself pin files,
+ * reserve IDs, or validate timeline state. */
+extern int ps_image_compaction_snapshot_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs);
+/* Validate a pinned, partially retired input set and all published outputs.
+ * The caller must hold its own pin on every input throughout retirement; a
+ * nonzero reader count alone does not establish ownership. It must also hold
+ * the map lock and writer/lifecycle fences and independently ensure coverage,
+ * output durability and timeline validity. Remote-durable inputs are rejected.
+ * After process restart, replan instead of resuming this in-memory snapshot. */
+extern int ps_image_compaction_retirement_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t retired_prefix);
 /* Force a fresh data-section checksum verification (ignores cached state). */
 /* Empty the process-wide image index cache; the layer store calls it on close. */
 extern void ps_image_layer_cache_reset(void);

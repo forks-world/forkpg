@@ -11,39 +11,55 @@
  * every input version (design doc S1.3's s_min(p))?  Legacy admission_seq
  * == 0 is already the numeric minimum, so no special case is needed.
  */
+static uint32_t
+position_lower_bound(const PsPruneVersion *versions, uint32_t n, uint64_t lsn)
+{
+	uint32_t lo = 0, hi = n;
+
+	while (lo < hi)
+	{
+		uint32_t mid = lo + (hi - lo) / 2;
+
+		if (versions[mid].lsn < lsn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
 static int
 version_is_smin(const PsPruneVersion *versions, uint32_t n, uint32_t idx)
 {
-	for (uint32_t j = 0; j < n; j++)
-		if (j != idx && versions[j].lsn == versions[idx].lsn &&
-			versions[j].admission_seq < versions[idx].admission_seq)
-			return 0;
-	return 1;
+	uint32_t first = position_lower_bound(versions, n, versions[idx].lsn);
+
+	return versions[first].admission_seq == versions[idx].admission_seq;
 }
 
-/* The index of the minimum-admission_seq version at this lsn, or n if none
- * exists (the caller only calls this for a position it already knows is
- * occupied).
- *
- * Codex 4104350489: an exact (lsn, admission_seq) tie is a duplicate tuple
- * whose *last* input element is authoritative (the same convention step 1's
- * exact-duplicate skip and step 2's best-selection tie-break both use, via
- * their own >= comparisons) -- the last append is what the stored bytes at
- * that identity actually resolve to.  A strict "<" here would instead keep
- * the *first* of a tied run, so closure could protect a stale duplicate's
- * index while the real payload the identity resolves to (the last one) is
- * left unprotected and can be pruned.  "<=" makes a later duplicate at the
- * same minimum seq win, matching that convention. */
+/* Versions are sorted by (lsn, sequence). Return the last copy of the
+ * minimum sequence at this LSN, matching exact-identity tie-breaking. */
 static uint32_t
 position_min_seq_index(const PsPruneVersion *versions, uint32_t n, uint64_t lsn)
 {
-	uint32_t	best = n;
+	uint32_t first = position_lower_bound(versions, n, lsn);
+	uint32_t lo, hi;
+	uint64_t min_seq;
 
-	for (uint32_t j = 0; j < n; j++)
-		if (versions[j].lsn == lsn &&
-			(best == n || versions[j].admission_seq <= versions[best].admission_seq))
-			best = j;
-	return best;
+	if (first == n || versions[first].lsn != lsn)
+		return n;
+	min_seq = versions[first].admission_seq;
+	lo = first;
+	hi = n;
+	while (lo < hi)
+	{
+		uint32_t mid = lo + (hi - lo) / 2;
+
+		if (versions[mid].lsn == lsn && versions[mid].admission_seq == min_seq)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo - 1;
 }
 
 int

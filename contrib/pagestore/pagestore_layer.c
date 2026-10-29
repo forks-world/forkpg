@@ -207,13 +207,61 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 									   image_memory_page, &page_size, out);
 }
 
+static int
+image_layer_write_stream_impl(uint64_t layer_id, uint32_t timeline,
+	const PsImgRec *recs, uint32_t n, uint32_t page_size,
+	PsImagePageReader read_page, void *arg, PsLayerDesc *out, bool share_adjacent);
+
+int
+ps_image_layer_write_sorted_batch(uint64_t layer_id, uint32_t timeline,
+								  const PsImgRec *recs, uint32_t n, uint32_t page_size,
+								  PsImagePageReader read_page, void *arg, PsLayerDesc *out)
+{
+	if (recs == NULL || out == NULL || n == 0 || n > PS_IMAGE_BATCH_MAX_RECORDS)
+		return -1;
+	for (uint32_t i = 1; i < n; i++)
+	{
+		int c = key_cmp(&recs[i - 1].key, &recs[i].key);
+
+		if (c > 0 || (c == 0 &&
+			(recs[i - 1].block > recs[i].block ||
+			 (recs[i - 1].block == recs[i].block &&
+			  (recs[i - 1].lsn > recs[i].lsn ||
+			   (recs[i - 1].lsn == recs[i].lsn &&
+				recs[i - 1].admission_seq > recs[i].admission_seq))))))
+			return -1;
+	}
+	return image_layer_write_stream_impl(layer_id, timeline, recs, n, page_size,
+										 read_page, arg, out, true);
+}
+
 int
 ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 							const PsImgRec *recs, uint32_t n, uint32_t page_size,
 							PsImagePageReader read_page, void *arg, PsLayerDesc *out)
 {
+	return image_layer_write_stream_impl(layer_id, timeline, recs, n, page_size,
+										 read_page, arg, out, false);
+}
+
+int
+ps_image_layer_write_compaction_stream(uint64_t layer_id, uint32_t timeline,
+										const PsImgRec *recs, uint32_t n, uint32_t page_size,
+										PsImagePageReader read_page, void *arg, PsLayerDesc *out)
+{
+	return image_layer_write_stream_impl(layer_id, timeline, recs, n, page_size,
+										 read_page, arg, out, true);
+}
+
+static int
+image_layer_write_stream_impl(uint64_t layer_id, uint32_t timeline,
+							const PsImgRec *recs, uint32_t n, uint32_t page_size,
+							PsImagePageReader read_page, void *arg, PsLayerDesc *out, bool share_adjacent)
+{
 	ImgSort    *sorted = NULL;
-	unsigned char *buffer = NULL;
+	unsigned char *buffer = NULL, *previous = NULL;
+	uint64_t previous_offset = 0;
+	bool have_previous = false;
 	PsImgFooter foot;
 	uint64_t	data_bytes = (uint64_t) n * page_size;
 	uint64_t	idx_bytes = (uint64_t) n * sizeof(PsImgIndexEnt);
@@ -231,7 +279,9 @@ ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 		return -1;
 	sorted = malloc((size_t) n * sizeof(*sorted));
 	buffer = malloc(IMAGE_STREAM_BYTES);
-	if (!sorted || !buffer)
+	if (share_adjacent)
+		previous = malloc(page_size);
+	if (!sorted || !buffer || (share_adjacent && !previous))
 		goto out;
 	for (uint32_t i = 0; i < n; i++)
 	{
@@ -260,9 +310,21 @@ ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 			offset += used;
 			used = 0;
 		}
-		sorted[i].ent.data_off = (uint64_t) i * page_size;
 		if (read_page(&recs[sorted[i].src], buffer + used, arg) != 0)
 			goto out;
+		if (share_adjacent && have_previous &&
+			memcmp(previous, buffer + used, page_size) == 0)
+		{
+			sorted[i].ent.data_off = previous_offset;
+			continue;
+		}
+		sorted[i].ent.data_off = offset + used;
+		if (share_adjacent)
+		{
+			memcpy(previous, buffer + used, page_size);
+			previous_offset = sorted[i].ent.data_off;
+			have_previous = true;
+		}
 		data_crc = img_crc_extend(data_crc, buffer + used, page_size);
 		used += page_size;
 	}
@@ -270,6 +332,8 @@ ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 		ps_layer_store->write_local_layer_at(layer_id, offset, buffer, used) != 0)
 		goto out;
 	offset += used;
+	data_bytes = offset;
+	total = data_bytes + idx_bytes + sizeof(PsImgFooter);
 	used = 0;
 	for (uint32_t i = 0; i < n; i++)
 	{
@@ -351,6 +415,7 @@ out:
 	}
 	free(sorted);
 	free(buffer);
+	free(previous);
 	return rc;
 }
 /* ===================== delta layer file format ========================= */
@@ -683,6 +748,838 @@ image_index_read(const PsLayerDesc *layer, int fd, uint64_t off, void *buf, uint
 {
 	return fd >= 0 ? image_fd_read(fd, off, buf, len) :
 		ps_layer_store->read_layer_block(layer, off, buf, len);
+}
+
+static void
+image_index_decode(uint32_t version, const unsigned char *src, PsImgIndexEnt *entry)
+{
+	memset(entry, 0, sizeof(*entry));
+	if (version == 2)
+	{
+		PsImgIndexEntV2 old;
+		memcpy(&old, src, sizeof(old));
+		entry->key = old.key; entry->block = old.block;
+		entry->lsn = old.lsn; entry->data_off = old.data_off;
+	}
+	else if (version == 3)
+	{
+		PsImgIndexEntV3 old;
+		memcpy(&old, src, sizeof(old));
+		entry->key = old.key; entry->block = old.block;
+		entry->lsn = old.lsn; entry->data_off = old.data_off;
+		entry->growth_lsn = old.growth_lsn; entry->order_id = old.order_id;
+		entry->seg_off = old.seg_off; entry->seg_id = old.seg_id; entry->flags = old.flags;
+	}
+	else
+		memcpy(entry, src, sizeof(*entry));
+}
+
+int
+ps_image_layer_visit_index(const PsLayerDesc *layer, PsImageIndexVisitor visit,
+						   void *arg)
+{
+	const PsLayerLocation *loc = layer != NULL ? img_local_loc(layer) : NULL;
+	PsImgFooter foot;
+	unsigned char *buf;
+	size_t ent_size;
+	uint32_t per_chunk;
+	uint64_t bytes;
+	int rc = -1;
+
+	if (visit == NULL || loc == NULL || loc->size < sizeof(foot) ||
+		image_index_read(layer, -1, loc->size - sizeof(foot), &foot, sizeof(foot)) != 0 ||
+		foot.magic != PS_IMG_MAGIC || foot.nrecs == 0 ||
+		(foot.version != 2 && foot.version != 3 && foot.version != PS_IMG_VERSION))
+		return -1;
+	ent_size = foot.version == 2 ? sizeof(PsImgIndexEntV2) :
+		foot.version == 3 ? sizeof(PsImgIndexEntV3) : sizeof(PsImgIndexEnt);
+	bytes = (uint64_t) foot.nrecs * ent_size;
+	if (foot.index_off > loc->size - sizeof(foot) ||
+		bytes != loc->size - sizeof(foot) - foot.index_off)
+		return -1;
+	per_chunk = (64 * 1024) / ent_size;
+	buf = malloc((size_t) per_chunk * ent_size);
+	if (buf == NULL)
+		return -1;
+	/* Validate before yielding entries; validate again to detect changes or
+	 * corruption during traversal.  The caller commits only after success. */
+	for (int pass = 0; pass < 2; pass++)
+	{
+		uint32_t crc = 2166136261u;
+		for (uint32_t first = 0; first < foot.nrecs;)
+		{
+			uint32_t count = foot.nrecs - first;
+			uint32_t len;
+
+			if (count > per_chunk)
+				count = per_chunk;
+			len = count * ent_size;
+			if (image_index_read(layer, -1, foot.index_off + (uint64_t) first * ent_size,
+								 buf, len) != 0)
+				goto out;
+			crc = img_crc_extend(crc, buf, len);
+			if (pass == 1)
+				for (uint32_t i = 0; i < count; i++)
+				{
+					PsImgIndexEnt entry;
+					image_index_decode(foot.version, buf + i * ent_size, &entry);
+					if (visit(&entry, arg) != 0)
+						goto out;
+				}
+			first += count;
+		}
+		if (crc != foot.index_crc)
+			goto out;
+	}
+	rc = 0;
+out:
+	free(buf);
+	return rc;
+}
+
+struct PsImageIndexCursor
+{
+	PsLayerDesc layer;
+	PsImgFooter foot;
+	PsImgIndexEnt previous;
+	unsigned char *buffer;
+	size_t ent_size;
+	uint32_t per_chunk, next, loaded, chunk_first, crc;
+	int have_previous, failed;
+};
+
+static int
+image_cursor_precheck(const PsImgIndexEnt *entry, void *arg)
+{
+	(void) entry;
+	(void) arg;
+	return 0;
+}
+
+int
+ps_image_index_cursor_open(const PsLayerDesc *layer, PsImageIndexCursor **out)
+{
+	const PsLayerLocation *loc;
+	PsImageIndexCursor *cursor;
+	uint64_t bytes;
+
+	if (out == NULL || layer == NULL)
+		return -1;
+	*out = NULL;
+	if (ps_image_layer_visit_index(layer, image_cursor_precheck, NULL) != 0)
+		return -1;
+	loc = img_local_loc(layer);
+	if (loc == NULL || loc->size < sizeof(PsImgFooter))
+		return -1;
+	cursor = calloc(1, sizeof(*cursor));
+	if (cursor == NULL)
+		return -1;
+	cursor->layer = *layer;
+	if (image_index_read(layer, -1, loc->size - sizeof(cursor->foot),
+						 &cursor->foot, sizeof(cursor->foot)) != 0 ||
+		cursor->foot.magic != PS_IMG_MAGIC || cursor->foot.nrecs == 0 ||
+		(cursor->foot.version != 2 && cursor->foot.version != 3 &&
+		 cursor->foot.version != PS_IMG_VERSION))
+		goto fail;
+	cursor->ent_size = cursor->foot.version == 2 ? sizeof(PsImgIndexEntV2) :
+		cursor->foot.version == 3 ? sizeof(PsImgIndexEntV3) : sizeof(PsImgIndexEnt);
+	bytes = (uint64_t) cursor->foot.nrecs * cursor->ent_size;
+	if (cursor->foot.index_off > loc->size - sizeof(cursor->foot) ||
+		bytes != loc->size - sizeof(cursor->foot) - cursor->foot.index_off)
+		goto fail;
+	cursor->per_chunk = (64 * 1024) / cursor->ent_size;
+	cursor->buffer = malloc(cursor->per_chunk * cursor->ent_size);
+	if (cursor->buffer == NULL)
+		goto fail;
+	cursor->crc = 2166136261u;
+	*out = cursor;
+	return 0;
+fail:
+	free(cursor);
+	return -1;
+}
+
+int
+ps_image_index_cursor_next(PsImageIndexCursor *cursor, PsImgIndexEnt *entry)
+{
+	int c;
+
+	if (cursor == NULL || entry == NULL || cursor->failed)
+		return -1;
+	if (cursor->next == cursor->foot.nrecs)
+	{
+		if (cursor->crc != cursor->foot.index_crc)
+		{
+			cursor->failed = 1;
+			return -1;
+		}
+		return 0;
+	}
+	if (cursor->next == cursor->loaded)
+	{
+		uint32_t count = cursor->foot.nrecs - cursor->next;
+		uint32_t len;
+		if (count > cursor->per_chunk)
+			count = cursor->per_chunk;
+		len = count * cursor->ent_size;
+		if (image_index_read(&cursor->layer, -1,
+				cursor->foot.index_off + (uint64_t) cursor->next * cursor->ent_size,
+				cursor->buffer, len) != 0)
+		{
+			cursor->failed = 1;
+			return -1;
+		}
+		cursor->crc = img_crc_extend(cursor->crc, cursor->buffer, len);
+		cursor->chunk_first = cursor->next;
+		cursor->loaded = cursor->next + count;
+	}
+	image_index_decode(cursor->foot.version,
+		cursor->buffer + (cursor->next - cursor->chunk_first) * cursor->ent_size, entry);
+	c = cursor->have_previous ? key_cmp(&cursor->previous.key, &entry->key) : 0;
+	if (cursor->have_previous && (c > 0 || (c == 0 &&
+		(cursor->previous.block > entry->block ||
+		 (cursor->previous.block == entry->block &&
+		  (cursor->previous.lsn > entry->lsn ||
+		   (cursor->previous.lsn == entry->lsn &&
+			cursor->previous.admission_seq > entry->admission_seq)))))))
+	{
+		cursor->failed = 1;
+		return -1;
+	}
+	cursor->previous = *entry;
+	cursor->have_previous = 1;
+	cursor->next++;
+	return 1;
+}
+
+void
+ps_image_index_cursor_close(PsImageIndexCursor *cursor)
+{
+	if (cursor != NULL)
+	{
+		free(cursor->buffer);
+		free(cursor);
+	}
+}
+
+struct PsImageIndexMerge
+{
+	PsImageIndexCursor *cursors[PS_IMAGE_MERGE_MAX_INPUTS];
+	PsImgIndexEnt heads[PS_IMAGE_MERGE_MAX_INPUTS];
+	uint64_t layer_ids[PS_IMAGE_MERGE_MAX_INPUTS];
+	unsigned char active[PS_IMAGE_MERGE_MAX_INPUTS];
+	uint32_t count;
+	int failed;
+};
+
+void
+ps_image_index_merge_close(PsImageIndexMerge *merge)
+{
+	if (merge != NULL)
+	{
+		for (uint32_t i = 0; i < merge->count; i++)
+			ps_image_index_cursor_close(merge->cursors[i]);
+		free(merge);
+	}
+}
+
+int
+ps_image_index_merge_open(const PsLayerDesc *layers, uint32_t count,
+						  PsImageIndexMerge **out)
+{
+	PsImageIndexMerge *merge;
+
+	if (out == NULL)
+		return -1;
+	*out = NULL;
+	if (layers == NULL || count == 0 || count > PS_IMAGE_MERGE_MAX_INPUTS)
+		return -1;
+	merge = calloc(1, sizeof(*merge));
+	if (merge == NULL)
+		return -1;
+	merge->count = count;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		int rc;
+		if (layers[i].kind != PS_LAYER_IMAGE || layers[i].deleting ||
+			layers[i].timeline != layers[0].timeline)
+			goto fail;
+		for (uint32_t j = 0; j < i; j++)
+			if (layers[j].layer_id == layers[i].layer_id)
+				goto fail;
+		merge->layer_ids[i] = layers[i].layer_id;
+		if (ps_image_index_cursor_open(&layers[i], &merge->cursors[i]) != 0)
+			goto fail;
+		rc = ps_image_index_cursor_next(merge->cursors[i], &merge->heads[i]);
+		if (rc < 0)
+			goto fail;
+		merge->active[i] = rc == 1;
+	}
+	*out = merge;
+	return 0;
+fail:
+	ps_image_index_merge_close(merge);
+	return -1;
+}
+
+int
+ps_image_index_merge_next(PsImageIndexMerge *merge, PsImgIndexEnt *entry,
+						  uint64_t *layer_id)
+{
+	uint32_t best = UINT32_MAX;
+
+	if (merge == NULL || entry == NULL || layer_id == NULL || merge->failed)
+		return -1;
+	for (uint32_t i = 0; i < merge->count; i++)
+	{
+		ImgSort a, b;
+		int cmp;
+		if (!merge->active[i])
+			continue;
+		if (best == UINT32_MAX)
+		{
+			best = i;
+			continue;
+		}
+		memset(&a, 0, sizeof(a));
+		memset(&b, 0, sizeof(b));
+		a.ent = merge->heads[i]; b.ent = merge->heads[best];
+		cmp = img_sort_cmp(&a, &b);
+		if (cmp < 0 || (cmp == 0 && merge->layer_ids[i] < merge->layer_ids[best]))
+			best = i;
+	}
+	if (best == UINT32_MAX)
+		return 0;
+	*entry = merge->heads[best];
+	*layer_id = merge->layer_ids[best];
+	{
+		int rc = ps_image_index_cursor_next(merge->cursors[best], &merge->heads[best]);
+		if (rc < 0)
+		{
+			merge->failed = 1;
+			return -1;
+		}
+		merge->active[best] = rc == 1;
+	}
+	return 1;
+}
+
+int
+ps_image_index_visit_groups(const PsLayerDesc *layers, uint32_t count,
+							uint32_t max_group, PsImageGroupVisitor visit, void *arg)
+{
+	PsImageIndexMerge *merge = NULL;
+	PsImageGroupEntry *group = NULL;
+	uint32_t used = 0;
+	int rc = -1;
+
+	if (visit == NULL || max_group == 0 || max_group > PS_IMAGE_GROUP_MAX_VERSIONS ||
+		ps_image_index_merge_open(layers, count, &merge) != 0)
+		return -1;
+	group = malloc((size_t) max_group * sizeof(*group));
+	if (group == NULL)
+		goto done;
+	for (;;)
+	{
+		PsImgIndexEnt entry;
+		uint64_t layer_id;
+		int next = ps_image_index_merge_next(merge, &entry, &layer_id);
+
+		if (next < 0)
+			goto done;
+		if (used != 0 && (next == 0 ||
+			key_cmp(&group[0].entry.key, &entry.key) != 0 ||
+			group[0].entry.block != entry.block))
+		{
+			if (visit(group, used, arg) != 0)
+				goto done;
+			used = 0;
+		}
+		if (next == 0)
+		{
+			rc = 0;
+			break;
+		}
+		if (used == max_group)
+		{
+			rc = -2;
+			goto done;
+		}
+		group[used].entry = entry;
+		group[used++].layer_id = layer_id;
+	}
+done:
+	free(group);
+	ps_image_index_merge_close(merge);
+	return rc;
+}
+
+typedef struct ImagePrepareSource
+{
+	const PsLayerDesc *layer;
+	uint64_t offset;
+} ImagePrepareSource;
+
+static int
+image_prepare_read_page(const PsImgRec *rec, void *page, void *arg)
+{
+	const ImagePrepareSource *source = rec->page;
+	uint32_t page_size = *(uint32_t *) arg;
+
+	return ps_layer_store->read_layer_block(source->layer, source->offset,
+											page, page_size);
+}
+
+/* Verify the data checksum and return the end of its page-data region. */
+static int
+image_compaction_data_end(const PsLayerDesc *layer, uint32_t page_size,
+						  uint64_t *data_end)
+{
+	PsLayerDesc copy = *layer;
+	const PsLayerLocation *loc = img_local_loc(&copy);
+	PsImgFooter foot;
+
+	if (loc == NULL || !loc->available || loc->tier == PS_LAYER_TIER_REMOTE_OBJECT ||
+		loc->size < sizeof(foot) ||
+		image_index_read(&copy, -1, loc->size - sizeof(foot), &foot, sizeof(foot)) != 0 ||
+		foot.magic != PS_IMG_MAGIC || foot.page_size != page_size ||
+		foot.index_off > loc->size - sizeof(foot) ||
+		foot.index_off % page_size != 0 ||
+		ps_image_layer_verify_data(&copy, page_size) != 0)
+		return -1;
+	*data_end = foot.index_off;
+	return 0;
+}
+
+int
+ps_image_compaction_prepare_counted(const PsLayerDesc *layers, uint32_t count,
+							const uint64_t *output_ids, uint32_t capacity,
+							uint32_t page_size, PsLayerDesc *outputs,
+							uint32_t *noutputs, uint64_t *uncertain_id,
+							uint64_t *scanned_out, uint64_t *kept_out)
+{
+	PsImageIndexMerge *merge = NULL;
+	PsImgRec *batch = NULL;
+	ImagePrepareSource *sources = NULL;
+	uint64_t data_ends[PS_IMAGE_MERGE_MAX_INPUTS];
+	uint64_t max_id = 0, scanned = 0, kept = 0;
+	uint32_t written = 0, used = 0;
+	PsImgIndexEnt pending;
+	uint32_t pending_source = 0;
+	int have_pending = 0;
+	int rc = -1;
+
+	if (noutputs == NULL || uncertain_id == NULL)
+		return -1;
+	*noutputs = 0;
+	*uncertain_id = 0;
+	if (scanned_out != NULL)
+		*scanned_out = 0;
+	if (kept_out != NULL)
+		*kept_out = 0;
+	if (layers == NULL || output_ids == NULL || outputs == NULL || count == 0 ||
+		count > PS_IMAGE_MERGE_MAX_INPUTS || capacity == 0 ||
+		capacity > PS_IMAGE_PREPARE_MAX_OUTPUTS || page_size == 0 ||
+		page_size > IMAGE_STREAM_BYTES)
+		return -1;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		/* Legacy shard-zero layers may hold keys for every shard.  A normal
+		 * shard-local output cannot represent their routing provenance. */
+		if (layers[i].legacy_shard_zero ||
+			(layers[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(layers[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT))
+			return -1;
+		if (layers[i].layer_id > max_id)
+			max_id = layers[i].layer_id;
+	}
+	for (uint32_t i = 0; i < capacity; i++)
+		if (output_ids[i] <= max_id ||
+			(output_ids[i] >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(layers[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) ||
+			(i != 0 && output_ids[i] <= output_ids[i - 1]))
+			return -1;
+	/* Verify payloads as well as indexes before copying bytes. A descriptor
+	 * copy avoids publishing advisory cache state from this helper. */
+	for (uint32_t i = 0; i < count; i++)
+		if (image_compaction_data_end(&layers[i], page_size, &data_ends[i]) != 0)
+			return -1;
+	if (ps_image_index_merge_open(layers, count, &merge) != 0)
+		return -1;
+	batch = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*batch));
+	sources = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*sources));
+	if (batch == NULL || sources == NULL)
+		goto out;
+	for (;;)
+	{
+		PsImgIndexEnt ent;
+		uint64_t layer_id;
+		uint32_t source = 0;
+		int next = ps_image_index_merge_next(merge, &ent, &layer_id);
+
+		if (next < 0)
+			goto out;
+		if (next == 1)
+		{
+			scanned++;
+			for (source = 0; source < count && layers[source].layer_id != layer_id; source++)
+				;
+			if (source == count || data_ends[source] < page_size ||
+				ent.data_off > data_ends[source] - page_size || ent.data_off % page_size != 0 ||
+				!layer_covers(&layers[source], &ent.key, ent.block) ||
+				ent.lsn < layers[source].lsn_start || ent.lsn > layers[source].lsn_end)
+				goto out;
+		}
+		if (next == 1 && (!have_pending ||
+			(key_cmp(&pending.key, &ent.key) == 0 && pending.block == ent.block &&
+			 pending.lsn == ent.lsn && pending.admission_seq == ent.admission_seq)))
+		{
+			/* The merge orders equal identities by source layer ID, and within
+			 * one source by index order. The final copy is the one a read sees. */
+			pending = ent;
+			pending_source = source;
+			have_pending = 1;
+			continue;
+		}
+		if (have_pending)
+		{
+			memset(&batch[used], 0, sizeof(batch[used]));
+			batch[used].key = pending.key;
+			batch[used].block = pending.block;
+			batch[used].lsn = pending.lsn;
+			batch[used].admission_seq = pending.admission_seq;
+			batch[used].growth_lsn = pending.growth_lsn;
+			batch[used].order_id = pending.order_id;
+			batch[used].seg_off = pending.seg_off;
+			batch[used].seg_id = pending.seg_id;
+			batch[used].flags = pending.flags;
+			sources[used].layer = &layers[pending_source];
+			sources[used].offset = pending.data_off;
+			batch[used].page = &sources[used];
+			used++;
+			kept++;
+		}
+		have_pending = next == 1;
+		if (have_pending)
+		{
+			pending = ent;
+			pending_source = source;
+		}
+		if (used == PS_IMAGE_BATCH_MAX_RECORDS || (next == 0 && used != 0))
+		{
+			if (written == capacity)
+			{
+				rc = -3; /* bounded output capacity exhausted */
+				goto out;
+			}
+			if (ps_image_layer_write_sorted_batch(output_ids[written], layers[0].timeline,
+					batch, used, page_size, image_prepare_read_page, &page_size,
+					&outputs[written]) != 0)
+			{
+				/* The writer attempts cleanup, but its API does not establish
+				 * ownership after a failed create or report failed unlink. */
+				*uncertain_id = output_ids[written];
+				goto out;
+			}
+			written++;
+			used = 0;
+		}
+		if (next == 0)
+		{
+			*noutputs = written;
+			if (scanned_out != NULL)
+				*scanned_out = scanned;
+			if (kept_out != NULL)
+				*kept_out = kept;
+			rc = 0;
+			goto done;
+		}
+	}
+out:
+	/* Preserve descriptors for failed unlinks so the owner can reconcile
+	 * them; never silently claim that ambiguous cleanup succeeded. */
+	{
+		uint32_t remaining = 0;
+		for (uint32_t i = 0; i < written; i++)
+			if (ps_layer_store->delete_local_layer(&outputs[i]) != 0)
+				outputs[remaining++] = outputs[i];
+		*noutputs = remaining;
+		if (remaining != 0 || *uncertain_id != 0)
+			rc = -2;
+	}
+done:
+	ps_image_index_merge_close(merge);
+	free(batch);
+	free(sources);
+	return rc;
+}
+
+int
+ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
+							const uint64_t *output_ids, uint32_t capacity,
+							uint32_t page_size, PsLayerDesc *outputs,
+							uint32_t *noutputs, uint64_t *uncertain_id)
+{
+	return ps_image_compaction_prepare_counted(layers, count, output_ids, capacity,
+		page_size, outputs, noutputs, uncertain_id, NULL, NULL);
+}
+
+static int
+image_identity_equal(const PsImgIndexEnt *a, const PsImgIndexEnt *b)
+{
+	return key_cmp(&a->key, &b->key) == 0 && a->block == b->block &&
+		a->lsn == b->lsn && a->admission_seq == b->admission_seq;
+}
+
+/* Compare durable/routing properties, not transient reader counts or cache
+ * verification hints. A tier transition invalidates the captured snapshot. */
+static int
+image_snapshot_descriptor_equal(const PsLayerDesc *a, const PsLayerDesc *b)
+{
+	if (a->layer_id != b->layer_id || a->kind != b->kind ||
+		a->timeline != b->timeline || key_cmp(&a->start_key, &b->start_key) != 0 ||
+		key_cmp(&a->end_key, &b->end_key) != 0 || a->start_block != b->start_block ||
+		a->end_block != b->end_block || a->lsn_start != b->lsn_start ||
+		a->lsn_end != b->lsn_end || a->created_at_lsn != b->created_at_lsn ||
+		a->remote_uploaded_lsn != b->remote_uploaded_lsn ||
+		a->remote_durable != b->remote_durable || a->local_pinned != b->local_pinned ||
+		a->deleting != b->deleting || a->legacy_shard_zero != b->legacy_shard_zero ||
+		a->location_count != b->location_count || a->location_count > PS_LAYER_MAX_LOCATIONS)
+		return 0;
+	for (uint32_t i = 0; i < a->location_count; i++)
+		if (a->locations[i].tier != b->locations[i].tier ||
+			a->locations[i].size != b->locations[i].size ||
+			a->locations[i].generation != b->locations[i].generation ||
+			a->locations[i].available != b->locations[i].available ||
+			strncmp(a->locations[i].uri, b->locations[i].uri, PS_LAYER_URI_MAX) != 0)
+			return 0;
+	return 1;
+}
+
+static int
+image_compaction_snapshot_valid(const PsLayerMap *map,
+								   const PsLayerDesc *inputs, uint32_t ninputs,
+								   const PsLayerDesc *outputs, uint32_t noutputs,
+	uint32_t retired_prefix, int retiring)
+{
+	uint64_t max_id = 0;
+	uint32_t seen_inputs = 0, seen_outputs = 0;
+	uint64_t seen_input_bits = 0, seen_output_bits = 0;
+
+	if (map == NULL || (map->nlayers != 0 && map->layers == NULL) ||
+		inputs == NULL || outputs == NULL || ninputs == 0 ||
+		noutputs == 0 || ninputs > PS_IMAGE_MERGE_MAX_INPUTS ||
+		noutputs > PS_IMAGE_PREPARE_MAX_OUTPUTS ||
+		(retiring && retired_prefix >= ninputs))
+		return 0;
+	for (uint32_t i = 0; i < ninputs; i++)
+	{
+		if (inputs[i].kind != PS_LAYER_IMAGE || inputs[i].deleting ||
+			(retiring && inputs[i].remote_durable) ||
+			inputs[i].location_count == 0 || inputs[i].location_count > PS_LAYER_MAX_LOCATIONS ||
+			inputs[i].legacy_shard_zero || inputs[i].timeline != inputs[0].timeline ||
+			(inputs[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(inputs[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT))
+			return 0;
+		for (uint32_t j = 0; j < i; j++)
+			if (inputs[i].layer_id == inputs[j].layer_id)
+				return 0;
+		if (inputs[i].layer_id > max_id)
+			max_id = inputs[i].layer_id;
+	}
+	for (uint32_t i = 0; i < noutputs; i++)
+		if (outputs[i].kind != PS_LAYER_IMAGE || outputs[i].deleting ||
+			outputs[i].location_count == 0 || outputs[i].location_count > PS_LAYER_MAX_LOCATIONS ||
+			outputs[i].legacy_shard_zero || outputs[i].timeline != inputs[0].timeline ||
+			outputs[i].layer_id <= max_id ||
+			(outputs[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(inputs[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) ||
+			(i != 0 && outputs[i].layer_id <= outputs[i - 1].layer_id))
+			return 0;
+	for (uint32_t i = 0; i < map->nlayers; i++)
+	{
+		const PsLayerDesc *current = &map->layers[i];
+		int matched = 0;
+		if (current->kind != PS_LAYER_IMAGE || current->timeline != inputs[0].timeline ||
+			(current->layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(inputs[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT))
+		{
+			for (uint32_t j = 0; j < noutputs; j++)
+				if (current->layer_id == outputs[j].layer_id)
+					return 0;
+			/* Legacy shard-zero layers can cover every shard. */
+			if (!current->deleting && current->kind == PS_LAYER_IMAGE &&
+				current->timeline == inputs[0].timeline && current->legacy_shard_zero)
+				return 0;
+			continue;
+		}
+		for (uint32_t j = 0; j < ninputs; j++)
+			if (current->layer_id == inputs[j].layer_id)
+			{
+				PsLayerDesc expected = inputs[j];
+
+				expected.deleting = retiring && j < retired_prefix;
+				if ((seen_input_bits & (UINT64_C(1) << j)) != 0 ||
+					(retiring && __atomic_load_n(&current->cache_readers, __ATOMIC_ACQUIRE) == 0) ||
+					!image_snapshot_descriptor_equal(current, &expected))
+					return 0;
+				seen_input_bits |= UINT64_C(1) << j;
+				seen_inputs++;
+				matched = 1;
+				break;
+			}
+		if (matched)
+			continue;
+		for (uint32_t j = 0; j < noutputs; j++)
+			if (current->layer_id == outputs[j].layer_id)
+			{
+				if ((seen_output_bits & (UINT64_C(1) << j)) != 0 ||
+					!image_snapshot_descriptor_equal(current, &outputs[j]))
+					return 0;
+				seen_output_bits |= UINT64_C(1) << j;
+				seen_outputs++;
+				matched = 1;
+				break;
+			}
+		if (!matched && !current->deleting)
+			return 0;
+	}
+	return seen_inputs == ninputs && (!retiring || seen_outputs == noutputs);
+}
+
+int
+ps_image_compaction_snapshot_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs)
+{
+	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs, 0, 0);
+}
+
+int
+ps_image_compaction_retirement_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	uint32_t retired_prefix)
+{
+	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs,
+	retired_prefix, 1);
+}
+
+int
+ps_image_compaction_verify_coverage(const PsLayerDesc *inputs, uint32_t ninputs,
+										const PsLayerDesc *outputs, uint32_t noutputs,
+										uint32_t page_size)
+{
+	PsImageIndexMerge *src = NULL, *dst = NULL;
+	uint64_t src_ends[PS_IMAGE_MERGE_MAX_INPUTS];
+	uint64_t dst_ends[PS_IMAGE_MERGE_MAX_INPUTS];
+	unsigned char *src_page = NULL, *dst_page = NULL;
+	PsImgIndexEnt pending;
+	uint64_t pending_id = 0, max_id = 0;
+	int have_pending = 0, rc = -1;
+
+	if (inputs == NULL || outputs == NULL || ninputs == 0 || noutputs == 0 ||
+		ninputs > PS_IMAGE_MERGE_MAX_INPUTS || noutputs > PS_IMAGE_MERGE_MAX_INPUTS ||
+		page_size == 0 || page_size > IMAGE_STREAM_BYTES)
+		return -1;
+	for (uint32_t i = 0; i < ninputs; i++)
+	{
+		if (inputs[i].legacy_shard_zero ||
+			(inputs[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(inputs[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) ||
+			image_compaction_data_end(&inputs[i], page_size, &src_ends[i]) != 0)
+			return -1;
+		if (inputs[i].layer_id > max_id)
+			max_id = inputs[i].layer_id;
+	}
+	for (uint32_t i = 0; i < noutputs; i++)
+		if (outputs[i].legacy_shard_zero || outputs[i].timeline != inputs[0].timeline ||
+			outputs[i].layer_id <= max_id ||
+			(outputs[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(inputs[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) ||
+			(i != 0 && outputs[i].layer_id <= outputs[i - 1].layer_id) ||
+			image_compaction_data_end(&outputs[i], page_size, &dst_ends[i]) != 0)
+			return -1;
+	if (ps_image_index_merge_open(inputs, ninputs, &src) != 0 ||
+		ps_image_index_merge_open(outputs, noutputs, &dst) != 0)
+		goto out;
+	src_page = malloc(page_size);
+	dst_page = malloc(page_size);
+	if (src_page == NULL || dst_page == NULL)
+		goto out;
+	for (;;)
+	{
+		PsImgIndexEnt ent;
+		uint64_t id;
+		int next = ps_image_index_merge_next(src, &ent, &id);
+		uint32_t source = 0;
+
+		if (next < 0)
+			goto out;
+		if (next == 1)
+		{
+			for (source = 0; source < ninputs && inputs[source].layer_id != id; source++)
+				;
+			if (source == ninputs || src_ends[source] < page_size ||
+				ent.data_off > src_ends[source] - page_size || ent.data_off % page_size != 0 ||
+				!layer_covers(&inputs[source], &ent.key, ent.block) ||
+				ent.lsn < inputs[source].lsn_start || ent.lsn > inputs[source].lsn_end)
+				goto out;
+		}
+		if (next == 1 && (!have_pending || image_identity_equal(&pending, &ent)))
+		{
+			pending = ent;
+			pending_id = id;
+			have_pending = 1;
+			continue;
+		}
+		if (have_pending)
+		{
+			PsImgIndexEnt actual;
+			uint64_t actual_id;
+			uint32_t si = 0, di = 0;
+
+			if (ps_image_index_merge_next(dst, &actual, &actual_id) != 1 ||
+				!image_identity_equal(&pending, &actual) ||
+				pending.growth_lsn != actual.growth_lsn || pending.order_id != actual.order_id ||
+				pending.seg_off != actual.seg_off || pending.seg_id != actual.seg_id ||
+				pending.flags != actual.flags)
+				goto out;
+			for (si = 0; si < ninputs && inputs[si].layer_id != pending_id; si++)
+				;
+			for (di = 0; di < noutputs && outputs[di].layer_id != actual_id; di++)
+				;
+			if (si == ninputs || di == noutputs || dst_ends[di] < page_size ||
+				actual.data_off > dst_ends[di] - page_size || actual.data_off % page_size != 0 ||
+				!layer_covers(&outputs[di], &actual.key, actual.block) ||
+				actual.lsn < outputs[di].lsn_start || actual.lsn > outputs[di].lsn_end ||
+				ps_layer_store->read_layer_block(&inputs[si], pending.data_off, src_page, page_size) != 0 ||
+				ps_layer_store->read_layer_block(&outputs[di], actual.data_off, dst_page, page_size) != 0 ||
+				memcmp(src_page, dst_page, page_size) != 0)
+				goto out;
+		}
+		have_pending = next == 1;
+		if (have_pending)
+		{
+			pending = ent;
+			pending_id = id;
+		}
+		else
+		{
+			PsImgIndexEnt extra;
+			uint64_t id_out;
+			if (ps_image_index_merge_next(dst, &extra, &id_out) != 0)
+				goto out;
+			rc = 0;
+			break;
+		}
+	}
+out:
+	ps_image_index_merge_close(src);
+	ps_image_index_merge_close(dst);
+	free(src_page);
+	free(dst_page);
+	return rc;
 }
 
 static int

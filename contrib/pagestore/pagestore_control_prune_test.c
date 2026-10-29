@@ -322,6 +322,220 @@ close_store(void)
 		ps_storage->close();
 }
 
+static int
+read_relation_at(uint32_t block, uint64_t lsn)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint32_t hi, lo;
+	int rc;
+
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&key));
+	rc = read_resolve(0, &key, block, lsn, 0, page, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	if (rc != 1)
+		return 0;
+	memcpy(&hi, page, sizeof(hi));
+	memcpy(&lo, page + sizeof(hi), sizeof(lo));
+	return (((uint64_t) hi << 32) | lo) == lsn;
+}
+
+static void
+test_bounded_compaction_maintenance(void)
+{
+	char store[] = "/tmp/pagestore-bounded-core-XXXXXX";
+	uint64_t before, zero_before;
+	uint32_t live = 0;
+	int shared = 0;
+
+	configure_core(1);
+	compact_layers = 100;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open bounded compaction store");
+	check(write_relation(0, 0, 1000), "seed bounded compaction store");
+	run_maintenance(32); /* consume startup pruning request */
+	check(!ps_test_page_prune_due(0, 0), "startup pruning has converged");
+	check(write_relation(0, 1, 2000) && write_relation(0, 1, 2000) &&
+		  write_relation(0, 2, 3000),
+		  "add bounded compaction inputs");
+	before = ps_test_bounded_compaction_count();
+	zero_before = ps_test_bounded_zero_floor_count();
+	compact_layers = 1;
+	run_maintenance(64);
+	check(ps_test_bounded_compaction_count() > before,
+		  "maintenance invokes bounded local compaction");
+	check(ps_test_bounded_zero_floor_count() > zero_before,
+		  "zero-floor maintenance bypasses the unbounded planner");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+		{
+			PsImgIndexEnt *index = NULL;
+			uint32_t count = 0;
+
+			live++;
+			if (ps_image_layer_read_index(&ps_layer_map.layers[i], &index, &count) == 0)
+				for (uint32_t j = 1; j < count; j++)
+					if (index[j - 1].key.klass == PS_KLASS_RELATION &&
+						index[j - 1].block == 1 && index[j].block == 1 &&
+						index[j - 1].lsn == 2000 && index[j].lsn == 2000 &&
+						index[j - 1].admission_seq != index[j].admission_seq &&
+						index[j - 1].data_off == index[j].data_off)
+						shared = 1;
+			free(index);
+		}
+	ps_unlock_map();
+	check(live == 1, "bounded compaction reduces live layers");
+	check(shared, "real compaction shares identical pages with distinct sequences");
+	check(read_relation_at(0, 1000) &&
+		  read_relation_at(1, 2000) && read_relation_at(2, 3000),
+		  "bounded compaction preserves source versions");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  read_relation_at(0, 1000) &&
+		  read_relation_at(1, 2000) && read_relation_at(2, 3000),
+		  "bounded compaction survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+static int
+read_fixture_page(const PsImgRec *rec, void *out, void *arg)
+{
+	(void) arg;
+	memcpy(out, rec->page, 8192);
+	return 0;
+}
+
+static void
+test_bounded_shared_payload_capacity_fallback(void)
+{
+	char store[] = "/tmp/pagestore-bounded-capacity-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsImgRec *recs = calloc(1100, sizeof(*recs));
+	PsLayerDesc first, second;
+	unsigned char page[8192] = {0};
+	uint64_t before;
+	uint32_t live = 0, nentries = 0;
+	int ok = recs != NULL;
+
+	configure_core(1);
+	compact_layers = 1;
+	check(ok && mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open shared-payload capacity store");
+	if (!ok)
+		return;
+	for (uint32_t i = 0; i < 1100; i++)
+	{
+		recs[i].key = key;
+		recs[i].lsn = 100;
+		recs[i].admission_seq = i + 1;
+		recs[i].page = page;
+	}
+	ok = ps_image_layer_write_compaction_stream(1, 0, recs, 1100, 8192,
+			read_fixture_page, NULL, &first) == 0;
+	recs[0].block = 1;
+	recs[0].admission_seq = 1101;
+	ok = ok && ps_image_layer_write_compaction_stream(2, 0, recs, 1, 8192,
+			read_fixture_page, NULL, &second) == 0;
+	ps_lock_map_wr();
+	ok = ok && ps_manifest_add_layer(&first) == 0 && ps_manifest_add_layer(&second) == 0;
+	ps_unlock_map();
+	check(ok && first.locations[0].size < 2 * 1024 * 1024,
+		  "seed more than one batch of logical versions in small shared-payload inputs");
+	close_store();
+	check(ok && ps_core_open(store) == 0, "recover shared-payload capacity store");
+	before = ps_test_bounded_compaction_count();
+	run_maintenance(64);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+		{
+			PsImgIndexEnt *index = NULL;
+			uint32_t n = 0;
+
+			live++;
+			if (ps_image_layer_read_index(&ps_layer_map.layers[i], &index, &n) == 0)
+				nentries += n;
+			free(index);
+		}
+	ps_unlock_map();
+	check(ps_test_bounded_compaction_count() > before && live == 1 && nentries == 1101,
+		  "capacity exhaustion falls back and preserves all logical versions");
+	close_store();
+	free(recs);
+	remove_tree(store);
+}
+
+typedef struct BoundedConflictProbe
+{
+	int called;
+	int wrote;
+} BoundedConflictProbe;
+
+static void *
+bounded_conflict_writer(void *arg)
+{
+	BoundedConflictProbe *probe = arg;
+
+	probe->wrote = write_relation(0, 3, 4000);
+	return NULL;
+}
+
+static void
+bounded_conflict_hook(void *arg)
+{
+	BoundedConflictProbe *probe = arg;
+	pthread_t thread;
+
+	probe->called++;
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	if (pthread_create(&thread, NULL, bounded_conflict_writer, probe) == 0)
+		(void) pthread_join(thread, NULL);
+}
+
+static void
+test_bounded_compaction_concurrent_write(void)
+{
+	char store[] = "/tmp/pagestore-bounded-conflict-XXXXXX";
+	BoundedConflictProbe probe = {0};
+	uint64_t before;
+	uint32_t live = 0;
+
+	configure_core(1);
+	compact_layers = 100;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  write_control(0, 1000, 800), "open bounded conflict store");
+	run_maintenance(32);
+	check(write_relation(0, 1, 2000) && write_relation(0, 2, 3000),
+		  "prepare bounded conflict inputs");
+	before = ps_test_bounded_compaction_count();
+	ps_test_set_compaction_unlocked_hook(bounded_conflict_hook, &probe);
+	compact_layers = 1;
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	check(probe.called && probe.wrote && ps_test_bounded_compaction_count() > before,
+		  "writer runs while bounded compaction prepares");
+	check(live >= 3 && read_relation_at(1, 2000) && read_relation_at(2, 3000) &&
+		  read_relation_at(3, 4000),
+		  "concurrent layer invalidates bounded publication and preserves data");
+	run_maintenance(64);
+	check(read_relation_at(1, 2000) && read_relation_at(2, 3000) &&
+		  read_relation_at(3, 4000), "bounded retry preserves concurrent write");
+	close_store();
+	remove_tree(store);
+}
+
 typedef struct StagedCompactionProbe
 {
 	int called;
@@ -1499,6 +1713,9 @@ test_compaction_source_read_batch(void)
 int
 main(void)
 {
+	test_bounded_compaction_maintenance();
+	test_bounded_shared_payload_capacity_fallback();
+	test_bounded_compaction_concurrent_write();
 	test_staged_compaction_rejects_concurrent_write(1);
 	test_staged_compaction_rejects_concurrent_write(2);
 	test_staged_compaction_rejects_new_retention_pin();

@@ -566,8 +566,8 @@ test_reader_pin_keeps_invalidated_history(void)
 	}
 	records_released = snapshot_lifecycle_records(store);
 	check(records_pinned > 0 && records_released > 0 &&
-		  records_released < records_pinned,
-		  "releasing the reader retires the fence it needed");
+		  ps_test_page_version_count(0, &rel_key, 1) > 0,
+		  "remaining finite materializer fence preserves first-arrival history");
 	check(read_tag_at(1, 3600, &tag) == 0,
 		  "the regrown block still has no content after the fence retired");
 	close_store();
@@ -708,10 +708,10 @@ live_image_layers(uint32_t timeline)
 	return n;
 }
 
-/* A dropped relation whose layers hold nothing else: compaction must retire
- * those layers and its versions even though nothing survives to publish. */
+/* A finite materializer fence can still admit a late same-LSN arrival. Keep
+ * first-arrival identities of a dropped relation until that fence is released. */
 static void
-test_dropped_relation_retires_its_layers(void)
+test_dropped_relation_retains_finite_fence(void)
 {
 	char		store[] = "/tmp/pagestore-lifecycle-drop-XXXXXX";
 	unsigned char tag = 0;
@@ -728,22 +728,21 @@ test_dropped_relation_retires_its_layers(void)
 	check(fork_op(PS_OP_UNLINK, 2000, 0, 0), "drop the relation");
 	check(reserve_pin(PS_RETENTION_OWNER_MATERIALIZER, 1, 1, 2500),
 		  "materializer cutoff above the drop");
-	for (int i = 0; i < 64 && (live_image_layers(0) != 0 ||
-							   ps_test_page_version_count(0, &rel_key, 0) != 0); i++)
-		(void) ps_core_maintenance();
-	check(ps_test_page_version_count(0, &rel_key, 0) == 0 &&
-		  ps_test_page_version_count(0, &rel_key, 1) == 0 &&
-		  ps_test_page_version_count(0, &rel_key, 2) == 0,
-		  "every version of the dropped relation leaves the index");
-	check(live_image_layers(0) == 0,
-		  "layers that held only the dropped relation are retired");
+	run_maintenance(64);
+	check(ps_test_page_version_count(0, &rel_key, 0) > 0 &&
+		  ps_test_page_version_count(0, &rel_key, 1) > 0 &&
+		  ps_test_page_version_count(0, &rel_key, 2) > 0,
+		  "finite fence retains first arrivals of the dropped relation");
+	check(live_image_layers(0) > 0,
+		  "retained first-arrival identities stay in live layers");
 	check(read_tag_at(0, 2500, &tag) == 0,
 		  "the dropped relation still reads as absent");
 	close_store();
 	configure_core();
-	check(ps_core_open(store) == 0 && live_image_layers(0) == 0 &&
+	check(ps_core_open(store) == 0 && live_image_layers(0) > 0 &&
+		  ps_test_page_version_count(0, &rel_key, 0) > 0 &&
 		  read_tag_at(0, 2500, &tag) == 0,
-		  "recovery keeps the retired layers gone and the relation absent");
+		  "recovery retains first arrivals while keeping the relation absent");
 	close_store();
 	remove_tree(store);
 }
@@ -952,7 +951,7 @@ main(void)
 	test_truncate_churn_is_bounded();
 	test_reader_pin_keeps_invalidated_history();
 	test_frontier_less_branch_caps_cutoff();
-	test_dropped_relation_retires_its_layers();
+	test_dropped_relation_retains_finite_fence();
 	test_deleted_branch_forgets_artifact_fences();
 	test_block_death_asof();
 	test_walidx_horizon_keeps_newest_death();

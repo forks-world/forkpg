@@ -267,7 +267,7 @@ test('pagestore_inspect_mailbox',
 # Unit test for the immutable image-layer file format (no daemon, no PG).
 pagestore_layer_test = executable('pagestore_layer_test',
   files('pagestore_layer_test.c', 'pagestore_layer.c', 'pagestore_store_owner.c', 'pagestore_layer_store.c',
-        'pagestore_fault.c'),
+        'pagestore_fault.c', 'pagestore_prune.c', 'pagestore_compaction_prune.c'),
   dependencies: [dependency('threads')],
   install: false,
 )
