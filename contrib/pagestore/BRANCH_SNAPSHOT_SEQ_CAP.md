@@ -1334,6 +1334,16 @@ snapshot shards. Replacement bases, death folds and forkmeta cutovers use full
 projected caps. Page closure preserves the selected visible identity at each
 retained position, while allowing fully invalidated positions to retire.
 
+This P5 description is narrower than the unconditional closure exception in
+§3.5(4). The production relation-page invalidation filter tests a whole LSN
+position: if a retained view selects a visible sibling, it keeps the planned
+siblings at that position, including the first-arrival sequence fact; if no
+retained view sees the position, it may retire them. The cutover regression
+covers a first arrival invalidated by a same-LSN truncate followed by a visible
+rewrite, including restart; the lifecycle regression covers fully invalidated
+positions. These examples do not yet prove equivalence for every future view.
+Resolve that specification gap before replacing the production planner.
+
 Artifact BEGIN registers an in-flight `(C,token)` control cap, and the producer
 reads CONTROL with that cap before publishing data. COMMIT retains the cap,
 including empty generations, until its physical completion record is retired.

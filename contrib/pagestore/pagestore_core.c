@@ -21863,6 +21863,9 @@ prune_version_needed(uint32_t timeline, const PsKey *key, uint32_t block,
 									  first, &ac, B, has_B))
 				visible = (int) i;
 		}
+		/* Judge all siblings at this LSN by the version selected at the
+		 * retained view. A visible later sibling keeps the first-arrival
+		 * sequence fact even when that first page was invalidated. */
 		if (visible < 0 || versions[visible].lsn != versions[idx].lsn)
 			continue;
 		memset(&pv, 0, sizeof(pv));
