@@ -234,6 +234,24 @@ extern int ps_image_index_merge_next(PsImageIndexMerge *merge,
 									  PsImgIndexEnt *entry, uint64_t *layer_id);
 extern void ps_image_index_merge_close(PsImageIndexMerge *merge);
 
+/* Visit complete (key, block) version groups in merge order, including
+ * duplicate identities and source IDs. Groups are bounded by max_group
+ * (1..PS_IMAGE_GROUP_MAX_VERSIONS). Return -2 if a group exceeds that limit,
+ * -1 on I/O, ordering, allocation or callback failure, and 0 on success.
+ * Callback data is transient. All effects must remain staged until the whole
+ * traversal succeeds: even earlier groups are invalid on a later failure.
+ * Inputs must remain immutable and pinned throughout the traversal. */
+#define PS_IMAGE_GROUP_MAX_VERSIONS 1024
+typedef struct PsImageGroupEntry
+{
+	PsImgIndexEnt entry;
+	uint64_t layer_id;
+} PsImageGroupEntry;
+typedef int (*PsImageGroupVisitor)(const PsImageGroupEntry *entries,
+	uint32_t count, void *arg);
+extern int ps_image_index_visit_groups(const PsLayerDesc *layers, uint32_t count,
+	uint32_t max_group, PsImageGroupVisitor visit, void *arg);
+
 /* The high 16 layer-ID bits encode the shard; the lower 48 are local IDs. */
 #define PS_IMAGE_LAYER_SHARD_SHIFT 48
 /* Prepare at most 64 unpublished output layers from caller-pinned local

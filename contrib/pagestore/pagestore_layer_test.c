@@ -630,6 +630,32 @@ read_batch_source(const PsImgRec *rec, void *page, void *arg)
 	return ps_layer_store->read_layer_block(source->layer, source->offset, page, PSZ);
 }
 
+typedef struct GroupProbe
+{
+	uint32_t groups;
+	uint32_t entries;
+	uint64_t source_sum;
+	int wrong_order;
+	int reject;
+} GroupProbe;
+
+static int
+visit_group(const PsImageGroupEntry *entries, uint32_t count, void *arg)
+{
+	GroupProbe *probe = arg;
+
+	probe->groups++;
+	probe->entries += count;
+	for (uint32_t i = 0; i < count; i++)
+		probe->source_sum += entries[i].layer_id;
+	for (uint32_t i = 1; i < count; i++)
+		if (entries[i - 1].entry.lsn == entries[i].entry.lsn &&
+			entries[i - 1].entry.admission_seq == entries[i].entry.admission_seq &&
+			entries[i - 1].layer_id > entries[i].layer_id)
+			probe->wrong_order = 1;
+	return probe->reject ? -1 : 0;
+}
+
 static void
 bounded_merge_test(void)
 {
@@ -686,6 +712,25 @@ bounded_merge_test(void)
 		  ps_image_layer_lookup_exact(&replacement, &key, 0, 100, 0,
 								out, PSZ, NULL, NULL) == 1 && out[0] == 2,
 		  "bounded output preserves the newest legacy source on an exact tie");
+	{
+		GroupProbe probe = {0};
+
+		check(ps_image_index_visit_groups(layers, 3, 3, visit_group, &probe) == 0 &&
+			  probe.groups == 1 && probe.entries == 3 && probe.source_sum == 995 + 996 + 997 &&
+			  !probe.wrong_order,
+			  "complete page group retains duplicate order and source IDs");
+		memset(&probe, 0, sizeof(probe));
+		check(ps_image_index_visit_groups(layers, 3, 2, visit_group, &probe) == -2 &&
+			  probe.groups == 0,
+			  "oversized page group fails without exposing a partial group");
+		probe.reject = 1;
+		check(ps_image_index_visit_groups(layers, 3, 3, visit_group, &probe) == -1,
+			  "group traversal propagates callback failure");
+		check(ps_image_index_visit_groups(layers, 3, 0, visit_group, &probe) == -1 &&
+			  ps_image_index_visit_groups(layers, 3, PS_IMAGE_GROUP_MAX_VERSIONS + 1,
+					visit_group, &probe) == -1,
+			  "group traversal enforces memory limits");
+	}
 	merge = NULL;
 	layers[1] = layers[0];
 	check(ps_image_index_merge_open(layers, 3, &merge) != 0 && merge == NULL,
@@ -724,6 +769,14 @@ bounded_sorted_batch_test(void)
 		  nindex == PS_IMAGE_BATCH_MAX_RECORDS && index[nindex - 1].block == nindex - 1,
 		  "sorted batch writes one bounded complete layer");
 	free(index);
+	{
+		GroupProbe probe = {0};
+
+		check(ps_image_index_visit_groups(&layer, 1, 1, visit_group, &probe) == 0 &&
+			  probe.groups == PS_IMAGE_BATCH_MAX_RECORDS &&
+			  probe.entries == PS_IMAGE_BATCH_MAX_RECORDS,
+			  "group traversal separates distinct pages at the smallest bound");
+	}
 	stream_pages = 0;
 	check(ps_image_layer_write_sorted_batch(999, 0, recs,
 			PS_IMAGE_BATCH_MAX_RECORDS + 1, PSZ, generated_page, NULL, &layer) != 0 &&
@@ -769,6 +822,26 @@ prepared_batch_boundary_test(void)
 								 PSZ, &inputs[0]) == 0;
 	records[0].page = newer;
 	ok = ok && ps_image_layer_write(1201, 0, records, 1, PSZ, &inputs[1]) == 0;
+	{
+		GroupProbe probe = {0};
+
+		check(ok && ps_image_index_visit_groups(inputs, 2, PS_IMAGE_GROUP_MAX_VERSIONS,
+				visit_group, &probe) == -2 && probe.groups == 0,
+			  "a page history beyond the group bound is rejected intact");
+	}
+	{
+		PsLayerDesc mixed[3];
+		PsImgRec prefix = {.key = key, .block = 0, .lsn = 100, .page = older};
+		GroupProbe probe = {0};
+
+		prefix.key.relNumber--;
+		mixed[0] = inputs[0];
+		mixed[1] = inputs[1];
+		check(ok && ps_image_layer_write(1199, 0, &prefix, 1, PSZ, &mixed[2]) == 0 &&
+			  ps_image_index_visit_groups(mixed, 3, PS_IMAGE_GROUP_MAX_VERSIONS,
+				visit_group, &probe) == -2 && probe.groups == 1 && probe.entries == 1,
+			  "later oversized group invalidates earlier staged groups");
+	}
 	check(ok && ps_image_compaction_prepare_counted(inputs, 2, ids, 2, PSZ, outputs,
 											&noutputs, &uncertain, &scanned, &kept) == 0 &&
 		  noutputs == 1 && uncertain == 0 &&

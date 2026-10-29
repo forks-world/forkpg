@@ -1022,6 +1022,56 @@ ps_image_index_merge_next(PsImageIndexMerge *merge, PsImgIndexEnt *entry,
 	return 1;
 }
 
+int
+ps_image_index_visit_groups(const PsLayerDesc *layers, uint32_t count,
+							uint32_t max_group, PsImageGroupVisitor visit, void *arg)
+{
+	PsImageIndexMerge *merge = NULL;
+	PsImageGroupEntry *group = NULL;
+	uint32_t used = 0;
+	int rc = -1;
+
+	if (visit == NULL || max_group == 0 || max_group > PS_IMAGE_GROUP_MAX_VERSIONS ||
+		ps_image_index_merge_open(layers, count, &merge) != 0)
+		return -1;
+	group = malloc((size_t) max_group * sizeof(*group));
+	if (group == NULL)
+		goto done;
+	for (;;)
+	{
+		PsImgIndexEnt entry;
+		uint64_t layer_id;
+		int next = ps_image_index_merge_next(merge, &entry, &layer_id);
+
+		if (next < 0)
+			goto done;
+		if (used != 0 && (next == 0 ||
+			key_cmp(&group[0].entry.key, &entry.key) != 0 ||
+			group[0].entry.block != entry.block))
+		{
+			if (visit(group, used, arg) != 0)
+				goto done;
+			used = 0;
+		}
+		if (next == 0)
+		{
+			rc = 0;
+			break;
+		}
+		if (used == max_group)
+		{
+			rc = -2;
+			goto done;
+		}
+		group[used].entry = entry;
+		group[used++].layer_id = layer_id;
+	}
+done:
+	free(group);
+	ps_image_index_merge_close(merge);
+	return rc;
+}
+
 typedef struct ImagePrepareSource
 {
 	const PsLayerDesc *layer;
