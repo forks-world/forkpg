@@ -263,6 +263,7 @@ extern uint32_t ps_test_wal_reclaim_watch_count(uint32_t timeline);
 extern uint64_t ps_test_compaction_count(void);
 extern uint64_t ps_test_bounded_compaction_count(void);
 extern uint64_t ps_test_bounded_zero_floor_count(void);
+extern uint64_t ps_test_bounded_nonzero_plan_count(void);
 extern int ps_test_page_prune_due(uint32_t timeline, uint32_t shard);
 /* Test-only: when nonzero, both wal_reclaim_watch fire sites (flush_memtable
  * and walidx_add_batch_locked) return without checking for a match --

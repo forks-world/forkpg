@@ -50,6 +50,7 @@
 #include "pagestore_artifact_format.h"
 #include "pagestore_compat.h"
 #include "pagestore_core.h"
+#include "pagestore_compaction_prune.h"
 #include "pagestore_format.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
@@ -3901,6 +3902,13 @@ ps_test_compact_read_batch(const PsLayerDesc *layer, uint32_t npages,
 
 static uint64_t test_bounded_compaction_count;
 static uint64_t test_bounded_zero_floor_count;
+static uint64_t test_bounded_nonzero_plan_count;
+
+uint64_t
+ps_test_bounded_nonzero_plan_count(void)
+{
+	return __atomic_load_n(&test_bounded_nonzero_plan_count, __ATOMIC_RELAXED);
+}
 
 uint64_t
 ps_test_bounded_compaction_count(void)
@@ -3914,11 +3922,28 @@ ps_test_bounded_zero_floor_count(void)
 	return __atomic_load_n(&test_bounded_zero_floor_count, __ATOMIC_RELAXED);
 }
 
+/* A bounded merge may conservatively keep more history than the ordinary
+ * planner (notably versions hidden by fork invalidation). Re-request pruning
+ * after a successful merge so that history remains eligible for reclamation. */
+static int
+bounded_all_versions_kept(const PsImageGroupEntry *entries, uint32_t count,
+		const unsigned char *keep, const unsigned char *closure, void *arg)
+{
+	int *all_kept = arg;
+
+	(void) entries;
+	(void) closure;
+	for (uint32_t i = 0; i < count; i++)
+		if (!keep[i])
+			*all_kept = 0;
+	return 0;
+}
+
 /* Merge without pruning when a bounded replacement can reduce layer count.
  * Entry and exit both hold all shard locks, page_prune_lock and map-wr.
  * Return 0 when ineligible, 1 on work, and -1 on an attempted failure. */
 static int
-compact_timeline_bounded(uint32_t timeline, uint32_t shard,
+compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 						 uint64_t *scanned_out, uint64_t *kept_out)
 {
 	PsLayerDesc inputs[PS_IMAGE_MERGE_MAX_INPUTS];
@@ -3928,7 +3953,12 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard,
 	uint32_t capacity;
 	uint64_t bytes = 0, retention_epoch, current_retention_epoch;
 	uint64_t timeline_epoch, admission_epoch;
-	int result = -1, prepare_rc, ambiguous = 0;
+	int result = -1, prepare_rc = 0, ambiguous = 0, eligible = 1;
+	PsHistoryFence *fences = NULL, *storage_fences = NULL;
+	PsViewFence *views = NULL;
+	uint32_t nfences = 0, nstorage = 0;
+	uint64_t inherited = 0;
+	bool has_inherited = false;
 
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 	{
@@ -3953,8 +3983,36 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard,
 	 * Duplicates may make this conservative, which only chooses the old path. */
 	if (bytes > (uint64_t) capacity * PS_IMAGE_BATCH_MAX_RECORDS * page_size)
 		return 0;
+	if (page_floor != 0)
+	{
+		if (page_prune_fences(timeline, &fences, &nfences) != 0 ||
+			page_storage_fences(timeline, fences, nfences, &storage_fences, &nstorage) != 0)
+		{
+			free(fences);
+			free(storage_fences);
+			return -1;
+		}
+		if (nstorage != 0)
+		{
+			views = malloc((size_t) nstorage * sizeof(*views));
+			if (views == NULL)
+			{
+				free(fences);
+				free(storage_fences);
+				return -1;
+			}
+			for (uint32_t i = 0; i < nstorage; i++)
+				views[i] = history_fence_view(storage_fences[i]);
+		}
+		inherited = timeline_inherited_below(timeline, &has_inherited);
+		free(fences);
+		free(storage_fences);
+	}
 	if (ps_retention_epoch(&retention_epoch) != 0)
+	{
+		free(views);
 		return -1;
+	}
 	timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 	admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	__atomic_fetch_add(&test_bounded_compaction_count, 1, __ATOMIC_RELAXED);
@@ -3969,12 +4027,37 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard,
 	pthread_rwlock_unlock(&page_prune_lock);
 	for (uint32_t s = core_shards(); s > 0; s--)
 		ps_unlock_shard(s - 1);
-	if (compaction_unlocked_test_hook != NULL)
+	if (page_floor == 0 && compaction_unlocked_test_hook != NULL)
 		compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
-	prepare_rc = ps_image_compaction_prepare_counted(inputs, ninputs, ids, capacity,
-										 page_size, outputs, &noutputs, &uncertain,
-										 scanned_out, kept_out);
-	if (prepare_rc == 0 &&
+	if (page_floor != 0)
+	{
+		PsCompactionRelationPlan *plan = NULL;
+		uint32_t visited;
+		int plan_rc = ps_compaction_relation_plan_open(inputs, ninputs,
+			PS_IMAGE_GROUP_MAX_VERSIONS, (PsPruneFence) {page_floor, UINT64_MAX},
+			views, nstorage, inherited, has_inherited, &plan);
+
+		if (plan_rc == 0)
+			do {
+				plan_rc = ps_compaction_relation_plan_step(plan, 32,
+					bounded_all_versions_kept, &eligible, &visited);
+			} while (plan_rc == 1 && eligible);
+		ps_compaction_relation_plan_close(plan);
+		if (plan_rc != 0 || !eligible)
+			eligible = 0;
+		if (eligible)
+		{
+			__atomic_fetch_add(&test_bounded_nonzero_plan_count, 1, __ATOMIC_RELAXED);
+			if (compaction_unlocked_test_hook != NULL)
+				compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
+		}
+	}
+	free(views);
+	if (eligible)
+		prepare_rc = ps_image_compaction_prepare_counted(inputs, ninputs, ids, capacity,
+											 page_size, outputs, &noutputs, &uncertain,
+											 scanned_out, kept_out);
+	if (eligible && prepare_rc == 0 &&
 		ps_image_compaction_verify_coverage(inputs, ninputs, outputs, noutputs, page_size) != 0)
 		prepare_rc = -1;
 	for (uint32_t s = 0; s < core_shards(); s++)
@@ -3991,6 +4074,36 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard,
 		ambiguous = prepare_rc == -2;
 		if (prepare_rc == 0 || prepare_rc == -3)
 			g_shards[shard].staged_compaction_retries = 1;
+		goto done;
+	}
+	/* A failed conservative plan may fall back to the ordinary path.  Its
+	 * pre-unlock source snapshot must still name the entire live set. */
+	if (count_image_layers(timeline, shard) != ninputs)
+	{
+		g_shards[shard].staged_compaction_retries = 1;
+		goto done;
+	}
+	for (uint32_t k = 0; k < ninputs; k++)
+	{
+		int found = 0;
+
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == inputs[k].layer_id)
+			{
+				found = !ps_layer_map.layers[i].deleting &&
+					ps_layer_map.layers[i].remote_durable == inputs[k].remote_durable &&
+					tier_local_location(&ps_layer_map.layers[i]) != NULL;
+				break;
+			}
+		if (!found)
+		{
+			g_shards[shard].staged_compaction_retries = 1;
+			goto done;
+		}
+	}
+	if (!eligible)
+	{
+		result = 0;
 		goto done;
 	}
 	for (uint32_t k = 0; k < noutputs; k++)
@@ -4056,7 +4169,8 @@ done:
 }
 
 static int
-compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
+compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
+				 int *prune_deferred)
 {
 	PsLayerDesc *old;
 	uint32_t	nold = count_image_layers(timeline, shard);
@@ -4149,7 +4263,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	if (page_floor == 0 && stage_unlocked && nold > 1)
 	{
 		uint64_t bounded_scanned = 0, bounded_kept = 0;
-		int bounded = compact_timeline_bounded(timeline, shard,
+		int bounded = compact_timeline_bounded(timeline, shard, 0,
 										 &bounded_scanned, &bounded_kept);
 
 		if (bounded != 0)
@@ -4164,6 +4278,35 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 				ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted,
 								 bounded_scanned - bounded_kept);
 				ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+			}
+			rc = bounded;
+			goto cleanup;
+		}
+	}
+
+	/* Conservatively merge relation-only histories when bounded planning proves
+	 * every version is kept. A later pruning turn handles fork invalidation. */
+	if (page_floor != 0 && stage_unlocked && nold > 1)
+	{
+		uint64_t bounded_scanned = 0, bounded_kept = 0;
+		int bounded = compact_timeline_bounded(timeline, shard, page_floor,
+										 &bounded_scanned, &bounded_kept);
+
+		if (bounded != 0)
+		{
+			if (bounded > 0)
+			{
+				*prune_deferred = 1;
+				if (metrics_header != NULL)
+				{
+					ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+					ps_fetch_add_u64(&metrics_header->page_prune_compactions, 1);
+					ps_fetch_add_u64(&metrics_header->page_prune_versions_scanned, bounded_scanned);
+					ps_fetch_add_u64(&metrics_header->page_prune_versions_kept, bounded_kept);
+					ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted,
+								 bounded_scanned - bounded_kept);
+					ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+				}
 			}
 			rc = bounded;
 			goto cleanup;
@@ -4342,7 +4485,7 @@ gather_complete:
 	 * Use the bounded merge only after it proves no versions were dropped. */
 	if (ndropped == 0 && stage_unlocked)
 	{
-		int bounded = compact_timeline_bounded(timeline, shard, NULL, NULL);
+		int bounded = compact_timeline_bounded(timeline, shard, 0, NULL, NULL);
 
 		if (bounded != 0)
 		{
@@ -26910,6 +27053,7 @@ ps_core_maintenance_impl(void)
 					PS_RETENTION_RESOURCE_PAGE_HISTORY, &page_floor, 1,
 					NULL, NULL, NULL, NULL) == 0)
 			{
+				int		prune_deferred = 0;
 				int		was_due = __atomic_exchange_n(&page_prune_due[ftl][fsh],
 													  0, __ATOMIC_ACQ_REL);
 
@@ -26918,8 +27062,8 @@ ps_core_maintenance_impl(void)
 				 * durable) is a fresh mark for the next pass, not one this
 				 * pass clears on its way out.  Zero disables pruning but
 				 * still permits a safe layer merge. */
-				did = compact_timeline(ftl, fsh, page_floor) > 0;
-				if (!did && was_due)
+				did = compact_timeline(ftl, fsh, page_floor, &prune_deferred) > 0;
+				if ((!did && was_due) || prune_deferred)
 					__atomic_store_n(&page_prune_due[ftl][fsh], 1,
 									 __ATOMIC_RELEASE);
 			}
