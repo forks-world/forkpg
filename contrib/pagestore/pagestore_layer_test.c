@@ -814,6 +814,58 @@ bounded_merge_test(void)
 		  "bounded merge enforces its fan-in limit");
 }
 
+static int
+read_memory_batch(const PsImgRec *rec, void *page, void *arg)
+{
+	(void) arg;
+	memcpy(page, rec->page, PSZ);
+	return 0;
+}
+
+static void
+bounded_shared_payload_test(void)
+{
+	PsKey key = {1, 1, 958, 0, PS_KLASS_RELATION};
+	PsImgRec recs[35] = {0};
+	unsigned char *pages = malloc((size_t) 33 * PSZ);
+	unsigned char actual[PSZ];
+	PsLayerDesc layer;
+	PsImgIndexEnt *index = NULL;
+	uint32_t nindex = 0;
+	int ok = pages != NULL;
+
+	check(ok, "allocate shared-payload fixture");
+	if (!ok)
+		return;
+	for (uint32_t i = 0; i < 33; i++)
+		memset(pages + (size_t) i * PSZ, (int) i, PSZ);
+	for (uint32_t i = 0; i < 35; i++)
+	{
+		recs[i].key = key;
+		recs[i].block = 0;
+		recs[i].lsn = 100;
+		recs[i].admission_seq = i + 1;
+		recs[i].page = pages + (size_t) (i < 32 ? i : i < 34 ? 31 : 32) * PSZ;
+	}
+	ok = ps_image_layer_write_sorted_batch(984, 0, recs, 35, PSZ,
+										  read_memory_batch, NULL, &layer) == 0;
+	check(ok && layer.locations[0].size == (uint64_t) 33 * PSZ +
+		  35 * sizeof(PsImgIndexEnt) + sizeof(PsImgFooter) &&
+		  ps_image_layer_read_index(&layer, &index, &nindex) == 0 && nindex == 35 &&
+		  index[31].data_off == index[32].data_off &&
+		  index[32].data_off == index[33].data_off &&
+		  index[34].data_off != index[33].data_off,
+		  "identical adjacent payloads share one offset across a write-buffer boundary");
+	check(ok && ps_image_layer_verify_data(&layer, PSZ) == 0 &&
+		  ps_image_layer_lookup_exact(&layer, &key, 0, 100, 33, actual, PSZ, NULL, NULL) == 1 &&
+		  memcmp(actual, pages + (size_t) 31 * PSZ, PSZ) == 0 &&
+		  ps_image_layer_lookup_exact(&layer, &key, 0, 100, 35, actual, PSZ, NULL, NULL) == 1 &&
+		  memcmp(actual, pages + (size_t) 32 * PSZ, PSZ) == 0,
+		  "shared payload versions remain checksummed and individually readable");
+	free(index);
+	free(pages);
+}
+
 static void
 bounded_sorted_batch_test(void)
 {
@@ -1060,6 +1112,7 @@ main(void)
 	legacy_index_visitor_test();
 	bounded_relation_plan_test();
 	bounded_merge_test();
+	bounded_shared_payload_test();
 	bounded_sorted_batch_test();
 	prepared_batch_boundary_test();
 	prepared_finite_sequence_test();

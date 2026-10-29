@@ -207,6 +207,11 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 									   image_memory_page, &page_size, out);
 }
 
+static int
+image_layer_write_stream_impl(uint64_t layer_id, uint32_t timeline,
+	const PsImgRec *recs, uint32_t n, uint32_t page_size,
+	PsImagePageReader read_page, void *arg, PsLayerDesc *out, bool share_adjacent);
+
 int
 ps_image_layer_write_sorted_batch(uint64_t layer_id, uint32_t timeline,
 								  const PsImgRec *recs, uint32_t n, uint32_t page_size,
@@ -226,8 +231,8 @@ ps_image_layer_write_sorted_batch(uint64_t layer_id, uint32_t timeline,
 				recs[i - 1].admission_seq > recs[i].admission_seq))))))
 			return -1;
 	}
-	return ps_image_layer_write_stream(layer_id, timeline, recs, n, page_size,
-									   read_page, arg, out);
+	return image_layer_write_stream_impl(layer_id, timeline, recs, n, page_size,
+										 read_page, arg, out, true);
 }
 
 int
@@ -235,8 +240,19 @@ ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 							const PsImgRec *recs, uint32_t n, uint32_t page_size,
 							PsImagePageReader read_page, void *arg, PsLayerDesc *out)
 {
+	return image_layer_write_stream_impl(layer_id, timeline, recs, n, page_size,
+										 read_page, arg, out, false);
+}
+
+static int
+image_layer_write_stream_impl(uint64_t layer_id, uint32_t timeline,
+							const PsImgRec *recs, uint32_t n, uint32_t page_size,
+							PsImagePageReader read_page, void *arg, PsLayerDesc *out, bool share_adjacent)
+{
 	ImgSort    *sorted = NULL;
-	unsigned char *buffer = NULL;
+	unsigned char *buffer = NULL, *previous = NULL;
+	uint64_t previous_offset = 0;
+	bool have_previous = false;
 	PsImgFooter foot;
 	uint64_t	data_bytes = (uint64_t) n * page_size;
 	uint64_t	idx_bytes = (uint64_t) n * sizeof(PsImgIndexEnt);
@@ -254,7 +270,9 @@ ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 		return -1;
 	sorted = malloc((size_t) n * sizeof(*sorted));
 	buffer = malloc(IMAGE_STREAM_BYTES);
-	if (!sorted || !buffer)
+	if (share_adjacent)
+		previous = malloc(page_size);
+	if (!sorted || !buffer || (share_adjacent && !previous))
 		goto out;
 	for (uint32_t i = 0; i < n; i++)
 	{
@@ -283,9 +301,21 @@ ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 			offset += used;
 			used = 0;
 		}
-		sorted[i].ent.data_off = (uint64_t) i * page_size;
 		if (read_page(&recs[sorted[i].src], buffer + used, arg) != 0)
 			goto out;
+		if (share_adjacent && have_previous &&
+			memcmp(previous, buffer + used, page_size) == 0)
+		{
+			sorted[i].ent.data_off = previous_offset;
+			continue;
+		}
+		sorted[i].ent.data_off = offset + used;
+		if (share_adjacent)
+		{
+			memcpy(previous, buffer + used, page_size);
+			previous_offset = sorted[i].ent.data_off;
+			have_previous = true;
+		}
 		data_crc = img_crc_extend(data_crc, buffer + used, page_size);
 		used += page_size;
 	}
@@ -293,6 +323,8 @@ ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 		ps_layer_store->write_local_layer_at(layer_id, offset, buffer, used) != 0)
 		goto out;
 	offset += used;
+	data_bytes = offset;
+	total = data_bytes + idx_bytes + sizeof(PsImgFooter);
 	used = 0;
 	for (uint32_t i = 0; i < n; i++)
 	{
@@ -374,6 +406,7 @@ out:
 	}
 	free(sorted);
 	free(buffer);
+	free(previous);
 	return rc;
 }
 /* ===================== delta layer file format ========================= */

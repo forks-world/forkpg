@@ -101,7 +101,7 @@ extern uint32_t ps_layer_map_count(const PsLayerMap *map);
  * Image layer file format (phase 2).
  *
  * An image layer is an immutable file holding full-page versions:
- *     [ page data : nrecs * page_size, back to back ]
+ *     [ page data : full pages, back to back; identical pages may share offsets ]
  *     [ index     : nrecs * PsImgIndexEnt, sorted by (key, block, lsn) ]
  *     [ footer    : PsImgFooter, fixed-size trailer at end of file ]
  * It stores *multiple versions* per (key, block) (keyed by page_lsn), so a read
@@ -176,7 +176,8 @@ extern int ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 /* One independently sealed, unpublished output batch. Metadata must already
  * be sorted by key, block, LSN and admission sequence.  The explicit record
  * limit bounds writer memory and output size to n * (page_size + index entry)
- * plus a footer.  Publishing and retiring sources remain the caller's job. */
+ * plus a footer. Adjacent identical page payloads share one data offset; their
+ * distinct version identities and recovery metadata remain in the index.  Publishing and retiring sources remain the caller's job. */
 #define PS_IMAGE_BATCH_MAX_RECORDS 1024
 extern int ps_image_layer_write_sorted_batch(uint64_t layer_id, uint32_t timeline,
  const PsImgRec *recs, uint32_t n, uint32_t page_size,
