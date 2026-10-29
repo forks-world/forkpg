@@ -3890,7 +3890,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	CompactReadCache read_cache = {0};
 	uint64_t	frontier_seq;
 	uint64_t	retention_epoch = 0, timeline_epoch = 0, admission_epoch = 0;
-	int			stage_unlocked = g_shards[shard].staged_compaction_retries < 2;
+	int			stage_unlocked = g_shards[shard].staged_compaction_retries < 1;
 	int			rc = -1;
 
 	if (!ps_timeline_live(timeline))
@@ -4114,7 +4114,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		}
 		if (write_rc != 0 || !valid)
 		{
-			if (!valid && g_shards[shard].staged_compaction_retries < 2)
+			if (!valid && g_shards[shard].staged_compaction_retries < 1)
 				g_shards[shard].staged_compaction_retries++;
 			if (write_rc == 0)
 				(void) ps_layer_store->delete_local_layer(&newdesc);
