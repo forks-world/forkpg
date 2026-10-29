@@ -1304,7 +1304,7 @@ image_compaction_snapshot_valid(const PsLayerMap *map,
 
 				expected.deleting = retiring && j < retired_prefix;
 				if ((seen_input_bits & (UINT64_C(1) << j)) != 0 ||
-					(retiring && current->cache_readers == 0) ||
+					(retiring && __atomic_load_n(&current->cache_readers, __ATOMIC_ACQUIRE) == 0) ||
 					!image_snapshot_descriptor_equal(current, &expected))
 					return 0;
 				seen_input_bits |= UINT64_C(1) << j;

@@ -3882,6 +3882,153 @@ ps_test_compact_read_batch(const PsLayerDesc *layer, uint32_t npages,
 	return rc;
 }
 
+static uint64_t test_bounded_compaction_count;
+
+uint64_t
+ps_test_bounded_compaction_count(void)
+{
+	return __atomic_load_n(&test_bounded_compaction_count, __ATOMIC_RELAXED);
+}
+
+/* Merge without pruning when a bounded replacement can reduce layer count.
+ * Entry and exit both hold all shard locks, page_prune_lock and map-wr.
+ * Return 0 when ineligible, 1 on work, and -1 on an attempted failure. */
+static int
+compact_timeline_bounded(uint32_t timeline, uint32_t shard)
+{
+	PsLayerDesc inputs[PS_IMAGE_MERGE_MAX_INPUTS];
+	PsLayerDesc outputs[PS_IMAGE_PREPARE_MAX_OUTPUTS];
+	uint64_t ids[PS_IMAGE_PREPARE_MAX_OUTPUTS], uncertain = 0;
+	uint32_t ninputs = 0, noutputs = 0, published = 0, retired = 0;
+	uint32_t capacity;
+	uint64_t bytes = 0, retention_epoch, current_retention_epoch;
+	uint64_t timeline_epoch, admission_epoch;
+	int result = -1, prepare_rc, ambiguous = 0;
+
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		const PsLayerLocation *loc;
+
+		if (d->kind != PS_LAYER_IMAGE || d->deleting || d->timeline != timeline ||
+			layer_shard_from_id(d->layer_id) != shard)
+			continue;
+		if (ninputs == PS_IMAGE_MERGE_MAX_INPUTS || d->remote_durable ||
+			d->legacy_shard_zero || (loc = tier_local_location(d)) == NULL ||
+			!loc->available || UINT64_MAX - bytes < loc->size ||
+			__atomic_load_n(&d->cache_readers, __ATOMIC_ACQUIRE) != 0)
+			return 0;
+		bytes += loc->size;
+		inputs[ninputs++] = *d;
+	}
+	if (ninputs < 2 || ps_manifest_poisoned())
+		return 0;
+	capacity = ninputs - 1;
+	/* Avoid staging a pass which cannot reasonably shrink the layer count.
+	 * Duplicates may make this conservative, which only chooses the old path. */
+	if (bytes > (uint64_t) capacity * PS_IMAGE_BATCH_MAX_RECORDS * page_size)
+		return 0;
+	if (ps_retention_epoch(&retention_epoch) != 0)
+		return -1;
+	timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	__atomic_fetch_add(&test_bounded_compaction_count, 1, __ATOMIC_RELAXED);
+	for (uint32_t i = 0; i < capacity; i++)
+		ids[i] = alloc_layer_id(&g_shards[shard]);
+	for (uint32_t k = 0; k < ninputs; k++)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == inputs[k].layer_id)
+				__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+
+	ps_unlock_map();
+	pthread_rwlock_unlock(&page_prune_lock);
+	for (uint32_t s = core_shards(); s > 0; s--)
+		ps_unlock_shard(s - 1);
+	if (compaction_unlocked_test_hook != NULL)
+		compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
+	prepare_rc = ps_image_compaction_prepare(inputs, ninputs, ids, capacity,
+										 page_size, outputs, &noutputs, &uncertain);
+	if (prepare_rc == 0 &&
+		ps_image_compaction_verify_coverage(inputs, ninputs, outputs, noutputs, page_size) != 0)
+		prepare_rc = -1;
+	for (uint32_t s = 0; s < core_shards(); s++)
+		ps_lock_shard_wr(s);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	if (prepare_rc != 0 || !ps_timeline_live(timeline) || ps_manifest_poisoned() ||
+		ps_retention_epoch(&current_retention_epoch) != 0 ||
+		current_retention_epoch != retention_epoch ||
+		__atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE) != timeline_epoch ||
+		__atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE) != admission_epoch)
+	{
+		/* On -2, the helper explicitly reports an uncertain or failed cleanup. */
+		ambiguous = prepare_rc == -2;
+		if (prepare_rc == 0)
+			g_shards[shard].staged_compaction_retries = 1;
+		goto done;
+	}
+	for (uint32_t k = 0; k < noutputs; k++)
+	{
+		if (!ps_timeline_live(timeline) ||
+			!ps_image_compaction_snapshot_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs))
+			goto done;
+		if (ps_manifest_publish_image_batch(inputs, ninputs, outputs, noutputs, k) != 0)
+		{
+			ambiguous = 1;
+			goto done;
+		}
+		published++;
+		inspection_metrics_changed();
+		/* Yield between records; the next iteration revalidates the snapshot. */
+		ps_unlock_map();
+		pthread_rwlock_unlock(&page_prune_lock);
+		for (uint32_t s = core_shards(); s > 0; s--)
+			ps_unlock_shard(s - 1);
+		for (uint32_t s = 0; s < core_shards(); s++)
+			ps_lock_shard_wr(s);
+		pthread_rwlock_rdlock(&page_prune_lock);
+		ps_lock_map_wr();
+	}
+	if (ps_fault_probe(PS_FAULT_POINT_PAGE_COMPACTION_AFTER_PUBLISH) != 0)
+		goto done;
+	for (uint32_t k = 0; k < ninputs; k++)
+	{
+		if (!ps_timeline_live(timeline) ||
+			ps_manifest_retire_image_source(inputs, ninputs, outputs, noutputs, k) != 0)
+			goto done;
+		retired++;
+		inspection_metrics_changed();
+		if (ps_fault_probe(PS_FAULT_POINT_PAGE_GC_AFTER_MARK_DELETE) != 0)
+			goto done;
+		ps_unlock_map();
+		pthread_rwlock_unlock(&page_prune_lock);
+		for (uint32_t s = core_shards(); s > 0; s--)
+			ps_unlock_shard(s - 1);
+		for (uint32_t s = 0; s < core_shards(); s++)
+			ps_lock_shard_wr(s);
+		pthread_rwlock_rdlock(&page_prune_lock);
+		ps_lock_map_wr();
+	}
+	result = 1;
+
+done:
+	for (uint32_t k = 0; k < ninputs; k++)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == inputs[k].layer_id)
+			{
+				__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+				break;
+			}
+	/* Only delete outputs known not to have been submitted to the manifest.
+	 * On any ambiguous append, retain the entire remaining set for recovery. */
+	if (!ambiguous)
+		for (uint32_t k = published; k < noutputs; k++)
+			(void) ps_layer_store->delete_local_layer(&outputs[k]);
+	if (retired != 0)
+		result = 1;
+	return result;
+}
+
 static int
 compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 {
@@ -4061,6 +4208,28 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		rc = 1;
 		g_shards[shard].staged_compaction_retries = 0;
 		goto cleanup;
+	}
+	/* The legacy planner may prune opportunistically even without a due flag.
+	 * Use the bounded merge only after it proves no versions were dropped. */
+	if (ndropped == 0 && stage_unlocked)
+	{
+		int bounded = compact_timeline_bounded(timeline, shard);
+
+		if (bounded != 0)
+		{
+			if (bounded > 0 && metrics_header != NULL)
+			{
+				ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+				ps_fetch_add_u64(&metrics_header->page_prune_compactions, 1);
+				ps_fetch_add_u64(&metrics_header->page_prune_versions_scanned, scanned);
+				ps_fetch_add_u64(&metrics_header->page_prune_versions_kept, nrec);
+				ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted,
+								 scanned - nrec);
+				ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+			}
+			rc = bounded;
+			goto cleanup;
+		}
 	}
 	frontier_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	if (frontier_seq != 0)
@@ -26192,6 +26361,7 @@ ps_core_maintenance_impl(void)
 	uint64_t	page_floor = 0;
 	int			found = 0;
 	int			did = 0;
+	int			defer_layer_gc = 0;
 	int			forkmeta_gc_scan_incomplete = 0;
 	int			forkmeta_temp_gc_observation_stale = 0;
 	int			snapshot_gc_due;
@@ -26426,9 +26596,18 @@ ps_core_maintenance_impl(void)
 	 * continuous tier/remote-GC streams so those classes cannot starve it. */
 	if (wal_segment_reclaim_one())
 		return 1;
-	if (gc_remote_one())
+	/* A failed post-unlink directory sync leaves counted segment debt until
+	 * absence is confirmed. Do that before draining a queue of layer GC. */
+	if (segment_gc_enabled && !timeline_delete_active() && ps_storage->seg_remove)
+		for (uint32_t sh = 0; sh < ns; sh++)
+		{
+			ps_lock_shard_rd(sh);
+			defer_layer_gc |= g_shards[sh].gc_pending_remove;
+			ps_unlock_shard(sh);
+		}
+	if (!defer_layer_gc && gc_remote_one())
 		return 1;
-	if (tier_one_layer())
+	if (!defer_layer_gc && tier_one_layer())
 		return 1;
 
 	/* Reclaim at most one complete segment.  The boundary segment containing
@@ -26494,6 +26673,8 @@ ps_core_maintenance_impl(void)
 		if (found)
 			return 1;
 	}
+	if (defer_layer_gc && (gc_remote_one() || tier_one_layer()))
+		return 1;
 	/*
 	 * Residual 2 (a superseded control note stuck in the memtable): service
 	 * any control-shard flush the WAL reclaimer requested (the control-note

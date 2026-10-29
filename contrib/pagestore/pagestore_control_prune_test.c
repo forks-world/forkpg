@@ -322,6 +322,132 @@ close_store(void)
 		ps_storage->close();
 }
 
+static int
+read_relation_at(uint32_t block, uint64_t lsn)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint32_t hi, lo;
+	int rc;
+
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&key));
+	rc = read_resolve(0, &key, block, lsn, 0, page, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	if (rc != 1)
+		return 0;
+	memcpy(&hi, page, sizeof(hi));
+	memcpy(&lo, page + sizeof(hi), sizeof(lo));
+	return (((uint64_t) hi << 32) | lo) == lsn;
+}
+
+static void
+test_bounded_compaction_maintenance(void)
+{
+	char store[] = "/tmp/pagestore-bounded-core-XXXXXX";
+	uint64_t before, version = 0;
+	uint32_t live = 0;
+
+	configure_core(1);
+	compact_layers = 100;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open bounded compaction store");
+	check(write_control(0, 1000, 800), "seed bounded compaction store");
+	run_maintenance(32); /* consume startup pruning request */
+	check(!ps_test_page_prune_due(0, 0), "startup pruning has converged");
+	check(write_relation(0, 1, 2000) && write_relation(0, 2, 3000),
+		  "add bounded compaction inputs");
+	before = ps_test_bounded_compaction_count();
+	compact_layers = 1;
+	run_maintenance(64);
+	check(ps_test_bounded_compaction_count() > before,
+		  "maintenance invokes bounded local compaction");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	check(live == 1, "bounded compaction reduces live layers");
+	check(read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 1000, &version) && version == 1000 &&
+		  read_relation_at(1, 2000) && read_relation_at(2, 3000),
+		  "bounded compaction preserves source versions");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 1000, &version) && version == 1000 &&
+		  read_relation_at(1, 2000) && read_relation_at(2, 3000),
+		  "bounded compaction survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+typedef struct BoundedConflictProbe
+{
+	int called;
+	int wrote;
+} BoundedConflictProbe;
+
+static void *
+bounded_conflict_writer(void *arg)
+{
+	BoundedConflictProbe *probe = arg;
+
+	probe->wrote = write_relation(0, 3, 4000);
+	return NULL;
+}
+
+static void
+bounded_conflict_hook(void *arg)
+{
+	BoundedConflictProbe *probe = arg;
+	pthread_t thread;
+
+	probe->called++;
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	if (pthread_create(&thread, NULL, bounded_conflict_writer, probe) == 0)
+		(void) pthread_join(thread, NULL);
+}
+
+static void
+test_bounded_compaction_concurrent_write(void)
+{
+	char store[] = "/tmp/pagestore-bounded-conflict-XXXXXX";
+	BoundedConflictProbe probe = {0};
+	uint64_t before;
+	uint32_t live = 0;
+
+	configure_core(1);
+	compact_layers = 100;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  write_control(0, 1000, 800), "open bounded conflict store");
+	run_maintenance(32);
+	check(write_relation(0, 1, 2000) && write_relation(0, 2, 3000),
+		  "prepare bounded conflict inputs");
+	before = ps_test_bounded_compaction_count();
+	ps_test_set_compaction_unlocked_hook(bounded_conflict_hook, &probe);
+	compact_layers = 1;
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	check(probe.called && probe.wrote && ps_test_bounded_compaction_count() > before,
+		  "writer runs while bounded compaction prepares");
+	check(live >= 3 && read_relation_at(1, 2000) && read_relation_at(2, 3000) &&
+		  read_relation_at(3, 4000),
+		  "concurrent layer invalidates bounded publication and preserves data");
+	run_maintenance(64);
+	check(read_relation_at(1, 2000) && read_relation_at(2, 3000) &&
+		  read_relation_at(3, 4000), "bounded retry preserves concurrent write");
+	close_store();
+	remove_tree(store);
+}
+
 typedef struct StagedCompactionProbe
 {
 	int called;
@@ -1499,6 +1625,8 @@ test_compaction_source_read_batch(void)
 int
 main(void)
 {
+	test_bounded_compaction_maintenance();
+	test_bounded_compaction_concurrent_write();
 	test_staged_compaction_rejects_concurrent_write(1);
 	test_staged_compaction_rejects_concurrent_write(2);
 	test_staged_compaction_rejects_new_retention_pin();
