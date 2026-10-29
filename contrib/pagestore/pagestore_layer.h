@@ -213,8 +213,10 @@ extern int ps_image_index_cursor_open(const PsLayerDesc *layer,
 extern int ps_image_index_cursor_next(PsImageIndexCursor *cursor,
 									   PsImgIndexEnt *entry);
 extern void ps_image_index_cursor_close(PsImageIndexCursor *cursor);
-/* Bounded fan-in. Identical versions are emitted in ascending source-layer
- * order, so the last copy matches the read path's layer-ID tie break. */
+/* Bounded fan-in for caller-pinned image layers on one timeline. Identical
+ * versions are emitted in ascending source-layer order, so the last copy
+ * matches the read path's layer-ID tie break.  As with a cursor, staged
+ * results are valid only if next reaches 0; close alone does not verify them. */
 #define PS_IMAGE_MERGE_MAX_INPUTS 64
 typedef struct PsImageIndexMerge PsImageIndexMerge;
 extern int ps_image_index_merge_open(const PsLayerDesc *layers, uint32_t count,
