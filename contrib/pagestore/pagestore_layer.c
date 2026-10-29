@@ -1060,16 +1060,17 @@ image_compaction_data_end(const PsLayerDesc *layer, uint32_t page_size,
 }
 
 int
-ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
+ps_image_compaction_prepare_counted(const PsLayerDesc *layers, uint32_t count,
 							const uint64_t *output_ids, uint32_t capacity,
 							uint32_t page_size, PsLayerDesc *outputs,
-							uint32_t *noutputs, uint64_t *uncertain_id)
+							uint32_t *noutputs, uint64_t *uncertain_id,
+							uint64_t *scanned_out, uint64_t *kept_out)
 {
 	PsImageIndexMerge *merge = NULL;
 	PsImgRec *batch = NULL;
 	ImagePrepareSource *sources = NULL;
 	uint64_t data_ends[PS_IMAGE_MERGE_MAX_INPUTS];
-	uint64_t max_id = 0;
+	uint64_t max_id = 0, scanned = 0, kept = 0;
 	uint32_t written = 0, used = 0;
 	PsImgIndexEnt pending;
 	uint32_t pending_source = 0;
@@ -1080,6 +1081,10 @@ ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 		return -1;
 	*noutputs = 0;
 	*uncertain_id = 0;
+	if (scanned_out != NULL)
+		*scanned_out = 0;
+	if (kept_out != NULL)
+		*kept_out = 0;
 	if (layers == NULL || output_ids == NULL || outputs == NULL || count == 0 ||
 		count > PS_IMAGE_MERGE_MAX_INPUTS || capacity == 0 ||
 		capacity > PS_IMAGE_PREPARE_MAX_OUTPUTS || page_size == 0 ||
@@ -1124,6 +1129,7 @@ ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 			goto out;
 		if (next == 1)
 		{
+			scanned++;
 			for (source = 0; source < count && layers[source].layer_id != layer_id; source++)
 				;
 			if (source == count || data_ends[source] < page_size ||
@@ -1159,6 +1165,7 @@ ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 			sources[used].offset = pending.data_off;
 			batch[used].page = &sources[used];
 			used++;
+			kept++;
 		}
 		have_pending = next == 1;
 		if (have_pending)
@@ -1185,6 +1192,10 @@ ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 		if (next == 0)
 		{
 			*noutputs = written;
+			if (scanned_out != NULL)
+				*scanned_out = scanned;
+			if (kept_out != NULL)
+				*kept_out = kept;
 			rc = 0;
 			goto done;
 		}
@@ -1206,6 +1217,16 @@ done:
 	free(batch);
 	free(sources);
 	return rc;
+}
+
+int
+ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
+							const uint64_t *output_ids, uint32_t capacity,
+							uint32_t page_size, PsLayerDesc *outputs,
+							uint32_t *noutputs, uint64_t *uncertain_id)
+{
+	return ps_image_compaction_prepare_counted(layers, count, output_ids, capacity,
+		page_size, outputs, noutputs, uncertain_id, NULL, NULL);
 }
 
 static int

@@ -346,23 +346,26 @@ static void
 test_bounded_compaction_maintenance(void)
 {
 	char store[] = "/tmp/pagestore-bounded-core-XXXXXX";
-	uint64_t before, version = 0;
+	uint64_t before, zero_before;
 	uint32_t live = 0;
 
 	configure_core(1);
 	compact_layers = 100;
 	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
 		  "open bounded compaction store");
-	check(write_control(0, 1000, 800), "seed bounded compaction store");
+	check(write_relation(0, 0, 1000), "seed bounded compaction store");
 	run_maintenance(32); /* consume startup pruning request */
 	check(!ps_test_page_prune_due(0, 0), "startup pruning has converged");
 	check(write_relation(0, 1, 2000) && write_relation(0, 2, 3000),
 		  "add bounded compaction inputs");
 	before = ps_test_bounded_compaction_count();
+	zero_before = ps_test_bounded_zero_floor_count();
 	compact_layers = 1;
 	run_maintenance(64);
 	check(ps_test_bounded_compaction_count() > before,
 		  "maintenance invokes bounded local compaction");
+	check(ps_test_bounded_zero_floor_count() > zero_before,
+		  "zero-floor maintenance bypasses the unbounded planner");
 	ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
@@ -370,12 +373,12 @@ test_bounded_compaction_maintenance(void)
 			live++;
 	ps_unlock_map();
 	check(live == 1, "bounded compaction reduces live layers");
-	check(read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 1000, &version) && version == 1000 &&
+	check(read_relation_at(0, 1000) &&
 		  read_relation_at(1, 2000) && read_relation_at(2, 3000),
 		  "bounded compaction preserves source versions");
 	close_store();
 	check(ps_core_open(store) == 0 &&
-		  read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 1000, &version) && version == 1000 &&
+		  read_relation_at(0, 1000) &&
 		  read_relation_at(1, 2000) && read_relation_at(2, 3000),
 		  "bounded compaction survives restart");
 	close_store();

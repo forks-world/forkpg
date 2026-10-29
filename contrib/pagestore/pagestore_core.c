@@ -3883,6 +3883,7 @@ ps_test_compact_read_batch(const PsLayerDesc *layer, uint32_t npages,
 }
 
 static uint64_t test_bounded_compaction_count;
+static uint64_t test_bounded_zero_floor_count;
 
 uint64_t
 ps_test_bounded_compaction_count(void)
@@ -3890,11 +3891,18 @@ ps_test_bounded_compaction_count(void)
 	return __atomic_load_n(&test_bounded_compaction_count, __ATOMIC_RELAXED);
 }
 
+uint64_t
+ps_test_bounded_zero_floor_count(void)
+{
+	return __atomic_load_n(&test_bounded_zero_floor_count, __ATOMIC_RELAXED);
+}
+
 /* Merge without pruning when a bounded replacement can reduce layer count.
  * Entry and exit both hold all shard locks, page_prune_lock and map-wr.
  * Return 0 when ineligible, 1 on work, and -1 on an attempted failure. */
 static int
-compact_timeline_bounded(uint32_t timeline, uint32_t shard)
+compact_timeline_bounded(uint32_t timeline, uint32_t shard,
+						 uint64_t *scanned_out, uint64_t *kept_out)
 {
 	PsLayerDesc inputs[PS_IMAGE_MERGE_MAX_INPUTS];
 	PsLayerDesc outputs[PS_IMAGE_PREPARE_MAX_OUTPUTS];
@@ -3946,8 +3954,9 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard)
 		ps_unlock_shard(s - 1);
 	if (compaction_unlocked_test_hook != NULL)
 		compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
-	prepare_rc = ps_image_compaction_prepare(inputs, ninputs, ids, capacity,
-										 page_size, outputs, &noutputs, &uncertain);
+	prepare_rc = ps_image_compaction_prepare_counted(inputs, ninputs, ids, capacity,
+										 page_size, outputs, &noutputs, &uncertain,
+										 scanned_out, kept_out);
 	if (prepare_rc == 0 &&
 		ps_image_compaction_verify_coverage(inputs, ninputs, outputs, noutputs, page_size) != 0)
 		prepare_rc = -1;
@@ -4116,6 +4125,32 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 				return 0;
 			}
 
+	/* At floor zero the prune planner retains every identity, for all key
+	 * classes. Skip its unbounded locked index gather in this case. */
+	if (page_floor == 0 && stage_unlocked && nold > 1)
+	{
+		uint64_t bounded_scanned = 0, bounded_kept = 0;
+		int bounded = compact_timeline_bounded(timeline, shard,
+										 &bounded_scanned, &bounded_kept);
+
+		if (bounded != 0)
+		{
+			__atomic_fetch_add(&test_bounded_zero_floor_count, 1, __ATOMIC_RELAXED);
+			if (bounded > 0 && metrics_header != NULL)
+			{
+				ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+				ps_fetch_add_u64(&metrics_header->page_prune_compactions, 1);
+				ps_fetch_add_u64(&metrics_header->page_prune_versions_scanned, bounded_scanned);
+				ps_fetch_add_u64(&metrics_header->page_prune_versions_kept, bounded_kept);
+				ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted,
+								 bounded_scanned - bounded_kept);
+				ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+			}
+			rc = bounded;
+			goto cleanup;
+		}
+	}
+
 	/* Gather metadata only; read retained pages on demand after pruning. */
 	for (uint32_t k = 0; k < nold; k++)
 	{
@@ -4213,7 +4248,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	 * Use the bounded merge only after it proves no versions were dropped. */
 	if (ndropped == 0 && stage_unlocked)
 	{
-		int bounded = compact_timeline_bounded(timeline, shard);
+		int bounded = compact_timeline_bounded(timeline, shard, NULL, NULL);
 
 		if (bounded != 0)
 		{

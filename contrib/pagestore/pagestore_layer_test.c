@@ -752,7 +752,7 @@ prepared_batch_boundary_test(void)
 	PsImgRec *records = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*records));
 	unsigned char older[PSZ] = {1}, newer[PSZ] = {2}, result[PSZ];
 	PsLayerDesc inputs[2], outputs[2];
-	uint64_t ids[2] = {1300, 1301}, uncertain = 0;
+	uint64_t ids[2] = {1300, 1301}, uncertain = 0, scanned = 0, kept = 0;
 	uint32_t noutputs = 0;
 	int ok = records != NULL;
 
@@ -769,9 +769,10 @@ prepared_batch_boundary_test(void)
 								 PSZ, &inputs[0]) == 0;
 	records[0].page = newer;
 	ok = ok && ps_image_layer_write(1201, 0, records, 1, PSZ, &inputs[1]) == 0;
-	check(ok && ps_image_compaction_prepare(inputs, 2, ids, 2, PSZ, outputs,
-											&noutputs, &uncertain) == 0 &&
-		  noutputs == 1 && uncertain == 0,
+	check(ok && ps_image_compaction_prepare_counted(inputs, 2, ids, 2, PSZ, outputs,
+											&noutputs, &uncertain, &scanned, &kept) == 0 &&
+		  noutputs == 1 && uncertain == 0 &&
+		  scanned == PS_IMAGE_BATCH_MAX_RECORDS + 1 && kept == 1,
 		  "collapse a duplicate identity crossing the batch limit");
 	if (noutputs == 1)
 	{
@@ -789,13 +790,14 @@ prepared_batch_boundary_test(void)
 		{
 			PsLayerDesc invalid_inputs[2] = {inputs[0], inputs[1]};
 			PsLayerDesc unused;
-			uint64_t new_id = 1306, unknown = 0;
+			uint64_t new_id = 1306, unknown = 0, bad_scanned = 9, bad_kept = 9;
 			uint32_t n = 0;
 
 			invalid_inputs[0].start_block++;
 			check(ps_image_compaction_verify_coverage(invalid_inputs, 2, outputs, 1, PSZ) != 0 &&
-				  ps_image_compaction_prepare(invalid_inputs, 2, &new_id, 1, PSZ,
-										  &unused, &n, &unknown) != 0 && n == 0,
+				  ps_image_compaction_prepare_counted(invalid_inputs, 2, &new_id, 1, PSZ,
+										  &unused, &n, &unknown, &bad_scanned, &bad_kept) != 0 &&
+				  n == 0 && bad_scanned == 0 && bad_kept == 0,
 				  "hidden input pages cannot be promoted by preparation or verification");
 		}
 		check(ps_image_layer_write(1304, 0, &wrong_rec, 1, PSZ, &wrong) == 0 &&

@@ -253,6 +253,12 @@ extern int ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count
 									  const uint64_t *output_ids, uint32_t capacity,
 									  uint32_t page_size, PsLayerDesc *outputs,
 									  uint32_t *noutputs, uint64_t *uncertain_id);
+/* As above, also report input entries and unique retained identities on
+ * success. Counts are zero on failure and do not authorize publication. */
+extern int ps_image_compaction_prepare_counted(const PsLayerDesc *layers,
+	uint32_t count, const uint64_t *output_ids, uint32_t capacity,
+	uint32_t page_size, PsLayerDesc *outputs, uint32_t *noutputs,
+	uint64_t *uncertain_id, uint64_t *scanned_out, uint64_t *kept_out);
 /* Compare the complete logical version set and page bytes against prepared
  * outputs. All inputs and outputs must remain immutable and pinned for the
  * whole call. Success alone is not authority to publish or retire a source:
