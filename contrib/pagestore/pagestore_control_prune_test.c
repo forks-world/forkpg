@@ -761,7 +761,7 @@ test_compaction_gather_rejects_concurrent_change(int pin_only)
 		(void) ps_core_maintenance();
 	ps_test_set_compaction_gather_hook(NULL, NULL);
 	check(probe.called == 1 && probe.read_ok && probe.write_ok,
-		  "foreground operation proceeds during unlocked index gathering");
+		  "foreground operation proceeds after unlocked gathering and sorting");
 	ps_lock_map_rd();
 	check(ps_layer_map_count(&ps_layer_map) == probe.layers_after_write,
 		  "changed snapshot rejects gathered compaction inputs");

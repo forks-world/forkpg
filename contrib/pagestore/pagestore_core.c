@@ -3258,6 +3258,27 @@ compact_order_cmp(const void *va, const void *vb)
 	return a->source < b->source ? -1 : (a->source > b->source ? 1 : 0);
 }
 
+/* Sorting depends only on the immutable gathered records, not on pruning
+ * state. The caller owns the returned order until its pass is finished. */
+static CompactOrder *
+compact_build_order(const PsImgRec *recs, uint32_t nrec)
+{
+	CompactOrder *order = malloc((size_t) nrec * sizeof(*order));
+
+	if (order == NULL)
+		return NULL;
+	for (uint32_t i = 0; i < nrec; i++)
+	{
+		order[i].key = recs[i].key;
+		order[i].block = recs[i].block;
+		order[i].version.lsn = recs[i].lsn;
+		order[i].version.admission_seq = recs[i].admission_seq;
+		order[i].source = i;
+	}
+	qsort(order, nrec, sizeof(*order), compact_order_cmp);
+	return order;
+}
+
 static int
 compact_same_page(const CompactOrder *a, const CompactOrder *b)
 {
@@ -3434,10 +3455,9 @@ compact_emit_grouped(const CompactOrder *order, uint32_t first, uint32_t end,
 
 static int
 prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
-						 uint64_t floor,
+						 uint64_t floor, const CompactOrder *order,
 						 PsImgRec **dropped_out, uint32_t *ndropped_out)
 {
-	CompactOrder *order;
 	PsPruneVersion *versions;
 	unsigned char *keep;
 	PsImgRec   *selected;
@@ -3480,7 +3500,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		return -1;
 	}
 
-	order = malloc((size_t) *nrec * sizeof(*order));
 	versions = malloc((size_t) *nrec * sizeof(*versions));
 	keep = malloc(*nrec);
 	selected = malloc((size_t) *nrec * sizeof(*selected));
@@ -3491,11 +3510,10 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	closure_protect = malloc((size_t) *nrec);
 	if (nrelation_fences > 8)
 		vfences = malloc((size_t) nrelation_fences * sizeof(*vfences));
-	if (!order || !versions || !keep || !selected || !dropped ||
+	if (!versions || !keep || !selected || !dropped ||
 		!obj_generations || !obj_required || !closure_protect ||
 		(nrelation_fences > 8 && !vfences))
 	{
-		free(order);
 		free(versions);
 		free(keep);
 		free(selected);
@@ -3513,15 +3531,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	}
 	for (uint32_t i = 0; i < nrelation_fences; i++)
 		vfences[i] = history_fence_view(relation_fences[i]);
-	for (uint32_t i = 0; i < *nrec; i++)
-	{
-		order[i].key = recs[i].key;
-		order[i].block = recs[i].block;
-		order[i].version.lsn = recs[i].lsn;
-		order[i].version.admission_seq = recs[i].admission_seq;
-		order[i].source = i;
-	}
-	qsort(order, *nrec, sizeof(*order), compact_order_cmp);
 	for (uint32_t first = 0; first < *nrec;)
 	{
 		uint32_t end = first + 1;
@@ -3683,7 +3692,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 								   floor, control_fences, ncontrol_fences,
 								   &plan) != 0)
 			{
-				free(order);
 				free(versions);
 				free(keep);
 				free(selected);
@@ -3741,7 +3749,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 										   closure_protect);
 			if (rc < 0)
 			{
-				free(order);
 				free(versions);
 				free(keep);
 				free(selected);
@@ -3771,7 +3778,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	memcpy(recs, selected, (size_t) out * sizeof(*recs));
 	free(obj_generations);
 	free(obj_required);
-	free(order);
 	free(versions);
 	free(keep);
 	free(selected);
@@ -4055,6 +4061,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	PsLayerDesc *old;
 	uint32_t	nold = count_image_layers(timeline, shard);
 	PsImgRec   *recs = NULL;
+	CompactOrder *order = NULL;
 	CompactPageSource **pages = NULL;
 	uint32_t	nrec = 0,
 				cap = 0,
@@ -4186,8 +4193,6 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 			pthread_rwlock_unlock(&page_prune_lock);
 			for (uint32_t sh = core_shards(); sh > 0; sh--)
 				ps_unlock_shard(sh - 1);
-			if (compaction_gather_test_hook != NULL)
-				compaction_gather_test_hook(compaction_gather_test_hook_arg);
 		}
 	}
 	/* Gather metadata only; read retained pages on demand after pruning. */
@@ -4254,6 +4259,15 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		}
 		free(idx);
 	}
+	if (nrec != 0)
+	{
+		order = compact_build_order(recs, nrec);
+		if (order == NULL)
+			goto gather_done;
+	}
+	/* Exercise snapshot validation after the unlocked sort has completed. */
+	if (gather_unlocked && compaction_gather_test_hook != NULL)
+		compaction_gather_test_hook(compaction_gather_test_hook_arg);
 	goto gather_complete;
 gather_done:
 	gather_ok = 0;
@@ -4300,7 +4314,7 @@ gather_complete:
 	if (nrec == 0)
 		goto cleanup;
 	scanned = nrec;
-	if (prune_compaction_records(timeline, recs, &nrec, page_floor,
+	if (prune_compaction_records(timeline, recs, &nrec, page_floor, order,
 								 &dropped, &ndropped) != 0)
 		goto cleanup;
 	/* Every source version can be invalidated (a dropped relation whose
@@ -4562,6 +4576,7 @@ cleanup:
 		free(pages[j]);
 	free(recs);
 	free(pages);
+	free(order);
 	free(dropped);
 	free(old);
 	return rc;
