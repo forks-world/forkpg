@@ -1050,6 +1050,9 @@ ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 	uint64_t data_ends[PS_IMAGE_MERGE_MAX_INPUTS];
 	uint64_t max_id = 0;
 	uint32_t written = 0, used = 0;
+	PsImgIndexEnt pending;
+	uint32_t pending_source = 0;
+	int have_pending = 0;
 	int rc = -1;
 
 	if (noutputs == NULL || uncertain_id == NULL)
@@ -1103,32 +1106,52 @@ ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 	{
 		PsImgIndexEnt ent;
 		uint64_t layer_id;
+		uint32_t source = 0;
 		int next = ps_image_index_merge_next(merge, &ent, &layer_id);
 
 		if (next < 0)
 			goto out;
 		if (next == 1)
 		{
-			uint32_t i;
-			for (i = 0; i < count && layers[i].layer_id != layer_id; i++)
+			for (source = 0; source < count && layers[source].layer_id != layer_id; source++)
 				;
-			if (i == count || data_ends[i] < page_size ||
-				ent.data_off > data_ends[i] - page_size || ent.data_off % page_size != 0)
+			if (source == count || data_ends[source] < page_size ||
+				ent.data_off > data_ends[source] - page_size || ent.data_off % page_size != 0)
 				goto out;
+		}
+		if (next == 1 && (!have_pending ||
+			(key_cmp(&pending.key, &ent.key) == 0 && pending.block == ent.block &&
+			 pending.lsn == ent.lsn && pending.admission_seq == ent.admission_seq)))
+		{
+			/* The merge orders equal identities by source layer ID, and within
+			 * one source by index order. The final copy is the one a read sees. */
+			pending = ent;
+			pending_source = source;
+			have_pending = 1;
+			continue;
+		}
+		if (have_pending)
+		{
 			memset(&batch[used], 0, sizeof(batch[used]));
-			batch[used].key = ent.key;
-			batch[used].block = ent.block;
-			batch[used].lsn = ent.lsn;
-			batch[used].admission_seq = ent.admission_seq;
-			batch[used].growth_lsn = ent.growth_lsn;
-			batch[used].order_id = ent.order_id;
-			batch[used].seg_off = ent.seg_off;
-			batch[used].seg_id = ent.seg_id;
-			batch[used].flags = ent.flags;
-			sources[used].layer = &layers[i];
-			sources[used].offset = ent.data_off;
+			batch[used].key = pending.key;
+			batch[used].block = pending.block;
+			batch[used].lsn = pending.lsn;
+			batch[used].admission_seq = pending.admission_seq;
+			batch[used].growth_lsn = pending.growth_lsn;
+			batch[used].order_id = pending.order_id;
+			batch[used].seg_off = pending.seg_off;
+			batch[used].seg_id = pending.seg_id;
+			batch[used].flags = pending.flags;
+			sources[used].layer = &layers[pending_source];
+			sources[used].offset = pending.data_off;
 			batch[used].page = &sources[used];
 			used++;
+		}
+		have_pending = next == 1;
+		if (have_pending)
+		{
+			pending = ent;
+			pending_source = source;
 		}
 		if (used == PS_IMAGE_BATCH_MAX_RECORDS || (next == 0 && used != 0))
 		{

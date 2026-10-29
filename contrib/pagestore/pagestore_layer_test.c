@@ -699,20 +699,85 @@ prepared_batch_boundary_test(void)
 	ok = ok && ps_image_layer_write(1201, 0, records, 1, PSZ, &inputs[1]) == 0;
 	check(ok && ps_image_compaction_prepare(inputs, 2, ids, 2, PSZ, outputs,
 											&noutputs, &uncertain) == 0 &&
-		  noutputs == 2 && uncertain == 0,
-		  "prepare a duplicate identity crossing the output boundary");
-	if (noutputs == 2)
+		  noutputs == 1 && uncertain == 0,
+		  "collapse a duplicate identity crossing the batch limit");
+	if (noutputs == 1)
 	{
+		PsImgIndexEnt *index = NULL;
+		uint32_t nindex = 0;
 		check(ps_image_layer_lookup_exact(&outputs[0], &key, 0, 100, 0,
-										result, PSZ, NULL, NULL) == 1 && result[0] == 1 &&
-			  ps_image_layer_lookup_exact(&outputs[1], &key, 0, 100, 0,
-										result, PSZ, NULL, NULL) == 1 && result[0] == 2,
-			  "later prepared output contains the higher-precedence source");
+										result, PSZ, NULL, NULL) == 1 && result[0] == 2 &&
+			  ps_image_layer_read_index(&outputs[0], &index, &nindex) == 0 && nindex == 1,
+			  "one prepared identity contains the highest-precedence source");
+		free(index);
 		for (uint32_t i = 0; i < noutputs; i++)
 			check(ps_layer_store->delete_local_layer(&outputs[i]) == 0,
 				  "remove boundary fixture output");
 	}
+	for (uint32_t i = 0; i < PS_IMAGE_BATCH_MAX_RECORDS; i++)
+	{
+		records[i].block = i;
+		records[i].page = older;
+	}
+	ok = ps_image_layer_write(1202, 0, records, PS_IMAGE_BATCH_MAX_RECORDS,
+								 PSZ, &inputs[0]) == 0;
+	records[0].block = PS_IMAGE_BATCH_MAX_RECORDS - 1;
+	records[1].block = PS_IMAGE_BATCH_MAX_RECORDS;
+	records[0].page = newer;
+	records[1].page = newer;
+	ok = ok && ps_image_layer_write(1203, 0, records, 2, PSZ, &inputs[1]) == 0;
+	ids[0] = 1302; ids[1] = 1303;
+	noutputs = 0;
+	uncertain = 0;
+	check(ok && ps_image_compaction_prepare(inputs, 2, ids, 2, PSZ, outputs,
+											&noutputs, &uncertain) == 0 &&
+		  noutputs == 2 && uncertain == 0,
+		  "prepare two batches with a duplicate at the first boundary");
+	if (noutputs == 2)
+	{
+		check(ps_image_layer_lookup_exact(&outputs[0], &key,
+							 PS_IMAGE_BATCH_MAX_RECORDS - 1, 100, 0, result,
+							 PSZ, NULL, NULL) == 1 && result[0] == 2 &&
+			  ps_image_layer_lookup_exact(&outputs[1], &key,
+							 PS_IMAGE_BATCH_MAX_RECORDS, 100, 0, result,
+							 PSZ, NULL, NULL) == 1 && result[0] == 2,
+			  "each prepared batch contains the winning copy for its identities");
+		for (uint32_t i = 0; i < noutputs; i++)
+			check(ps_layer_store->delete_local_layer(&outputs[i]) == 0,
+				  "remove split-batch fixture output");
+	}
 	free(records);
+}
+
+static void
+prepared_finite_sequence_test(void)
+{
+	PsKey key = {1, 1, 958, 0, PS_KLASS_RELATION};
+	unsigned char legacy[PSZ] = {3}, newer[PSZ] = {4}, page[PSZ];
+	PsImgRec rec = {.key = key, .block = 0, .lsn = 100};
+	PsLayerDesc inputs[2], output;
+	uint64_t id = 1500, uncertain = 0;
+	uint32_t noutputs = 0;
+	int ok;
+
+	rec.page = legacy;
+	ok = ps_image_layer_write(1400, 0, &rec, 1, PSZ, &inputs[0]) == 0;
+	rec.page = newer;
+	rec.admission_seq = 8;
+	ok = ok && ps_image_layer_write(1401, 0, &rec, 1, PSZ, &inputs[1]) == 0;
+	check(ok && ps_image_compaction_prepare(inputs, 2, &id, 1, PSZ, &output,
+											&noutputs, &uncertain) == 0 && noutputs == 1,
+		  "prepare equal-LSN distinct admission sequences");
+	if (noutputs == 1)
+	{
+		check(ps_image_layer_lookup_exact(&output, &key, 0, 100, 0, page, PSZ,
+												NULL, NULL) == 1 && page[0] == 3 &&
+			  ps_image_layer_lookup_exact(&output, &key, 0, 100, 8, page, PSZ,
+												NULL, NULL) == 1 && page[0] == 4,
+			  "exact sequence views retain both logical versions");
+		check(ps_layer_store->delete_local_layer(&output) == 0,
+			  "remove finite sequence fixture output");
+	}
 }
 
 int
@@ -737,6 +802,7 @@ main(void)
 	bounded_merge_test();
 	bounded_sorted_batch_test();
 	prepared_batch_boundary_test();
+	prepared_finite_sequence_test();
 
 	/* Upgraded stores retain sequence-zero tuples alongside same-LSN rewrites.
 	 * Exact reads must find the old identity, including when another layer

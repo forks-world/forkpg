@@ -22,6 +22,11 @@ The preparation helper connects a single merge pass to up to 64 unpublished
 outputs and reports cleanup ambiguity. It is not used by compaction, cannot
 process an input requiring more than 64 output batches, and cannot publish
 results safely across a crash.
+Within that single pass it collapses exact duplicate identities to the final
+source in read-precedence order before cutting an output batch. This ensures
+that one identity cannot be split into an older output and a newer source;
+it does not validate concurrent arrivals, make outputs atomic, or authorize
+source deletion.
 
 ## Boundaries
 
@@ -69,6 +74,15 @@ must be recoverable or reclaimable without treating an incomplete manifest or an
 ambiguous durability result as permission to delete data. A committed replacement
 must remain valid if cleanup is interrupted. Reader pins protect both local and
 remote copies until in-flight readers finish.
+
+Compatibility constraint: the existing v3 manifest replay can classify an
+unknown final record as a torn tail and truncate it. A new manifest event or
+version alone therefore does not make old binaries fail closed. Do not retire
+inputs using such a record until an independently enforced upgrade/downgrade
+barrier exists. An alternative to investigate is existing ADD and MARK_DELETE
+records after exact-identity winners are selected, keeping all sources until
+every output ADD is durable. Its crash and concurrent-write properties still
+require proof and tests; it is not implemented here.
 
 If an input is remote-durable, the replacement must become durable in the same
 tier before the old remote copy can be retired. Retry and cleanup of failed or

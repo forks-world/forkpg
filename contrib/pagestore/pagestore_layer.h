@@ -244,7 +244,9 @@ extern void ps_image_index_merge_close(PsImageIndexMerge *merge);
  * failed create/write needs reconciliation. On -2, outputs[0..*noutputs)
  * are sealed files whose cleanup failed; *uncertain_id is the attempted ID
  * whose create/write outcome could not be established (0 if none). Never
- * publish a partial result. This API does not persist a transaction. */
+ * publish a partial result. Exact duplicate identities are collapsed to the
+ * winning source; distinct logical versions are retained. This API does not
+ * persist a transaction. */
 #define PS_IMAGE_PREPARE_MAX_OUTPUTS 64
 extern int ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 									  const uint64_t *output_ids, uint32_t capacity,
