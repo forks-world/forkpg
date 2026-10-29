@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "pagestore_layer.h"
+#include "pagestore_compaction_prune.h"
 #include "pagestore_layer_store.h"
 
 static int	run = 0,
@@ -656,6 +657,79 @@ visit_group(const PsImageGroupEntry *entries, uint32_t count, void *arg)
 	return probe->reject ? -1 : 0;
 }
 
+typedef struct RelationPlanProbe
+{
+	uint32_t calls;
+	uint32_t count;
+	uint64_t ids[4];
+	unsigned char keep[4];
+	unsigned char closure[4];
+} RelationPlanProbe;
+
+static int
+visit_relation_plan(const PsImageGroupEntry *entries, uint32_t count,
+					const unsigned char *keep, const unsigned char *closure, void *arg)
+{
+	RelationPlanProbe *probe = arg;
+
+	if (count > 4 || probe->calls != 0)
+		return -1;
+	probe->calls++;
+	probe->count = count;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		probe->ids[i] = entries[i].layer_id;
+		probe->keep[i] = keep[i];
+		probe->closure[i] = closure[i];
+	}
+	return 0;
+}
+
+static void
+bounded_relation_plan_test(void)
+{
+	PsKey key = {1, 1, 954, 0, PS_KLASS_RELATION};
+	unsigned char page[PSZ] = {0};
+	PsLayerDesc inputs[3];
+	PsImgRec rec = {.key = key, .block = 0, .lsn = 100, .page = page};
+	PsViewFence fence = {200, 1, PS_PRUNE_SEQ_UNBOUNDED};
+	RelationPlanProbe probe = {0};
+	int ok;
+
+	rec.admission_seq = 1;
+	ok = ps_image_layer_write(980, 0, &rec, 1, PSZ, &inputs[0]) == 0;
+	rec.admission_seq = 2;
+	ok = ok && ps_image_layer_write(981, 0, &rec, 1, PSZ, &inputs[1]) == 0;
+	ok = ok && ps_image_layer_write(982, 0, &rec, 1, PSZ, &inputs[2]) == 0;
+	check(ok && ps_compaction_plan_relation_groups(inputs, 3, 3,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
+			visit_relation_plan, &probe) == 0 && probe.calls == 1 &&
+		  probe.count == 3 && probe.ids[0] == 980 && probe.ids[1] == 981 &&
+		  probe.ids[2] == 982 && probe.keep[0] && !probe.keep[1] && probe.keep[2] &&
+		  probe.closure[0],
+		  "bounded relation plan preserves finite-sequence closure and latest duplicate");
+	memset(&probe, 0, sizeof(probe));
+	check(ok && ps_compaction_plan_relation_groups(inputs, 3, 2,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
+			visit_relation_plan, &probe) == -2 && probe.calls == 0,
+		  "relation plan refuses an incomplete oversized page history");
+	check(ps_compaction_plan_relation_groups(inputs, 3, 3,
+			(PsPruneFence) {0, UINT64_MAX}, &fence, 1, 0, 0,
+			visit_relation_plan, &probe) == -1 && probe.calls == 0,
+		  "relation plan refuses an invalid retention floor");
+	rec.key.klass = PS_KLASS_CONTROL;
+	check(ps_image_layer_write(983, 0, &rec, 1, PSZ, &inputs[0]) == 0 &&
+		  ps_compaction_plan_relation_groups(inputs, 1, 3,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
+			visit_relation_plan, &probe) == -1 && probe.calls == 0,
+		  "relation plan rejects control-page groups");
+	check(ps_compaction_plan_relation_groups(inputs, 2, 3,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
+			visit_relation_plan, &probe) == -1 && probe.calls == 1 &&
+		  probe.ids[0] == 981,
+		  "later unsupported group invalidates an earlier staged relation plan");
+}
+
 static void
 bounded_merge_test(void)
 {
@@ -984,6 +1058,7 @@ main(void)
 		return 2;
 	}
 	legacy_index_visitor_test();
+	bounded_relation_plan_test();
 	bounded_merge_test();
 	bounded_sorted_batch_test();
 	prepared_batch_boundary_test();
