@@ -1215,6 +1215,114 @@ image_identity_equal(const PsImgIndexEnt *a, const PsImgIndexEnt *b)
 		a->lsn == b->lsn && a->admission_seq == b->admission_seq;
 }
 
+/* Compare durable/routing properties, not transient reader counts or cache
+ * verification hints. A tier transition invalidates the captured snapshot. */
+static int
+image_snapshot_descriptor_equal(const PsLayerDesc *a, const PsLayerDesc *b)
+{
+	if (a->layer_id != b->layer_id || a->kind != b->kind ||
+		a->timeline != b->timeline || key_cmp(&a->start_key, &b->start_key) != 0 ||
+		key_cmp(&a->end_key, &b->end_key) != 0 || a->start_block != b->start_block ||
+		a->end_block != b->end_block || a->lsn_start != b->lsn_start ||
+		a->lsn_end != b->lsn_end || a->created_at_lsn != b->created_at_lsn ||
+		a->remote_uploaded_lsn != b->remote_uploaded_lsn ||
+		a->remote_durable != b->remote_durable || a->local_pinned != b->local_pinned ||
+		a->deleting != b->deleting || a->legacy_shard_zero != b->legacy_shard_zero ||
+		a->location_count != b->location_count || a->location_count > PS_LAYER_MAX_LOCATIONS)
+		return 0;
+	for (uint32_t i = 0; i < a->location_count; i++)
+		if (a->locations[i].tier != b->locations[i].tier ||
+			a->locations[i].size != b->locations[i].size ||
+			a->locations[i].generation != b->locations[i].generation ||
+			a->locations[i].available != b->locations[i].available ||
+			strncmp(a->locations[i].uri, b->locations[i].uri, PS_LAYER_URI_MAX) != 0)
+			return 0;
+	return 1;
+}
+
+int
+ps_image_compaction_snapshot_valid(const PsLayerMap *map,
+								   const PsLayerDesc *inputs, uint32_t ninputs,
+								   const PsLayerDesc *outputs, uint32_t noutputs)
+{
+	uint64_t max_id = 0;
+	uint32_t seen_inputs = 0;
+	uint64_t seen_input_bits = 0, seen_output_bits = 0;
+
+	if (map == NULL || (map->nlayers != 0 && map->layers == NULL) ||
+		inputs == NULL || outputs == NULL || ninputs == 0 ||
+		noutputs == 0 || ninputs > PS_IMAGE_MERGE_MAX_INPUTS ||
+		noutputs > PS_IMAGE_PREPARE_MAX_OUTPUTS)
+		return 0;
+	for (uint32_t i = 0; i < ninputs; i++)
+	{
+		if (inputs[i].kind != PS_LAYER_IMAGE || inputs[i].deleting ||
+			inputs[i].location_count == 0 || inputs[i].location_count > PS_LAYER_MAX_LOCATIONS ||
+			inputs[i].legacy_shard_zero || inputs[i].timeline != inputs[0].timeline ||
+			(inputs[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(inputs[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT))
+			return 0;
+		for (uint32_t j = 0; j < i; j++)
+			if (inputs[i].layer_id == inputs[j].layer_id)
+				return 0;
+		if (inputs[i].layer_id > max_id)
+			max_id = inputs[i].layer_id;
+	}
+	for (uint32_t i = 0; i < noutputs; i++)
+		if (outputs[i].kind != PS_LAYER_IMAGE || outputs[i].deleting ||
+			outputs[i].location_count == 0 || outputs[i].location_count > PS_LAYER_MAX_LOCATIONS ||
+			outputs[i].legacy_shard_zero || outputs[i].timeline != inputs[0].timeline ||
+			outputs[i].layer_id <= max_id ||
+			(outputs[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(inputs[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) ||
+			(i != 0 && outputs[i].layer_id <= outputs[i - 1].layer_id))
+			return 0;
+	for (uint32_t i = 0; i < map->nlayers; i++)
+	{
+		const PsLayerDesc *current = &map->layers[i];
+		int matched = 0;
+		if (current->kind != PS_LAYER_IMAGE || current->timeline != inputs[0].timeline ||
+			(current->layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(inputs[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT))
+		{
+			for (uint32_t j = 0; j < noutputs; j++)
+				if (current->layer_id == outputs[j].layer_id)
+					return 0;
+			/* Legacy shard-zero layers can cover every shard. */
+			if (!current->deleting && current->kind == PS_LAYER_IMAGE &&
+				current->timeline == inputs[0].timeline && current->legacy_shard_zero)
+				return 0;
+			continue;
+		}
+		for (uint32_t j = 0; j < ninputs; j++)
+			if (current->layer_id == inputs[j].layer_id)
+			{
+				if ((seen_input_bits & (UINT64_C(1) << j)) != 0 ||
+					!image_snapshot_descriptor_equal(current, &inputs[j]))
+					return 0;
+				seen_input_bits |= UINT64_C(1) << j;
+				seen_inputs++;
+				matched = 1;
+				break;
+			}
+		if (matched)
+			continue;
+		for (uint32_t j = 0; j < noutputs; j++)
+			if (current->layer_id == outputs[j].layer_id)
+			{
+				if ((seen_output_bits & (UINT64_C(1) << j)) != 0 ||
+					!image_snapshot_descriptor_equal(current, &outputs[j]))
+					return 0;
+				seen_output_bits |= UINT64_C(1) << j;
+				matched = 1;
+				break;
+			}
+		if (!matched && !current->deleting)
+			return 0;
+	}
+	return seen_inputs == ninputs;
+}
+
 int
 ps_image_compaction_verify_coverage(const PsLayerDesc *inputs, uint32_t ninputs,
 										const PsLayerDesc *outputs, uint32_t noutputs,

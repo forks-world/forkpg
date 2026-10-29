@@ -316,7 +316,41 @@ streaming_layer_test(void)
 			  "large source prepares four bounded unpublished outputs");
 		if (noutputs == 4)
 		{
+			PsLayerDesc present[3];
+			PsLayerMap map = {.layers = present, .nlayers = 1, .capacity = 3};
 			PsLayerDesc legacy_outputs[4];
+
+			present[0] = layer;
+			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 1,
+				  "captured source set remains valid before publication");
+			present[1] = outputs[0];
+			present[1].cache_readers = 3;
+			map.nlayers = 2;
+			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 1,
+				  "published prefix and reader pins preserve snapshot validity");
+			present[2] = layer;
+			present[2].layer_id = 1021;
+			map.nlayers = 3;
+			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 0,
+				  "new source layer invalidates the preparation snapshot");
+			present[2].deleting = true;
+			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 1,
+				  "unrelated already-deleting layer does not invalidate snapshot");
+			present[2].deleting = false;
+			present[2].layer_id |= UINT64_C(1) << PS_IMAGE_LAYER_SHARD_SHIFT;
+			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 1,
+				  "an unrelated shard does not invalidate the snapshot");
+			present[2].legacy_shard_zero = true;
+			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 0,
+				  "a mixed-shard legacy layer invalidates the snapshot");
+			present[2].deleting = true;
+			present[0].remote_durable = true;
+			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 0,
+				  "source durability transition invalidates the snapshot");
+			present[0] = layer;
+			present[1].timeline++;
+			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 0,
+				  "output ID collision on another timeline is rejected");
 			memcpy(legacy_outputs, outputs, sizeof(legacy_outputs));
 			legacy_outputs[0].legacy_shard_zero = true;
 			check(ps_image_compaction_verify_coverage(&layer, 1, legacy_outputs, 4,

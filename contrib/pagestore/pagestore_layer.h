@@ -261,6 +261,15 @@ extern int ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count
 extern int ps_image_compaction_verify_coverage(const PsLayerDesc *inputs,
 	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs,
 	uint32_t page_size);
+/* Check that the current map still contains exactly the captured input set
+ * plus any already-published outputs. Returns 1 when it matches, 0 otherwise.
+ * Caller must hold the map lock and fence relevant writers and lifecycle
+ * changes; output IDs must have been reserved so later layer allocations
+ * cannot reuse them or sort before them. This check does not itself pin files,
+ * reserve IDs, or validate timeline state. */
+extern int ps_image_compaction_snapshot_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs);
 /* Force a fresh data-section checksum verification (ignores cached state). */
 /* Empty the process-wide image index cache; the layer store calls it on close. */
 extern void ps_image_layer_cache_reset(void);

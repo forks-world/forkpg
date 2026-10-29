@@ -92,9 +92,14 @@ records after exact-identity winners are selected, keeping all sources until
 every output ADD is durable. Its crash and concurrent-write properties still
 require proof and tests. The strict single-output ADD helper rejects ID
 collisions, but does not itself prove coverage, fence concurrent changes, or
-retire inputs. A process-exit test covers a partial output prefix and a later
-partial input retirement; torn writes and the production orchestration still
-need dedicated coverage.
+retire inputs. Process-exit tests cover a partial output prefix, a later partial
+input retirement, and simulated torn ADD and MARK_DELETE tails. Actual write
+failures and the production orchestration still need dedicated coverage.
+
+All output IDs must be reserved under the shard allocator before the snapshot
+is released, so a later layer cannot reuse an output ID or receive an earlier
+ID. A map snapshot check can reject newly added sources and changed descriptors,
+but it cannot reserve IDs, pin files, or replace lifecycle and writer fencing.
 
 If an input is remote-durable, the replacement must become durable in the same
 tier before the old remote copy can be retired. Retry and cleanup of failed or

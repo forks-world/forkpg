@@ -92,6 +92,37 @@ read_live_exact(const PsKey *key, uint32_t block, unsigned char *page)
 	return found;
 }
 
+static int
+read_live_latest(const PsKey *key, uint32_t block, unsigned char *page)
+{
+	unsigned char candidate[PSZ];
+	uint64_t best_id = 0, best_lsn = 0, best_seq = 0;
+	int found = 0;
+
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *layer = &ps_layer_map.layers[i];
+		uint64_t lsn = 0, seq = 0;
+		int rc;
+		if (layer->deleting)
+			continue;
+		rc = ps_image_layer_lookup(layer, key, block, 100, 0, candidate, PSZ, &lsn, &seq);
+		if (rc < 0)
+			return -1;
+		if (rc == 1 && (!found || lsn > best_lsn ||
+			(lsn == best_lsn && (seq > best_seq ||
+			 (seq == best_seq && layer->layer_id > best_id)))))
+		{
+			memcpy(page, candidate, PSZ);
+			best_lsn = lsn;
+			best_seq = seq;
+			best_id = layer->layer_id;
+			found = 1;
+		}
+	}
+	return found;
+}
+
 /* A process exit after the first ADD must leave all inputs authoritative.
  * The unrecorded second output is an orphan, not permission to retire input. */
 static void
@@ -101,8 +132,8 @@ test_partial_batch_publication_restart(void)
 	char command[4096];
 	PsKey key = {1, 1, 955, 0, PS_KLASS_RELATION};
 	PsImgRec *records = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*records));
-	unsigned char older[PSZ] = {1}, newer[PSZ] = {2}, page[PSZ];
-	PsLayerDesc inputs[2], outputs[2];
+	unsigned char older[PSZ] = {1}, newer[PSZ] = {2}, concurrent[PSZ] = {3}, page[PSZ];
+	PsLayerDesc inputs[2], outputs[2], later;
 	uint64_t ids[2] = {3, 4}, uncertain = 0;
 	uint32_t noutputs = 0;
 	pid_t child;
@@ -134,6 +165,20 @@ test_partial_batch_publication_restart(void)
 										&noutputs, &uncertain) == 0 && noutputs == 2 &&
 		ps_image_compaction_verify_coverage(inputs, 2, outputs, 2, PSZ) == 0;
 	check(ok, "prepare and verify two output batches");
+	if (ok)
+		check(ps_image_compaction_snapshot_valid(&ps_layer_map, inputs, 2, outputs, 2) == 1,
+			  "prepared inputs match the original manifest snapshot");
+	if (ok)
+	{
+		PsImgRec later_rec = {.key = key, .block = PS_IMAGE_BATCH_MAX_RECORDS - 1,
+			.lsn = 100, .admission_seq = 8, .page = concurrent};
+
+		ok = ps_image_layer_write(5, 0, &later_rec, 1, PSZ, &later) == 0 &&
+			ps_manifest_add_layer(&later) == 0;
+		check(ok, "publish a higher-sequence write after the preparation snapshot");
+		check(ok && ps_image_compaction_snapshot_valid(&ps_layer_map, inputs, 2, outputs, 2) == 0,
+			  "later source invalidates the snapshot before production publication");
+	}
 	if (ok)
 	{
 		PsLayerDesc collision = outputs[0];
@@ -172,13 +217,15 @@ test_partial_batch_publication_restart(void)
 	check(read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS - 1, page) == 1 && page[0] == 2 &&
 		  read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS, page) == 1 && page[0] == 2,
 		  "partial publication preserves the winning pages across the batch boundary");
+	check(read_live_latest(&key, PS_IMAGE_BATCH_MAX_RECORDS - 1, page) == 1 && page[0] == 3,
+		  "partial publication does not override the later finite-sequence write");
 	check(ps_layer_store->recover_local_layers(&ps_layer_map) == 0 &&
 		  ps_layer_store->layer_exists_local(4) == 0 &&
 		  ps_layer_store->layer_exists_local(1) == 1 &&
 		  ps_layer_store->layer_exists_local(2) == 1,
 		  "orphan sweep removes only the unrecorded output, not the inputs");
-	ids[0] = 5;
-	ids[1] = 6;
+	ids[0] = 6;
+	ids[1] = 7;
 	noutputs = 0;
 	uncertain = 0;
 	ok = ps_image_compaction_prepare(inputs, 2, ids, 2, PSZ, outputs,
@@ -189,20 +236,114 @@ test_partial_batch_publication_restart(void)
 	ps_layer_store->close();
 	if (!ok)
 		goto done;
+	/* Model a torn second ADD by truncating its synced record to a partial
+	 * header, then exit without manifest shutdown. This is a deterministic
+	 * replay fixture, not a claim about power-loss behavior. */
+	child = fork();
+	if (child == 0)
+	{
+		char path[4096];
+		struct stat before;
+		int fd = -1;
+		int child_ok = snprintf(path, sizeof(path), "%s/layers.manifest", dir) > 0 &&
+			ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
+			ps_manifest_replay(&ps_layer_map) == 0 &&
+			ps_manifest_add_new_layer(&outputs[0]) == 0 && stat(path, &before) == 0 &&
+			ps_manifest_add_new_layer(&outputs[1]) == 0;
+		if (child_ok)
+		{
+			fd = open(path, O_WRONLY);
+			child_ok = fd >= 0 && ftruncate(fd, before.st_size + 8) == 0 && fsync(fd) == 0;
+			if (fd >= 0)
+				close(fd);
+		}
+		_exit(child_ok ? 0 : 1);
+	}
+	if (child < 0 || waitpid(child, &status, 0) != child ||
+		!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+	{
+		check(0, "simulate a torn second output ADD");
+		goto done;
+	}
+	check(ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0 && ps_manifest_replay_repaired() &&
+		  ps_manifest_orphan_sweep_inhibited() == 1,
+		  "torn output ADD is repaired with orphan-sweep quarantine");
+	check(find_layer(1) != NULL && !find_layer(1)->deleting &&
+		  find_layer(2) != NULL && !find_layer(2)->deleting &&
+		  find_layer(6) != NULL && find_layer(7) == NULL &&
+		  ps_layer_store->layer_exists_local(7) == 1,
+		  "torn ADD preserves sources and retains the ambiguous output file");
+	check(read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS - 1, page) == 1 && page[0] == 2 &&
+		  read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS, page) == 1 && page[0] == 2,
+		  "torn ADD recovery preserves winning page versions");
+	ids[0] = 8;
+	ids[1] = 9;
+	noutputs = 0;
+	uncertain = 0;
+	ok = ps_image_compaction_prepare(inputs, 2, ids, 2, PSZ, outputs,
+										&noutputs, &uncertain) == 0 && noutputs == 2 &&
+		ps_image_compaction_verify_coverage(inputs, 2, outputs, 2, PSZ) == 0;
+	check(ok, "prepare a replacement after quarantined torn ADD");
+	ps_manifest_close();
+	ps_layer_store->close();
+	if (!ok)
+		goto done;
+	child = fork();
+	if (child == 0)
+	{
+		char path[4096];
+		struct stat before;
+		int fd = -1;
+		int child_ok = ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
+			ps_manifest_replay(&ps_layer_map) == 0 &&
+			ps_manifest_add_new_layer(&outputs[0]) == 0 &&
+			ps_manifest_add_new_layer(&outputs[1]) == 0 &&
+			snprintf(path, sizeof(path), "%s/layers.manifest", dir) > 0 &&
+			stat(path, &before) == 0 &&
+			ps_manifest_mark_delete(inputs[0].layer_id) == 0;
+		if (child_ok)
+		{
+			fd = open(path, O_WRONLY);
+			child_ok = fd >= 0 && ftruncate(fd, before.st_size + 8) == 0 && fsync(fd) == 0;
+			if (fd >= 0)
+				close(fd);
+		}
+		_exit(child_ok ? 0 : 1);
+	}
+	if (child < 0 || waitpid(child, &status, 0) != child ||
+		!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+	{
+		check(0, "simulate a torn source tombstone after output publication");
+		goto done;
+	}
+	check(ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0 && ps_manifest_replay_repaired() &&
+		  ps_manifest_orphan_sweep_inhibited() == 1,
+		  "replay repairs a torn source tombstone");
+	check(find_layer(1) != NULL && !find_layer(1)->deleting &&
+		  find_layer(2) != NULL && !find_layer(2)->deleting &&
+		  find_layer(8) != NULL && find_layer(9) != NULL &&
+		  ps_layer_store->layer_exists_local(1) == 1,
+		  "torn tombstone keeps both inputs and complete outputs");
+	check(read_live_exact(&key, 0, page) == 1 && page[0] == 1 &&
+		  read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS - 1, page) == 1 && page[0] == 2 &&
+		  read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS, page) == 1 && page[0] == 2,
+		  "torn tombstone leaves all logical pages readable");
+	ps_manifest_close();
+	ps_layer_store->close();
 	child = fork();
 	if (child == 0)
 	{
 		int child_ok = ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
 			ps_manifest_replay(&ps_layer_map) == 0 &&
-			ps_manifest_add_new_layer(&outputs[0]) == 0 &&
-			ps_manifest_add_new_layer(&outputs[1]) == 0 &&
 			ps_manifest_mark_delete(inputs[0].layer_id) == 0;
 		_exit(child_ok ? 0 : 1);
 	}
 	if (child < 0 || waitpid(child, &status, 0) != child ||
 		!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 	{
-		check(0, "publish complete replacement and mark one source before exit");
+		check(0, "publish source tombstone after torn-write recovery");
 		goto done;
 	}
 	check(ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
@@ -210,12 +351,14 @@ test_partial_batch_publication_restart(void)
 		  "replay after process exits during source retirement");
 	check(find_layer(1) != NULL && find_layer(1)->deleting &&
 		  find_layer(2) != NULL && !find_layer(2)->deleting &&
-		  find_layer(5) != NULL && find_layer(6) != NULL,
+		  find_layer(8) != NULL && find_layer(9) != NULL,
 		  "source tombstone follows both durable output ADDs");
 	check(read_live_exact(&key, 0, page) == 1 && page[0] == 1 &&
 		  read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS - 1, page) == 1 && page[0] == 2 &&
 		  read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS, page) == 1 && page[0] == 2,
 		  "replacement remains readable after a partial source retirement");
+	check(read_live_latest(&key, PS_IMAGE_BATCH_MAX_RECORDS - 1, page) == 1 && page[0] == 3,
+		  "source retirement retains the later finite-sequence write");
 	gc_resume_like();
 	check(find_layer(1) == NULL && find_layer(2) != NULL &&
 		  read_live_exact(&key, 0, page) == 1 && page[0] == 1,
