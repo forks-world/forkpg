@@ -3072,6 +3072,13 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 			  restarted_barrier_seq > durable_barrier_seq,
 			  "restart allocates above an unclaimed durable admission barrier");
 	}
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 29201, 1,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 12000) == PS_STATUS_OK,
+		  "a durable replacement cutoff protects current page history");
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 29200, 1) ==
+		  PS_STATUS_OK && op_retention_drop(0, PS_RETENTION_OWNER_READER, 29205, 1) ==
+	PS_STATUS_OK,
+		  "dropping the reader releases admission-fenced page history");
 	/* Different LSNs guarantee a real history deletion. Same-LSN first
 	 * arrivals remain protected by finite fences even after their bytes are
 	 * hidden, so they no longer establish a reclamation frontier alone. */
@@ -3085,13 +3092,6 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		fill_page(page, ps, 13000 + block, (unsigned char) block);
 		op_write_one(rel + 4, 0, block, page);
 	}
-	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 29201, 1,
-					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 12000) == PS_STATUS_OK,
-		  "a durable replacement cutoff protects current page history");
-	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 29200, 1) ==
-		  PS_STATUS_OK && op_retention_drop(0, PS_RETENTION_OWNER_READER, 29205, 1) ==
-	PS_STATUS_OK,
-		  "dropping the reader releases admission-fenced page history");
 	{
 		PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
