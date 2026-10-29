@@ -41,6 +41,9 @@ outside the batch can change the result. The planner must resolve the winning
 copy across all relevant sources before publishing that identity; grouping all
 copies of an identity at a batch boundary is one possible approach. Concurrent
 new layers and legacy shard-zero inputs must also obey the existing ordering.
+For example, publishing a first batch containing only an older copy of an
+identity can make it outrank a newer copy still present in an input layer.
+Therefore merely publishing output files in sorted order is not sufficient.
 
 The first incremental merge must preserve every logical version. A page-history
 frontier must not advance and page-index entries must not be removed merely
