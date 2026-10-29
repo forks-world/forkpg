@@ -733,6 +733,49 @@ staged_compaction_concurrent_write(void *arg)
 }
 
 static void
+gather_compaction_concurrent_change(void *arg)
+{
+	StagedCompactionProbe *probe = arg;
+	pthread_t thread;
+
+	probe->called++;
+	ps_test_set_compaction_gather_hook(NULL, NULL);
+	if (pthread_create(&thread, NULL, staged_compaction_foreground, arg) == 0)
+		(void) pthread_join(thread, NULL);
+}
+
+static void
+test_compaction_gather_rejects_concurrent_change(int pin_only)
+{
+	char store[] = "/tmp/pagestore-gather-conflict-XXXXXX";
+	StagedCompactionProbe probe = {.pin_only = pin_only};
+	uint64_t version = 0;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open compaction gather conflict store");
+	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
+		  "prepare compaction gather sources");
+	ps_test_set_compaction_gather_hook(gather_compaction_concurrent_change, &probe);
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_gather_hook(NULL, NULL);
+	check(probe.called == 1 && probe.read_ok && probe.write_ok,
+		  "foreground operation proceeds during unlocked index gathering");
+	ps_lock_map_rd();
+	check(ps_layer_map_count(&ps_layer_map) == probe.layers_after_write,
+		  "changed snapshot rejects gathered compaction inputs");
+	ps_unlock_map();
+	run_maintenance(64);
+	check(read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 2000, &version) && version == 2000,
+		  "gather retry preserves the control image");
+	if (!pin_only)
+		check(read_relation_at(1, 3000), "gather retry preserves the concurrent write");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_staged_compaction_makes_progress_after_conflicts(void)
 {
 	char store[] = "/tmp/pagestore-staged-retry-XXXXXX";
@@ -1746,6 +1789,8 @@ main(void)
 	test_bounded_compaction_maintenance();
 	test_bounded_shared_payload_capacity_fallback();
 	test_bounded_compaction_concurrent_write();
+	test_compaction_gather_rejects_concurrent_change(0);
+	test_compaction_gather_rejects_concurrent_change(1);
 	test_staged_compaction_rejects_concurrent_write(1);
 	test_staged_compaction_rejects_concurrent_write(2);
 	test_staged_compaction_rejects_new_retention_pin();

@@ -292,6 +292,7 @@ extern uint64_t ps_test_page_gc_coverage_observation_count(void);
  * Production frontends never install these hooks. */
 typedef void (*PsForkmetaCutoverTestHook)(void *arg);
 extern void ps_test_set_compaction_unlocked_hook(void (*hook)(void *), void *arg);
+extern void ps_test_set_compaction_gather_hook(void (*hook)(void *), void *arg);
 /* Called after a forkmeta GC cursor reports SCAN_INCOMPLETE and maintenance
  * continues into the later WAL/timeline/segment/compaction phases. */
 typedef void (*PsForkmetaPostGcTestHook)(void *arg);

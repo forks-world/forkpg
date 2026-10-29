@@ -701,6 +701,15 @@ static uint64_t ps_test_compaction_pass_count;
 static unsigned segment_gc_compaction_turn;
 static void (*compaction_unlocked_test_hook)(void *);
 static void *compaction_unlocked_test_hook_arg;
+static void (*compaction_gather_test_hook)(void *);
+static void *compaction_gather_test_hook_arg;
+
+void
+ps_test_set_compaction_gather_hook(void (*hook)(void *), void *arg)
+{
+	compaction_gather_test_hook = hook;
+	compaction_gather_test_hook_arg = arg;
+}
 
 void
 ps_test_set_compaction_unlocked_hook(void (*hook)(void *), void *arg)
@@ -4060,6 +4069,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	uint64_t	frontier_seq;
 	uint64_t	retention_epoch = 0, timeline_epoch = 0, admission_epoch = 0;
 	int			stage_unlocked = g_shards[shard].staged_compaction_retries < 1;
+	int			gather_unlocked = 0, gather_ok = 1;
 	int			rc = -1;
 
 	if (!ps_timeline_live(timeline))
@@ -4153,6 +4163,33 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		}
 	}
 
+	/* Snapshot and pin verified local inputs so index I/O and record allocation
+	 * do not block writers. The pruning decision still runs under the locks. */
+	if (stage_unlocked && nold > 0)
+	{
+		gather_unlocked = 1;
+		for (uint32_t k = 0; k < nold; k++)
+			if (old[k].remote_durable || old[k].legacy_shard_zero ||
+				!old[k].data_verified || tier_local_location(&old[k]) == NULL)
+				gather_unlocked = 0;
+		if (gather_unlocked && ps_retention_epoch(&retention_epoch) != 0)
+			goto cleanup;
+		if (gather_unlocked)
+		{
+			timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+			admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+			for (uint32_t k = 0; k < nold; k++)
+				for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+					if (ps_layer_map.layers[i].layer_id == old[k].layer_id)
+						__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+			ps_unlock_map();
+			pthread_rwlock_unlock(&page_prune_lock);
+			for (uint32_t sh = core_shards(); sh > 0; sh--)
+				ps_unlock_shard(sh - 1);
+			if (compaction_gather_test_hook != NULL)
+				compaction_gather_test_hook(compaction_gather_test_hook_arg);
+		}
+	}
 	/* Gather metadata only; read retained pages on demand after pruning. */
 	for (uint32_t k = 0; k < nold; k++)
 	{
@@ -4160,15 +4197,13 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		uint32_t	n;
 
 		if (read_image_index_refreshing(&old[k], &idx, &n) != 0)
-			goto cleanup;
-		/* materialize_compaction_inputs() checksummed this local copy just
-		 * before the locks were taken, and only an eviction -- excluded by
-		 * the map write lock held here -- clears the flag.  Checksumming every
-		 * input again would double the time all writers of this shard wait. */
+			goto gather_done;
+		/* materialize_compaction_inputs() verified this copy before the pass.
+		 * The map lock or the gather pin prevents eviction while it is read. */
 		if (!old[k].data_verified && verify_image_layer_refreshing(&old[k]) != 0)
 		{
 			free(idx);
-			goto cleanup;
+			goto gather_done;
 		}
 		for (uint32_t j = 0; j < n; j++)
 		{
@@ -4183,14 +4218,14 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 				if (!nr)
 				{
 					free(idx);
-					goto cleanup;
+					goto gather_done;
 				}
 				recs = nr;
 				np = realloc(pages, (size_t) nc * sizeof(*pages));
 				if (!np)
 				{
 					free(idx);
-					goto cleanup;
+					goto gather_done;
 				}
 				pages = np;
 				cap = nc;
@@ -4199,7 +4234,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 			if (!pg)
 			{
 				free(idx);
-				goto cleanup;
+				goto gather_done;
 			}
 			pg->layer = &old[k];
 			pg->offset = idx[j].data_off;
@@ -4219,6 +4254,49 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		}
 		free(idx);
 	}
+	goto gather_complete;
+gather_done:
+	gather_ok = 0;
+gather_complete:
+	if (gather_unlocked)
+	{
+		uint64_t current_retention_epoch;
+		int valid = 1;
+
+		for (uint32_t sh = 0; sh < core_shards(); sh++)
+			ps_lock_shard_wr(sh);
+		pthread_rwlock_rdlock(&page_prune_lock);
+		ps_lock_map_wr();
+		if (!ps_timeline_live(timeline) || ps_manifest_poisoned() ||
+			ps_retention_epoch(&current_retention_epoch) != 0 ||
+			current_retention_epoch != retention_epoch ||
+			__atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE) != timeline_epoch ||
+			__atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE) != admission_epoch ||
+			count_image_layers(timeline, shard) != nold)
+			valid = 0;
+		for (uint32_t k = 0; k < nold; k++)
+		{
+			int found = 0;
+			for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+				if (ps_layer_map.layers[i].layer_id == old[k].layer_id)
+				{
+					found = !ps_layer_map.layers[i].deleting &&
+						ps_layer_map.layers[i].remote_durable == old[k].remote_durable &&
+						tier_local_location(&ps_layer_map.layers[i]) != NULL;
+					__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+					break;
+				}
+			if (!found)
+				valid = 0;
+		}
+		if (!valid)
+		{
+			g_shards[shard].staged_compaction_retries = 1;
+			gather_ok = 0;
+		}
+	}
+	if (!gather_ok)
+		goto cleanup;
 	if (nrec == 0)
 		goto cleanup;
 	scanned = nrec;
