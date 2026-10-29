@@ -244,6 +244,15 @@ ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
 										 read_page, arg, out, false);
 }
 
+int
+ps_image_layer_write_compaction_stream(uint64_t layer_id, uint32_t timeline,
+										const PsImgRec *recs, uint32_t n, uint32_t page_size,
+										PsImagePageReader read_page, void *arg, PsLayerDesc *out)
+{
+	return image_layer_write_stream_impl(layer_id, timeline, recs, n, page_size,
+										 read_page, arg, out, true);
+}
+
 static int
 image_layer_write_stream_impl(uint64_t layer_id, uint32_t timeline,
 							const PsImgRec *recs, uint32_t n, uint32_t page_size,

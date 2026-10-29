@@ -173,6 +173,13 @@ extern int ps_image_layer_write_stream(uint64_t layer_id, uint32_t timeline,
  const PsImgRec *recs, uint32_t n, uint32_t page_size,
  PsImagePageReader read_page, void *arg, PsLayerDesc *out);
 
+/* Compaction variant shares adjacent byte-identical payloads while retaining
+ * each version's index identity. Callers provide the same lifetime and
+ * publication guarantees as for the ordinary streaming writer. */
+extern int ps_image_layer_write_compaction_stream(uint64_t layer_id, uint32_t timeline,
+	const PsImgRec *recs, uint32_t n, uint32_t page_size,
+	PsImagePageReader read_page, void *arg, PsLayerDesc *out);
+
 /* One independently sealed, unpublished output batch. Metadata must already
  * be sorted by key, block, LSN and admission sequence.  The explicit record
  * limit bounds writer memory and output size to n * (page_size + index entry)

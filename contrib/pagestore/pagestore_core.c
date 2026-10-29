@@ -4299,7 +4299,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 			ps_unlock_shard(s - 1);
 		if (compaction_unlocked_test_hook != NULL)
 			compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
-		write_rc = ps_image_layer_write_stream(nid, timeline, recs, nrec,
+		write_rc = ps_image_layer_write_compaction_stream(nid, timeline, recs, nrec,
 						page_size, compact_read_page, &read_cache, &newdesc);
 		for (uint32_t s = 0; s < core_shards(); s++)
 			ps_lock_shard_wr(s);
@@ -4335,7 +4335,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 			goto cleanup;
 		}
 	}
-	else if (ps_image_layer_write_stream(nid, timeline, recs, nrec, page_size,
+	else if (ps_image_layer_write_compaction_stream(nid, timeline, recs, nrec, page_size,
 						 compact_read_page, &read_cache, &newdesc) != 0)
 		goto cleanup;
 	for (uint32_t k = 0; k < nold; k++)

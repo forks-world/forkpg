@@ -863,6 +863,17 @@ bounded_shared_payload_test(void)
 		  memcmp(actual, pages + (size_t) 32 * PSZ, PSZ) == 0,
 		  "shared payload versions remain checksummed and individually readable");
 	free(index);
+	index = NULL;
+	ok = ps_image_layer_write_compaction_stream(985, 0, recs, 35, PSZ,
+											 read_memory_batch, NULL, &layer) == 0;
+	check(ok && layer.locations[0].size == (uint64_t) 33 * PSZ +
+		  35 * sizeof(PsImgIndexEnt) + sizeof(PsImgFooter) &&
+		  ps_image_layer_read_index(&layer, &index, &nindex) == 0 && nindex == 35 &&
+		  index[31].data_off == index[33].data_off &&
+		  ps_image_layer_lookup_exact(&layer, &key, 0, 100, 34, actual, PSZ, NULL, NULL) == 1 &&
+		  memcmp(actual, pages + (size_t) 31 * PSZ, PSZ) == 0,
+		  "ordinary compaction also shares bytes while retaining version identities");
+	free(index);
 	free(pages);
 }
 
