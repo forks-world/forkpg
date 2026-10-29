@@ -350,6 +350,25 @@ streaming_layer_test(void)
 		if (noutputs == 1)
 			check(ps_layer_store->delete_local_layer(&outputs[0]) == 0,
 				  "test reconciles the reported failed unlink");
+		{
+			uint64_t occupied_id = 1020;
+			PsLayerDesc occupied;
+			PsImgRec existing = {.key = key, .block = 0, .lsn = 100, .page = page};
+
+			memset(page, 0x4a, sizeof(page));
+			check(ps_image_layer_write(occupied_id, 0, &existing, 1, PSZ, &occupied) == 0,
+				  "create a pre-existing output ID");
+			noutputs = 0;
+			uncertain = 0;
+			check(ps_image_compaction_prepare(&layer, 1, &occupied_id, 1, PSZ,
+					outputs, &noutputs, &uncertain) == -2 && noutputs == 0 &&
+				  uncertain == occupied_id &&
+				  ps_image_layer_lookup(&occupied, &key, 0, 100, 0, page, PSZ,
+											NULL, NULL) == 1 && page[0] == 0x4a,
+				  "failed create reports ambiguity without deleting the existing layer");
+			check(ps_layer_store->delete_local_layer(&occupied) == 0,
+				  "test removes the pre-existing fixture layer");
+		}
 	}
 	{
 		uint32_t count = 0;
