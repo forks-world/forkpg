@@ -198,8 +198,9 @@ extern int ps_image_layer_lookup_exact(const PsLayerDesc *layer, const PsKey *ke
  */
 extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
 									  PsImgIndexEnt **out, uint32_t *n);
-/* Bounded index traversal.  Callbacks must stage their effects until success:
- * a later I/O or checksum error invalidates every previously visited entry. */
+/* Bounded index traversal.  The entry pointer is valid only during the call.
+ * Callbacks must stage their effects until success: a later I/O or checksum
+ * error invalidates every previously visited entry. */
 typedef int (*PsImageIndexVisitor)(const PsImgIndexEnt *entry, void *arg);
 extern int ps_image_layer_visit_index(const PsLayerDesc *layer,
 									  PsImageIndexVisitor visit, void *arg);
