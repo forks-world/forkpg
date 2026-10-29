@@ -233,6 +233,20 @@ extern int ps_image_index_merge_open(const PsLayerDesc *layers, uint32_t count,
 extern int ps_image_index_merge_next(PsImageIndexMerge *merge,
 									  PsImgIndexEnt *entry, uint64_t *layer_id);
 extern void ps_image_index_merge_close(PsImageIndexMerge *merge);
+
+/* Prepare at most 64 unpublished output layers from caller-pinned local
+ * sources on the same shard. Output IDs must be strictly increasing and greater than every
+ * source ID. 0 means every output is sealed and *noutputs describes them;
+ * -1 means failure with no known remaining outputs; -2 means cleanup or a
+ * failed create/write needs reconciliation. On -2, outputs[0..*noutputs)
+ * are sealed files whose cleanup failed; *uncertain_id is the attempted ID
+ * whose create/write outcome could not be established (0 if none). Never
+ * publish a partial result. This API does not persist a transaction. */
+#define PS_IMAGE_PREPARE_MAX_OUTPUTS 64
+extern int ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
+									  const uint64_t *output_ids, uint32_t capacity,
+									  uint32_t page_size, PsLayerDesc *outputs,
+									  uint32_t *noutputs, uint64_t *uncertain_id);
 /* Force a fresh data-section checksum verification (ignores cached state). */
 /* Empty the process-wide image index cache; the layer store calls it on close. */
 extern void ps_image_layer_cache_reset(void);

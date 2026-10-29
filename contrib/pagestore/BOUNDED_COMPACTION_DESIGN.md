@@ -18,6 +18,10 @@ metadata, not permission to make an intermediate run visible in the manifest.
 The sorted-batch writer bounds each output to 1024 records and seals it without
 publishing it. It is a primitive, not a transaction: it does not bind multiple
 outputs to their sources, persist merge progress, or make source deletion safe.
+The preparation helper connects a single merge pass to up to 64 unpublished
+outputs and reports cleanup ambiguity. It is not used by compaction, cannot
+process an input requiring more than 64 output batches, and cannot publish
+results safely across a crash.
 
 ## Boundaries
 

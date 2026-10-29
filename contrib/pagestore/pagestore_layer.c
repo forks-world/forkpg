@@ -1022,6 +1022,148 @@ ps_image_index_merge_next(PsImageIndexMerge *merge, PsImgIndexEnt *entry,
 	return 1;
 }
 
+typedef struct ImagePrepareSource
+{
+	const PsLayerDesc *layer;
+	uint64_t offset;
+} ImagePrepareSource;
+
+static int
+image_prepare_read_page(const PsImgRec *rec, void *page, void *arg)
+{
+	const ImagePrepareSource *source = rec->page;
+	uint32_t page_size = *(uint32_t *) arg;
+
+	return ps_layer_store->read_layer_block(source->layer, source->offset,
+											page, page_size);
+}
+
+int
+ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
+							const uint64_t *output_ids, uint32_t capacity,
+							uint32_t page_size, PsLayerDesc *outputs,
+							uint32_t *noutputs, uint64_t *uncertain_id)
+{
+	PsImageIndexMerge *merge = NULL;
+	PsImgRec *batch = NULL;
+	ImagePrepareSource *sources = NULL;
+	uint64_t data_ends[PS_IMAGE_MERGE_MAX_INPUTS];
+	uint64_t max_id = 0;
+	uint32_t written = 0, used = 0;
+	int rc = -1;
+
+	if (noutputs == NULL || uncertain_id == NULL)
+		return -1;
+	*noutputs = 0;
+	*uncertain_id = 0;
+	if (layers == NULL || output_ids == NULL || outputs == NULL || count == 0 ||
+		count > PS_IMAGE_MERGE_MAX_INPUTS || capacity == 0 ||
+		capacity > PS_IMAGE_PREPARE_MAX_OUTPUTS || page_size == 0 ||
+		page_size > IMAGE_STREAM_BYTES)
+		return -1;
+	for (uint32_t i = 0; i < count; i++)
+		if (layers[i].layer_id > max_id)
+			max_id = layers[i].layer_id;
+	for (uint32_t i = 0; i < capacity; i++)
+		if (output_ids[i] <= max_id || (i != 0 && output_ids[i] <= output_ids[i - 1]))
+			return -1;
+	/* Verify payloads as well as indexes before copying bytes. A descriptor
+	 * copy avoids publishing advisory cache state from this helper. */
+	for (uint32_t i = 0; i < count; i++)
+	{
+		PsLayerDesc copy = layers[i];
+		const PsLayerLocation *loc = img_local_loc(&copy);
+		PsImgFooter foot;
+
+		if (loc == NULL || !loc->available || loc->tier == PS_LAYER_TIER_REMOTE_OBJECT ||
+			loc->size < sizeof(foot) ||
+			image_index_read(&copy, -1, loc->size - sizeof(foot), &foot, sizeof(foot)) != 0 ||
+			foot.magic != PS_IMG_MAGIC || foot.page_size != page_size ||
+			foot.index_off > loc->size - sizeof(foot) ||
+			foot.index_off % page_size != 0 ||
+			ps_image_layer_verify_data(&copy, page_size) != 0)
+			return -1;
+		data_ends[i] = foot.index_off;
+	}
+	if (ps_image_index_merge_open(layers, count, &merge) != 0)
+		return -1;
+	batch = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*batch));
+	sources = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*sources));
+	if (batch == NULL || sources == NULL)
+		goto out;
+	for (;;)
+	{
+		PsImgIndexEnt ent;
+		uint64_t layer_id;
+		int next = ps_image_index_merge_next(merge, &ent, &layer_id);
+
+		if (next < 0)
+			goto out;
+		if (next == 1)
+		{
+			uint32_t i;
+			for (i = 0; i < count && layers[i].layer_id != layer_id; i++)
+				;
+			if (i == count || data_ends[i] < page_size ||
+				ent.data_off > data_ends[i] - page_size || ent.data_off % page_size != 0)
+				goto out;
+			memset(&batch[used], 0, sizeof(batch[used]));
+			batch[used].key = ent.key;
+			batch[used].block = ent.block;
+			batch[used].lsn = ent.lsn;
+			batch[used].admission_seq = ent.admission_seq;
+			batch[used].growth_lsn = ent.growth_lsn;
+			batch[used].order_id = ent.order_id;
+			batch[used].seg_off = ent.seg_off;
+			batch[used].seg_id = ent.seg_id;
+			batch[used].flags = ent.flags;
+			sources[used].layer = &layers[i];
+			sources[used].offset = ent.data_off;
+			batch[used].page = &sources[used];
+			used++;
+		}
+		if (used == PS_IMAGE_BATCH_MAX_RECORDS || (next == 0 && used != 0))
+		{
+			if (written == capacity)
+				goto out;
+			if (ps_image_layer_write_sorted_batch(output_ids[written], layers[0].timeline,
+					batch, used, page_size, image_prepare_read_page, &page_size,
+					&outputs[written]) != 0)
+			{
+				/* The writer attempts cleanup, but its API does not establish
+				 * ownership after a failed create or report failed unlink. */
+				*uncertain_id = output_ids[written];
+				goto out;
+			}
+			written++;
+			used = 0;
+		}
+		if (next == 0)
+		{
+			*noutputs = written;
+			rc = 0;
+			goto done;
+		}
+	}
+out:
+	/* Preserve descriptors for failed unlinks so the owner can reconcile
+	 * them; never silently claim that ambiguous cleanup succeeded. */
+	{
+		uint32_t remaining = 0;
+		for (uint32_t i = 0; i < written; i++)
+			if (ps_layer_store->delete_local_layer(&outputs[i]) != 0)
+				outputs[remaining++] = outputs[i];
+		*noutputs = remaining;
+		if (remaining != 0 || *uncertain_id != 0)
+			rc = -2;
+	}
+done:
+	ps_image_index_merge_close(merge);
+	free(batch);
+	free(sources);
+	return rc;
+}
+
 static int
 image_read_index_impl(const PsLayerDesc *layer, int fd, PsImgIndexEnt **out,
 						  uint32_t *n)

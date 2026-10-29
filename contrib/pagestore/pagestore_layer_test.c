@@ -163,6 +163,9 @@ static uint32_t stream_write_max;
 static uint32_t stream_read_max;
 static uint32_t stream_pages;
 static int	stream_fail_after = -1;
+static uint64_t prepare_fail_write_id;
+static uint64_t prepare_fail_delete_id;
+static int prepare_corrupt_source;
 static uint32_t visitor_read_max;
 static int visitor_corrupt;
 static int visitor_first_chunk_reads;
@@ -206,6 +209,8 @@ reject_stream_index(const PsImgIndexEnt *entry, void *arg)
 static int
 bounded_write(uint64_t id, uint64_t off, const void *buf, uint32_t len)
 {
+	if (id == prepare_fail_write_id)
+		return -1;
 	if (len > stream_write_max)
 		stream_write_max = len;
 	if (len > 256 * 1024)
@@ -214,8 +219,17 @@ bounded_write(uint64_t id, uint64_t off, const void *buf, uint32_t len)
 }
 
 static int
+bounded_delete(const PsLayerDesc *layer)
+{
+	if (layer->layer_id == prepare_fail_delete_id)
+		return -1;
+	return PsLayerStoreLocal.delete_local_layer(layer);
+}
+
+static int
 bounded_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
 {
+	int rc;
 	/* Index metadata remains proportional to record count. */
 	if (off < (uint64_t) 4096 * PSZ)
 	{
@@ -224,7 +238,10 @@ bounded_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
 		if (len > 256 * 1024)
 			return -1;
 	}
-	return PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
+	rc = PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
+	if (rc == 0 && prepare_corrupt_source && layer->layer_id == 910 && off == 0 && len != 0)
+		((unsigned char *) buf)[0] ^= 1;
+	return rc;
 }
 static int
 generated_page(const PsImgRec *rec, void *page, void *arg)
@@ -252,6 +269,7 @@ streaming_layer_test(void)
 		return;
 	bounded.write_local_layer_at = bounded_write;
 	bounded.read_layer_block = bounded_read;
+	bounded.delete_local_layer = bounded_delete;
 	ps_layer_store = &bounded;
 	for (uint32_t i = 0; i < 4096; i++)
 	{
@@ -267,6 +285,59 @@ streaming_layer_test(void)
 	check(ps_image_layer_verify_data(&layer, PSZ) == 0 &&
 		  stream_read_max <= 256 * 1024,
 		  "large layer checksum uses bounded reads");
+	{
+		uint64_t ids[4] = {1010, 1011, 1012, 1013};
+		uint64_t uncertain = 0;
+		uint32_t noutputs = 0;
+		PsLayerDesc outputs[4];
+		int rc = ps_image_compaction_prepare(&layer, 1, ids, 4, PSZ, outputs,
+												 &noutputs, &uncertain);
+
+		check(rc == 0 && noutputs == 4 && uncertain == 0,
+			  "large source prepares four bounded unpublished outputs");
+		for (uint32_t i = 0; i < noutputs; i++)
+		{
+			uint32_t block = i * PS_IMAGE_BATCH_MAX_RECORDS;
+			check(outputs[i].locations[0].size <=
+				  (uint64_t) PS_IMAGE_BATCH_MAX_RECORDS *
+					(PSZ + sizeof(PsImgIndexEnt)) + sizeof(PsImgFooter) &&
+				  ps_image_layer_lookup(&outputs[i], &key, block, 100, UINT64_MAX,
+										page, PSZ, NULL, NULL) == 1 &&
+				  page[0] == (unsigned char) block,
+				  "prepared output stays bounded and preserves source data");
+			check(ps_layer_store->delete_local_layer(&outputs[i]) == 0,
+				  "test removes sealed unpublished output");
+		}
+		uncertain = 0;
+		noutputs = 0;
+		prepare_corrupt_source = 1;
+		check(ps_image_compaction_prepare(&layer, 1, ids, 4, PSZ, outputs,
+											  &noutputs, &uncertain) == -1 &&
+			  noutputs == 0 && uncertain == 0 &&
+			  ps_layer_store->layer_exists_local(ids[0]) == 0,
+			  "corrupt source data is rejected before creating output");
+		prepare_corrupt_source = 0;
+		uncertain = 0;
+		noutputs = 0;
+		check(ps_image_compaction_prepare(&layer, 1, ids, 1, PSZ, outputs,
+											  &noutputs, &uncertain) == -1 &&
+			  noutputs == 0 && uncertain == 0 &&
+			  ps_layer_store->layer_exists_local(ids[0]) == 0,
+			  "capacity exhaustion cleans every sealed output");
+		prepare_fail_write_id = ids[1];
+		prepare_fail_delete_id = ids[0];
+		uncertain = 0;
+		noutputs = 0;
+		check(ps_image_compaction_prepare(&layer, 1, ids, 4, PSZ, outputs,
+											  &noutputs, &uncertain) == -2 &&
+			  noutputs == 1 && outputs[0].layer_id == ids[0] && uncertain == ids[1],
+			  "write and unlink failures report all unresolved output identities");
+		prepare_fail_write_id = 0;
+		prepare_fail_delete_id = 0;
+		if (noutputs == 1)
+			check(ps_layer_store->delete_local_layer(&outputs[0]) == 0,
+				  "test reconciles the reported failed unlink");
+	}
 	{
 		uint32_t count = 0;
 		PsImageIndexCursor *cursor = NULL;
@@ -570,6 +641,48 @@ bounded_sorted_batch_test(void)
 	free(recs);
 }
 
+static void
+prepared_batch_boundary_test(void)
+{
+	PsKey key = {1, 1, 957, 0, PS_KLASS_RELATION};
+	PsImgRec *records = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*records));
+	unsigned char older[PSZ] = {1}, newer[PSZ] = {2}, result[PSZ];
+	PsLayerDesc inputs[2], outputs[2];
+	uint64_t ids[2] = {1300, 1301}, uncertain = 0;
+	uint32_t noutputs = 0;
+	int ok = records != NULL;
+
+	check(ok, "allocate duplicate-identity boundary fixture");
+	if (!ok)
+		return;
+	for (uint32_t i = 0; i < PS_IMAGE_BATCH_MAX_RECORDS; i++)
+	{
+		records[i].key = key;
+		records[i].lsn = 100;
+		records[i].page = older;
+	}
+	ok = ps_image_layer_write(1200, 0, records, PS_IMAGE_BATCH_MAX_RECORDS,
+								 PSZ, &inputs[0]) == 0;
+	records[0].page = newer;
+	ok = ok && ps_image_layer_write(1201, 0, records, 1, PSZ, &inputs[1]) == 0;
+	check(ok && ps_image_compaction_prepare(inputs, 2, ids, 2, PSZ, outputs,
+											&noutputs, &uncertain) == 0 &&
+		  noutputs == 2 && uncertain == 0,
+		  "prepare a duplicate identity crossing the output boundary");
+	if (noutputs == 2)
+	{
+		check(ps_image_layer_lookup_exact(&outputs[0], &key, 0, 100, 0,
+										result, PSZ, NULL, NULL) == 1 && result[0] == 1 &&
+			  ps_image_layer_lookup_exact(&outputs[1], &key, 0, 100, 0,
+										result, PSZ, NULL, NULL) == 1 && result[0] == 2,
+			  "later prepared output contains the higher-precedence source");
+		for (uint32_t i = 0; i < noutputs; i++)
+			check(ps_layer_store->delete_local_layer(&outputs[i]) == 0,
+				  "remove boundary fixture output");
+	}
+	free(records);
+}
+
 int
 main(void)
 {
@@ -591,6 +704,7 @@ main(void)
 	legacy_index_visitor_test();
 	bounded_merge_test();
 	bounded_sorted_batch_test();
+	prepared_batch_boundary_test();
 
 	/* Upgraded stores retain sequence-zero tuples alongside same-LSN rewrites.
 	 * Exact reads must find the old identity, including when another layer
