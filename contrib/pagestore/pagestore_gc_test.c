@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "pagestore_manifest.h"
@@ -32,6 +33,7 @@
 
 static int	run = 0,
 			failed = 0;
+static void gc_resume_like(void);
 
 static void
 check(int cond, const char *msg)
@@ -59,6 +61,171 @@ find_layer(uint64_t id)
 		if (ps_layer_map.layers[i].layer_id == id)
 			return &ps_layer_map.layers[i];
 	return NULL;
+}
+
+/* Resolve the same exact version from live layers using the production
+ * layer-ID tie break. The manifest here is quiescent. */
+static int
+read_live_exact(const PsKey *key, uint32_t block, unsigned char *page)
+{
+	unsigned char candidate[PSZ];
+	uint64_t best = 0;
+	int found = 0;
+
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *layer = &ps_layer_map.layers[i];
+		int rc;
+		if (layer->deleting)
+			continue;
+		rc = ps_image_layer_lookup_exact(layer, key, block, 100, 0,
+											candidate, PSZ, NULL, NULL);
+		if (rc < 0)
+			return -1;
+		if (rc == 1 && (!found || layer->layer_id > best))
+		{
+			memcpy(page, candidate, PSZ);
+			best = layer->layer_id;
+			found = 1;
+		}
+	}
+	return found;
+}
+
+/* A process exit after the first ADD must leave all inputs authoritative.
+ * The unrecorded second output is an orphan, not permission to retire input. */
+static void
+test_partial_batch_publication_restart(void)
+{
+	char dir[] = "/tmp/ps-batch-replay-XXXXXX";
+	char command[4096];
+	PsKey key = {1, 1, 955, 0, PS_KLASS_RELATION};
+	PsImgRec *records = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*records));
+	unsigned char older[PSZ] = {1}, newer[PSZ] = {2}, page[PSZ];
+	PsLayerDesc inputs[2], outputs[2];
+	uint64_t ids[2] = {3, 4}, uncertain = 0;
+	uint32_t noutputs = 0;
+	pid_t child;
+	int status = 0, ok;
+
+	if (records == NULL || mkdtemp(dir) == NULL ||
+		ps_layer_store->open(dir) != 0 || ps_manifest_open(dir) != 0)
+	{
+		check(0, "open partial-publication fixture");
+		free(records);
+		return;
+	}
+	for (uint32_t i = 0; i < PS_IMAGE_BATCH_MAX_RECORDS; i++)
+	{
+		records[i].key = key;
+		records[i].block = i;
+		records[i].lsn = 100;
+		records[i].page = older;
+	}
+	ok = ps_image_layer_write(1, 0, records, PS_IMAGE_BATCH_MAX_RECORDS,
+								PSZ, &inputs[0]) == 0;
+	records[0].block = PS_IMAGE_BATCH_MAX_RECORDS - 1;
+	records[1].block = PS_IMAGE_BATCH_MAX_RECORDS;
+	records[0].page = newer;
+	records[1].page = newer;
+	ok = ok && ps_image_layer_write(2, 0, records, 2, PSZ, &inputs[1]) == 0 &&
+		ps_manifest_add_layer(&inputs[0]) == 0 && ps_manifest_add_layer(&inputs[1]) == 0 &&
+		ps_image_compaction_prepare(inputs, 2, ids, 2, PSZ, outputs,
+										&noutputs, &uncertain) == 0 && noutputs == 2 &&
+		ps_image_compaction_verify_coverage(inputs, 2, outputs, 2, PSZ) == 0;
+	check(ok, "prepare and verify two output batches");
+	if (ok)
+	{
+		PsLayerDesc collision = outputs[0];
+
+		collision.layer_id = inputs[0].layer_id;
+		check(ps_manifest_add_new_layer(&collision) != 0 && find_layer(1) != NULL &&
+			  read_live_exact(&key, 0, page) == 1 && page[0] == 1,
+			  "fresh ADD rejects an existing input ID without changing it");
+	}
+	ps_manifest_close();
+	ps_layer_store->close();
+	if (!ok)
+		goto done;
+	child = fork();
+	if (child == 0)
+	{
+		int child_ok = ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
+			ps_manifest_replay(&ps_layer_map) == 0 &&
+			ps_manifest_add_new_layer(&outputs[0]) == 0 &&
+			ps_manifest_add_new_layer(&outputs[0]) != 0;
+		_exit(child_ok ? 0 : 1);
+	}
+	if (child < 0 || waitpid(child, &status, 0) != child ||
+		!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+	{
+		check(0, "publish first batch before process exit");
+		goto done;
+	}
+	check(ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0,
+		  "replay after process exits following first output ADD");
+	check(find_layer(1) != NULL && !find_layer(1)->deleting &&
+		  find_layer(2) != NULL && !find_layer(2)->deleting &&
+		  find_layer(3) != NULL && find_layer(4) == NULL,
+		  "partial publication leaves both sources live");
+	check(read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS - 1, page) == 1 && page[0] == 2 &&
+		  read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS, page) == 1 && page[0] == 2,
+		  "partial publication preserves the winning pages across the batch boundary");
+	check(ps_layer_store->recover_local_layers(&ps_layer_map) == 0 &&
+		  ps_layer_store->layer_exists_local(4) == 0 &&
+		  ps_layer_store->layer_exists_local(1) == 1 &&
+		  ps_layer_store->layer_exists_local(2) == 1,
+		  "orphan sweep removes only the unrecorded output, not the inputs");
+	ids[0] = 5;
+	ids[1] = 6;
+	noutputs = 0;
+	uncertain = 0;
+	ok = ps_image_compaction_prepare(inputs, 2, ids, 2, PSZ, outputs,
+										&noutputs, &uncertain) == 0 && noutputs == 2 &&
+		ps_image_compaction_verify_coverage(inputs, 2, outputs, 2, PSZ) == 0;
+	check(ok, "prepare a complete replacement after partial recovery");
+	ps_manifest_close();
+	ps_layer_store->close();
+	if (!ok)
+		goto done;
+	child = fork();
+	if (child == 0)
+	{
+		int child_ok = ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
+			ps_manifest_replay(&ps_layer_map) == 0 &&
+			ps_manifest_add_new_layer(&outputs[0]) == 0 &&
+			ps_manifest_add_new_layer(&outputs[1]) == 0 &&
+			ps_manifest_mark_delete(inputs[0].layer_id) == 0;
+		_exit(child_ok ? 0 : 1);
+	}
+	if (child < 0 || waitpid(child, &status, 0) != child ||
+		!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+	{
+		check(0, "publish complete replacement and mark one source before exit");
+		goto done;
+	}
+	check(ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0,
+		  "replay after process exits during source retirement");
+	check(find_layer(1) != NULL && find_layer(1)->deleting &&
+		  find_layer(2) != NULL && !find_layer(2)->deleting &&
+		  find_layer(5) != NULL && find_layer(6) != NULL,
+		  "source tombstone follows both durable output ADDs");
+	check(read_live_exact(&key, 0, page) == 1 && page[0] == 1 &&
+		  read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS - 1, page) == 1 && page[0] == 2 &&
+		  read_live_exact(&key, PS_IMAGE_BATCH_MAX_RECORDS, page) == 1 && page[0] == 2,
+		  "replacement remains readable after a partial source retirement");
+	gc_resume_like();
+	check(find_layer(1) == NULL && find_layer(2) != NULL &&
+		  read_live_exact(&key, 0, page) == 1 && page[0] == 1,
+		  "GC can complete the tombstone while replacement stays readable");
+	ps_manifest_close();
+	ps_layer_store->close();
+done:
+	free(records);
+	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", dir) > 0 && system(command) != 0)
+		fprintf(stderr, "warning: failed to remove batch fixture\n");
 }
 
 /*
@@ -832,6 +999,7 @@ main(void)
 	PsLayerDesc *pa,
 			   *pb;
 
+	test_partial_batch_publication_restart();
 	if (!mkdtemp(dir) || !mkdtemp(objects) ||
 		setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0 ||
 		ps_layer_store->open(dir) != 0 ||

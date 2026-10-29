@@ -1024,6 +1024,16 @@ ps_manifest_add_layer(const PsLayerDesc *desc)
 }
 
 int
+ps_manifest_add_new_layer(const PsLayerDesc *desc)
+{
+	/* Unlike the legacy idempotent ADD, staged output must never accept a
+	 * collision as proof that its particular file is the recorded one. */
+	if (desc == NULL || manifest_layer_exists(&ps_layer_map, desc->layer_id))
+		return -1;
+	return ps_manifest_add_layer(desc);
+}
+
+int
 ps_manifest_set_remote_location(uint64_t layer_id,
 								const PsLayerLocation *location)
 {

@@ -31,6 +31,11 @@ extern int	ps_manifest_replay_had_manifest(void);
 extern int	ps_manifest_orphan_sweep_inhibited(void);
 extern int	ps_manifest_replay(PsLayerMap *map);
 extern int	ps_manifest_add_layer(const PsLayerDesc *desc);
+/* Add a freshly prepared layer only if its ID is not present. The caller
+ * serializes map mutations, proves coverage and fences concurrent changes.
+ * A failure after an append may have an ambiguous durable result; no output
+ * or input may be deleted merely because this call failed. */
+extern int ps_manifest_add_new_layer(const PsLayerDesc *desc);
 extern int	ps_manifest_set_remote_location(uint64_t layer_id,
 											const PsLayerLocation *location);
 extern int	ps_manifest_set_remote_durable(uint64_t layer_id,

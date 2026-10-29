@@ -90,7 +90,11 @@ inputs using such a record until an independently enforced upgrade/downgrade
 barrier exists. An alternative to investigate is existing ADD and MARK_DELETE
 records after exact-identity winners are selected, keeping all sources until
 every output ADD is durable. Its crash and concurrent-write properties still
-require proof and tests; it is not implemented here.
+require proof and tests. The strict single-output ADD helper rejects ID
+collisions, but does not itself prove coverage, fence concurrent changes, or
+retire inputs. A process-exit test covers a partial output prefix and a later
+partial input retirement; torn writes and the production orchestration still
+need dedicated coverage.
 
 If an input is remote-durable, the replacement must become durable in the same
 tier before the old remote copy can be retired. Retry and cleanup of failed or
