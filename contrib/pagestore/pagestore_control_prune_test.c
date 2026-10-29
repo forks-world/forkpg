@@ -343,6 +343,35 @@ read_relation_at(uint32_t block, uint64_t lsn)
 }
 
 static void
+test_segment_gc_does_not_starve_compaction(void)
+{
+	char store[] = "/tmp/pagestore-gc-compaction-fairness-XXXXXX";
+	uint64_t before;
+	int wrote = 1;
+
+	configure_core(1);
+	compact_layers = 1;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open segment GC and compaction fairness store");
+	for (uint32_t block = 0; block < 24; block++)
+		wrote &= write_relation(0, block, 1000 + block);
+	check(wrote && ps_storage->seg_size(0, 0) > 0,
+		  "create closed segments and excess image layers");
+	before = ps_test_compaction_count();
+	(void) ps_core_maintenance();
+	check(ps_storage->seg_size(0, 0) < 0,
+		  "the maintenance turn reclaims a closed segment");
+	(void) ps_core_maintenance();
+	check(ps_test_compaction_count() > before,
+		  "a reclaimed segment does not prevent compaction on the next turn");
+	run_maintenance(64);
+	check(read_relation_at(0, 1000) && read_relation_at(23, 1023),
+		  "fair segment reclamation and compaction preserve pages");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_bounded_compaction_maintenance(void)
 {
 	char store[] = "/tmp/pagestore-bounded-core-XXXXXX";
@@ -1713,6 +1742,7 @@ test_compaction_source_read_batch(void)
 int
 main(void)
 {
+	test_segment_gc_does_not_starve_compaction();
 	test_bounded_compaction_maintenance();
 	test_bounded_shared_payload_capacity_fallback();
 	test_bounded_compaction_concurrent_write();

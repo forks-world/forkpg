@@ -698,6 +698,7 @@ ps_test_wal_reclaim_watch_count(uint32_t tl)
  * merge or prune" early return).  Used to prove idle maintenance performs no
  * compaction when nothing requested one. */
 static uint64_t ps_test_compaction_pass_count;
+static unsigned segment_gc_compaction_turn;
 static void (*compaction_unlocked_test_hook)(void *);
 static void *compaction_unlocked_test_hook_arg;
 
@@ -25520,6 +25521,7 @@ ps_core_close_impl(void)
 	int		join_rc;
 
 	__atomic_store_n(&core_opened, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&segment_gc_compaction_turn, 0, __ATOMIC_RELEASE);
 
 	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 0)
 	{
@@ -26400,6 +26402,7 @@ ps_core_maintenance_impl(void)
 	uint64_t	page_floor = 0;
 	int			found = 0;
 	int			did = 0;
+	int			skip_segment_gc;
 	int			defer_layer_gc = 0;
 	int			forkmeta_gc_scan_incomplete = 0;
 	int			forkmeta_temp_gc_observation_stale = 0;
@@ -26653,7 +26656,9 @@ ps_core_maintenance_impl(void)
 	 * the watermark stays present because its suffix may not be in a layer.
 	 * Shared segments can contain records from several timelines, so retain all
 	 * of them while any deletion awaits its filtered-rewrite phase. */
-	if (segment_gc_enabled && !timeline_delete_active() && ps_storage->seg_remove)
+	skip_segment_gc = !defer_layer_gc &&
+		__atomic_exchange_n(&segment_gc_compaction_turn, 0, __ATOMIC_ACQ_REL);
+	if (segment_gc_enabled && !skip_segment_gc && !timeline_delete_active() && ps_storage->seg_remove)
 	{
 		uint32_t prepared_victim[MAX_SHARDS];
 		bool layers_prepared[MAX_SHARDS] = {false};
@@ -26709,8 +26714,25 @@ ps_core_maintenance_impl(void)
 			ps_unlock_shard(sh - 1);
 		for (uint32_t sh = 0; sh < ns; sh++)
 			free(verified[sh].layers);
+		/* Give compaction a turn before another ordinary segment GC. */
 		if (found)
+		{
+			int compact_due = 0;
+
+			ps_lock_map_rd();
+			for (uint32_t tl = 0; tl < MAX_TIMELINES && !compact_due; tl++)
+				for (uint32_t sh = 0; sh < ns; sh++)
+					if (ps_timeline_live(tl) &&
+						count_image_layers(tl, sh) > (uint32_t) compact_layers)
+					{
+						compact_due = 1;
+						break;
+					}
+			ps_unlock_map();
+			if (compact_due)
+				__atomic_store_n(&segment_gc_compaction_turn, 1, __ATOMIC_RELEASE);
 			return 1;
+		}
 	}
 	if (defer_layer_gc && (gc_remote_one() || tier_one_layer()))
 		return 1;
@@ -26849,7 +26871,7 @@ ps_core_maintenance_impl(void)
 			did = 1;
 	}
 
-	return did;
+	return did || skip_segment_gc;
 }
 
 int
