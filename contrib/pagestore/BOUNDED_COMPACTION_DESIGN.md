@@ -4,6 +4,10 @@ Status: design; the implementation remains in progress. This builds on the
 staged local output work in PR #371. It does not describe behavior that is
 already implemented.
 
+The index visitor added with this design is a bounded-memory building block;
+it is not yet used by compaction and does not implement the merge or publication
+protocol. Its callbacks must not commit effects until the visitor returns success.
+
 ## Boundaries
 
 A batch must bound both the data it reads/writes and the metadata it holds in
@@ -12,6 +16,9 @@ can be many GiB. Likewise, producing several output files after loading and
 sorting every input index is not a bounded compaction. The implementation must
 use a bounded-memory merge over input indexes and cap output by bytes or
 records. Tests must include an individual source larger than the output bound.
+Older image indexes may be unsorted. The visitor preserves on-disk order; a
+future merge must detect unsorted inputs and use a bounded external sort or fail
+closed, rather than assume every source can be fed into a sorted merge.
 
 ## Preserve version precedence
 

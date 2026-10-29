@@ -685,6 +685,87 @@ image_index_read(const PsLayerDesc *layer, int fd, uint64_t off, void *buf, uint
 		ps_layer_store->read_layer_block(layer, off, buf, len);
 }
 
+int
+ps_image_layer_visit_index(const PsLayerDesc *layer, PsImageIndexVisitor visit,
+						   void *arg)
+{
+	const PsLayerLocation *loc = img_local_loc(layer);
+	PsImgFooter foot;
+	unsigned char *buf;
+	size_t ent_size;
+	uint32_t per_chunk;
+	uint64_t bytes;
+	int rc = -1;
+
+	if (visit == NULL || loc == NULL || loc->size < sizeof(foot) ||
+		image_index_read(layer, -1, loc->size - sizeof(foot), &foot, sizeof(foot)) != 0 ||
+		foot.magic != PS_IMG_MAGIC || foot.nrecs == 0 ||
+		(foot.version != 2 && foot.version != 3 && foot.version != PS_IMG_VERSION))
+		return -1;
+	ent_size = foot.version == 2 ? sizeof(PsImgIndexEntV2) :
+		foot.version == 3 ? sizeof(PsImgIndexEntV3) : sizeof(PsImgIndexEnt);
+	bytes = (uint64_t) foot.nrecs * ent_size;
+	if (foot.index_off > loc->size - sizeof(foot) ||
+		bytes != loc->size - sizeof(foot) - foot.index_off)
+		return -1;
+	per_chunk = (64 * 1024) / ent_size;
+	buf = malloc((size_t) per_chunk * ent_size);
+	if (buf == NULL)
+		return -1;
+	/* Validate before yielding entries; validate again to detect changes or
+	 * corruption during traversal.  The caller commits only after success. */
+	for (int pass = 0; pass < 2; pass++)
+	{
+		uint32_t crc = 2166136261u;
+		for (uint32_t first = 0; first < foot.nrecs;)
+		{
+			uint32_t count = foot.nrecs - first;
+			uint32_t len;
+
+			if (count > per_chunk)
+				count = per_chunk;
+			len = count * ent_size;
+			if (image_index_read(layer, -1, foot.index_off + (uint64_t) first * ent_size,
+								 buf, len) != 0)
+				goto out;
+			crc = img_crc_extend(crc, buf, len);
+			if (pass == 1)
+				for (uint32_t i = 0; i < count; i++)
+				{
+					PsImgIndexEnt entry;
+					memset(&entry, 0, sizeof(entry));
+					if (foot.version == 2)
+					{
+						PsImgIndexEntV2 old;
+						memcpy(&old, buf + i * ent_size, sizeof(old));
+						entry.key = old.key; entry.block = old.block;
+						entry.lsn = old.lsn; entry.data_off = old.data_off;
+					}
+					else if (foot.version == 3)
+					{
+						PsImgIndexEntV3 old;
+						memcpy(&old, buf + i * ent_size, sizeof(old));
+						entry.key = old.key; entry.block = old.block;
+						entry.lsn = old.lsn; entry.data_off = old.data_off;
+						entry.growth_lsn = old.growth_lsn; entry.order_id = old.order_id;
+						entry.seg_off = old.seg_off; entry.seg_id = old.seg_id; entry.flags = old.flags;
+					}
+					else
+						memcpy(&entry, buf + i * ent_size, sizeof(entry));
+					if (visit(&entry, arg) != 0)
+						goto out;
+				}
+			first += count;
+		}
+		if (crc != foot.index_crc)
+			goto out;
+	}
+	rc = 0;
+out:
+	free(buf);
+	return rc;
+}
+
 static int
 image_read_index_impl(const PsLayerDesc *layer, int fd, PsImgIndexEnt **out,
 						  uint32_t *n)

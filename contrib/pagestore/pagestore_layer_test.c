@@ -35,11 +35,133 @@ check(int cond, const char *msg)
 
 #define PSZ 8192
 
+typedef struct LegacyIndexV2
+{
+	PsKey key;
+	uint32_t block;
+	uint64_t lsn;
+	uint64_t data_off;
+} LegacyIndexV2;
+typedef struct LegacyIndexV3
+{
+	PsKey key;
+	uint32_t block;
+	uint64_t lsn, data_off, growth_lsn, order_id, seg_off;
+	uint32_t seg_id, flags;
+} LegacyIndexV3;
+static unsigned char legacy_file[1024];
+static size_t legacy_file_size;
+
+static int
+legacy_memory_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
+{
+	(void) layer;
+	if (off > legacy_file_size || len > legacy_file_size - off)
+		return -1;
+	memcpy(buf, legacy_file + off, len);
+	return 0;
+}
+
+static int
+compare_legacy_index(const PsImgIndexEnt *entry, void *arg)
+{
+	PsImgIndexEnt **expected = arg;
+	int different = memcmp(entry, *expected, sizeof(*entry)) != 0;
+	(*expected)++;
+	return different ? -1 : 0;
+}
+
+static void
+legacy_index_visitor_test(void)
+{
+	PsLayerStore memory = PsLayerStoreLocal;
+	const PsLayerStore *saved = ps_layer_store;
+	PsLayerDesc layer;
+	PsImgFooter foot;
+	LegacyIndexV2 v2 = {.key = {1, 2, 3, 0, PS_KLASS_RELATION},
+		.block = 9, .lsn = 17, .data_off = 4};
+	LegacyIndexV3 v3 = {.key = {1, 2, 3, 0, PS_KLASS_RELATION},
+		.block = 9, .lsn = 17, .data_off = 4, .growth_lsn = 13,
+		.order_id = 23, .seg_off = 27, .seg_id = 2, .flags = 1};
+
+	memory.read_layer_block = legacy_memory_read;
+	ps_layer_store = &memory;
+	for (int version = 2; version <= 3; version++)
+	{
+		const void *data = version == 2 ? (const void *) &v2 : (const void *) &v3;
+		size_t len = version == 2 ? sizeof(v2) : sizeof(v3);
+		uint32_t crc = 2166136261u;
+		PsImgIndexEnt *expected = NULL, *cursor;
+		uint32_t count = 0;
+
+		memcpy(legacy_file, data, len);
+		for (size_t i = 0; i < len; i++)
+			crc = (crc ^ legacy_file[i]) * 16777619u;
+		memset(&foot, 0, sizeof(foot));
+		foot.magic = PS_IMG_MAGIC; foot.version = version;
+		foot.nrecs = 1; foot.index_crc = crc;
+		memcpy(legacy_file + len, &foot, sizeof(foot));
+		legacy_file_size = len + sizeof(foot);
+		memset(&layer, 0, sizeof(layer));
+		layer.location_count = 1;
+		layer.locations[0].tier = PS_LAYER_TIER_LOCAL_HOT;
+		layer.locations[0].size = legacy_file_size;
+		layer.locations[0].available = true;
+		check(ps_image_layer_read_index(&layer, &expected, &count) == 0 && count == 1,
+			  "legacy fixture is accepted by the existing reader");
+		cursor = expected;
+		check(expected != NULL && ps_image_layer_visit_index(&layer,
+							 compare_legacy_index, &cursor) == 0 && cursor == expected + 1,
+			  "bounded visitor matches legacy index conversion");
+		free(expected);
+	}
+	ps_layer_store = saved;
+}
+
 /* A generated 32-MiB layer must never require whole-payload I/O. */
 static uint32_t stream_write_max;
 static uint32_t stream_read_max;
 static uint32_t stream_pages;
 static int	stream_fail_after = -1;
+static uint32_t visitor_read_max;
+static int visitor_corrupt;
+static int visitor_first_chunk_reads;
+
+static int
+visitor_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
+{
+	int rc = PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
+	if (len > visitor_read_max)
+		visitor_read_max = len;
+	if (off == (uint64_t) 4096 * PSZ)
+	{
+		visitor_first_chunk_reads++;
+		if (rc == 0 && (visitor_corrupt == 1 ||
+			(visitor_corrupt == 2 && visitor_first_chunk_reads == 2)))
+			((unsigned char *) buf)[0] ^= 1;
+	}
+	return rc;
+}
+
+static int
+visit_stream_index(const PsImgIndexEnt *entry, void *arg)
+{
+	uint32_t *count = arg;
+	if (entry->block != *count || entry->lsn != 100 ||
+		entry->data_off != (uint64_t) *count * PSZ)
+		return -1;
+	(*count)++;
+	return 0;
+}
+
+static int
+reject_stream_index(const PsImgIndexEnt *entry, void *arg)
+{
+	uint32_t *count = arg;
+	(void) entry;
+	(*count)++;
+	return -1;
+}
 
 static int
 bounded_write(uint64_t id, uint64_t off, const void *buf, uint32_t len)
@@ -105,6 +227,29 @@ streaming_layer_test(void)
 	check(ps_image_layer_verify_data(&layer, PSZ) == 0 &&
 		  stream_read_max <= 256 * 1024,
 		  "large layer checksum uses bounded reads");
+	{
+		uint32_t count = 0;
+		bounded.read_layer_block = visitor_read;
+		visitor_read_max = 0;
+		check(ps_image_layer_visit_index(&layer, visit_stream_index, &count) == 0 &&
+			  count == 4096 && visitor_read_max <= 64 * 1024,
+			  "index visitor returns sorted entries using bounded reads");
+		visitor_corrupt = 1;
+		visitor_first_chunk_reads = 0;
+		count = 0;
+		check(ps_image_layer_visit_index(&layer, visit_stream_index, &count) != 0 &&
+			  count == 0, "corrupt index is rejected before visiting entries");
+		visitor_corrupt = 2;
+		visitor_first_chunk_reads = 0;
+		count = 0;
+		check(ps_image_layer_visit_index(&layer, visit_stream_index, &count) != 0,
+			  "index changes during traversal are rejected");
+		visitor_corrupt = 0;
+		count = 0;
+		check(ps_image_layer_visit_index(&layer, reject_stream_index, &count) != 0 &&
+			  count == 1, "index visitor errors stop traversal");
+		bounded.read_layer_block = bounded_read;
+	}
 	for (uint32_t block = 0; block < 4096; block += 4095)
 	{
 		check(ps_image_layer_lookup(&layer, &key, block, 100, UINT64_MAX,
@@ -250,6 +395,7 @@ main(void)
 		fprintf(stderr, "setup failed\n");
 		return 2;
 	}
+	legacy_index_visitor_test();
 
 	/* Upgraded stores retain sequence-zero tuples alongside same-LSN rewrites.
 	 * Exact reads must find the old identity, including when another layer
