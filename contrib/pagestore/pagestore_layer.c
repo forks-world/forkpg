@@ -1062,10 +1062,18 @@ ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 		page_size > IMAGE_STREAM_BYTES)
 		return -1;
 	for (uint32_t i = 0; i < count; i++)
+	{
+		if ((layers[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(layers[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT))
+			return -1;
 		if (layers[i].layer_id > max_id)
 			max_id = layers[i].layer_id;
+	}
 	for (uint32_t i = 0; i < capacity; i++)
-		if (output_ids[i] <= max_id || (i != 0 && output_ids[i] <= output_ids[i - 1]))
+		if (output_ids[i] <= max_id ||
+			(output_ids[i] >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(layers[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) ||
+			(i != 0 && output_ids[i] <= output_ids[i - 1]))
 			return -1;
 	/* Verify payloads as well as indexes before copying bytes. A descriptor
 	 * copy avoids publishing advisory cache state from this helper. */

@@ -2070,6 +2070,9 @@ struct WalIdxEnt;
 #define MAX_SHARDS		PS_MAX_CHANNELS
 #define LAYER_ID_SHARD_BITS	16
 #define LAYER_ID_LOCAL_BITS	(64 - LAYER_ID_SHARD_BITS)
+#if PS_IMAGE_LAYER_SHARD_SHIFT != LAYER_ID_LOCAL_BITS
+#error "image preparation and core layer-ID layouts must match"
+#endif
 #define LAYER_ID_SHARD_MASK	((uint64_t) (((uint64_t) 1 << LAYER_ID_SHARD_BITS) - 1) << LAYER_ID_LOCAL_BITS)
 #define LAYER_ID_LOCAL_MASK	((uint64_t) ((1ULL << LAYER_ID_LOCAL_BITS) - 1))
 

@@ -288,9 +288,22 @@ streaming_layer_test(void)
 	{
 		uint64_t ids[4] = {1010, 1011, 1012, 1013};
 		uint64_t uncertain = 0;
+		uint64_t wrong_shard_id = (UINT64_C(1) << PS_IMAGE_LAYER_SHARD_SHIFT) | ids[0];
 		uint32_t noutputs = 0;
 		PsLayerDesc outputs[4];
-		int rc = ps_image_compaction_prepare(&layer, 1, ids, 4, PSZ, outputs,
+		PsLayerDesc mixed[2] = {layer, layer};
+		int rc;
+
+		mixed[1].layer_id |= UINT64_C(1) << PS_IMAGE_LAYER_SHARD_SHIFT;
+		check(ps_image_compaction_prepare(mixed, 2, ids, 4, PSZ, outputs,
+											  &noutputs, &uncertain) == -1 &&
+			  noutputs == 0 && uncertain == 0,
+			  "preparation rejects sources from different shards");
+		check(ps_image_compaction_prepare(&layer, 1, &wrong_shard_id, 1, PSZ, outputs,
+											  &noutputs, &uncertain) == -1 &&
+			  noutputs == 0 && uncertain == 0,
+			  "preparation rejects an output ID on another shard");
+		rc = ps_image_compaction_prepare(&layer, 1, ids, 4, PSZ, outputs,
 												 &noutputs, &uncertain);
 
 		check(rc == 0 && noutputs == 4 && uncertain == 0,

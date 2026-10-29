@@ -234,9 +234,12 @@ extern int ps_image_index_merge_next(PsImageIndexMerge *merge,
 									  PsImgIndexEnt *entry, uint64_t *layer_id);
 extern void ps_image_index_merge_close(PsImageIndexMerge *merge);
 
+/* The high 16 layer-ID bits encode the shard; the lower 48 are local IDs. */
+#define PS_IMAGE_LAYER_SHARD_SHIFT 48
 /* Prepare at most 64 unpublished output layers from caller-pinned local
- * sources on the same shard. Output IDs must be strictly increasing and greater than every
- * source ID. 0 means every output is sealed and *noutputs describes them;
+ * sources. The input and output arrays must not overlap.
+ * Output IDs must be strictly increasing and greater than every source ID.
+ * 0 means every output is sealed and *noutputs describes them;
  * -1 means failure with no known remaining outputs; -2 means cleanup or a
  * failed create/write needs reconciliation. On -2, outputs[0..*noutputs)
  * are sealed files whose cleanup failed; *uncertain_id is the attempted ID
