@@ -36,6 +36,15 @@ extern int	ps_manifest_add_layer(const PsLayerDesc *desc);
  * A failure after an append may have an ambiguous durable result; no output
  * or input may be deleted merely because this call failed. */
 extern int ps_manifest_add_new_layer(const PsLayerDesc *desc);
+/* Append one output in order only while the captured input set and already
+ * published prefix still match. Caller must first verify complete coverage,
+ * pin sources/outputs, reserve every output ID, and hold the map and relevant
+ * writer/lifecycle fences. A failed append may be durably ambiguous; do not
+ * delete inputs or outputs based on the return code. This does not retire
+ * sources and does not make the operation crash-atomic. */
+extern int ps_manifest_publish_image_batch(const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs,
+	uint32_t batch_index);
 extern int	ps_manifest_set_remote_location(uint64_t layer_id,
 											const PsLayerLocation *location);
 extern int	ps_manifest_set_remote_durable(uint64_t layer_id,

@@ -1034,6 +1034,24 @@ ps_manifest_add_new_layer(const PsLayerDesc *desc)
 }
 
 int
+ps_manifest_publish_image_batch(const PsLayerDesc *inputs, uint32_t ninputs,
+								const PsLayerDesc *outputs, uint32_t noutputs,
+								uint32_t batch_index)
+{
+	if (batch_index >= noutputs ||
+		!ps_image_compaction_snapshot_valid(&ps_layer_map, inputs, ninputs,
+										outputs, noutputs))
+		return -1;
+	/* A prefix is the only accepted state. A durable-but-ambiguous ADD must
+	 * be resolved by replay rather than guessed or silently retried here. */
+	for (uint32_t i = 0; i < noutputs; i++)
+		if ((manifest_find_layer(&ps_layer_map, outputs[i].layer_id) != NULL) !=
+			(i < batch_index))
+			return -1;
+	return ps_manifest_add_new_layer(&outputs[batch_index]);
+}
+
+int
 ps_manifest_set_remote_location(uint64_t layer_id,
 								const PsLayerLocation *location)
 {

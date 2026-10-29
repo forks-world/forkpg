@@ -133,7 +133,8 @@ test_partial_batch_publication_restart(void)
 	PsKey key = {1, 1, 955, 0, PS_KLASS_RELATION};
 	PsImgRec *records = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*records));
 	unsigned char older[PSZ] = {1}, newer[PSZ] = {2}, concurrent[PSZ] = {3}, page[PSZ];
-	PsLayerDesc inputs[2], outputs[2], later;
+	PsLayerDesc inputs[2], outputs[2], later, captured[5];
+	uint32_t ncaptured = 0;
 	uint64_t ids[2] = {3, 4}, uncertain = 0;
 	uint32_t noutputs = 0;
 	pid_t child;
@@ -169,6 +170,10 @@ test_partial_batch_publication_restart(void)
 		check(ps_image_compaction_snapshot_valid(&ps_layer_map, inputs, 2, outputs, 2) == 1,
 			  "prepared inputs match the original manifest snapshot");
 	if (ok)
+		check(ps_manifest_publish_image_batch(inputs, 2, outputs, 2, 1) != 0 &&
+			  find_layer(outputs[0].layer_id) == NULL && find_layer(outputs[1].layer_id) == NULL,
+			  "batch publication rejects a missing earlier prefix");
+	if (ok)
 	{
 		PsImgRec later_rec = {.key = key, .block = PS_IMAGE_BATCH_MAX_RECORDS - 1,
 			.lsn = 100, .admission_seq = 8, .page = concurrent};
@@ -178,6 +183,9 @@ test_partial_batch_publication_restart(void)
 		check(ok, "publish a higher-sequence write after the preparation snapshot");
 		check(ok && ps_image_compaction_snapshot_valid(&ps_layer_map, inputs, 2, outputs, 2) == 0,
 			  "later source invalidates the snapshot before production publication");
+		check(ok && ps_manifest_publish_image_batch(inputs, 2, outputs, 2, 0) != 0 &&
+			  find_layer(outputs[0].layer_id) == NULL,
+			  "batch publication refuses the stale snapshot without appending");
 	}
 	if (ok)
 	{
@@ -228,41 +236,49 @@ test_partial_batch_publication_restart(void)
 	ids[1] = 7;
 	noutputs = 0;
 	uncertain = 0;
-	ok = ps_image_compaction_prepare(inputs, 2, ids, 2, PSZ, outputs,
+	captured[0] = inputs[0]; captured[1] = inputs[1]; captured[2] = later;
+	ok = find_layer(3) != NULL;
+	if (ok)
+		captured[3] = *find_layer(3);
+	ncaptured = 4;
+	ok = ok && ps_image_compaction_prepare(captured, ncaptured, ids, 2, PSZ, outputs,
 										&noutputs, &uncertain) == 0 && noutputs == 2 &&
-		ps_image_compaction_verify_coverage(inputs, 2, outputs, 2, PSZ) == 0;
+		ps_image_compaction_verify_coverage(captured, ncaptured, outputs, 2, PSZ) == 0;
 	check(ok, "prepare a complete replacement after partial recovery");
 	ps_manifest_close();
 	ps_layer_store->close();
 	if (!ok)
 		goto done;
-	/* Model a torn second ADD by truncating its synced record to a partial
-	 * header, then exit without manifest shutdown. This is a deterministic
-	 * replay fixture, not a claim about power-loss behavior. */
+	/* Force the second ADD to fail mid-write. The child exits without
+	 * manifest shutdown; this tests process-crash replay, not power loss. */
 	child = fork();
 	if (child == 0)
 	{
 		char path[4096];
 		struct stat before;
-		int fd = -1;
+		struct rlimit saved, limit;
 		int child_ok = snprintf(path, sizeof(path), "%s/layers.manifest", dir) > 0 &&
 			ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
 			ps_manifest_replay(&ps_layer_map) == 0 &&
-			ps_manifest_add_new_layer(&outputs[0]) == 0 && stat(path, &before) == 0 &&
-			ps_manifest_add_new_layer(&outputs[1]) == 0;
+			ps_manifest_publish_image_batch(captured, ncaptured, outputs, 2, 0) == 0 &&
+			stat(path, &before) == 0 && getrlimit(RLIMIT_FSIZE, &saved) == 0;
 		if (child_ok)
 		{
-			fd = open(path, O_WRONLY);
-			child_ok = fd >= 0 && ftruncate(fd, before.st_size + 8) == 0 && fsync(fd) == 0;
-			if (fd >= 0)
-				close(fd);
+			limit = saved;
+			limit.rlim_cur = (rlim_t) before.st_size + 8;
+			signal(SIGXFSZ, SIG_IGN);
+			child_ok = setrlimit(RLIMIT_FSIZE, &limit) == 0 &&
+				ps_manifest_publish_image_batch(captured, ncaptured, outputs, 2, 1) != 0 &&
+				ps_manifest_poisoned();
+			child_ok = setrlimit(RLIMIT_FSIZE, &saved) == 0 && child_ok &&
+				ps_manifest_mark_delete(inputs[0].layer_id) != 0;
 		}
 		_exit(child_ok ? 0 : 1);
 	}
 	if (child < 0 || waitpid(child, &status, 0) != child ||
 		!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 	{
-		check(0, "simulate a torn second output ADD");
+		check(0, "inject a torn second output ADD and verify poison fencing");
 		goto done;
 	}
 	check(ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
@@ -281,9 +297,13 @@ test_partial_batch_publication_restart(void)
 	ids[1] = 9;
 	noutputs = 0;
 	uncertain = 0;
-	ok = ps_image_compaction_prepare(inputs, 2, ids, 2, PSZ, outputs,
+	ok = find_layer(6) != NULL;
+	if (ok)
+		captured[4] = *find_layer(6);
+	ncaptured = 5;
+	ok = ok && ps_image_compaction_prepare(captured, ncaptured, ids, 2, PSZ, outputs,
 										&noutputs, &uncertain) == 0 && noutputs == 2 &&
-		ps_image_compaction_verify_coverage(inputs, 2, outputs, 2, PSZ) == 0;
+		ps_image_compaction_verify_coverage(captured, ncaptured, outputs, 2, PSZ) == 0;
 	check(ok, "prepare a replacement after quarantined torn ADD");
 	ps_manifest_close();
 	ps_layer_store->close();
@@ -294,27 +314,30 @@ test_partial_batch_publication_restart(void)
 	{
 		char path[4096];
 		struct stat before;
-		int fd = -1;
+		struct rlimit saved, limit;
 		int child_ok = ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
 			ps_manifest_replay(&ps_layer_map) == 0 &&
-			ps_manifest_add_new_layer(&outputs[0]) == 0 &&
-			ps_manifest_add_new_layer(&outputs[1]) == 0 &&
+			ps_manifest_publish_image_batch(captured, ncaptured, outputs, 2, 0) == 0 &&
+			ps_manifest_publish_image_batch(captured, ncaptured, outputs, 2, 1) == 0 &&
 			snprintf(path, sizeof(path), "%s/layers.manifest", dir) > 0 &&
-			stat(path, &before) == 0 &&
-			ps_manifest_mark_delete(inputs[0].layer_id) == 0;
+			stat(path, &before) == 0 && getrlimit(RLIMIT_FSIZE, &saved) == 0;
 		if (child_ok)
 		{
-			fd = open(path, O_WRONLY);
-			child_ok = fd >= 0 && ftruncate(fd, before.st_size + 8) == 0 && fsync(fd) == 0;
-			if (fd >= 0)
-				close(fd);
+			limit = saved;
+			limit.rlim_cur = (rlim_t) before.st_size + 8;
+			signal(SIGXFSZ, SIG_IGN);
+			child_ok = setrlimit(RLIMIT_FSIZE, &limit) == 0 &&
+				ps_manifest_mark_delete(inputs[0].layer_id) != 0 &&
+				ps_manifest_poisoned();
+			child_ok = setrlimit(RLIMIT_FSIZE, &saved) == 0 && child_ok &&
+				ps_manifest_mark_delete(inputs[1].layer_id) != 0;
 		}
 		_exit(child_ok ? 0 : 1);
 	}
 	if (child < 0 || waitpid(child, &status, 0) != child ||
 		!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 	{
-		check(0, "simulate a torn source tombstone after output publication");
+		check(0, "inject a torn source tombstone and verify poison fencing");
 		goto done;
 	}
 	check(ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
@@ -363,6 +386,28 @@ test_partial_batch_publication_restart(void)
 	check(find_layer(1) == NULL && find_layer(2) != NULL &&
 		  read_live_exact(&key, 0, page) == 1 && page[0] == 1,
 		  "GC can complete the tombstone while replacement stays readable");
+	{
+		PsLayerDesc live[PS_IMAGE_MERGE_MAX_INPUTS], staged[2], added;
+		unsigned char newest[PSZ] = {4};
+		PsImgRec new_rec = {.key = key, .block = PS_IMAGE_BATCH_MAX_RECORDS - 1,
+			.lsn = 100, .admission_seq = 9, .page = newest};
+		uint64_t staged_ids[2] = {20, 21}, unknown = 0;
+		uint32_t nlive = 0, nstaged = 0;
+
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (!ps_layer_map.layers[i].deleting && nlive < PS_IMAGE_MERGE_MAX_INPUTS)
+				live[nlive++] = ps_layer_map.layers[i];
+		ok = nlive > 0 && ps_image_compaction_prepare(live, nlive, staged_ids, 2,
+				PSZ, staged, &nstaged, &unknown) == 0 && nstaged == 2 &&
+			ps_image_compaction_verify_coverage(live, nlive, staged, nstaged, PSZ) == 0 &&
+			ps_manifest_publish_image_batch(live, nlive, staged, nstaged, 0) == 0 &&
+			ps_image_layer_write(22, 0, &new_rec, 1, PSZ, &added) == 0 &&
+			ps_manifest_add_new_layer(&added) == 0;
+		check(ok && ps_manifest_publish_image_batch(live, nlive, staged, nstaged, 1) != 0 &&
+			  find_layer(21) == NULL && read_live_latest(&key,
+				PS_IMAGE_BATCH_MAX_RECORDS - 1, page) == 1 && page[0] == 4,
+			  "a new layer between output ADDs blocks the next batch and preserves the write");
+	}
 	ps_manifest_close();
 	ps_layer_store->close();
 done:

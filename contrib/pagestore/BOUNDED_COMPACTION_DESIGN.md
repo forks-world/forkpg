@@ -90,11 +90,11 @@ inputs using such a record until an independently enforced upgrade/downgrade
 barrier exists. An alternative to investigate is existing ADD and MARK_DELETE
 records after exact-identity winners are selected, keeping all sources until
 every output ADD is durable. Its crash and concurrent-write properties still
-require proof and tests. The strict single-output ADD helper rejects ID
-collisions, but does not itself prove coverage, fence concurrent changes, or
-retire inputs. Process-exit tests cover a partial output prefix, a later partial
-input retirement, and simulated torn ADD and MARK_DELETE tails. Actual write
-failures and the production orchestration still need dedicated coverage.
+require proof and tests. The single-batch ADD helper checks snapshot identity
+and publication order, but does not itself prove coverage, acquire fences, or
+retire inputs. Process-exit tests cover partial output and source retirement,
+and use file-size limits to force torn ADD and MARK_DELETE writes. The
+production orchestration still needs dedicated concurrency and recovery tests.
 
 All output IDs must be reserved under the shard allocator before the snapshot
 is released, so a later layer cannot reuse an output ID or receive an earlier
