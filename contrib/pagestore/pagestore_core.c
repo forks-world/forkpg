@@ -2995,6 +2995,12 @@ gc_finish_local(uint64_t layer_id, int remote_done)
 		{
 			PsTimelineState state;
 
+			if (__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+								__ATOMIC_ACQUIRE) != 0)
+			{
+				ps_unlock_map();
+				return 0;
+			}
 			if (!ps_timeline_state(ps_layer_map.layers[i].timeline, &state, NULL) ||
 				(state != PS_TIMELINE_LIVE && state != PS_TIMELINE_DELETING))
 				break;
@@ -3123,6 +3129,8 @@ gc_remote_one(void)
 			PsTimelineState timeline_state;
 
 			if (ps_layer_map.layers[i].deleting &&
+				__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+								__ATOMIC_ACQUIRE) == 0 &&
 				ps_timeline_state(ps_layer_map.layers[i].timeline,
 								  &timeline_state, NULL) &&
 				(timeline_state == PS_TIMELINE_LIVE ||
@@ -4103,9 +4111,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 				if (ps_layer_map.layers[i].layer_id == old[k].layer_id)
 				{
 					found = !ps_layer_map.layers[i].deleting &&
-						ps_layer_map.layers[i].remote_durable == old[k].remote_durable &&
-						__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
-											__ATOMIC_ACQUIRE) == 1;
+						ps_layer_map.layers[i].remote_durable == old[k].remote_durable;
 					__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
 					break;
 				}
@@ -4230,16 +4236,18 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		 * not durable).  A failed unlink is not a manifest error: the layer is
 		 * durably deleting, so we can move on and let gc_resume() retry it.
 		 */
-		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-			if (ps_layer_map.layers[i].layer_id == old[k].layer_id &&
-				__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
-							 __ATOMIC_ACQUIRE) != 0)
-				goto next_old;
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
 		/* The replacement is visible and this source is now durably retired. */
 		if (ps_fault_probe(PS_FAULT_POINT_PAGE_GC_AFTER_MARK_DELETE) != 0)
 			goto cleanup;
+		/* Existing snapshot readers may still open this source.  New readers
+		 * skip the tombstone and use the published replacement. */
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == old[k].layer_id &&
+				__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+								__ATOMIC_ACQUIRE) != 0)
+				goto next_old;
 		layer_verified_forget(old[k].layer_id);
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */

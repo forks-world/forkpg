@@ -332,6 +332,7 @@ typedef struct StagedCompactionProbe
 	int hold_reader;
 	int max_calls;
 	uint64_t remote_layer_id;
+	PsLayerDesc pinned_layer;
 	uint32_t layers_after_write;
 } StagedCompactionProbe;
 
@@ -354,6 +355,7 @@ staged_compaction_foreground(void *arg)
 				!ps_layer_map.layers[i].deleting)
 			{
 				probe->remote_layer_id = ps_layer_map.layers[i].layer_id;
+				probe->pinned_layer = ps_layer_map.layers[i];
 				__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1,
 								   __ATOMIC_ACQ_REL);
 				probe->write_ok = 1;
@@ -423,11 +425,15 @@ test_staged_compaction_rejects_remote_transition(void)
 }
 
 static void
-test_staged_compaction_rejects_pinned_reader(void)
+test_staged_compaction_preserves_pinned_reader(void)
 {
 	char store[] = "/tmp/pagestore-staged-reader-XXXXXX";
 	StagedCompactionProbe probe = {.hold_reader = 1};
 	int released = 0;
+	int marked = 0;
+	PsKey key = control_key();
+	unsigned char page[8192];
+	uint64_t found_lsn = 0, found_seq = 0;
 
 	configure_core(1);
 	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
@@ -439,9 +445,20 @@ test_staged_compaction_rejects_pinned_reader(void)
 		(void) ps_core_maintenance();
 	ps_test_set_compaction_unlocked_hook(NULL, NULL);
 	ps_lock_map_rd();
-	check(probe.called == 1 && probe.write_ok &&
-		  ps_layer_map_count(&ps_layer_map) == probe.layers_after_write,
-		  "concurrent layer reader invalidates staged replacement");
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == probe.remote_layer_id)
+			marked = ps_layer_map.layers[i].deleting;
+	ps_unlock_map();
+	check(probe.called == 1 && probe.write_ok && marked,
+		  "compaction publishes while retaining a pinned source");
+	run_maintenance(32);
+	check(ps_layer_store->layer_exists_local(probe.remote_layer_id) == 1,
+		  "background GC leaves the pinned source on disk");
+	check(ps_image_layer_lookup(&probe.pinned_layer, &key,
+			PS_REDO_NOTE_BLOCK, UINT64_MAX, 0, page, page_size,
+			&found_lsn, &found_seq) == 1,
+		  "pinned source remains readable during GC");
+	ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].layer_id == probe.remote_layer_id)
 		{
@@ -453,6 +470,8 @@ test_staged_compaction_rejects_pinned_reader(void)
 	ps_unlock_map();
 	check(released, "concurrent reader can release the original layer");
 	run_maintenance(64);
+	check(ps_layer_store->layer_exists_local(probe.remote_layer_id) == 0,
+		  "background GC reclaims the source after the reader releases it");
 	close_store();
 	remove_tree(store);
 }
@@ -1484,7 +1503,7 @@ main(void)
 	test_staged_compaction_rejects_concurrent_write(2);
 	test_staged_compaction_rejects_new_retention_pin();
 	test_staged_compaction_rejects_remote_transition();
-	test_staged_compaction_rejects_pinned_reader();
+	test_staged_compaction_preserves_pinned_reader();
 	test_staged_compaction_makes_progress_after_conflicts();
 	test_compaction_source_read_batch();
 	check(ps_test_control_fence_selections() == 0, "cached control fence selections match the original planner");
