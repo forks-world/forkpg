@@ -3746,7 +3746,8 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 				return -1;
 			}
 			for (uint32_t i = first; i < end; i++)
-				if (keep[i - first] && order[i].version.lsn < floor &&
+				if (keep[i - first] && !closure_protect[i - first] &&
+					order[i].version.lsn < floor &&
 					!prune_version_needed(timeline, &order[first].key,
 										  order[first].block, versions,
 										  end - first, i - first, floor,
