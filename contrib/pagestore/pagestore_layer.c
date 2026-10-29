@@ -1124,7 +1124,9 @@ ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 			for (source = 0; source < count && layers[source].layer_id != layer_id; source++)
 				;
 			if (source == count || data_ends[source] < page_size ||
-				ent.data_off > data_ends[source] - page_size || ent.data_off % page_size != 0)
+				ent.data_off > data_ends[source] - page_size || ent.data_off % page_size != 0 ||
+				!layer_covers(&layers[source], &ent.key, ent.block) ||
+				ent.lsn < layers[source].lsn_start || ent.lsn > layers[source].lsn_end)
 				goto out;
 		}
 		if (next == 1 && (!have_pending ||
@@ -1264,7 +1266,9 @@ ps_image_compaction_verify_coverage(const PsLayerDesc *inputs, uint32_t ninputs,
 			for (source = 0; source < ninputs && inputs[source].layer_id != id; source++)
 				;
 			if (source == ninputs || src_ends[source] < page_size ||
-				ent.data_off > src_ends[source] - page_size || ent.data_off % page_size != 0)
+				ent.data_off > src_ends[source] - page_size || ent.data_off % page_size != 0 ||
+				!layer_covers(&inputs[source], &ent.key, ent.block) ||
+				ent.lsn < inputs[source].lsn_start || ent.lsn > inputs[source].lsn_end)
 				goto out;
 		}
 		if (next == 1 && (!have_pending || image_identity_equal(&pending, &ent)))
@@ -1292,6 +1296,8 @@ ps_image_compaction_verify_coverage(const PsLayerDesc *inputs, uint32_t ninputs,
 				;
 			if (si == ninputs || di == noutputs || dst_ends[di] < page_size ||
 				actual.data_off > dst_ends[di] - page_size || actual.data_off % page_size != 0 ||
+				!layer_covers(&outputs[di], &actual.key, actual.block) ||
+				actual.lsn < outputs[di].lsn_start || actual.lsn > outputs[di].lsn_end ||
 				ps_layer_store->read_layer_block(&inputs[si], pending.data_off, src_page, page_size) != 0 ||
 				ps_layer_store->read_layer_block(&outputs[di], actual.data_off, dst_page, page_size) != 0 ||
 				memcmp(src_page, dst_page, page_size) != 0)

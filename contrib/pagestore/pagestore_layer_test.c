@@ -710,11 +710,34 @@ prepared_batch_boundary_test(void)
 
 		check(ps_image_compaction_verify_coverage(inputs, 2, outputs, 1, PSZ) == 0,
 			  "coverage verifies the winning legacy duplicate");
+		wrong = outputs[0];
+		wrong.start_block++;
+		check(ps_image_compaction_verify_coverage(inputs, 2, &wrong, 1, PSZ) != 0,
+			  "coverage rejects a descriptor that hides an output page");
+		{
+			PsLayerDesc invalid_inputs[2] = {inputs[0], inputs[1]};
+			PsLayerDesc unused;
+			uint64_t new_id = 1306, unknown = 0;
+			uint32_t n = 0;
+
+			invalid_inputs[0].start_block++;
+			check(ps_image_compaction_verify_coverage(invalid_inputs, 2, outputs, 1, PSZ) != 0 &&
+				  ps_image_compaction_prepare(invalid_inputs, 2, &new_id, 1, PSZ,
+										  &unused, &n, &unknown) != 0 && n == 0,
+				  "hidden input pages cannot be promoted by preparation or verification");
+		}
 		check(ps_image_layer_write(1304, 0, &wrong_rec, 1, PSZ, &wrong) == 0 &&
 			  ps_image_compaction_verify_coverage(inputs, 2, &wrong, 1, PSZ) != 0,
 			  "coverage rejects correct identity with the wrong source bytes");
 		check(ps_layer_store->delete_local_layer(&wrong) == 0,
 			  "remove wrong-coverage fixture");
+		wrong_rec.page = newer;
+		wrong_rec.growth_lsn = 9;
+		check(ps_image_layer_write(1305, 0, &wrong_rec, 1, PSZ, &wrong) == 0 &&
+			  ps_image_compaction_verify_coverage(inputs, 2, &wrong, 1, PSZ) != 0,
+			  "coverage rejects changed recovery metadata even with correct bytes");
+		check(ps_layer_store->delete_local_layer(&wrong) == 0,
+			  "remove wrong-metadata fixture");
 		check(ps_image_layer_lookup_exact(&outputs[0], &key, 0, 100, 0,
 										result, PSZ, NULL, NULL) == 1 && result[0] == 2 &&
 			  ps_image_layer_read_index(&outputs[0], &index, &nindex) == 0 && nindex == 1,
