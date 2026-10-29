@@ -16,6 +16,7 @@
 #endif
 
 #include <stdint.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,7 @@
 #include "pagestore_core.h"
 #include "pagestore_layer.h"
 #include "pagestore_layer_store.h"
+#include "pagestore_manifest.h"
 
 static int checks;
 static int failed;
@@ -318,6 +320,259 @@ close_store(void)
 	ps_core_close();
 	if (ps_storage->close != NULL)
 		ps_storage->close();
+}
+
+typedef struct StagedCompactionProbe
+{
+	int called;
+	int read_ok;
+	int write_ok;
+	int pin_only;
+	int remote_transition;
+	int hold_reader;
+	int max_calls;
+	uint64_t remote_layer_id;
+	PsLayerDesc pinned_layer;
+	uint32_t layers_after_write;
+} StagedCompactionProbe;
+
+static void staged_compaction_concurrent_write(void *arg);
+
+static void *
+staged_compaction_foreground(void *arg)
+{
+	StagedCompactionProbe *probe = arg;
+	uint64_t version = 0;
+
+	probe->read_ok = read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 2000, &version) &&
+		version == 2000;
+	if (probe->hold_reader)
+	{
+		/* Keep a concurrent reader's layer pin until validation finishes. */
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting)
+			{
+				probe->remote_layer_id = ps_layer_map.layers[i].layer_id;
+				probe->pinned_layer = ps_layer_map.layers[i];
+				__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1,
+								   __ATOMIC_ACQ_REL);
+				probe->write_ok = 1;
+				break;
+			}
+		ps_unlock_map();
+	}
+	else if (probe->remote_transition)
+	{
+		/* Model the in-memory publication performed by the upload worker.
+		 * The test restores the flag before closing the fixture. */
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting)
+			{
+				probe->remote_layer_id = ps_layer_map.layers[i].layer_id;
+				ps_layer_map.layers[i].remote_durable = true;
+				probe->write_ok = 1;
+				break;
+			}
+		ps_unlock_map();
+	}
+	else if (probe->pin_only)
+		probe->write_ok = reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+									 PS_RETENTION_RESOURCE_ALL, 2000);
+	else
+		probe->write_ok = write_relation(0, 1, 3000);
+	ps_lock_map_rd();
+	probe->layers_after_write = ps_layer_map_count(&ps_layer_map);
+	ps_unlock_map();
+	return NULL;
+}
+
+static void
+test_staged_compaction_rejects_remote_transition(void)
+{
+	char store[] = "/tmp/pagestore-staged-remote-XXXXXX";
+	StagedCompactionProbe probe = {.remote_transition = 1};
+	int restored = 0;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open staged remote transition store");
+	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
+		  "prepare staged remote transition sources");
+	ps_test_set_compaction_unlocked_hook(staged_compaction_concurrent_write, &probe);
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_wr();
+	check(probe.called == 1 && probe.write_ok &&
+		  ps_layer_map_count(&ps_layer_map) == probe.layers_after_write,
+		  "remote durability transition invalidates staged replacement");
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == probe.remote_layer_id)
+		{
+			ps_layer_map.layers[i].remote_durable = false;
+			restored = 1;
+			break;
+		}
+	ps_unlock_map();
+	check(restored, "remote transition leaves the original layer live");
+	run_maintenance(64);
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_staged_compaction_preserves_pinned_reader(void)
+{
+	char store[] = "/tmp/pagestore-staged-reader-XXXXXX";
+	StagedCompactionProbe probe = {.hold_reader = 1};
+	int released = 0;
+	int marked = 0;
+	PsKey key = control_key();
+	unsigned char page[8192];
+	uint64_t found_lsn = 0, found_seq = 0;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open staged reader store");
+	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
+		  "prepare staged reader sources");
+	ps_test_set_compaction_unlocked_hook(staged_compaction_concurrent_write, &probe);
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == probe.remote_layer_id)
+			marked = ps_layer_map.layers[i].deleting;
+	ps_unlock_map();
+	check(probe.called == 1 && probe.write_ok && marked,
+		  "compaction publishes while retaining a pinned source");
+	run_maintenance(32);
+	check(ps_layer_store->layer_exists_local(probe.remote_layer_id) == 1,
+		  "background GC leaves the pinned source on disk");
+	check(ps_image_layer_lookup(&probe.pinned_layer, &key,
+			PS_REDO_NOTE_BLOCK, UINT64_MAX, 0, page, page_size,
+			&found_lsn, &found_seq) == 1,
+		  "pinned source remains readable during GC");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == probe.remote_layer_id)
+		{
+			__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1,
+								   __ATOMIC_ACQ_REL);
+			released = 1;
+			break;
+		}
+	ps_unlock_map();
+	check(released, "concurrent reader can release the original layer");
+	run_maintenance(64);
+	check(ps_layer_store->layer_exists_local(probe.remote_layer_id) == 0,
+		  "background GC reclaims the source after the reader releases it");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+staged_compaction_concurrent_write(void *arg)
+{
+	StagedCompactionProbe *probe = arg;
+	pthread_t thread;
+
+	probe->called++;
+	if (probe->called >= (probe->max_calls ? probe->max_calls : 1))
+		ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	if (pthread_create(&thread, NULL, staged_compaction_foreground, arg) == 0)
+		(void) pthread_join(thread, NULL);
+}
+
+static void
+test_staged_compaction_makes_progress_after_conflicts(void)
+{
+	char store[] = "/tmp/pagestore-staged-retry-XXXXXX";
+	StagedCompactionProbe probe = {.max_calls = 1};
+	uint64_t version = 0;
+	uint32_t layers;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open staged compaction retry store");
+	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
+		  "prepare sources for staged retry");
+	ps_test_set_compaction_unlocked_hook(staged_compaction_concurrent_write, &probe);
+	run_maintenance(64);
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_rd();
+	layers = ps_layer_map_count(&ps_layer_map);
+	ps_unlock_map();
+	check(probe.called == 1 && probe.write_ok && layers < probe.layers_after_write,
+		  "compaction makes progress after repeated conflicts");
+	check(read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 2000, &version) && version == 2000,
+		  "fallback preserves control image after conflicts");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_staged_compaction_rejects_concurrent_write(uint32_t nshards)
+{
+	char store[] = "/tmp/pagestore-staged-compaction-XXXXXX";
+	StagedCompactionProbe probe = {0};
+	uint64_t version = 0;
+
+	configure_core(1);
+	ps_nshards = nshards;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open staged compaction store");
+	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
+		  "prepare staged compaction sources");
+	ps_test_set_compaction_unlocked_hook(staged_compaction_concurrent_write, &probe);
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	check(probe.called == 1 && probe.read_ok && probe.write_ok,
+		  "foreground reads and writes proceed during staged output");
+	ps_lock_map_rd();
+	check(ps_layer_map_count(&ps_layer_map) == probe.layers_after_write,
+		  "concurrent write invalidates staged replacement");
+	ps_unlock_map();
+	run_maintenance(64);
+	check(read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 2000, &version) && version == 2000,
+		  "retry preserves control image after concurrent write");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_staged_compaction_rejects_new_retention_pin(void)
+{
+	char store[] = "/tmp/pagestore-staged-pin-XXXXXX";
+	StagedCompactionProbe probe = {.pin_only = 1};
+	uint64_t version = 0;
+
+	configure_core(1);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open staged retention store");
+	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
+		  "prepare staged retention sources");
+	ps_test_set_compaction_unlocked_hook(staged_compaction_concurrent_write, &probe);
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	check(probe.called == 1 && probe.read_ok && probe.write_ok,
+		  "retention pin can be installed during staged output");
+	ps_lock_map_rd();
+	check(ps_layer_map_count(&ps_layer_map) == probe.layers_after_write,
+		  "new retention pin invalidates staged replacement");
+	ps_unlock_map();
+	run_maintenance(64);
+	check(read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 2000, &version) && version == 2000,
+		  "retry preserves the pinned control image");
+	close_store();
+	remove_tree(store);
 }
 
 /* Three checkpoints; the materializer floor above all of them keeps only the
@@ -1244,6 +1499,12 @@ test_compaction_source_read_batch(void)
 int
 main(void)
 {
+	test_staged_compaction_rejects_concurrent_write(1);
+	test_staged_compaction_rejects_concurrent_write(2);
+	test_staged_compaction_rejects_new_retention_pin();
+	test_staged_compaction_rejects_remote_transition();
+	test_staged_compaction_preserves_pinned_reader();
+	test_staged_compaction_makes_progress_after_conflicts();
 	test_compaction_source_read_batch();
 	check(ps_test_control_fence_selections() == 0, "cached control fence selections match the original planner");
 	test_floor_retires_older_checkpoints();

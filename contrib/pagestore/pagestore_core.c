@@ -698,6 +698,15 @@ ps_test_wal_reclaim_watch_count(uint32_t tl)
  * merge or prune" early return).  Used to prove idle maintenance performs no
  * compaction when nothing requested one. */
 static uint64_t ps_test_compaction_pass_count;
+static void (*compaction_unlocked_test_hook)(void *);
+static void *compaction_unlocked_test_hook_arg;
+
+void
+ps_test_set_compaction_unlocked_hook(void (*hook)(void *), void *arg)
+{
+	compaction_unlocked_test_hook = hook;
+	compaction_unlocked_test_hook_arg = arg;
+}
 
 uint64_t
 ps_test_compaction_count(void)
@@ -2084,6 +2093,7 @@ typedef struct Shard
 	int			note_flush_pending;	/* a checkpoint note awaits durability */
 	int			coverage_broken;	/* a record was not staged; do not advance */
 	uint64_t	next_layer_id;		/* next layer-local id for this shard */
+	unsigned	staged_compaction_retries;
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
 				rr_seg;
@@ -2985,6 +2995,12 @@ gc_finish_local(uint64_t layer_id, int remote_done)
 		{
 			PsTimelineState state;
 
+			if (__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+								__ATOMIC_ACQUIRE) != 0)
+			{
+				ps_unlock_map();
+				return 0;
+			}
 			if (!ps_timeline_state(ps_layer_map.layers[i].timeline, &state, NULL) ||
 				(state != PS_TIMELINE_LIVE && state != PS_TIMELINE_DELETING))
 				break;
@@ -3113,6 +3129,8 @@ gc_remote_one(void)
 			PsTimelineState timeline_state;
 
 			if (ps_layer_map.layers[i].deleting &&
+				__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+								__ATOMIC_ACQUIRE) == 0 &&
 				ps_timeline_state(ps_layer_map.layers[i].timeline,
 								  &timeline_state, NULL) &&
 				(timeline_state == PS_TIMELINE_LIVE ||
@@ -3879,6 +3897,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	uint32_t	ndropped = 0;
 	CompactReadCache read_cache = {0};
 	uint64_t	frontier_seq;
+	uint64_t	retention_epoch = 0, timeline_epoch = 0, admission_epoch = 0;
+	int			stage_unlocked = g_shards[shard].staged_compaction_retries < 1;
 	int			rc = -1;
 
 	if (!ps_timeline_live(timeline))
@@ -4036,6 +4056,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	if (nold == 1 && ndropped == 0 && !old[0].legacy_shard_zero)
 	{
 		rc = 1;
+		g_shards[shard].staged_compaction_retries = 0;
 		goto cleanup;
 	}
 	frontier_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
@@ -4046,7 +4067,67 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	if (nrec != 0)
 	{
 	nid = alloc_layer_id(&g_shards[shard]);
-	if (ps_image_layer_write_stream(nid, timeline, recs, nrec, page_size,
+	/* Remote publication has additional provider cleanup requirements and
+	 * retains the existing locked path for now. */
+	for (uint32_t k = 0; k < nold; k++)
+		if (old[k].remote_durable)
+			stage_unlocked = 0;
+	if (stage_unlocked && ps_retention_epoch(&retention_epoch) != 0)
+		goto cleanup;
+	if (stage_unlocked)
+	{
+		int write_rc, valid = 1;
+		uint64_t current_retention_epoch;
+
+		timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+		admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+		for (uint32_t k = 0; k < nold; k++)
+			for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+				if (ps_layer_map.layers[i].layer_id == old[k].layer_id)
+					__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+		ps_unlock_map();
+		pthread_rwlock_unlock(&page_prune_lock);
+		for (uint32_t s = core_shards(); s > 0; s--)
+			ps_unlock_shard(s - 1);
+		if (compaction_unlocked_test_hook != NULL)
+			compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
+		write_rc = ps_image_layer_write_stream(nid, timeline, recs, nrec,
+						page_size, compact_read_page, &read_cache, &newdesc);
+		for (uint32_t s = 0; s < core_shards(); s++)
+			ps_lock_shard_wr(s);
+		pthread_rwlock_rdlock(&page_prune_lock);
+		ps_lock_map_wr();
+		if (ps_retention_epoch(&current_retention_epoch) != 0 ||
+			current_retention_epoch != retention_epoch ||
+			__atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE) != timeline_epoch ||
+			__atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE) != admission_epoch ||
+			count_image_layers(timeline, shard) != nold ||
+			!ps_timeline_live(timeline) || ps_manifest_poisoned())
+			valid = 0;
+		for (uint32_t k = 0; k < nold; k++)
+		{
+			int found = 0;
+			for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+				if (ps_layer_map.layers[i].layer_id == old[k].layer_id)
+				{
+					found = !ps_layer_map.layers[i].deleting &&
+						ps_layer_map.layers[i].remote_durable == old[k].remote_durable;
+					__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+					break;
+				}
+			if (!found)
+				valid = 0;
+		}
+		if (write_rc != 0 || !valid)
+		{
+			if (!valid && g_shards[shard].staged_compaction_retries < 1)
+				g_shards[shard].staged_compaction_retries++;
+			if (write_rc == 0)
+				(void) ps_layer_store->delete_local_layer(&newdesc);
+			goto cleanup;
+		}
+	}
+	else if (ps_image_layer_write_stream(nid, timeline, recs, nrec, page_size,
 						 compact_read_page, &read_cache, &newdesc) != 0)
 		goto cleanup;
 	for (uint32_t k = 0; k < nold; k++)
@@ -4155,16 +4236,18 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		 * not durable).  A failed unlink is not a manifest error: the layer is
 		 * durably deleting, so we can move on and let gc_resume() retry it.
 		 */
-		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-			if (ps_layer_map.layers[i].layer_id == old[k].layer_id &&
-				__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
-							 __ATOMIC_ACQUIRE) != 0)
-				goto next_old;
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
 		/* The replacement is visible and this source is now durably retired. */
 		if (ps_fault_probe(PS_FAULT_POINT_PAGE_GC_AFTER_MARK_DELETE) != 0)
 			goto cleanup;
+		/* Existing snapshot readers may still open this source.  New readers
+		 * skip the tombstone and use the published replacement. */
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == old[k].layer_id &&
+				__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+								__ATOMIC_ACQUIRE) != 0)
+				goto next_old;
 		layer_verified_forget(old[k].layer_id);
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
@@ -4183,6 +4266,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		;
 	}
 	rc = 1;
+	g_shards[shard].staged_compaction_retries = 0;
 
 cleanup:
 	for (int i = 0; i < COMPACT_READ_SLOTS; i++)
@@ -26105,7 +26189,6 @@ ps_core_maintenance_impl(void)
 	uint64_t	page_floor = 0;
 	int			found = 0;
 	int			did = 0;
-	int			legacy_compaction = 0;
 	int			forkmeta_gc_scan_incomplete = 0;
 	int			forkmeta_temp_gc_observation_stale = 0;
 	int			snapshot_gc_due;
@@ -26460,31 +26543,25 @@ ps_core_maintenance_impl(void)
 				ftl = tl;
 				fsh = sh;
 				found = 1;
-				for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-					if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
-						!ps_layer_map.layers[i].deleting &&
-						ps_layer_map.layers[i].timeline == tl &&
-						layer_shard_from_id(ps_layer_map.layers[i].layer_id) == sh &&
-						ps_layer_map.layers[i].legacy_shard_zero)
-						legacy_compaction = 1;
 				break;
 			}
 	ps_unlock_map();
 
 	/*
-	 * Phase 2: compact the chosen shard under shard-wr + map-wr (the order other
-	 * paths use), which excludes that shard's worker and other map mutators.
-	 * Re-check under the write lock since the count may have changed.
+	 * Phase 2: drain all shard writers before taking the pruning snapshot and
+	 * map lock.  Staged local output releases these locks and validates the
+	 * snapshot after reacquiring them in the same order.
 	 */
 	if (found)
 	{
 		if (materialize_compaction_inputs(ftl, fsh) == 0)
 		{
-			if (legacy_compaction)
-				for (uint32_t sh = 0; sh < ns; sh++)
-					ps_lock_shard_wr(sh);
-			else
-				ps_lock_shard_wr(fsh);
+			/* Drain every shard before taking the admission sequence snapshot.
+			 * A writer on a different shard may have allocated its sequence but
+			 * still be waiting for map-rd; without this drain it could mutate a
+			 * pruning fence during staged I/O without changing that snapshot. */
+			for (uint32_t sh = 0; sh < ns; sh++)
+				ps_lock_shard_wr(sh);
 			pthread_rwlock_rdlock(&page_prune_lock);
 			ps_lock_map_wr();
 			if (ps_timeline_live(ftl) &&
@@ -26510,11 +26587,8 @@ ps_core_maintenance_impl(void)
 			}
 			ps_unlock_map();
 			pthread_rwlock_unlock(&page_prune_lock);
-			if (legacy_compaction)
-				for (uint32_t sh = ns; sh > 0; sh--)
-					ps_unlock_shard(sh - 1);
-			else
-				ps_unlock_shard(fsh);
+			for (uint32_t sh = ns; sh > 0; sh--)
+				ps_unlock_shard(sh - 1);
 		}
 	}
 	/* Keep compaction inputs resident until due compaction has run.  Evicting
