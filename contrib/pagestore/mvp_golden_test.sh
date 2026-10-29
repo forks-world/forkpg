@@ -819,8 +819,11 @@ assert_eq "$("${BP[@]}" -c "SELECT pagestore_ext.pagestore_shipped_wal_lsn();")"
 
 "${BP[@]}" -c "INSERT INTO mvp_golden VALUES (3, 'branch_local'); CHECKPOINT;" \
 	>/dev/null || fail "branch could not write on its own timeline"
+echo "pagestore.startup_ancestry_timeout = '90s'" >> "$BRANCH/postgresql.conf"
 "$BIN/pg_ctl" -D "$BRANCH" -m fast -w restart >/dev/null 2>&1 ||
 	fail "branch compute restart failed"
+assert_eq "$("${BP[@]}" -c "SELECT current_setting('pagestore.startup_ancestry_timeout');")" \
+	"90s" "branch startup ancestry timeout is configurable"
 assert_eq "$("${BP[@]}" -c "SELECT note FROM mvp_golden WHERE id=3;")" \
 	"branch_local" "branch write survives compute restart on timeline 1"
 assert_eq "$("${BP[@]}" -c "SELECT count(*) FROM mvp_golden WHERE id=2;")" \

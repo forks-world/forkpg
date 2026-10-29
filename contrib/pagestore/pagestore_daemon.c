@@ -726,6 +726,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_RETENTION_FLOOR:
 		case PS_OP_ADMISSION_BARRIER:
 		case PS_OP_TIMELINE_STATE:
+		case PS_OP_TIMELINE_INFO:
 			return 0;
 		default:
 			return 1;

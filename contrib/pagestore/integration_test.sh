@@ -696,6 +696,8 @@ $P -c "CREATE FUNCTION pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS bigint
         AS 'pagestore','pagestore_slru_read_at' LANGUAGE C STRICT;" >/dev/null
 assert "$($P -c "SELECT current_setting('pagestore.slru_snapshot_timeout');")" "1min" \
     "SLRU snapshot requests have a bounded 60 second default"
+assert "$($P -c "SELECT current_setting('pagestore.startup_ancestry_timeout');")" "1min" \
+    "startup ancestry requests have a bounded 60 second default"
 assert "$($P -c "SELECT set_config('pagestore.slru_snapshot_timeout', '90s', false);")" "90s" \
     "SLRU snapshot request timeout is configurable"
 $P -c "CHECKPOINT;" >/dev/null

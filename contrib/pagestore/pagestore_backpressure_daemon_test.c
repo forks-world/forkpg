@@ -528,6 +528,25 @@ run_test(const char *daemon_path)
 	check(wait_for_state(reader, PS_STATE_DONE, 1000) &&
 		  reader->status == PS_STATUS_OK,
 		  "TIMELINE_INFO continues during page throttle");
+	/* A timeline lookup is metadata-only even when the channel still has a
+	 * relation key.  Hold a synthetic admission fence at the maximum cutoff:
+	 * read requests must not enter the mutation admission path at all. */
+	ps_store_release_u64(&hdr->admission_pending_lsn, UINT64_MAX);
+	ps_store_release(&hdr->admission_fence_owner, (uint32_t) getpid());
+	ps_store_release_u64(&hdr->admission_pending_epoch, 1);
+	reader->opcode = PS_OP_TIMELINE_INFO;
+	reader->timeline = 0;
+	reader->incarnation = 1;
+	reader->req_lsn = 0;
+	reader->req_seq = 0;
+	ps_request_generation_next(reader);
+	ps_store_release(&reader->state, PS_STATE_REQUEST);
+	int timeline_finished = wait_for_state(reader, PS_STATE_DONE, 1000);
+	ps_store_release_u64(&hdr->admission_pending_epoch, 0);
+	ps_store_release_u64(&hdr->admission_pending_lsn, 0);
+	ps_store_release(&hdr->admission_fence_owner, 0);
+	check(timeline_finished && reader->status == PS_STATUS_OK,
+		  "TIMELINE_INFO bypasses the mutation admission fence");
 	reader->opcode = PS_OP_CHECK_BRANCH;
 	reader->timeline = 77;
 	reader->parent_timeline = 0;
