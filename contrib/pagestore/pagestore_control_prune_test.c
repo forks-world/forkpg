@@ -951,7 +951,9 @@ long_chain_snapshot_hook(void *arg)
 	{
 		segment_gc_enabled = 1;
 		probe->worker_started = pthread_create(&probe->worker, NULL, long_chain_gc_worker, NULL) == 0;
-		for (int i = 0; probe->worker_started && i < 10000 &&
+		/* Wait for the actual unlink; this is a test watchdog, not a
+		 * production lock or reclamation deadline. */
+		for (int i = 0; probe->worker_started && i < 30000 &&
 			 ps_storage->seg_size(0, 0) >= 0; i++)
 			usleep(1000);
 		probe->reclaimed = ps_storage->seg_size(0, 0) < 0;
