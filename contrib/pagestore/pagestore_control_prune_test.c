@@ -323,7 +323,7 @@ close_store(void)
 }
 
 static int
-read_relation_at(uint32_t block, uint64_t lsn)
+read_relation_asof(uint32_t block, uint64_t lsn, uint64_t expected)
 {
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	unsigned char page[8192];
@@ -339,7 +339,13 @@ read_relation_at(uint32_t block, uint64_t lsn)
 		return 0;
 	memcpy(&hi, page, sizeof(hi));
 	memcpy(&lo, page + sizeof(hi), sizeof(lo));
-	return (((uint64_t) hi << 32) | lo) == lsn;
+	return (((uint64_t) hi << 32) | lo) == expected;
+}
+
+static int
+read_relation_at(uint32_t block, uint64_t lsn)
+{
+	return read_relation_asof(block, lsn, lsn);
 }
 
 static void
@@ -367,6 +373,78 @@ test_segment_gc_does_not_starve_compaction(void)
 	run_maintenance(64);
 	check(read_relation_at(0, 1000) && read_relation_at(23, 1023),
 		  "fair segment reclamation and compaction preserve pages");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_nonzero_floor_bounded_plan(int prune_needed)
+{
+	char store[] = "/tmp/pagestore-bounded-floor-XXXXXX";
+	uint64_t before;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open nonzero-floor compaction store");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "set nonzero page-history floor");
+	check(write_relation(0, 0, 1000) &&
+		  write_relation(0, prune_needed ? 0 : 1, 2000) &&
+		  write_relation(0, 2, 3000),
+		  "write relation-only input layers");
+	before = ps_test_bounded_nonzero_plan_count();
+	compact_layers = 1;
+	/* Count is process-global, so compare with the value before this store. */
+	for (int i = 0; i < 64 && !prune_needed &&
+		 ps_test_bounded_nonzero_plan_count() == before; i++)
+		(void) ps_core_maintenance();
+	if (!prune_needed)
+	{
+		check(ps_test_bounded_nonzero_plan_count() > before &&
+			  ps_test_page_prune_due(0, 0),
+			  "nonzero bounded merge preserves a later pruning request");
+		check(read_relation_at(0, 1000) && read_relation_at(1, 2000) &&
+			  read_relation_at(2, 3000),
+			  "bounded nonzero-floor merge preserves every page");
+	}
+	run_maintenance(64);
+	if (prune_needed)
+	{
+		uint32_t old_versions = 0;
+
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		{
+			PsImgIndexEnt *idx = NULL;
+			uint32_t n = 0;
+
+			if (ps_layer_map.layers[i].kind != PS_LAYER_IMAGE ||
+				ps_layer_map.layers[i].deleting)
+				continue;
+			if (ps_image_layer_read_index(&ps_layer_map.layers[i], &idx, &n) == 0)
+				for (uint32_t j = 0; j < n; j++)
+					if (idx[j].key.klass == PS_KLASS_RELATION &&
+						idx[j].block == 0 && idx[j].lsn == 1000)
+						old_versions++;
+			free(idx);
+		}
+		ps_unlock_map();
+		check(ps_test_bounded_nonzero_plan_count() == before,
+			  "prunable history falls back from the bounded merge");
+		check(old_versions == 0 && read_relation_asof(0, 5000, 2000),
+			  "fallback removes obsolete layer history and preserves its successor");
+	}
+	else
+		check(!ps_test_page_prune_due(0, 0),
+			  "deferred pruning eventually completes");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000,
+											prune_needed ? 2000 : 1000) &&
+		  read_relation_asof(2, 5000, 3000),
+		  "nonzero-floor result survives restart");
 	close_store();
 	remove_tree(store);
 }
@@ -561,6 +639,101 @@ test_bounded_compaction_concurrent_write(void)
 	run_maintenance(64);
 	check(read_relation_at(1, 2000) && read_relation_at(2, 3000) &&
 		  read_relation_at(3, 4000), "bounded retry preserves concurrent write");
+	close_store();
+	remove_tree(store);
+}
+
+typedef struct FloorPlanConflict
+{
+	int called;
+	int changed;
+	int pin_only;
+	int remote_transition;
+	uint64_t layer_id;
+} FloorPlanConflict;
+
+static void *
+floor_plan_foreground(void *arg)
+{
+	FloorPlanConflict *probe = arg;
+
+	if (probe->remote_transition)
+	{
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting)
+			{
+				probe->layer_id = ps_layer_map.layers[i].layer_id;
+				ps_layer_map.layers[i].remote_durable = true;
+				probe->changed = 1;
+				break;
+			}
+		ps_unlock_map();
+		return NULL;
+	}
+	probe->changed = probe->pin_only ?
+		reserve_pin(0, PS_RETENTION_OWNER_READER, 77, 1,
+					PS_RETENTION_RESOURCE_PAGE_HISTORY, 4500) :
+		write_relation(0, 3, 4000);
+	return NULL;
+}
+
+static void
+floor_plan_conflict_hook(void *arg)
+{
+	FloorPlanConflict *probe = arg;
+	pthread_t thread;
+
+	probe->called++;
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	if (pthread_create(&thread, NULL, floor_plan_foreground, arg) == 0)
+		(void) pthread_join(thread, NULL);
+}
+
+static void
+test_nonzero_bounded_plan_conflict(int mode)
+{
+	char store[] = "/tmp/pagestore-bounded-floor-conflict-XXXXXX";
+	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2};
+	uint32_t live = 0;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
+		  write_relation(0, 0, 1000) && write_relation(0, 1, 2000) &&
+		  write_relation(0, 2, 3000),
+		  "prepare nonzero-floor conflict sources");
+	ps_test_set_compaction_unlocked_hook(floor_plan_conflict_hook, &probe);
+	compact_layers = 1;
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	check(probe.called && probe.changed && live >= (uint32_t) (mode ? 3 : 4),
+		  "concurrent change rejects the nonzero-floor staged plan");
+	if (probe.remote_transition)
+	{
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == probe.layer_id)
+				ps_layer_map.layers[i].remote_durable = false;
+		ps_unlock_map();
+	}
+	run_maintenance(64);
+	check(read_relation_asof(0, 5000, 1000) &&
+		  read_relation_asof(1, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000) &&
+		  (mode != 0 || read_relation_asof(3, 5000, 4000)),
+		  "nonzero-floor retry preserves foreground data");
 	close_store();
 	remove_tree(store);
 }
@@ -1785,6 +1958,11 @@ test_compaction_source_read_batch(void)
 int
 main(void)
 {
+	test_nonzero_floor_bounded_plan(0);
+	test_nonzero_floor_bounded_plan(1);
+	test_nonzero_bounded_plan_conflict(0);
+	test_nonzero_bounded_plan_conflict(1);
+	test_nonzero_bounded_plan_conflict(2);
 	test_segment_gc_does_not_starve_compaction();
 	test_bounded_compaction_maintenance();
 	test_bounded_shared_payload_capacity_fallback();
