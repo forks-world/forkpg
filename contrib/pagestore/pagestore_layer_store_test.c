@@ -15,6 +15,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_store_owner.h"
 
@@ -50,13 +51,13 @@ file_matches(const char *path, const char *want)
 int
 main(void)
 {
-	char		local_dir[] = "/tmp/pslayerstorelocalXXXXXX";
-	char		other_local_dir[] = "/tmp/pslayerstoreotherXXXXXX";
-	char		object_dir[] = "/tmp/pslayerstoreobjectXXXXXX";
+	char		local_dir[PS_TEST_TEMP_PATH_MAX] = "pslayerstorelocalXXXXXX";
+	char		other_local_dir[PS_TEST_TEMP_PATH_MAX] = "pslayerstoreotherXXXXXX";
+	char		object_dir[PS_TEST_TEMP_PATH_MAX] = "pslayerstoreobjectXXXXXX";
 	char		owner_path[sizeof(object_dir) + 32];
 	char		stale_path[sizeof(object_dir) + 64];
 	char		retained_path[sizeof(local_dir) + 64];
-	char		alias_dir[] = "/tmp/pslayerstorealiasXXXXXX";
+	char		alias_dir[PS_TEST_TEMP_PATH_MAX] = "pslayerstorealiasXXXXXX";
 	char		saved_cwd[4096];
 	char		configured_object_dir[sizeof(object_dir) + 2];
 	char		expected_remote_uri[PS_LAYER_URI_MAX];
@@ -68,8 +69,8 @@ main(void)
 	PsLayerDesc layer;
 	PsLayerDesc remote_only;
 
-	if (mkdtemp(local_dir) == NULL || mkdtemp(other_local_dir) == NULL ||
-		mkdtemp(object_dir) == NULL)
+	if (ps_test_mkdtemp(local_dir, sizeof(local_dir)) == NULL || ps_test_mkdtemp(other_local_dir, sizeof(other_local_dir)) == NULL ||
+		ps_test_mkdtemp(object_dir, sizeof(object_dir)) == NULL)
 	{
 		fprintf(stderr, "setup failed\n");
 		return 2;
@@ -296,7 +297,7 @@ main(void)
 		int		leaf_linked;
 
 		ps_layer_map_init(&legacy);
-		alias_ready = mkdtemp(alias_dir) != NULL && rmdir(alias_dir) == 0 &&
+		alias_ready = ps_test_mkdtemp(alias_dir, sizeof(alias_dir)) != NULL && rmdir(alias_dir) == 0 &&
 			symlink(local_dir, alias_dir) == 0;
 		check(alias_ready, "create a legacy store spelling alias");
 		snprintf(validation_orphan, sizeof(validation_orphan),
@@ -692,9 +693,9 @@ main(void)
 	snprintf(owner_path, sizeof(owner_path), "%s/.pagestore-store-id", other_local_dir);
 	unlink(owner_path);
 	unlink(local_uri);
-	rmdir(local_dir);
-	rmdir(other_local_dir);
-	rmdir(object_dir);
+	ps_test_remove_tree(local_dir);
+	ps_test_remove_tree(other_local_dir);
+	ps_test_remove_tree(object_dir);
 	printf("pagestore_layer_store_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }
