@@ -24,6 +24,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
+
 #include "pagestore_core.h"
 #include "pagestore_forkmeta_snapshot.h"
 #include "pagestore_manifest.h"
@@ -74,16 +76,6 @@ check(int ok, const char *name)
 		fprintf(stderr, "FAIL: %s\n", name);
 		failed++;
 	}
-}
-
-static void
-remove_tree(const char *path)
-{
-	char		command[512];
-
-	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) > 0 &&
-		system(command) != 0)
-		fprintf(stderr, "warning: could not remove %s\n", path);
 }
 
 static void
@@ -401,7 +393,7 @@ directory_bytes(const char *path)
 static void
 test_truncate_churn_is_bounded(void)
 {
-	char		store[] = "/tmp/pagestore-lifecycle-churn-XXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-lifecycle-churn-XXXXXX";
 	char		snapshots[1100];
 	uint64_t	lsn = 1000;
 	unsigned char tag = 0;
@@ -413,7 +405,7 @@ test_truncate_churn_is_bounded(void)
 	configure_core();
 	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
 		  "arm a small forkmeta snapshot trigger");
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for truncate churn");
 	snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(fork_op(PS_OP_CREATE, lsn, 0, 0), "create the relation");
@@ -486,7 +478,7 @@ test_truncate_churn_is_bounded(void)
 		check(read_tag_at(b, lsn, &tag) == 0,
 			  "regrown block still has no content after restart");
 	close_store();
-	remove_tree(store);
+	ps_test_remove_tree(store);
 	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
 }
 
@@ -495,7 +487,7 @@ test_truncate_churn_is_bounded(void)
 static void
 test_reader_pin_keeps_invalidated_history(void)
 {
-	char		store[] = "/tmp/pagestore-lifecycle-reader-XXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-lifecycle-reader-XXXXXX";
 	unsigned char tag = 0;
 	int			records_pinned;
 	int			records_released;
@@ -503,7 +495,7 @@ test_reader_pin_keeps_invalidated_history(void)
 	configure_core();
 	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
 		  "arm a small forkmeta snapshot trigger for the reader test");
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for reader retention");
 	/* Two versions of block 0 give image compaction something to drop, which
 	 * publishes the durable page frontier the forkmeta cutoff needs. */
@@ -571,7 +563,7 @@ test_reader_pin_keeps_invalidated_history(void)
 	check(read_tag_at(1, 3600, &tag) == 0,
 		  "the regrown block still has no content after the fence retired");
 	close_store();
-	remove_tree(store);
+	ps_test_remove_tree(store);
 	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
 }
 
@@ -647,7 +639,7 @@ selected_cutoff_lsn(const char *store)
 static void
 test_frontier_less_branch_caps_cutoff(void)
 {
-	char		store[] = "/tmp/pagestore-lifecycle-branch-XXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-lifecycle-branch-XXXXXX";
 	uint64_t	lsn = 1000;
 	unsigned char tag = 0;
 	uint64_t	generation;
@@ -655,7 +647,7 @@ test_frontier_less_branch_caps_cutoff(void)
 	configure_core();
 	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
 		  "arm a small forkmeta snapshot trigger for the branch test");
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the branch cutoff test");
 	check(fork_op(PS_OP_CREATE, lsn, 0, 0) &&
 		  fork_op(PS_OP_ZEROEXTEND, lsn += 10, 2, 0) &&
@@ -691,7 +683,7 @@ test_frontier_less_branch_caps_cutoff(void)
 			  "root reads stay intact beside the branch");
 	}
 	close_store();
-	remove_tree(store);
+	ps_test_remove_tree(store);
 	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
 }
 
@@ -713,11 +705,11 @@ live_image_layers(uint32_t timeline)
 static void
 test_dropped_relation_retains_finite_fence(void)
 {
-	char		store[] = "/tmp/pagestore-lifecycle-drop-XXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-lifecycle-drop-XXXXXX";
 	unsigned char tag = 0;
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the drop test");
 	check(fork_op(PS_OP_CREATE, 1000, 0, 0) &&
 		  fork_op(PS_OP_ZEROEXTEND, 1010, 3, 0) &&
@@ -744,7 +736,7 @@ test_dropped_relation_retains_finite_fence(void)
 		  read_tag_at(0, 2500, &tag) == 0,
 		  "recovery retains first arrivals while keeping the relation absent");
 	close_store();
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 static int
@@ -814,10 +806,10 @@ block_death_asof(uint32_t timeline, uint32_t block, uint64_t lsn)
 static void
 test_block_death_asof(void)
 {
-	char		store[] = "/tmp/pagestore-lifecycle-death-XXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-lifecycle-death-XXXXXX";
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the block death query");
 	check(fork_op(PS_OP_CREATE, 1000, 0, 0) &&
 		  fork_op(PS_OP_ZEROEXTEND, 1100, 2, 0) &&
@@ -855,7 +847,7 @@ test_block_death_asof(void)
 	check(block_death_asof(0, 0, 0) == UINT64_MAX,
 		  "the query requires a horizon");
 	close_store();
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 /* A WAL-index-only owner between a truncate that killed a block and a later
@@ -867,14 +859,14 @@ test_block_death_asof(void)
 static void
 test_walidx_horizon_keeps_newest_death(void)
 {
-	char		store[] = "/tmp/pagestore-lifecycle-envelope-XXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-lifecycle-envelope-XXXXXX";
 	uint64_t	lsn = 5000;
 	uint64_t	generation;
 
 	configure_core();
 	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
 		  "arm a small forkmeta snapshot trigger for the envelope test");
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the death envelope test");
 	check(fork_op(PS_OP_CREATE, 1000, 0, 0) &&
 		  fork_op(PS_OP_ZEROEXTEND, 1100, 8, 0) &&
@@ -907,20 +899,20 @@ test_walidx_horizon_keeps_newest_death(void)
 	check(block_death_asof(0, 5, 3500) == 2000 && nblocks_asof(0, 3500) == 6,
 		  "death and size at the WAL-index-only horizon survive restart");
 	close_store();
-	remove_tree(store);
+	ps_test_remove_tree(store);
 	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
 }
 
 static void
 test_deleted_branch_forgets_artifact_fences(void)
 {
-	char		store[] = "/tmp/pagestore-lifecycle-artifact-XXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-lifecycle-artifact-XXXXXX";
 	PsKey		seed = {0, 0, 9, 0, PS_KLASS_SLRU};
 	unsigned char page[8192];
 	PsTimelineState state = PS_TIMELINE_LIVE;
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the artifact fence test");
 	check(fork_op(PS_OP_CREATE, 1000, 0, 0) && write_page(0, 1010, 0xF0) &&
 		  create_branch(1, 0, 1020), "fork a branch");
@@ -942,12 +934,42 @@ test_deleted_branch_forgets_artifact_fences(void)
 	check(ps_test_artifact_fence_count(1) == 0,
 		  "deletion forgets the branch's artifact fences");
 	close_store();
-	remove_tree(store);
+	ps_test_remove_tree(store);
+}
+
+static void
+test_temp_cleanup_symlink(void)
+{
+	char root[PS_TEST_TEMP_PATH_MAX] = "pagestore-temp-symlink-XXXXXX";
+	char target[512], linkpath[512], sentinel[512];
+	FILE *file;
+	struct stat st;
+	int ok;
+
+	ps_test_mkdtemp(root, sizeof(root));
+	ok = snprintf(target, sizeof(target), "%s/target", root) > 0 &&
+		snprintf(linkpath, sizeof(linkpath), "%s/link", root) > 0 &&
+		snprintf(sentinel, sizeof(sentinel), "%s/target/sentinel", root) > 0 &&
+		mkdir(target, 0700) == 0;
+	file = ok ? fopen(sentinel, "w") : NULL;
+	if (file == NULL)
+		ok = 0;
+	else
+		ok = fclose(file) == 0 && symlink(target, linkpath) == 0;
+	check(ok, "prepare symlink cleanup fixture");
+	if (ok)
+	{
+		ps_test_remove_tree(linkpath);
+		check(lstat(linkpath, &st) != 0 && access(sentinel, F_OK) == 0,
+			  "cleanup removes a root symlink without traversing its target");
+	}
+	ps_test_remove_tree(root);
 }
 
 int
 main(void)
 {
+	test_temp_cleanup_symlink();
 	test_truncate_churn_is_bounded();
 	test_reader_pin_keeps_invalidated_history();
 	test_frontier_less_branch_caps_cutoff();
