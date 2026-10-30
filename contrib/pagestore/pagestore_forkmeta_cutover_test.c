@@ -1557,7 +1557,7 @@ test_fork_event_index_periodic_cutover_bounded(void)
 		/*
 		 * The frontier FILE only needs to exist once (round 0 creates it);
 		 * from round 1 on, wait for content by polling the block's own
-		 * version count (page-prune's actual effect) down to stability
+		 * version count (page-prune's actual effect) down to its bound
 		 * instead of a blind fixed tick budget, so a round that converges
 		 * in a couple of ticks does not pay for the worst case every time.
 		 */
@@ -1566,19 +1566,18 @@ test_fork_event_index_periodic_cutover_bounded(void)
 				  "publish the first frontier and reclaim this round's versions");
 		else
 		{
-			uint32_t	prev = ps_test_page_version_count(0, &key, 0);
-			int			stable = 0;
+			int tick;
 
-			for (int tick = 0; tick < 300 && stable < 3; tick++)
+			/* Reclamation can spend several turns retiring old layers before
+			 * touching this block. An unchanged count is not convergence. */
+			for (tick = 0; tick < 300 &&
+				 ps_test_page_version_count(0, &key, 0) > 2; tick++)
 			{
-				uint32_t	cur;
-
 				(void) ps_core_maintenance();
 				usleep(5000);
-				cur = ps_test_page_version_count(0, &key, 0);
-				stable = (cur == prev) ? stable + 1 : 0;
-				prev = cur;
 			}
+			check(ps_test_page_version_count(0, &key, 0) <= 2,
+				  "periodic reclaim reduces the block's versions");
 		}
 		/*
 		 * The snapshot trigger stays high while each round's writes land

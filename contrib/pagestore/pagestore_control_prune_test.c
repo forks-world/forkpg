@@ -381,7 +381,7 @@ static void
 test_nonzero_floor_bounded_plan(int prune_needed)
 {
 	char store[] = "/tmp/pagestore-bounded-floor-XXXXXX";
-	uint64_t before;
+	uint64_t before, prune_before;
 
 	configure_core(1);
 	segment_gc_enabled = 0;
@@ -396,6 +396,7 @@ test_nonzero_floor_bounded_plan(int prune_needed)
 		  write_relation(0, 2, 3000),
 		  "write relation-only input layers");
 	before = ps_test_bounded_nonzero_plan_count();
+	prune_before = ps_test_bounded_prune_published_count();
 	compact_layers = 1;
 	/* Count is process-global, so compare with the value before this store. */
 	for (int i = 0; i < 64 && !prune_needed &&
@@ -434,8 +435,10 @@ test_nonzero_floor_bounded_plan(int prune_needed)
 		ps_unlock_map();
 		check(ps_test_bounded_nonzero_plan_count() == before,
 			  "prunable history falls back from the bounded merge");
+		check(ps_test_bounded_prune_published_count() > prune_before,
+			  "prunable history publishes through the bounded pruning path");
 		check(old_versions == 0 && read_relation_asof(0, 5000, 2000),
-			  "fallback removes obsolete layer history and preserves its successor");
+			  "bounded pruning removes obsolete layer history and preserves its successor");
 	}
 	else
 		check(!ps_test_page_prune_due(0, 0),
@@ -689,6 +692,111 @@ floor_plan_conflict_hook(void *arg)
 	ps_test_set_compaction_unlocked_hook(NULL, NULL);
 	if (pthread_create(&thread, NULL, floor_plan_foreground, arg) == 0)
 		(void) pthread_join(thread, NULL);
+}
+
+static void
+prune_retired_conflict_hook(void *arg)
+{
+	FloorPlanConflict *probe = arg;
+	pthread_t thread;
+
+	probe->called++;
+	ps_test_set_prune_retired_hook(NULL, NULL);
+	if (pthread_create(&thread, NULL, floor_plan_foreground, arg) == 0)
+		(void) pthread_join(thread, NULL);
+}
+
+static void
+test_bounded_prune_interrupted_retirement(void)
+{
+	char store[] = "/tmp/pagestore-bounded-prune-retirement-XXXXXX";
+	FloorPlanConflict probe = {0};
+	uint64_t before;
+	uint32_t live = 0;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
+		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
+		  write_relation(0, 2, 3000), "prepare bounded-pruning retirement conflict");
+	before = ps_test_bounded_prune_published_count();
+	ps_test_set_prune_retired_hook(prune_retired_conflict_hook, &probe);
+	compact_layers = 1;
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_prune_retired_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	check(probe.called && probe.changed &&
+		  ps_test_bounded_prune_published_count() > before && live >= 4 &&
+		  ps_test_page_prune_due(0, 0),
+		  "writer between source retirements stops the stale retirement prefix");
+	run_maintenance(64);
+	check(read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000) && read_relation_asof(3, 5000, 4000),
+		  "replanning after partial retirement preserves foreground data");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(3, 5000, 4000),
+		  "partial retirement recovery preserves pages after restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_bounded_prune_conflict(int mode)
+{
+	char store[] = "/tmp/pagestore-bounded-prune-conflict-XXXXXX";
+	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2};
+	uint64_t before;
+	uint32_t live = 0;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
+		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
+		  write_relation(0, 2, 3000), "prepare bounded-pruning conflict");
+	before = ps_test_bounded_prune_published_count();
+	ps_test_set_compaction_unlocked_hook(floor_plan_conflict_hook, &probe);
+	compact_layers = 1;
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	check(probe.called && probe.changed &&
+		  ps_test_bounded_prune_published_count() == before &&
+		  live >= (uint32_t) (mode ? 3 : 4),
+		  "concurrent mutation rejects a staged pruning replacement");
+	if (probe.remote_transition)
+	{
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == probe.layer_id)
+				ps_layer_map.layers[i].remote_durable = false;
+		ps_unlock_map();
+	}
+	run_maintenance(64);
+	check(read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000) &&
+		  (mode != 0 || read_relation_asof(3, 5000, 4000)),
+		  "bounded-pruning retry preserves required foreground data");
+	close_store();
+	remove_tree(store);
 }
 
 static void
@@ -1963,6 +2071,10 @@ main(void)
 	test_nonzero_bounded_plan_conflict(0);
 	test_nonzero_bounded_plan_conflict(1);
 	test_nonzero_bounded_plan_conflict(2);
+	test_bounded_prune_conflict(0);
+	test_bounded_prune_conflict(1);
+	test_bounded_prune_conflict(2);
+	test_bounded_prune_interrupted_retirement();
 	test_segment_gc_does_not_starve_compaction();
 	test_bounded_compaction_maintenance();
 	test_bounded_shared_payload_capacity_fallback();
