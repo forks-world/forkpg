@@ -4069,14 +4069,8 @@ static uint32_t page_prune_fast_batch_count(uint32_t timeline,
 static int
 prune_abandon_local_only(void)
 {
-	char uri[4096];
-	int rc;
-
-	if (ps_layer_store != &PsLayerStoreLocal || ps_layer_store->remote_uri == NULL)
-		return 0;
-	errno = 0;
-	rc = ps_layer_store->remote_uri(0, uri, sizeof(uri));
-	return rc != 0 && errno == ENOTSUP;
+	return ps_layer_store == &PsLayerStoreLocal &&
+		ps_layer_store_local_object_enabled() == 0;
 }
 
 int
@@ -4097,8 +4091,7 @@ prune_single_output_abandonable(uint32_t timeline, const PsLayerDesc *inputs,
 
 	if (!prune_abandon_local_only() || ps_manifest_poisoned() ||
 		!ps_timeline_live(timeline) ||
-		(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) != 0 &&
-		 tier_upload_candidate.layer_id == output->layer_id) ||
+		__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) != 0 ||
 		!ps_image_compaction_publication_valid(&ps_layer_map, inputs, ninputs,
 			output, 1, 1))
 		return 0;

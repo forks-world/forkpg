@@ -1341,9 +1341,14 @@ test_prune_abandon_provider_gate(void)
 	check(!ps_test_prune_abandon_local_only(),
 		  "configured object tier disables output abandonment");
 	close_store();
+	check(!ps_test_prune_abandon_local_only(),
+		  "closed local provider cannot establish the cleanup gate");
 	unsetenv("PAGESTORE_OBJECT_DIR");
 	check(ps_core_open(store) == 0 && ps_test_prune_abandon_local_only(),
 		  "local-only provider permits guarded output abandonment");
+	check(setenv("PAGESTORE_OBJECT_DIR", objects, 1) == 0 &&
+		  ps_test_prune_abandon_local_only(),
+		  "gate reflects the open provider rather than a later environment change");
 	unknown = *ps_layer_store;
 	ps_layer_store = &unknown;
 	check(!ps_test_prune_abandon_local_only(),
