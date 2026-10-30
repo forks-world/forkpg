@@ -21,9 +21,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include "pagestore_artifact_format.h"
 #include "pagestore_core.h"
+#include "pagestore_fault.h"
 #include "pagestore_layer.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
@@ -704,6 +706,97 @@ prune_retired_conflict_hook(void *arg)
 	ps_test_set_prune_retired_hook(NULL, NULL);
 	if (pthread_create(&thread, NULL, floor_plan_foreground, arg) == 0)
 		(void) pthread_join(thread, NULL);
+}
+
+/* The hook runs only after the bounded plan and replacement are verified. */
+static void
+bounded_prune_crash_marker(void *arg)
+{
+	int fd = *(int *) arg;
+	char marker = 'B';
+
+	(void) write(fd, &marker, 1);
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+}
+
+static void
+test_bounded_prune_crash(const char *fault_name)
+{
+	char store[] = "/tmp/pagestore-bounded-prune-crash-XXXXXX";
+	char control[] = "/tmp/pagestore-bounded-prune-fault-XXXXXX";
+	char arm[512], marker = 0;
+	FILE *arm_file;
+	int pipefd[2], status = 0;
+	pid_t child;
+	ssize_t marker_bytes;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (!mkdtemp(store) || !mkdtemp(control) ||
+		snprintf(arm, sizeof(arm), "%s/arm", control) >= (int) sizeof(arm) ||
+		(arm_file = fopen(arm, "w")) == NULL)
+	{
+		check(0, "prepare bounded-pruning crash fixture");
+		return;
+	}
+	fclose(arm_file);
+	if (ps_core_open(store) != 0)
+	{
+		check(0, "open bounded-pruning crash store");
+		return;
+	}
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
+		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
+		  write_relation(0, 2, 3000), "prepare bounded-pruning crash inputs");
+	close_store();
+	if (pipe(pipefd) != 0)
+	{
+		check(0, "create bounded-pruning crash marker pipe");
+		return;
+	}
+	child = fork();
+	if (child == 0)
+	{
+		close(pipefd[0]);
+		if (setenv("PAGESTORE_TEST_FAULT_NAME", fault_name, 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_DIR", control, 1) != 0 ||
+			ps_fault_init(store) != 0 || ps_core_open(store) != 0)
+			_exit(91);
+		ps_test_set_compaction_unlocked_hook(bounded_prune_crash_marker, &pipefd[1]);
+		compact_layers = 1;
+		run_maintenance(64);
+		_exit(92);
+	}
+	close(pipefd[1]);
+	if (child < 0 || waitpid(child, &status, 0) != child)
+	{
+		check(0, "wait for bounded-pruning crash");
+		close(pipefd[0]);
+		return;
+	}
+	marker_bytes = read(pipefd[0], &marker, 1);
+	close(pipefd[0]);
+	check(WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT &&
+		  marker_bytes == 1 && marker == 'B',
+		  "fault crashes after the bounded pruning plan was verified");
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000),
+		  "bounded pruning crash recovers all required pages");
+	compact_layers = 1;
+	run_maintenance(64);
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(2, 5000, 3000),
+		  "bounded pruning crash remains readable after reclamation retries");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000),
+		  "bounded pruning recovery and retries survive a second restart");
+	close_store();
+	remove_tree(store);
+	remove_tree(control);
 }
 
 static void
@@ -2075,6 +2168,9 @@ main(void)
 	test_bounded_prune_conflict(1);
 	test_bounded_prune_conflict(2);
 	test_bounded_prune_interrupted_retirement();
+	test_bounded_prune_crash("page_prune.after_frontier");
+	test_bounded_prune_crash("page_compaction.after_publish");
+	test_bounded_prune_crash("page_gc.after_mark_delete");
 	test_segment_gc_does_not_starve_compaction();
 	test_bounded_compaction_maintenance();
 	test_bounded_shared_payload_capacity_fallback();
