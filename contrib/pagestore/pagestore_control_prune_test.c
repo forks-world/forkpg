@@ -822,6 +822,99 @@ test_bounded_prune_index_batches(int mode)
 	remove_tree(store);
 }
 
+typedef struct HotPagePruneProbe
+{
+	int mode, called, midpoint_ok, wrote;
+} HotPagePruneProbe;
+
+static void
+hot_page_prune_hook(void *arg)
+{
+	HotPagePruneProbe *probe = arg;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	probe->called++;
+	probe->midpoint_ok = ps_test_page_version_count(0, &key, 0) == 128 &&
+		read_relation_asof(0, 5000, 1255);
+	ps_test_set_prune_index_hook(NULL, NULL);
+	if (probe->mode == 2)
+		_exit(probe->midpoint_ok ? 86 : 87);
+	if (probe->mode == 1)
+		probe->wrote = write_relation(0, 0, 2000);
+}
+
+static void
+test_hot_page_prune_batches(int mode)
+{
+	char store[] = "/tmp/pagestore-prune-hot-page-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	HotPagePruneProbe probe = {.mode = mode};
+	uint64_t before;
+	int ok = 1;
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open hot-page pruning store");
+		return;
+	}
+	for (uint32_t i = 0; i < 256 && ok; i++)
+		ok = write_relation(0, 0, 1000 + i);
+	check(ok && ps_test_page_version_count(0, &key, 0) == 256 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "prepare one page with 256 durable versions");
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	if (mode == 2)
+	{
+		pid_t child;
+		int status = 0;
+
+		close_store();
+		child = fork();
+		if (child == 0)
+		{
+			if (ps_core_open(store) != 0)
+				_exit(88);
+			ps_test_set_prune_index_hook(hot_page_prune_hook, &probe);
+			run_maintenance(64);
+			_exit(89);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "crash after the first hot-page index batch remains readable");
+		check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 1255),
+			  "hot-page pruning recovers after the partial index update");
+	}
+	else
+	{
+		ps_test_set_prune_index_hook(hot_page_prune_hook, &probe);
+		for (int i = 0; i < 64 && !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_index_hook(NULL, NULL);
+		check(probe.called && probe.midpoint_ok &&
+			  ps_test_bounded_prune_published_count() > before &&
+			  (mode != 1 || (probe.wrote && ps_test_page_prune_due(0, 0))),
+			  "hot-page versions remain readable between index batches");
+	}
+	run_maintenance(64);
+	compact_layers = 100;
+	check(read_relation_asof(0, 5000, mode == 1 ? 2000 : 1255),
+		  "hot-page pruning and retry preserve the newest version");
+	if (mode == 0)
+		check(ps_test_page_version_count(0, &key, 0) == 1,
+			  "all obsolete hot-page versions are removed");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  read_relation_asof(0, 5000, mode == 1 ? 2000 : 1255),
+		  "hot-page pruning preserves the newest version across restart");
+	close_store();
+	remove_tree(store);
+}
+
 typedef struct BoundedConflictProbe
 {
 	int called;
@@ -2421,6 +2514,9 @@ main(void)
 	test_bounded_prune_index_batches(0);
 	test_bounded_prune_index_batches(1);
 	test_bounded_prune_index_batches(2);
+	test_hot_page_prune_batches(0);
+	test_hot_page_prune_batches(1);
+	test_hot_page_prune_batches(2);
 	test_bounded_compaction_concurrent_write();
 	test_compaction_gather_rejects_concurrent_change(0);
 	test_compaction_gather_rejects_concurrent_change(1);
