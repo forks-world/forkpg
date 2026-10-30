@@ -37,6 +37,17 @@ extern int ps_compaction_relation_plan_step(PsCompactionRelationPlan *plan,
 	uint32_t *visited);
 extern void ps_compaction_relation_plan_close(PsCompactionRelationPlan *plan);
 
+/* Collapse the physical copies of each planned logical identity. The selected
+ * copy is the highest-layer kept copy; each fully dropped identity appears
+ * exactly once in dropped. Inputs are one complete, merge-ordered relation
+ * page group; arrays must not overlap. The function makes no publication or
+ * reclamation decision. On failure counts are zero and output arrays are not
+ * modified: -2 means insufficient output capacity, -1 malformed input. */
+extern int ps_compaction_relation_select_group(const PsImageGroupEntry *entries,
+	uint32_t count, const unsigned char *keep,
+	PsImageGroupEntry *selected, uint32_t selected_capacity, uint32_t *nselected,
+	PsImageGroupEntry *dropped, uint32_t dropped_capacity, uint32_t *ndropped);
+
 extern int ps_compaction_plan_relation_groups(const PsLayerDesc *layers,
 	uint32_t count, uint32_t max_group, PsPruneFence floor,
 	const PsViewFence *fences, uint32_t nfences, uint64_t inherited_below,
