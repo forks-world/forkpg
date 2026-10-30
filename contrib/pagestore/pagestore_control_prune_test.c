@@ -1058,6 +1058,19 @@ test_long_chain_prune_snapshot(int mode)
 		if (mode == 0 || mode == 4)
 			check(ps_test_page_version_count(0, &key, block) == 1537,
 				  "snapshot replacement removes the complete obsolete prefix");
+		if (mode == 1 || mode == 3 || mode == 5)
+		{
+			uint32_t live = 0;
+
+			ps_lock_map_rd();
+			for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+				if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+					!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+					live++;
+			ps_unlock_map();
+			check(live >= (uint32_t) (mode == 3 ? 2 : 9),
+				  "snapshot conflict retains every source layer before retry");
+		}
 	}
 	run_maintenance(64);
 	compact_layers = 100;
