@@ -290,6 +290,15 @@ extern int ps_image_compaction_stage_selected_batch(const PsLayerDesc *layers,
 	uint64_t output_id, uint32_t page_size, PsLayerDesc *out,
 	uint64_t *uncertain_id);
 
+/* Independently verify that each selected entry is present in its named
+ * source index and that the sealed output contains exactly those identities,
+ * metadata and page bytes. All files remain pinned and immutable. This does
+ * not prove the selection is complete or that omitted history is reclaimable;
+ * caller must separately validate the full pruning plan and fence publication. */
+extern int ps_image_compaction_verify_selected_batch(const PsLayerDesc *layers,
+	uint32_t count, const PsImageGroupEntry *selected, uint32_t nselected,
+	const PsLayerDesc *output, uint32_t page_size);
+
 extern int ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 									  const uint64_t *output_ids, uint32_t capacity,
 									  uint32_t page_size, PsLayerDesc *outputs,
