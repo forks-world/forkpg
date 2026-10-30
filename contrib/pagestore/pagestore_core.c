@@ -4063,6 +4063,28 @@ static int page_prune_long_chain(uint32_t timeline, const PsImgRec *recs,
 static uint32_t page_prune_fast_batch_count(uint32_t timeline,
 	const PsImgRec *recs, uint32_t nrec);
 
+/* Until output lifetime is coordinated with the asynchronous tier scheduler,
+ * only the local provider with its object tier explicitly disabled can retire
+ * a newly published replacement here. Unknown providers fail closed. */
+static int
+prune_abandon_local_only(void)
+{
+	char uri[4096];
+	int rc;
+
+	if (ps_layer_store != &PsLayerStoreLocal || ps_layer_store->remote_uri == NULL)
+		return 0;
+	errno = 0;
+	rc = ps_layer_store->remote_uri(0, uri, sizeof(uri));
+	return rc != 0 && errno == ENOTSUP;
+}
+
+int
+ps_test_prune_abandon_local_only(void)
+{
+	return prune_abandon_local_only();
+}
+
 /* A verified single output can be discarded only while the complete original
  * source set remains live and pinned. The exact publication check also rules
  * out new layers, tier changes and a changed replacement. Entry holds map-wr. */
@@ -4073,7 +4095,10 @@ prune_single_output_abandonable(uint32_t timeline, const PsLayerDesc *inputs,
 	uint32_t pinned = 0;
 	int output_idle = 0;
 
-	if (ps_manifest_poisoned() || !ps_timeline_live(timeline) ||
+	if (!prune_abandon_local_only() || ps_manifest_poisoned() ||
+		!ps_timeline_live(timeline) ||
+		(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) != 0 &&
+		 tier_upload_candidate.layer_id == output->layer_id) ||
 		!ps_image_compaction_publication_valid(&ps_layer_map, inputs, ninputs,
 			output, 1, 1))
 		return 0;

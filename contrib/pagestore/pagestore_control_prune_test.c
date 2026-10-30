@@ -1312,6 +1312,55 @@ test_prune_abandon_conflict(int mode)
 	remove_tree(store);
 }
 
+static void
+test_prune_abandon_provider_gate(void)
+{
+	char store[] = "/tmp/pagestore-prune-provider-XXXXXX";
+	char objects[] = "/tmp/pagestore-prune-objects-XXXXXX";
+	const char *old_env = getenv("PAGESTORE_OBJECT_DIR");
+	char *saved = old_env != NULL ? strdup(old_env) : NULL;
+	PsLayerStore unknown;
+
+	configure_core(1);
+	if ((old_env != NULL && saved == NULL) || mkdtemp(store) == NULL ||
+		mkdtemp(objects) == NULL || setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0 ||
+		ps_core_open(store) != 0)
+	{
+		check(0, "open pruning provider-gate fixture");
+		if (saved != NULL)
+			setenv("PAGESTORE_OBJECT_DIR", saved, 1);
+		else if (old_env == NULL)
+			unsetenv("PAGESTORE_OBJECT_DIR");
+		free(saved);
+		if (strstr(store, "XXXXXX") == NULL)
+			remove_tree(store);
+		if (strstr(objects, "XXXXXX") == NULL)
+			remove_tree(objects);
+		return;
+	}
+	check(!ps_test_prune_abandon_local_only(),
+		  "configured object tier disables output abandonment");
+	close_store();
+	unsetenv("PAGESTORE_OBJECT_DIR");
+	check(ps_core_open(store) == 0 && ps_test_prune_abandon_local_only(),
+		  "local-only provider permits guarded output abandonment");
+	unknown = *ps_layer_store;
+	ps_layer_store = &unknown;
+	check(!ps_test_prune_abandon_local_only(),
+		  "unknown layer providers fail closed");
+	ps_layer_store = &PsLayerStoreLocal;
+	close_store();
+	if (saved != NULL)
+	{
+		setenv("PAGESTORE_OBJECT_DIR", saved, 1);
+		free(saved);
+	}
+	else
+		unsetenv("PAGESTORE_OBJECT_DIR");
+	remove_tree(store);
+	remove_tree(objects);
+}
+
 typedef struct BoundedConflictProbe
 {
 	int called;
@@ -2924,6 +2973,7 @@ main(void)
 	test_prune_abandon_conflict(0);
 	test_prune_abandon_conflict(1);
 	test_prune_abandon_conflict(2);
+	test_prune_abandon_provider_gate();
 	test_bounded_compaction_concurrent_write();
 	test_compaction_gather_rejects_concurrent_change(0);
 	test_compaction_gather_rejects_concurrent_change(1);
