@@ -768,6 +768,42 @@ stage_pruned_batch_test(void)
 		  ps_image_layer_lookup_exact(&output, &key, 1, 100, 2, out_page,
 			PSZ, NULL, NULL) == 1 && memcmp(out_page, pages[1], PSZ) == 0,
 		  "staged output contains only the selected versions and bytes");
+	check(ps_image_compaction_verify_selected_batch(layers, 2, selected, 2,
+			&output, PSZ) == 0,
+		  "independent verification matches selected sources and output bytes");
+	bad[0] = selected[0];
+	bad[1] = selected[1];
+	bad[0].entry.growth_lsn++;
+	check(ps_image_compaction_verify_selected_batch(layers, 2, bad, 2,
+			&output, PSZ) == -1,
+		  "verification rejects selected metadata absent from the source index");
+	bad[0] = selected[0];
+	bad[0].layer_id = layers[0].layer_id;
+	check(ps_image_compaction_verify_selected_batch(layers, 2, bad, 2,
+			&output, PSZ) == -1,
+		  "verification rejects an identity attributed to the wrong source layer");
+	bad[0] = selected[0];
+	bad[1].entry.data_off = index0[0].data_off;
+	check(ps_image_compaction_verify_selected_batch(layers, 2, bad, 2,
+			&output, PSZ) == -1,
+		  "verification rejects an in-range offset not belonging to the selected identity");
+	check(ps_image_compaction_verify_selected_batch(layers, 2, selected, 1,
+			&output, PSZ) == -1,
+		  "verification rejects an extra output identity");
+	{
+		PsImgRec incorrect[2] = {newer, recs[1]};
+		PsLayerDesc wrong, missing;
+
+		incorrect[0].page = pages[0];
+		check(ps_image_layer_write(31986, 0, incorrect, 2, PSZ, &wrong) == 0 &&
+			  ps_image_compaction_verify_selected_batch(layers, 2, selected, 2,
+				&wrong, PSZ) == -1,
+			  "verification rejects validly checksummed output with wrong page bytes");
+		check(ps_image_layer_write(31987, 0, &newer, 1, PSZ, &missing) == 0 &&
+			  ps_image_compaction_verify_selected_batch(layers, 2, selected, 2,
+				&missing, PSZ) == -1,
+			  "verification rejects output missing a selected identity");
+	}
 	check(ps_image_compaction_stage_selected_batch(layers, 2, selected, 2,
 			31982, PSZ, &ignored, &uncertain) == -2 && uncertain == 31982 &&
 		  ps_image_layer_lookup_exact(&output, &key, 0, 200, 3, out_page,
