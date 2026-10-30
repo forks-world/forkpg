@@ -1681,6 +1681,30 @@ ps_image_compaction_snapshot_valid(const PsLayerMap *map,
 }
 
 int
+ps_image_compaction_publication_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t published_prefix)
+{
+	if (published_prefix > noutputs ||
+		!ps_image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs))
+		return 0;
+	for (uint32_t k = 0; k < noutputs; k++)
+	{
+		int present = 0;
+
+		for (uint32_t i = 0; i < map->nlayers; i++)
+			if (map->layers[i].layer_id == outputs[k].layer_id)
+			{
+				present = 1;
+				break;
+			}
+		if (present != (k < published_prefix))
+			return 0;
+	}
+	return 1;
+}
+
+int
 ps_image_compaction_retirement_valid(const PsLayerMap *map,
 	const PsLayerDesc *inputs, uint32_t ninputs,
 	const PsLayerDesc *outputs, uint32_t noutputs,

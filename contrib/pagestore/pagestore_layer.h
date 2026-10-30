@@ -326,6 +326,12 @@ extern int ps_image_compaction_verify_coverage(const PsLayerDesc *inputs,
 extern int ps_image_compaction_snapshot_valid(const PsLayerMap *map,
 	const PsLayerDesc *inputs, uint32_t ninputs,
 	const PsLayerDesc *outputs, uint32_t noutputs);
+/* As above, additionally require exactly outputs[0..published_prefix) to be
+ * present. This is a metadata check; callers must separately prove contents,
+ * durability, owned pins and concurrent-state fencing. */
+extern int ps_image_compaction_publication_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t published_prefix);
 /* Validate a pinned, partially retired input set and all published outputs.
  * The caller must hold its own pin on every input throughout retirement; a
  * nonzero reader count alone does not establish ownership. It must also hold

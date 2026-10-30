@@ -3,6 +3,54 @@
 
 #include "pagestore_compaction_prune.h"
 
+int
+ps_compaction_prune_fence_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	const PsCompactionPruneFence *captured, const PsCompactionPruneFence *current,
+	int timeline_live, int manifest_poisoned, uint32_t published_prefix,
+	uint32_t retired_prefix, int frontier_durable, int page_index_updated)
+{
+	if (inputs == NULL || outputs == NULL || ninputs == 0 || noutputs == 0 ||
+		ninputs > PS_IMAGE_MERGE_MAX_INPUTS || noutputs > PS_IMAGE_PREPARE_MAX_OUTPUTS ||
+		captured == NULL || current == NULL || !timeline_live || manifest_poisoned ||
+		captured->timeline_incarnation == 0 || captured->page_floor == 0 ||
+		captured->retention_epoch != current->retention_epoch ||
+		captured->timeline_epoch != current->timeline_epoch ||
+		captured->admission_epoch != current->admission_epoch ||
+		captured->timeline_incarnation != current->timeline_incarnation ||
+		captured->page_floor != current->page_floor ||
+		published_prefix > noutputs || retired_prefix >= ninputs ||
+		(published_prefix != 0 && !frontier_durable) ||
+		(page_index_updated && (!frontier_durable || published_prefix != noutputs)) ||
+		(retired_prefix != 0 && !page_index_updated))
+		return 0;
+	for (uint32_t i = 0; i < ninputs; i++)
+		if (inputs[i].remote_durable)
+			return 0;
+	if (page_index_updated || retired_prefix != 0)
+		return ps_image_compaction_retirement_valid(map, inputs, ninputs,
+			outputs, noutputs, retired_prefix);
+	if (!ps_image_compaction_publication_valid(map, inputs, ninputs,
+			outputs, noutputs, published_prefix))
+		return 0;
+	for (uint32_t k = 0; k < ninputs; k++)
+	{
+		int pinned = 0;
+
+		for (uint32_t i = 0; i < map->nlayers; i++)
+			if (map->layers[i].layer_id == inputs[k].layer_id)
+			{
+				pinned = __atomic_load_n(&map->layers[i].cache_readers,
+										 __ATOMIC_ACQUIRE) != 0;
+				break;
+			}
+		if (!pinned)
+			return 0;
+	}
+	return 1;
+}
+
 struct PsCompactionRelationPlan
 {
 	PsImageIndexMerge *merge;

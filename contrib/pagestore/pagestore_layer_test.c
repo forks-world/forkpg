@@ -353,6 +353,81 @@ streaming_layer_test(void)
 			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 0,
 				  "output ID collision on another timeline is rejected");
 			{
+				PsLayerDesc sources[2] = {layer, layer}, entries[6];
+				PsLayerMap guarded = {.layers = entries, .nlayers = 2, .capacity = 6};
+				PsCompactionPruneFence captured = {11, 12, 13, 1, 5000};
+				PsCompactionPruneFence current = captured;
+
+				sources[1].layer_id = 911;
+				entries[0] = sources[0];
+				entries[1] = sources[1];
+				entries[0].cache_readers = entries[1].cache_readers = 1;
+				check(ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "pinned captured set passes before frontier publication");
+				entries[0].cache_readers = 0;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "pruned publication fencing rejects an unpinned source");
+				entries[0].cache_readers = 1;
+				sources[0].remote_durable = true;
+				entries[0].remote_durable = true;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "pruned publication fencing rejects remote-durable inputs");
+				sources[0].remote_durable = false;
+				entries[0].remote_durable = false;
+				current.retention_epoch++;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "a changed retention epoch invalidates the pruning fence");
+				current = captured;
+				current.admission_epoch++;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "a concurrent write invalidates the pruning fence");
+				current = captured;
+				current.timeline_incarnation++;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "timeline reuse invalidates the pruning fence");
+				current = captured;
+				current.page_floor++;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0) &&
+					  !ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &captured, 0, 0, 0, 0, 0, 0),
+					  "a changed floor or non-live timeline invalidates the pruning fence");
+				current = captured;
+				entries[2] = outputs[1];
+				guarded.nlayers = 3;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 1, 0, 1, 0),
+					  "published outputs must form the exact prefix");
+				entries[2] = outputs[0];
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 1, 0, 0, 0) &&
+					  ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 1, 0, 1, 0),
+					  "a partial output prefix requires a durable frontier");
+				memcpy(&entries[2], outputs, sizeof(legacy_outputs));
+				guarded.nlayers = 6;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 4, 1, 1, 0),
+					  "retiring a source requires the page index update");
+				entries[0].deleting = true;
+				check(ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 4, 1, 1, 1),
+					  "completed outputs and index update allow the next source retirement check");
+				current = captured;
+				current.timeline_epoch++;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 4, 1, 1, 1) &&
+					  !ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &captured, 1, 1, 4, 1, 1, 1),
+					  "retirement rejects changed timeline and poisoned manifest");
+			}
+			{
 				PsLayerDesc entries[5], remote = layer;
 				PsLayerMap retirement = {.layers = entries, .nlayers = 5, .capacity = 5};
 
