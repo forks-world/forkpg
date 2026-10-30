@@ -1068,7 +1068,7 @@ test_long_chain_prune_snapshot(int mode)
 					!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
 					live++;
 			ps_unlock_map();
-			check(live >= (uint32_t) (mode == 3 ? 2 : 9),
+			check(live >= (uint32_t) (mode == 3 ? 1 : 8),
 				  "snapshot conflict retains every source layer before retry");
 		}
 	}
@@ -1084,6 +1084,288 @@ test_long_chain_prune_snapshot(int mode)
 		  "long-chain snapshot survives a later restart");
 	close_store();
 	remove_tree(store);
+}
+
+typedef struct PruneChurnProbe
+{
+	int called, wrote, pin_output, mutate_source;
+	uint64_t pinned_layer, changed_source;
+} PruneChurnProbe;
+
+static void
+prune_churn_hook(void *arg)
+{
+	PruneChurnProbe *probe = arg;
+
+	probe->called++;
+	ps_test_set_prune_snapshot_hook(NULL, NULL);
+	if (probe->pin_output)
+	{
+		PsLayerDesc *latest = NULL;
+
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting &&
+				(!latest || ps_layer_map.layers[i].layer_id > latest->layer_id))
+				latest = &ps_layer_map.layers[i];
+		if (latest != NULL)
+		{
+			probe->pinned_layer = latest->layer_id;
+			__atomic_add_fetch(&latest->cache_readers, 1, __ATOMIC_ACQ_REL);
+		}
+		ps_unlock_map();
+	}
+	if (probe->mutate_source)
+	{
+		PsLayerDesc *earliest = NULL;
+
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting &&
+				(!earliest || ps_layer_map.layers[i].layer_id < earliest->layer_id))
+				earliest = &ps_layer_map.layers[i];
+		if (earliest != NULL)
+		{
+			probe->changed_source = earliest->layer_id;
+			earliest->remote_durable = true;
+		}
+		ps_unlock_map();
+	}
+	probe->wrote = write_relation(0, 1, 9000 + probe->called);
+}
+
+static uint32_t
+count_live_image_layers(void)
+{
+	uint32_t live = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	return live;
+}
+
+static uint32_t
+count_deleting_image_layers(void)
+{
+	uint32_t deleting = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			deleting++;
+	ps_unlock_map();
+	return deleting;
+}
+
+static void
+test_prune_snapshot_conflict_churn(void)
+{
+	char store[] = "/tmp/pagestore-prune-conflict-churn-XXXXXX";
+	PruneChurnProbe probe = {0};
+	uint32_t initial, maximum = 0, maximum_deleting = 0;
+	int ok = 1;
+
+	configure_core(0);
+	segment_size = 32 * 1024 * 1024;
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open pruning-conflict churn store");
+		return;
+	}
+	for (uint32_t i = 0; i < 512 && ok; i++)
+		ok = write_relation(0, 0, 1000 + i);
+	close_store();
+	flush_pages = 100000;
+	check(ok && long_chain_finish_setup(store, 0),
+		  "prepare prunable long chain for repeated conflicts");
+	initial = count_live_image_layers();
+	compact_layers = 1;
+	for (int attempt = 0; attempt < 5; attempt++)
+	{
+		int old_called = probe.called;
+		uint32_t live;
+
+		ps_test_set_prune_snapshot_hook(prune_churn_hook, &probe);
+		for (int i = 0; i < 128 && probe.called == old_called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_snapshot_hook(NULL, NULL);
+		check(probe.called == old_called + 1 && probe.wrote &&
+			  ps_test_page_prune_due(0, 0),
+			  "foreground mutation interrupts each published pruning attempt");
+		live = count_live_image_layers();
+		if (live > maximum)
+			maximum = live;
+		live = count_deleting_image_layers();
+		if (live > maximum_deleting)
+			maximum_deleting = live;
+	}
+	if (maximum > initial)
+		fprintf(stderr, "pruning churn live layers: initial=%u maximum=%u\n", initial, maximum);
+	check(maximum <= initial,
+		  "repeated failed pruning does not accumulate live output layers");
+	check(maximum_deleting <= 1,
+		  "normal GC drains abandoned outputs before the next conflict");
+	run_maintenance(64);
+	compact_layers = 100;
+	check(read_relation_asof(0, 5000, 1511) && read_relation_asof(0, 10000, 7535) &&
+		  read_relation_asof(1, 10000, 9005),
+		  "churn cleanup and retry preserve old and foreground versions");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 1511) &&
+		  read_relation_asof(1, 10000, 9005),
+		  "churn cleanup remains readable after restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+prune_abandon_crash(void *arg)
+{
+	(void) arg;
+	_exit(86);
+}
+
+static void
+test_prune_abandon_conflict(int mode)
+{
+	char store[] = "/tmp/pagestore-prune-abandon-XXXXXX";
+	PruneChurnProbe probe = {.pin_output = mode == 0, .mutate_source = mode == 2};
+	uint32_t initial;
+	int ok = 1;
+
+	configure_core(0);
+	segment_size = 32 * 1024 * 1024;
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open pruning abandonment boundary store");
+		return;
+	}
+	for (uint32_t i = 0; i < 512 && ok; i++)
+		ok = write_relation(0, 0, 1000 + i);
+	initial = count_live_image_layers();
+	close_store();
+	flush_pages = 100000;
+	compact_layers = 1;
+	if (mode == 1)
+	{
+		pid_t child = fork();
+		int status = 0;
+
+		if (child == 0)
+		{
+			if (!ok || !long_chain_finish_setup(store, 0))
+				_exit(88);
+			ps_test_set_prune_snapshot_hook(prune_churn_hook, &probe);
+			ps_test_set_prune_abandon_hook(prune_abandon_crash, NULL);
+			run_maintenance(64);
+			_exit(89);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "process exits after the abandoned-output tombstone");
+		check(ps_core_open(store) == 0 && count_live_image_layers() <= initial + 1 &&
+			  read_relation_asof(0, 5000, 1511) && read_relation_asof(0, 10000, 7535) &&
+			  read_relation_asof(1, 10000, 9001),
+			  "abandoned-output tombstone recovers sources and foreground data");
+	}
+	else
+	{
+		check(ok && long_chain_finish_setup(store, 0),
+			  "prepare a pinned replacement during a pruning conflict");
+		ps_test_set_prune_snapshot_hook(prune_churn_hook, &probe);
+		for (int i = 0; i < 128 && !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_snapshot_hook(NULL, NULL);
+		check(probe.called && probe.wrote &&
+			  (mode == 0 ? probe.pinned_layer != 0 : probe.changed_source != 0) &&
+			  count_live_image_layers() == initial + 1 && ps_test_page_prune_due(0, 0),
+			  "a pinned output or changed source prevents abandonment");
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		{
+			if (ps_layer_map.layers[i].layer_id == probe.pinned_layer)
+				__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+			if (ps_layer_map.layers[i].layer_id == probe.changed_source)
+				ps_layer_map.layers[i].remote_durable = false;
+		}
+		ps_unlock_map();
+	}
+	run_maintenance(64);
+	compact_layers = 100;
+	check(read_relation_asof(0, 5000, 1511) && read_relation_asof(0, 10000, 7535) &&
+		  read_relation_asof(1, 10000, 9001),
+		  "abandonment boundary preserves required pages after retry");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 1511) &&
+		  read_relation_asof(0, 10000, 7535) && read_relation_asof(1, 10000, 9001),
+		  "abandonment boundary preserves pages after another restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_prune_abandon_provider_gate(void)
+{
+	char store[] = "/tmp/pagestore-prune-provider-XXXXXX";
+	char objects[] = "/tmp/pagestore-prune-objects-XXXXXX";
+	const char *old_env = getenv("PAGESTORE_OBJECT_DIR");
+	char *saved = old_env != NULL ? strdup(old_env) : NULL;
+	PsLayerStore unknown;
+
+	configure_core(1);
+	if ((old_env != NULL && saved == NULL) || mkdtemp(store) == NULL ||
+		mkdtemp(objects) == NULL || setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0 ||
+		ps_core_open(store) != 0)
+	{
+		check(0, "open pruning provider-gate fixture");
+		if (saved != NULL)
+			setenv("PAGESTORE_OBJECT_DIR", saved, 1);
+		else if (old_env == NULL)
+			unsetenv("PAGESTORE_OBJECT_DIR");
+		free(saved);
+		if (strstr(store, "XXXXXX") == NULL)
+			remove_tree(store);
+		if (strstr(objects, "XXXXXX") == NULL)
+			remove_tree(objects);
+		return;
+	}
+	check(!ps_test_prune_abandon_local_only(),
+		  "configured object tier disables output abandonment");
+	close_store();
+	check(!ps_test_prune_abandon_local_only(),
+		  "closed local provider cannot establish the cleanup gate");
+	unsetenv("PAGESTORE_OBJECT_DIR");
+	check(ps_core_open(store) == 0 && ps_test_prune_abandon_local_only(),
+		  "local-only provider permits guarded output abandonment");
+	check(setenv("PAGESTORE_OBJECT_DIR", objects, 1) == 0 &&
+		  ps_test_prune_abandon_local_only(),
+		  "gate reflects the open provider rather than a later environment change");
+	unknown = *ps_layer_store;
+	ps_layer_store = &unknown;
+	check(!ps_test_prune_abandon_local_only(),
+		  "unknown layer providers fail closed");
+	ps_layer_store = &PsLayerStoreLocal;
+	close_store();
+	if (saved != NULL)
+	{
+		setenv("PAGESTORE_OBJECT_DIR", saved, 1);
+		free(saved);
+	}
+	else
+		unsetenv("PAGESTORE_OBJECT_DIR");
+	remove_tree(store);
+	remove_tree(objects);
 }
 
 typedef struct BoundedConflictProbe
@@ -2694,6 +2976,11 @@ main(void)
 	test_long_chain_prune_snapshot(3);
 	test_long_chain_prune_snapshot(4);
 	test_long_chain_prune_snapshot(5);
+	test_prune_snapshot_conflict_churn();
+	test_prune_abandon_conflict(0);
+	test_prune_abandon_conflict(1);
+	test_prune_abandon_conflict(2);
+	test_prune_abandon_provider_gate();
 	test_bounded_compaction_concurrent_write();
 	test_compaction_gather_rejects_concurrent_change(0);
 	test_compaction_gather_rejects_concurrent_change(1);

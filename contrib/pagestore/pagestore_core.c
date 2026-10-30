@@ -712,6 +712,16 @@ ps_test_set_prune_snapshot_swap_hook(void (*hook)(void *), void *arg)
 	prune_snapshot_swap_test_hook_arg = arg;
 }
 
+static void (*prune_abandon_test_hook)(void *);
+static void *prune_abandon_test_hook_arg;
+
+void
+ps_test_set_prune_abandon_hook(void (*hook)(void *), void *arg)
+{
+	prune_abandon_test_hook = hook;
+	prune_abandon_test_hook_arg = arg;
+}
+
 static void (*prune_snapshot_test_hook)(void *);
 static void *prune_snapshot_test_hook_arg;
 
@@ -4053,6 +4063,52 @@ static int page_prune_long_chain(uint32_t timeline, const PsImgRec *recs,
 static uint32_t page_prune_fast_batch_count(uint32_t timeline,
 	const PsImgRec *recs, uint32_t nrec);
 
+/* Until output lifetime is coordinated with the asynchronous tier scheduler,
+ * only the local provider with its object tier explicitly disabled can retire
+ * a newly published replacement here. Unknown providers fail closed. */
+static int
+prune_abandon_local_only(void)
+{
+	return ps_layer_store == &PsLayerStoreLocal &&
+		ps_layer_store_local_object_enabled() == 0;
+}
+
+int
+ps_test_prune_abandon_local_only(void)
+{
+	return prune_abandon_local_only();
+}
+
+/* A verified single output can be discarded only while the complete original
+ * source set remains live and pinned. The exact publication check also rules
+ * out new layers, tier changes and a changed replacement. Entry holds map-wr. */
+static int
+prune_single_output_abandonable(uint32_t timeline, const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *output)
+{
+	uint32_t pinned = 0;
+	int output_idle = 0;
+
+	if (!prune_abandon_local_only() || ps_manifest_poisoned() ||
+		!ps_timeline_live(timeline) ||
+		__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) != 0 ||
+		!ps_image_compaction_publication_valid(&ps_layer_map, inputs, ninputs,
+			output, 1, 1))
+		return 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->layer_id == output->layer_id)
+			output_idle = __atomic_load_n(&d->cache_readers, __ATOMIC_ACQUIRE) == 0;
+		for (uint32_t j = 0; j < ninputs; j++)
+			if (d->layer_id == inputs[j].layer_id &&
+				__atomic_load_n(&d->cache_readers, __ATOMIC_ACQUIRE) != 0)
+				pinned++;
+	}
+	return output_idle && pinned == ninputs;
+}
+
 /* Caller holds the same locks as compact_timeline. Input layers are pinned
  * while planning, writing and verifying outside those locks. */
 static int
@@ -4374,6 +4430,22 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 	g_shards[shard].staged_compaction_retries = 0;
 
 done:
+	/* Before any source is retired, a complete pinned source set still covers
+	 * a verified single output. Retire it on an aborted attempt so repeated
+	 * snapshot conflicts do not accumulate redundant live layers. Never guess
+	 * after an ambiguous manifest append or changed layer set. */
+	if (result < 0 && noutputs == 1 && published == 1 && retired == 0 && !ambiguous &&
+		prune_single_output_abandonable(timeline, inputs, ninputs, &outputs[0]))
+	{
+		if (ps_manifest_mark_delete(outputs[0].layer_id) == 0)
+		{
+			inspection_metrics_changed();
+			if (prune_abandon_test_hook != NULL)
+				prune_abandon_test_hook(prune_abandon_test_hook_arg);
+		}
+		else
+			g_shards[shard].staged_compaction_retries = 1;
+	}
 	for (uint32_t k = 0; k < ninputs; k++)
 		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 			if (ps_layer_map.layers[i].layer_id == inputs[k].layer_id)
