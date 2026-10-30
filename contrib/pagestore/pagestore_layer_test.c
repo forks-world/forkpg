@@ -861,6 +861,124 @@ done:
 }
 
 static void
+verify_pruned_plan_duplicate_test(void)
+{
+	PsKey key = {1, 1, 31801, 0, PS_KLASS_RELATION};
+	unsigned char pages[3][PSZ];
+	PsImgRec recs[3] = {0}, selected[2], wrong[2];
+	PsLayerDesc inputs[3], output, bad_output;
+	PsViewFence fence = {200, 1, PS_PRUNE_SEQ_UNBOUNDED};
+	uint64_t kept, dropped;
+	int ok;
+
+	for (uint32_t i = 0; i < 3; i++)
+	{
+		memset(pages[i], (int) (0x51 + i), PSZ);
+		recs[i].key = key;
+		recs[i].lsn = 100;
+		recs[i].admission_seq = i == 0 ? 1 : 2;
+		recs[i].page = pages[i];
+	}
+	selected[0] = recs[0];
+	selected[1] = recs[2];
+	wrong[0] = recs[0];
+	wrong[1] = recs[1];
+	ok = ps_image_layer_write(32010, 0, &recs[0], 1, PSZ, &inputs[0]) == 0 &&
+		ps_image_layer_write(32011, 0, &recs[1], 1, PSZ, &inputs[1]) == 0 &&
+		ps_image_layer_write(32012, 0, &recs[2], 1, PSZ, &inputs[2]) == 0 &&
+		ps_image_layer_write(32013, 0, selected, 2, PSZ, &output) == 0 &&
+		ps_image_layer_write(32014, 0, wrong, 2, PSZ, &bad_output) == 0;
+	check(ok, "create duplicate-source full-plan fixture");
+	if (!ok)
+		return;
+	check(ps_compaction_verify_relation_plan(inputs, 3, &output, 1, PSZ, 3,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
+			NULL, NULL, &kept, &dropped) == 0 && kept == 2 && dropped == 0,
+		  "full plan retains closure and selects the highest kept duplicate");
+	check(ps_compaction_verify_relation_plan(inputs, 3, &bad_output, 1, PSZ, 3,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
+			NULL, NULL, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "full plan rejects bytes from the lower-priority duplicate");
+}
+
+static void
+verify_pruned_plan_test(void)
+{
+	PsKey key = {1, 1, 31800, 0, PS_KLASS_RELATION};
+	unsigned char pages[4][PSZ];
+	PsImgRec records[4] = {0}, first[2], second[1], extra[3], wrong[1];
+	PsLayerDesc input, outputs[2], excessive[2], bad_page[2];
+	uint64_t kept, dropped;
+	GroupProbe drops = {0};
+	PsViewFence historical = {100, 1, PS_PRUNE_SEQ_UNBOUNDED};
+	int ok;
+
+	for (uint32_t i = 0; i < 4; i++)
+	{
+		memset(pages[i], (int) (0x31 + i), PSZ);
+		records[i].key = key;
+		records[i].block = i < 2 ? 0 : i - 1;
+		records[i].lsn = i == 1 ? 200 : 100;
+		records[i].admission_seq = i + 1;
+		records[i].page = pages[i];
+	}
+	first[0] = records[1];
+	first[1] = records[2];
+	second[0] = records[3];
+	extra[0] = records[0];
+	extra[1] = records[1];
+	extra[2] = records[2];
+	wrong[0] = records[3];
+	wrong[0].page = pages[0];
+	ok = ps_image_layer_write(32000, 0, records, 4, PSZ, &input) == 0 &&
+		ps_image_layer_write(32001, 0, first, 2, PSZ, &outputs[0]) == 0 &&
+		ps_image_layer_write(32002, 0, second, 1, PSZ, &outputs[1]) == 0 &&
+		ps_image_layer_write(32003, 0, extra, 3, PSZ, &excessive[0]) == 0 &&
+		ps_image_layer_write(32004, 0, second, 1, PSZ, &excessive[1]) == 0 &&
+		ps_image_layer_write(32005, 0, first, 2, PSZ, &bad_page[0]) == 0 &&
+		ps_image_layer_write(32006, 0, wrong, 1, PSZ, &bad_page[1]) == 0;
+	check(ok, "create complete pruned-plan verification fixture");
+	if (!ok)
+		return;
+	check(ps_compaction_verify_relation_plan(&input, 1, outputs, 2, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == 0 && kept == 3 && dropped == 1 &&
+		  drops.groups == 1 && drops.entries == 1 && drops.source_sum == 32000,
+		  "complete plan verifies multiple output batches and stages exact dropped identities");
+	memset(&drops, 0, sizeof(drops));
+	check(ps_compaction_verify_relation_plan(&input, 1, outputs, 1, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "missing output batch invalidates the whole staged plan");
+	memset(&drops, 0, sizeof(drops));
+	check(ps_compaction_verify_relation_plan(&input, 1, excessive, 2, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "an output containing a version the plan drops is rejected");
+	memset(&drops, 0, sizeof(drops));
+	check(ps_compaction_verify_relation_plan(&input, 1, bad_page, 2, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -1 && kept == 0 && dropped == 0 &&
+		  drops.entries == 1,
+		  "later wrong bytes invalidate even previously staged drop callbacks");
+	memset(&drops, 0, sizeof(drops));
+	check(ps_compaction_verify_relation_plan(&input, 1, outputs, 2, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, &historical, 1, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "a retained historical fence rejects output that omits its version");
+	memset(&drops, 0, sizeof(drops));
+	check(ps_compaction_verify_relation_plan(&input, 1, outputs, 2, PSZ, 1,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -2 && kept == 0 && dropped == 0,
+		  "oversized page history invalidates the full plan");
+	drops.reject = 1;
+	check(ps_compaction_verify_relation_plan(&input, 1, outputs, 2, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "drop staging failure invalidates the full plan");
+}
+
+static void
 relation_group_selection_test(void)
 {
 	PsImageGroupEntry entries[6] = {0}, selected[2], dropped[1];
@@ -1437,6 +1555,8 @@ main(void)
 	resumable_relation_plan_test();
 	relation_group_selection_test();
 	stage_pruned_batch_test();
+	verify_pruned_plan_test();
+	verify_pruned_plan_duplicate_test();
 	bounded_merge_test();
 	bounded_shared_payload_test();
 	bounded_sorted_batch_test();

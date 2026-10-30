@@ -48,6 +48,27 @@ extern int ps_compaction_relation_select_group(const PsImageGroupEntry *entries,
 	PsImageGroupEntry *selected, uint32_t selected_capacity, uint32_t *nselected,
 	PsImageGroupEntry *dropped, uint32_t dropped_capacity, uint32_t *ndropped);
 
+/* Recompute the conservative relation plan and verify the entire ordered set
+ * of staged outputs against it. At least one nonempty output is required;
+ * each output is limited to one image batch.
+ * Dropped identities are delivered once in plan order to stage_drop, which
+ * must only stage effects. A later error invalidates all earlier callbacks.
+ * On success, *kept_out and *dropped_out are logical identity counts; on
+ * failure they are zero. Returns -2 for an oversized page history, -1 for
+ * other failures. Sources, outputs and the retention snapshot must be pinned
+ * and immutable throughout. The caller must separately revalidate concurrent
+ * state and safely advance the frontier, update the page index and publish or
+ * retire layers. Verification scans whole indexes and may rescan them for
+ * each output, so it does not bound execution time or total I/O. */
+typedef int (*PsCompactionDroppedVisitor)(const PsImageGroupEntry *dropped,
+	uint32_t count, void *arg);
+extern int ps_compaction_verify_relation_plan(const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs,
+	uint32_t page_size, uint32_t max_group, PsPruneFence floor,
+	const PsViewFence *fences, uint32_t nfences, uint64_t inherited_below,
+	int has_inherited_below, PsCompactionDroppedVisitor stage_drop, void *arg,
+	uint64_t *kept_out, uint64_t *dropped_out);
+
 extern int ps_compaction_plan_relation_groups(const PsLayerDesc *layers,
 	uint32_t count, uint32_t max_group, PsPruneFence floor,
 	const PsViewFence *fences, uint32_t nfences, uint64_t inherited_below,
