@@ -10,6 +10,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1607,10 +1608,32 @@ prepared_finite_sequence_test(void)
 	}
 }
 
+static int
+remove_test_directory(const char *path)
+{
+	DIR *dir = opendir(path);
+	struct dirent *entry;
+	int ok = 1;
+
+	if (dir == NULL)
+		return 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		if (unlinkat(dirfd(dir), entry->d_name, 0) != 0)
+			ok = 0;
+	}
+	if (closedir(dir) != 0 || rmdir(path) != 0)
+		ok = 0;
+	return ok;
+}
+
 int
 main(void)
 {
-	char		dir[] = "/tmp/pslayertestXXXXXX";
+	char        dir[4096];
+	const char *tmpdir = getenv("TMPDIR");
 	uint32_t	psz = PSZ;
 	static unsigned char pg[5][PSZ];
 	PsKey		k5 = {1, 1, 5, 0, PS_KLASS_RELATION};	/* relation 5, block 0 */
@@ -1620,9 +1643,18 @@ main(void)
 	unsigned char out[PSZ];
 	int			r;
 
-	if (!mkdtemp(dir) || ps_layer_store->open(dir) != 0)
+	if (tmpdir == NULL || *tmpdir == '\0')
+		tmpdir = "/tmp";
+	if (snprintf(dir, sizeof(dir), "%s/pslayertestXXXXXX", tmpdir) >= (int) sizeof(dir) ||
+		!mkdtemp(dir))
 	{
-		fprintf(stderr, "setup failed\n");
+		fprintf(stderr, "temporary directory setup failed\n");
+		return 2;
+	}
+	if (ps_layer_store->open(dir) != 0)
+	{
+		fprintf(stderr, "layer store setup failed\n");
+		(void) remove_test_directory(dir);
 		return 2;
 	}
 	legacy_index_visitor_test();
@@ -1951,6 +1983,8 @@ main(void)
 	streaming_layer_test();
 	index_cache_pressure_test();
 	index_direct_read_test();
+	ps_layer_store->close();
+	check(remove_test_directory(dir), "remove temporary layer test directory");
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }
