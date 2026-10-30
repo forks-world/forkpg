@@ -15,7 +15,9 @@
 #define _GNU_SOURCE
 #endif
 
+#include <dirent.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +31,53 @@
 #include "pagestore_layer.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
+
+#define TEST_TEMP_PATH_MAX 192
+
+/* Failure must stop the test: callers may otherwise use or remove a partial
+ * path. Resolve the root because fault injection requires an absolute path. */
+static void
+test_tmp_template(char *path, size_t capacity)
+{
+	const char *root = getenv("TMPDIR");
+	char name[256];
+	char *absolute;
+	int n;
+
+	if (root == NULL || *root == '\0')
+		root = "/tmp";
+	if (strlen(path) >= sizeof(name))
+	{
+		fprintf(stderr, "temporary fixture name is too long\n");
+		exit(2);
+	}
+	strcpy(name, path);
+	absolute = realpath(root, NULL);
+	if (absolute == NULL)
+	{
+		perror("resolve TMPDIR");
+		exit(2);
+	}
+	n = snprintf(path, capacity, "%s/%s", absolute, name);
+	free(absolute);
+	if (n < 0 || (size_t) n >= capacity)
+	{
+		fprintf(stderr, "temporary fixture path is too long\n");
+		exit(2);
+	}
+}
+
+static char *
+test_mkdtemp(char *path, size_t capacity)
+{
+	test_tmp_template(path, capacity);
+	if (mkdtemp(path) == NULL)
+	{
+		perror("create temporary fixture directory");
+		exit(2);
+	}
+	return path;
+}
 
 static int checks;
 static int failed;
@@ -47,12 +96,35 @@ check(int ok, const char *name)
 static void
 remove_tree(const char *path)
 {
-	char command[512];
+	DIR *dir = opendir(path);
+	struct dirent *entry;
 
-	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) > 0 &&
-		system(command) != 0)
-		fprintf(stderr, "warning: could not remove %s\n", path);
+	if (dir == NULL)
+	{
+		(void) unlink(path);
+		return;
+	}
+	while ((entry = readdir(dir)) != NULL)
+	{
+		char child[1024];
+		struct stat st;
+		int n;
+
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		n = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+		if (n < 0 || (size_t) n >= sizeof(child) || lstat(child, &st) != 0)
+			continue;
+		if (S_ISDIR(st.st_mode))
+			remove_tree(child);
+		else
+			(void) unlink(child);
+	}
+	closedir(dir);
+	if (rmdir(path) != 0)
+		fprintf(stderr, "note: could not remove %s\n", path);
 }
+
 
 static void
 configure_core(int flush_every_page)
@@ -353,13 +425,13 @@ read_relation_at(uint32_t block, uint64_t lsn)
 static void
 test_segment_gc_does_not_starve_compaction(void)
 {
-	char store[] = "/tmp/pagestore-gc-compaction-fairness-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-compaction-fairness-XXXXXX";
 	uint64_t before;
 	int wrote = 1;
 
 	configure_core(1);
 	compact_layers = 1;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open segment GC and compaction fairness store");
 	for (uint32_t block = 0; block < 24; block++)
 		wrote &= write_relation(0, block, 1000 + block);
@@ -382,13 +454,13 @@ test_segment_gc_does_not_starve_compaction(void)
 static void
 test_nonzero_floor_bounded_plan(int prune_needed)
 {
-	char store[] = "/tmp/pagestore-bounded-floor-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-floor-XXXXXX";
 	uint64_t before, prune_before;
 
 	configure_core(1);
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open nonzero-floor compaction store");
 	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
@@ -457,14 +529,14 @@ test_nonzero_floor_bounded_plan(int prune_needed)
 static void
 test_bounded_compaction_maintenance(void)
 {
-	char store[] = "/tmp/pagestore-bounded-core-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-core-XXXXXX";
 	uint64_t before, zero_before;
 	uint32_t live = 0;
 	int shared = 0;
 
 	configure_core(1);
 	compact_layers = 100;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open bounded compaction store");
 	check(write_relation(0, 0, 1000), "seed bounded compaction store");
 	run_maintenance(32); /* consume startup pruning request */
@@ -525,7 +597,7 @@ read_fixture_page(const PsImgRec *rec, void *out, void *arg)
 static void
 test_bounded_shared_payload_capacity_fallback(void)
 {
-	char store[] = "/tmp/pagestore-bounded-capacity-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-capacity-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	PsImgRec *recs = calloc(1100, sizeof(*recs));
 	PsLayerDesc first, second;
@@ -536,7 +608,7 @@ test_bounded_shared_payload_capacity_fallback(void)
 
 	configure_core(1);
 	compact_layers = 1;
-	check(ok && mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ok && test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open shared-payload capacity store");
 	if (!ok)
 		return;
@@ -604,7 +676,7 @@ multi_output_conflict(void *arg)
 static void
 test_bounded_prune_multiple_outputs(int mode)
 {
-	char store[] = "/tmp/pagestore-bounded-prune-multi-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-multi-XXXXXX";
 	uint64_t before;
 	uint32_t live = 0, entries = 0;
 	int ok = 1;
@@ -613,7 +685,7 @@ test_bounded_prune_multiple_outputs(int mode)
 	configure_core(0);
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open multi-output pruning fixture");
 		return;
@@ -726,7 +798,7 @@ prune_index_conflict(void *arg)
 static void
 test_bounded_prune_index_batches(int mode)
 {
-	char store[] = "/tmp/pagestore-prune-index-batches-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-index-batches-XXXXXX";
 	PruneIndexProbe probe = {.mode = mode};
 	uint64_t before;
 	uint32_t live = 0;
@@ -735,7 +807,7 @@ test_bounded_prune_index_batches(int mode)
 	configure_core(0);
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open batched index pruning store");
 		return;
@@ -846,7 +918,7 @@ hot_page_prune_hook(void *arg)
 static void
 test_hot_page_prune_batches(int mode)
 {
-	char store[] = "/tmp/pagestore-prune-hot-page-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-hot-page-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	HotPagePruneProbe probe = {.mode = mode};
 	uint64_t before;
@@ -855,7 +927,7 @@ test_hot_page_prune_batches(int mode)
 	configure_core(0);
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open hot-page pruning store");
 		return;
@@ -976,7 +1048,7 @@ long_chain_finish_setup(const char *store, uint32_t block)
 static void
 test_long_chain_prune_snapshot(int mode)
 {
-	char store[] = "/tmp/pagestore-prune-long-chain-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-long-chain-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	LongChainProbe probe = {.mode = mode, .block = mode == 4 ? 1 : 0};
 	uint32_t block = probe.block;
@@ -989,7 +1061,7 @@ test_long_chain_prune_snapshot(int mode)
 	segment_size = (mode == 3 ? 4 : 32) * 1024 * 1024;
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open long-page-chain pruning store");
 		return;
@@ -1167,7 +1239,7 @@ count_deleting_image_layers(void)
 static void
 test_prune_snapshot_conflict_churn(void)
 {
-	char store[] = "/tmp/pagestore-prune-conflict-churn-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-conflict-churn-XXXXXX";
 	PruneChurnProbe probe = {0};
 	uint32_t initial, maximum = 0, maximum_deleting = 0;
 	int ok = 1;
@@ -1176,7 +1248,7 @@ test_prune_snapshot_conflict_churn(void)
 	segment_size = 32 * 1024 * 1024;
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open pruning-conflict churn store");
 		return;
@@ -1237,7 +1309,7 @@ prune_abandon_crash(void *arg)
 static void
 test_prune_abandon_conflict(int mode)
 {
-	char store[] = "/tmp/pagestore-prune-abandon-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-abandon-XXXXXX";
 	PruneChurnProbe probe = {.pin_output = mode == 0, .mutate_source = mode == 2};
 	uint32_t initial;
 	int ok = 1;
@@ -1246,7 +1318,7 @@ test_prune_abandon_conflict(int mode)
 	segment_size = 32 * 1024 * 1024;
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open pruning abandonment boundary store");
 		return;
@@ -1317,15 +1389,15 @@ test_prune_abandon_conflict(int mode)
 static void
 test_prune_abandon_provider_gate(void)
 {
-	char store[] = "/tmp/pagestore-prune-provider-XXXXXX";
-	char objects[] = "/tmp/pagestore-prune-objects-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-provider-XXXXXX";
+	char objects[TEST_TEMP_PATH_MAX] = "pagestore-prune-objects-XXXXXX";
 	const char *old_env = getenv("PAGESTORE_OBJECT_DIR");
 	char *saved = old_env != NULL ? strdup(old_env) : NULL;
 	PsLayerStore unknown;
 
 	configure_core(1);
-	if ((old_env != NULL && saved == NULL) || mkdtemp(store) == NULL ||
-		mkdtemp(objects) == NULL || setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0 ||
+	if ((old_env != NULL && saved == NULL) || test_mkdtemp(store, sizeof(store)) == NULL ||
+		test_mkdtemp(objects, sizeof(objects)) == NULL || setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0 ||
 		ps_core_open(store) != 0)
 	{
 		check(0, "open pruning provider-gate fixture");
@@ -1386,7 +1458,7 @@ partial_output_churn_hook(void *arg)
 static void
 test_partial_output_conflict_churn(void)
 {
-	char store[] = "/tmp/pagestore-prune-partial-churn-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-partial-churn-XXXXXX";
 	PartialOutputChurnProbe probe = {0};
 	uint32_t initial, maximum = 0, maximum_deleting = 0;
 	int ok = 1;
@@ -1394,7 +1466,7 @@ test_partial_output_conflict_churn(void)
 	configure_core(0);
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open partial-output conflict churn store");
 		return;
@@ -1447,7 +1519,7 @@ test_partial_output_conflict_churn(void)
 static void
 test_partial_output_abandon_crash(void)
 {
-	char store[] = "/tmp/pagestore-prune-partial-crash-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-partial-crash-XXXXXX";
 	PartialOutputChurnProbe probe = {0};
 	int ok = 1;
 	int status = 0;
@@ -1456,7 +1528,7 @@ test_partial_output_abandon_crash(void)
 	configure_core(0);
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open partial-output crash store");
 		return;
@@ -1524,14 +1596,14 @@ bounded_conflict_hook(void *arg)
 static void
 test_bounded_compaction_concurrent_write(void)
 {
-	char store[] = "/tmp/pagestore-bounded-conflict-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-conflict-XXXXXX";
 	BoundedConflictProbe probe = {0};
 	uint64_t before;
 	uint32_t live = 0;
 
 	configure_core(1);
 	compact_layers = 100;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  write_control(0, 1000, 800), "open bounded conflict store");
 	run_maintenance(32);
 	check(write_relation(0, 1, 2000) && write_relation(0, 2, 3000),
@@ -1635,8 +1707,8 @@ bounded_prune_crash_marker(void *arg)
 static void
 test_bounded_prune_crash(const char *fault_name)
 {
-	char store[] = "/tmp/pagestore-bounded-prune-crash-XXXXXX";
-	char control[] = "/tmp/pagestore-bounded-prune-fault-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-crash-XXXXXX";
+	char control[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-fault-XXXXXX";
 	char arm[512], marker = 0;
 	FILE *arm_file;
 	int pipefd[2], status = 0;
@@ -1646,7 +1718,7 @@ test_bounded_prune_crash(const char *fault_name)
 	configure_core(1);
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	if (!mkdtemp(store) || !mkdtemp(control) ||
+	if (!test_mkdtemp(store, sizeof(store)) || !test_mkdtemp(control, sizeof(control)) ||
 		snprintf(arm, sizeof(arm), "%s/arm", control) >= (int) sizeof(arm) ||
 		(arm_file = fopen(arm, "w")) == NULL)
 	{
@@ -1715,7 +1787,7 @@ test_bounded_prune_crash(const char *fault_name)
 static void
 test_bounded_prune_interrupted_retirement(void)
 {
-	char store[] = "/tmp/pagestore-bounded-prune-retirement-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-retirement-XXXXXX";
 	FloorPlanConflict probe = {0};
 	uint64_t before;
 	uint32_t live = 0;
@@ -1723,7 +1795,7 @@ test_bounded_prune_interrupted_retirement(void)
 	configure_core(1);
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
 		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
@@ -1759,7 +1831,7 @@ test_bounded_prune_interrupted_retirement(void)
 static void
 test_bounded_prune_conflict(int mode)
 {
-	char store[] = "/tmp/pagestore-bounded-prune-conflict-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-conflict-XXXXXX";
 	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2};
 	uint64_t before;
 	uint32_t live = 0;
@@ -1767,7 +1839,7 @@ test_bounded_prune_conflict(int mode)
 	configure_core(1);
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
 		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
@@ -1808,14 +1880,14 @@ test_bounded_prune_conflict(int mode)
 static void
 test_nonzero_bounded_plan_conflict(int mode)
 {
-	char store[] = "/tmp/pagestore-bounded-floor-conflict-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-floor-conflict-XXXXXX";
 	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2};
 	uint32_t live = 0;
 
 	configure_core(1);
 	segment_gc_enabled = 0;
 	compact_layers = 100;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
 		  write_relation(0, 0, 1000) && write_relation(0, 1, 2000) &&
@@ -1923,12 +1995,12 @@ staged_compaction_foreground(void *arg)
 static void
 test_staged_compaction_rejects_remote_transition(void)
 {
-	char store[] = "/tmp/pagestore-staged-remote-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-staged-remote-XXXXXX";
 	StagedCompactionProbe probe = {.remote_transition = 1};
 	int restored = 0;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open staged remote transition store");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "prepare staged remote transition sources");
@@ -1957,7 +2029,7 @@ test_staged_compaction_rejects_remote_transition(void)
 static void
 test_staged_compaction_preserves_pinned_reader(void)
 {
-	char store[] = "/tmp/pagestore-staged-reader-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-staged-reader-XXXXXX";
 	StagedCompactionProbe probe = {.hold_reader = 1};
 	int released = 0;
 	int marked = 0;
@@ -1966,7 +2038,7 @@ test_staged_compaction_preserves_pinned_reader(void)
 	uint64_t found_lsn = 0, found_seq = 0;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open staged reader store");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "prepare staged reader sources");
@@ -2034,12 +2106,12 @@ gather_compaction_concurrent_change(void *arg)
 static void
 test_compaction_gather_rejects_concurrent_change(int pin_only)
 {
-	char store[] = "/tmp/pagestore-gather-conflict-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gather-conflict-XXXXXX";
 	StagedCompactionProbe probe = {.pin_only = pin_only};
 	uint64_t version = 0;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open compaction gather conflict store");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "prepare compaction gather sources");
@@ -2065,13 +2137,13 @@ test_compaction_gather_rejects_concurrent_change(int pin_only)
 static void
 test_staged_compaction_makes_progress_after_conflicts(void)
 {
-	char store[] = "/tmp/pagestore-staged-retry-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-staged-retry-XXXXXX";
 	StagedCompactionProbe probe = {.max_calls = 1};
 	uint64_t version = 0;
 	uint32_t layers;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open staged compaction retry store");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "prepare sources for staged retry");
@@ -2092,13 +2164,13 @@ test_staged_compaction_makes_progress_after_conflicts(void)
 static void
 test_staged_compaction_rejects_concurrent_write(uint32_t nshards)
 {
-	char store[] = "/tmp/pagestore-staged-compaction-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-staged-compaction-XXXXXX";
 	StagedCompactionProbe probe = {0};
 	uint64_t version = 0;
 
 	configure_core(1);
 	ps_nshards = nshards;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open staged compaction store");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "prepare staged compaction sources");
@@ -2122,12 +2194,12 @@ test_staged_compaction_rejects_concurrent_write(uint32_t nshards)
 static void
 test_staged_compaction_rejects_new_retention_pin(void)
 {
-	char store[] = "/tmp/pagestore-staged-pin-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-staged-pin-XXXXXX";
 	StagedCompactionProbe probe = {.pin_only = 1};
 	uint64_t version = 0;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open staged retention store");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "prepare staged retention sources");
@@ -2153,10 +2225,10 @@ test_staged_compaction_rejects_new_retention_pin(void)
 static void
 test_floor_retires_older_checkpoints(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-floor-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-floor-XXXXXX";
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for floor test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -2196,10 +2268,10 @@ test_floor_retires_older_checkpoints(void)
 static void
 test_note_identity_trailer(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-trailer-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-trailer-XXXXXX";
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the note trailer test");
 	check(write_relation(0, 0, 900) && write_note(0, 1000, 800),
 		  "a legacy note without a trailer");
@@ -2224,10 +2296,10 @@ test_note_identity_trailer(void)
 static void
 test_reader_pin_retains_its_checkpoint(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-reader-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-reader-XXXXXX";
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for reader test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -2261,10 +2333,10 @@ test_reader_pin_retains_its_checkpoint(void)
 static void
 test_branch_cap_retains_its_checkpoint(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-branch-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-branch-XXXXXX";
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for branch test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -2293,7 +2365,7 @@ test_branch_cap_retains_its_checkpoint(void)
 static void
 test_split_pair_is_never_unnoted(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-split-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-split-XXXXXX";
 	PsKey key = control_key();
 	unsigned char page[8192];
 
@@ -2301,7 +2373,7 @@ test_split_pair_is_never_unnoted(void)
 	 * its image stays in the page log. */
 	configure_core(0);
 	flush_pages = 2;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for split-pair test");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "two complete checkpoints flushed into layers");
@@ -2341,11 +2413,11 @@ test_split_pair_is_never_unnoted(void)
 static void
 test_retry_copies_collapse(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-retry-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-retry-XXXXXX";
 	PsKey key = control_key();
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for retry test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_control(0, 1000, 800) && write_control(0, 1000, 800) &&
@@ -2383,11 +2455,11 @@ test_retry_copies_collapse(void)
 static void
 test_in_flight_note_retries_collapse(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-inflight-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-inflight-XXXXXX";
 	PsKey key = control_key();
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the in-flight note test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -2431,11 +2503,11 @@ test_in_flight_note_retries_collapse(void)
 static void
 test_wal_only_pin_release_reschedules(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-walpin-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-walpin-XXXXXX";
 
 	configure_core(1);
 	compact_layers = 1;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for WAL-only pin test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -2464,12 +2536,12 @@ test_wal_only_pin_release_reschedules(void)
 static void
 test_slru_seed_keeps_its_control_image(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-seed-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-seed-XXXXXX";
 	PsKey seed = {0, 0, 7, 0, PS_KLASS_SLRU};
 	unsigned char page[8192];
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the SLRU seed test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -2522,14 +2594,14 @@ test_slru_seed_keeps_its_control_image(void)
 static void
 test_late_artifact_below_frontier_is_refused(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-late-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-late-XXXXXX";
 	PsKey seed = {0, 0, 7, 0, PS_KLASS_SLRU};
 	PsKey snapshot = {0, 0, 9, 0, PS_KLASS_READER_SNAPSHOT};
 	unsigned char page[8192];
 	int rc_below, rc_snapshot_below, rc_at;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the late artifact test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -2572,13 +2644,13 @@ test_late_artifact_below_frontier_is_refused(void)
 static void
 test_failed_artifact_append_releases_its_fence(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-release-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-release-XXXXXX";
 	PsKey seed = {0, 0, 7, 0, PS_KLASS_SLRU};
 	unsigned char page[8192];
 	int rc;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the released fence test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -2622,12 +2694,12 @@ test_failed_artifact_append_releases_its_fence(void)
 static void
 test_materializer_pin_is_the_page_cutoff(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-marker-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-marker-XXXXXX";
 	PsKey rel = {1, 1, 1, 0, PS_KLASS_RELATION};
 	uint64_t version = 0;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the materializer cutoff test");
 	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_WAL |
@@ -2678,12 +2750,12 @@ test_materializer_pin_is_the_page_cutoff(void)
 static void
 test_checkpoint_note_is_the_page_cutoff(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-note-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-note-XXXXXX";
 	PsKey rel = {1, 1, 1, 0, PS_KLASS_RELATION};
 	uint64_t version = 0;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the note cutoff test");
 	check(write_relation(0, 0, 900) && write_checkpoint(0, 800, 1000) &&
 		  write_relation(0, 0, 1900) && write_checkpoint(0, 1800, 2000) &&
@@ -2703,8 +2775,8 @@ test_checkpoint_note_is_the_page_cutoff(void)
 	/* With a materializer owner present, the writer's newer checkpoint notes
 	 * do not move the cutoff ahead of materialization. */
 	configure_core(1);
-	strcpy(store, "/tmp/pagestore-control-prune-note-XXXXXX");
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	strcpy(store, "pagestore-control-prune-note-XXXXXX");
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the materializer-owned note test");
 	check(write_relation(0, 0, 900) && write_checkpoint(0, 800, 1000) &&
 		  write_relation(0, 0, 1900) && write_checkpoint(0, 1800, 2000) &&
@@ -2766,12 +2838,12 @@ object_version_at(uint32_t timeline, uint32_t klass, uint32_t object,
 static void
 test_stale_artifacts_are_retired(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-artifact-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-artifact-XXXXXX";
 	PsKey rel = {1, 1, 1, 0, PS_KLASS_RELATION};
 	PsKey seed7 = {0, 0, 7, 0, PS_KLASS_SLRU};
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the artifact retention test");
 	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_WAL |
@@ -2860,13 +2932,13 @@ test_stale_artifacts_are_retired(void)
 static void
 test_live_slru_mirror_follows_page_history(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-slrulive-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-slrulive-XXXXXX";
 	PsKey live = {0, 0, 7, 0, PS_KLASS_SLRU_LIVE};
 	PsKey tomb = {0, 0, 7, 0, PS_KLASS_SLRU_TOMB};
 	PsKey wm = {0, 0, 0, 0, PS_KLASS_SLRU_WM};
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the live SLRU retention test");
 	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_WAL |
@@ -2915,7 +2987,7 @@ test_live_slru_mirror_follows_page_history(void)
 static void
 test_same_version_twin_supersedes_pre_checkpoint_image(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-twin-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-twin-XXXXXX";
 	PsKey key = control_key();
 	unsigned char page[8192];
 	uint64_t version = 0;
@@ -2924,7 +2996,7 @@ test_same_version_twin_supersedes_pre_checkpoint_image(void)
 	const uint64_t prev_redo = 2800;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the exact-redo twin test");
 
 	/* The pre-checkpoint state image: its note names the previous
@@ -2965,12 +3037,12 @@ test_same_version_twin_supersedes_pre_checkpoint_image(void)
 static void
 test_independent_blocks_keep_their_newest(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-marker-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-marker-XXXXXX";
 	PsKey key = control_key();
 	unsigned char page[8192];
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the marker test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -3021,7 +3093,7 @@ compact_counted_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t
 static void
 test_compaction_source_read_batch(void)
 {
-	char store[] = "/tmp/pagestore-compact-read-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-compact-read-XXXXXX";
 	PsLayerStore counted = PsLayerStoreLocal;
 	PsImgRec recs[32] = {0};
 	unsigned char pages[32][8192];
@@ -3031,7 +3103,7 @@ test_compaction_source_read_batch(void)
 	int rc;
 
 	configure_core(0);
-	if (out == NULL || mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (out == NULL || test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open compaction source-read fixture");
 		free(out);
