@@ -715,7 +715,8 @@ bounded_prune_crash_marker(void *arg)
 	int fd = *(int *) arg;
 	char marker = 'B';
 
-	(void) write(fd, &marker, 1);
+	if (write(fd, &marker, 1) != 1)
+		_exit(90);
 	ps_test_set_compaction_unlocked_hook(NULL, NULL);
 }
 
