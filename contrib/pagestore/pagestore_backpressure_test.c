@@ -16,6 +16,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
+
 #include "pagestore_core.h"
 #include "pagestore_forkmeta_snapshot.h"
 #include "pagestore_retention.h"
@@ -252,15 +254,6 @@ close_forkmeta_runtime(void *arg)
 	ps_storage->close();
 	__atomic_store_n(&race->close_completed, 1, __ATOMIC_RELEASE);
 	return NULL;
-}
-
-static void
-remove_tree(const char *path)
-{
-	char command[512];
-
-	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) > 0)
-		(void) system(command);
 }
 
 static void
@@ -501,7 +494,7 @@ test_forkmeta_rejects_nonposix_provider(void)
 static void
 test_walidx_append_tail_restart(void)
 {
-	char store[] = "/tmp/pagestore-walidx-backpressure-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-walidx-backpressure-XXXXXX";
 	PsShmHeader metrics;
 	PsChannel channel;
 
@@ -509,7 +502,7 @@ test_walidx_append_tail_restart(void)
 	memset(&metrics, 0, sizeof(metrics));
 	check(ps_backpressure_configure_all(0, 0, 0, 0, 1, 0) == 0,
 		  "configure WAL-index backpressure for append-tail coverage");
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open a store for WAL-index append-tail coverage");
 	ps_core_set_metrics_header(&metrics);
 	memset(&channel, 0, sizeof(channel));
@@ -857,7 +850,7 @@ test_walidx_append_tail_restart(void)
 	ps_storage->close();
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 		  "disable WAL-index backpressure after append-tail test");
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 static int
@@ -1003,8 +996,8 @@ test_path_suffix(char *path, size_t path_size, const char *base,
 static void
 test_forkmeta_runtime_enable_and_symlink_root(void)
 {
-	char store[] = "/tmp/pagestore-forkmeta-runtime-enable-XXXXXX";
-	char symlink_root[] = "/tmp/pagestore-forkmeta-symlink-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-forkmeta-runtime-enable-XXXXXX";
+	char symlink_root[PS_TEST_TEMP_PATH_MAX] = "pagestore-forkmeta-symlink-XXXXXX";
 	char target_a[1024];
 	char target_b[1024];
 	char link_path[1024];
@@ -1026,7 +1019,7 @@ test_forkmeta_runtime_enable_and_symlink_root(void)
 	configure_page_core();
 	memset(&metrics, 0, sizeof(metrics));
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0 &&
-			mkdtemp(store) != NULL && (opened = ps_core_open(store) == 0),
+			ps_test_mkdtemp(store, sizeof(store)) != NULL && (opened = ps_core_open(store) == 0),
 			"open with forkmeta observation disabled");
 	if (opened)
 	{
@@ -1095,11 +1088,11 @@ test_forkmeta_runtime_enable_and_symlink_root(void)
 	}
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 			"disable forkmeta observation after runtime-enable test");
-	remove_tree(store);
+	ps_test_remove_tree(store);
 
 	opened = 0;
 	memset(&metrics, 0, sizeof(metrics));
-	check(mkdtemp(symlink_root) != NULL &&
+	check(ps_test_mkdtemp(symlink_root, sizeof(symlink_root)) != NULL &&
 			snprintf(target_a, sizeof(target_a), "%s/store-a", symlink_root) >= 0 &&
 			snprintf(target_b, sizeof(target_b), "%s/store-b", symlink_root) >= 0 &&
 			snprintf(link_path, sizeof(link_path), "%s/store-link", symlink_root) >= 0 &&
@@ -1158,13 +1151,13 @@ test_forkmeta_runtime_enable_and_symlink_root(void)
 	}
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 			"disable forkmeta observation after symlink-root test");
-	remove_tree(symlink_root);
+	ps_test_remove_tree(symlink_root);
 }
 
 static void
 test_forkmeta_backpressure_observer(void)
 {
-	char store[] = "/tmp/pagestore-forkmeta-backpressure-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-forkmeta-backpressure-XXXXXX";
 	char snapshots[1024];
 	char old_checkpoint[1200];
 	char old_tail[1200];
@@ -1185,7 +1178,7 @@ test_forkmeta_backpressure_observer(void)
 	memset(&metrics, 0, sizeof(metrics));
 	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
 																				128, 20) == 0 &&
-			mkdtemp(store) != NULL && ps_core_open(store) == 0,
+			ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 				"open a store for forkmeta backpressure observation");
 	ps_core_set_metrics_header(&metrics);
 	check(snprintf(source, sizeof(source), "%s/forkmeta", store) >= 0 &&
@@ -1412,13 +1405,13 @@ test_forkmeta_backpressure_observer(void)
 	ps_storage->close();
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 			"disable forkmeta backpressure after observer test");
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 static void
 test_forkmeta_self_recovery(void)
 {
-	char store[] = "/tmp/pagestore-forkmeta-self-recovery-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-forkmeta-self-recovery-XXXXXX";
 	char manifest[1200];
 	char snapshots[1200];
 	char old_checkpoint[1200];
@@ -1457,7 +1450,7 @@ test_forkmeta_self_recovery(void)
 	compact_layers = 0;
 	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
 			32, 20) == 0 &&
-			mkdtemp(store) != NULL && ps_core_open(store) == 0,
+			ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 			"open a store for forkmeta self-recovery");
 	memset(&metrics, 0, sizeof(metrics));
 	ps_core_set_metrics_header(&metrics);
@@ -1722,7 +1715,7 @@ test_forkmeta_self_recovery(void)
 		check(unlink(bad_temp) == 0 && rename(snapshots, snapshots_probe) == 0 &&
 				rename(snapshots_saved, snapshots) == 0,
 				"restore canonical overflow after malformed temp probe");
-		remove_tree(snapshots_probe);
+		ps_test_remove_tree(snapshots_probe);
 		ps_backpressure_refresh();
 		/* Repeat with a symlink to exercise the no-follow failure path. */
 		check(rename(snapshots, snapshots_saved) == 0 && mkdir(snapshots, 0700) == 0 &&
@@ -1759,7 +1752,7 @@ test_forkmeta_self_recovery(void)
 		check(unlink(bad_temp) == 0 && rename(snapshots, snapshots_probe) == 0 &&
 				rename(snapshots_saved, snapshots) == 0,
 				"restore canonical overflow after symlink temp probe");
-		remove_tree(snapshots_probe);
+		ps_test_remove_tree(snapshots_probe);
 		ps_backpressure_refresh();
 		/* A durability-ambiguous canonical probe must also suppress the armed
 		 * cutover for this tick.  Keep the old generation in a small replacement
@@ -1823,7 +1816,7 @@ test_forkmeta_self_recovery(void)
 		check(rename(snapshots, snapshots_probe) == 0 &&
 				rename(snapshots_saved, snapshots) == 0,
 				"restore canonical overflow after ambiguity probe");
-		remove_tree(snapshots_probe);
+		ps_test_remove_tree(snapshots_probe);
 		ps_backpressure_refresh();
 		memset(&generation_order, 0, sizeof(generation_order));
 		generation_order.expected_scan_calls = 4097;
@@ -1953,7 +1946,7 @@ test_forkmeta_self_recovery(void)
 					replacement_moved = rename(snapshots, snapshots_probe) == 0;
 				if (!replacement_moved && replacement_created)
 				{
-					remove_tree(snapshots);
+					ps_test_remove_tree(snapshots);
 					replacement_moved = 1;
 				}
 				if (!replacement_created)
@@ -1961,7 +1954,7 @@ test_forkmeta_self_recovery(void)
 				if (replacement_moved)
 					original_restored = rename(snapshots_saved, snapshots) == 0;
 				if (original_restored && replacement_created)
-					remove_tree(snapshots_probe);
+					ps_test_remove_tree(snapshots_probe);
 				check(original_restored,
 						"restore original residue after isolated GC-only fixture");
 				if (!original_restored)
@@ -1971,7 +1964,7 @@ test_forkmeta_self_recovery(void)
 					ps_core_close();
 					ps_storage->close();
 					(void) ps_backpressure_configure(0, 0, 0, 0);
-					remove_tree(store);
+					ps_test_remove_tree(store);
 					return;
 				}
 				original_renamed = 0;
@@ -2516,19 +2509,19 @@ test_forkmeta_self_recovery(void)
 	ps_storage->close();
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 			"disable forkmeta backpressure after self-recovery test");
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 static void
 test_walidx_aggregate_force(void)
 {
-	char store[] = "/tmp/pagestore-walidx-aggregate-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-walidx-aggregate-XXXXXX";
 	PsShmHeader metrics;
 
 	configure_page_core();
 	memset(&metrics, 0, sizeof(metrics));
 	check(ps_backpressure_configure_all(0, 0, 0, 0, 100, 0) == 0 &&
-		  mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open a store for aggregate WAL-index force scheduling");
 	ps_core_set_metrics_header(&metrics);
 	check(append_test_walidx_tail(0, 128),
@@ -2548,13 +2541,13 @@ test_walidx_aggregate_force(void)
 	ps_storage->close();
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 		  "disable aggregate WAL-index backpressure");
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 static void
 test_wal_automatic_observation_rate(void)
 {
-	char store[] = "/tmp/pagestore-wal-observation-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-wal-observation-XXXXXX";
 	PsShmHeader metrics;
 	uint64_t before;
 	uint64_t after;
@@ -2562,7 +2555,7 @@ test_wal_automatic_observation_rate(void)
 	configure_page_core();
 	memset(&metrics, 0, sizeof(metrics));
 	check(ps_backpressure_configure_all(0, 0, 100, 0, 0, 0) == 0 &&
-		  mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open a store for automatic WAL observation pacing");
 	ps_core_set_metrics_header(&metrics);
 	before = ps_test_backpressure_wal_observation_count();
@@ -2586,13 +2579,13 @@ test_wal_automatic_observation_rate(void)
 	ps_storage->close();
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 		  "disable WAL backpressure after observation pacing test");
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 static void
 test_walidx_automatic_observation_rate(void)
 {
-	char store[] = "/tmp/pagestore-walidx-observation-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-walidx-observation-XXXXXX";
 	PsShmHeader metrics;
 	uint64_t before;
 	uint64_t after;
@@ -2600,7 +2593,7 @@ test_walidx_automatic_observation_rate(void)
 	configure_page_core();
 	memset(&metrics, 0, sizeof(metrics));
 	check(ps_backpressure_configure_all(0, 0, 0, 0, 100, 0) == 0 &&
-		  mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open a store for automatic WAL-index observation pacing");
 	ps_core_set_metrics_header(&metrics);
 	before = ps_test_backpressure_walidx_observation_count();
@@ -2620,7 +2613,7 @@ test_walidx_automatic_observation_rate(void)
 	ps_storage->close();
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 		  "disable WAL-index backpressure after observation pacing test");
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 typedef struct AdmissionFairnessState
@@ -2779,7 +2772,7 @@ make_page_debt_store(char *store)
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	unsigned char page[8192];
 
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (ps_test_mkdtemp(store, PS_TEST_TEMP_PATH_MAX) == NULL || ps_core_open(store) != 0)
 		return 0;
 	for (uint32_t block = 0; block < 5; block++)
 	{
@@ -2842,7 +2835,7 @@ sentinel_segment_size(uint32_t shard, int seg)
 static void
 test_page_debt_disabled_fast_path(void)
 {
-	char store[] = "/tmp/pagestore-page-debt-disabled-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-page-debt-disabled-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	unsigned char page[8192];
 	PsShmHeader metrics;
@@ -2857,7 +2850,7 @@ test_page_debt_disabled_fast_path(void)
 	counting_storage.seg_size = counting_segment_size;
 	ps_storage = &counting_storage;
 	segment_size_calls = 0;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open disabled PAGE debt fast-path store");
 	observations_before = ps_test_page_gc_coverage_observation_count();
 	for (uint32_t block = 0; block < 9 && appended; block++)
@@ -2900,13 +2893,13 @@ test_page_debt_disabled_fast_path(void)
 	ps_core_set_metrics_header(NULL);
 	ps_core_close();
 	ps_storage->close();
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 static void
 test_page_debt_partial_account_unavailable(void)
 {
-	char store[] = "/tmp/pagestore-page-debt-unavailable-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-page-debt-unavailable-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	unsigned char page[8192];
 	PsShmHeader metrics;
@@ -2921,7 +2914,7 @@ test_page_debt_partial_account_unavailable(void)
 	faulting_storage.seg_size = partial_account_segment_size;
 	ps_storage = &faulting_storage;
 	partial_account_failure = 0;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open PAGE debt unavailable test store");
 	partial_account_failure = 1;
 	for (uint32_t block = 0; block < 9 && appended; block++)
@@ -2972,13 +2965,13 @@ test_page_debt_partial_account_unavailable(void)
 	ps_core_set_metrics_header(NULL);
 	ps_core_close();
 	ps_storage->close();
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 static void
 test_page_storage_fail_closed(void)
 {
-	char store[] = "/tmp/pagestore-page-backpressure-eio-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-page-backpressure-eio-XXXXXX";
 	PsShmHeader metrics;
 	PsStorage failing_storage;
 
@@ -2988,7 +2981,7 @@ test_page_storage_fail_closed(void)
 	if (!make_page_debt_store(store))
 	{
 		check(0, "construct covered page segment for storage-error tests");
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return;
 	}
 	check(1,
@@ -3081,13 +3074,13 @@ test_page_storage_fail_closed(void)
 			  WIFEXITED(status) && WEXITSTATUS(status) == 0,
 			  "enabled page controller fails startup on non-ENOENT segment-size error");
 	}
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 static void
 test_ambiguous_page_segment_remove(void)
 {
-	char store[] = "/tmp/pagestore-page-backpressure-remove-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-page-backpressure-remove-XXXXXX";
 	PsShmHeader metrics;
 	int64_t removed_size;
 
@@ -3097,7 +3090,7 @@ test_ambiguous_page_segment_remove(void)
 	if (!make_page_debt_store(store))
 	{
 		check(0, "construct PAGE debt for ambiguous segment removal");
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return;
 	}
 	check(1, "construct PAGE debt for ambiguous segment removal");
@@ -3151,7 +3144,7 @@ test_ambiguous_page_segment_remove(void)
 	ps_core_set_metrics_header(NULL);
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 		  "disable PAGE debt after ambiguous segment removal test");
-	remove_tree(store);
+	ps_test_remove_tree(store);
 }
 
 int
