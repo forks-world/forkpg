@@ -704,6 +704,126 @@ visit_relation_plan(const PsImageGroupEntry *entries, uint32_t count,
 	return 0;
 }
 
+static int
+stage_pruned_bad_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
+{
+	int rc = PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
+
+	if (rc == 0 && layer->layer_id == 31980 && off == 0 && len != 0)
+		((unsigned char *) buf)[0] ^= 1;
+	return rc;
+}
+
+static void
+stage_pruned_batch_test(void)
+{
+	PsKey key = {1, 1, 31415, 0, PS_KLASS_RELATION};
+	unsigned char pages[3][PSZ], out_page[PSZ];
+	PsImgRec recs[2] = {0}, newer = {0};
+	PsLayerDesc layers[2], output, ignored;
+	PsImgIndexEnt *index0 = NULL, *index1 = NULL;
+	PsImageGroupEntry selected[2], bad[2];
+	uint32_t n0 = 0, n1 = 0;
+	uint64_t uncertain = 0, found_lsn = 0, found_seq = 0;
+	int ok;
+
+	memset(pages[0], 0x11, PSZ);
+	memset(pages[1], 0x22, PSZ);
+	memset(pages[2], 0x33, PSZ);
+	for (uint32_t i = 0; i < 2; i++)
+	{
+		recs[i].key = key;
+		recs[i].block = i;
+		recs[i].lsn = 100;
+		recs[i].admission_seq = i + 1;
+		recs[i].page = pages[i];
+	}
+	newer = recs[0];
+	newer.lsn = 200;
+	newer.admission_seq = 3;
+	newer.page = pages[2];
+	ok = ps_image_layer_write(31980, 0, recs, 2, PSZ, &layers[0]) == 0 &&
+		ps_image_layer_write(31981, 0, &newer, 1, PSZ, &layers[1]) == 0 &&
+		ps_image_layer_read_index(&layers[0], &index0, &n0) == 0 && n0 == 2 &&
+		ps_image_layer_read_index(&layers[1], &index1, &n1) == 0 && n1 == 1;
+	check(ok, "prepare selected staging source layers");
+	if (!ok)
+		goto done;
+	selected[0].entry = index1[0];
+	selected[0].layer_id = layers[1].layer_id;
+	selected[1].entry = index0[1];
+	selected[1].layer_id = layers[0].layer_id;
+	check(ps_image_compaction_stage_selected_batch(layers, 2, selected,
+			PS_IMAGE_BATCH_MAX_RECORDS + 1, 31983, PSZ, &ignored, &uncertain) == -1 &&
+		  uncertain == 0 && ps_layer_store->layer_exists_local(31983) == 0,
+		  "selected output batch refuses more than the record bound");
+	check(ps_image_compaction_stage_selected_batch(layers, 2, selected, 2,
+			31982, PSZ, &output, &uncertain) == 0 && uncertain == 0,
+		  "seal one unpublished selected batch");
+	check(ps_image_layer_lookup_exact(&output, &key, 0, 200, 3, out_page,
+			PSZ, &found_lsn, &found_seq) == 1 &&
+		  memcmp(out_page, pages[2], PSZ) == 0 &&
+		  ps_image_layer_lookup_exact(&output, &key, 0, 100, 1, out_page,
+			PSZ, NULL, NULL) == 0 &&
+		  ps_image_layer_lookup_exact(&output, &key, 1, 100, 2, out_page,
+			PSZ, NULL, NULL) == 1 && memcmp(out_page, pages[1], PSZ) == 0,
+		  "staged output contains only the selected versions and bytes");
+	check(ps_image_compaction_stage_selected_batch(layers, 2, selected, 2,
+			31982, PSZ, &ignored, &uncertain) == -2 && uncertain == 31982 &&
+		  ps_image_layer_lookup_exact(&output, &key, 0, 200, 3, out_page,
+			PSZ, NULL, NULL) == 1 && memcmp(out_page, pages[2], PSZ) == 0,
+		  "failed create reports uncertainty without deleting an occupied output");
+	bad[0] = selected[1];
+	bad[1] = selected[0];
+	check(ps_image_compaction_stage_selected_batch(layers, 2, bad, 2,
+			31983, PSZ, &ignored, &uncertain) == -1 && uncertain == 0 &&
+		  ps_layer_store->layer_exists_local(31983) == 0,
+		  "unsorted selections fail before creating output");
+	bad[0] = selected[0];
+	bad[0].entry.data_off = layers[1].locations[0].size;
+	check(ps_image_compaction_stage_selected_batch(layers, 2, bad, 1,
+			31983, PSZ, &ignored, &uncertain) == -1 && uncertain == 0 &&
+		  ps_layer_store->layer_exists_local(31983) == 0,
+		  "out-of-range source offset fails before creating output");
+	{
+		PsLayerStore injected = PsLayerStoreLocal;
+		const PsLayerStore *saved = ps_layer_store;
+
+		injected.read_layer_block = stage_pruned_bad_read;
+		ps_layer_store = &injected;
+		check(ps_image_compaction_stage_selected_batch(layers, 2, selected, 2,
+				31983, PSZ, &ignored, &uncertain) == -1 && uncertain == 0 &&
+			  ps_layer_store->layer_exists_local(31983) == 0,
+			  "corrupt source data is rejected before output creation");
+		injected.read_layer_block = PsLayerStoreLocal.read_layer_block;
+		injected.write_local_layer_at = bounded_write;
+		prepare_fail_write_id = 31984;
+		check(ps_image_compaction_stage_selected_batch(layers, 2, selected, 2,
+				31984, PSZ, &ignored, &uncertain) == -2 && uncertain == 31984,
+			  "failed output write reports its identity for reconciliation");
+		prepare_fail_write_id = 0;
+		injected.delete_local_layer = bounded_delete;
+		prepare_fail_write_id = 31985;
+		prepare_fail_delete_id = 31985;
+		check(ps_image_compaction_stage_selected_batch(layers, 2, selected, 2,
+				31985, PSZ, &ignored, &uncertain) == -2 && uncertain == 31985 &&
+			  ps_layer_store->layer_exists_local(31985) == 1,
+			  "failed cleanup leaves the uncertain partial file for reconciliation");
+		prepare_fail_write_id = 0;
+		prepare_fail_delete_id = 0;
+		{
+			PsLayerDesc partial = {.layer_id = 31985};
+
+			check(PsLayerStoreLocal.delete_local_layer(&partial) == 0,
+				  "test reconciles the reported partial file");
+		}
+		ps_layer_store = saved;
+	}
+done:
+	free(index0);
+	free(index1);
+}
+
 static void
 relation_group_selection_test(void)
 {
@@ -1280,6 +1400,7 @@ main(void)
 	bounded_relation_plan_test();
 	resumable_relation_plan_test();
 	relation_group_selection_test();
+	stage_pruned_batch_test();
 	bounded_merge_test();
 	bounded_shared_payload_test();
 	bounded_sorted_batch_test();
