@@ -19,6 +19,66 @@
 #include "pagestore_prune.h"
 #include "pagestore_retention.h"
 
+/* Failure must stop the test: callers may otherwise use or remove a partial
+ * path. Resolve the root because fault injection requires an absolute path. */
+static void
+test_tmp_template(char *path, size_t capacity)
+{
+	const char *root = getenv("TMPDIR");
+	char name[256];
+	char *absolute;
+	int n;
+
+	if (root == NULL || *root == '\0')
+		root = "/tmp";
+	if (strlen(path) >= sizeof(name))
+	{
+		fprintf(stderr, "temporary fixture name is too long\n");
+		exit(2);
+	}
+	strcpy(name, path);
+	absolute = realpath(root, NULL);
+	if (absolute == NULL)
+	{
+		perror("resolve TMPDIR");
+		exit(2);
+	}
+	n = snprintf(path, capacity, "%s/%s", absolute, name);
+	free(absolute);
+	if (n < 0 || (size_t) n >= capacity)
+	{
+		fprintf(stderr, "temporary fixture path is too long\n");
+		exit(2);
+	}
+}
+
+static char *
+test_mkdtemp(char *path, size_t capacity)
+{
+	test_tmp_template(path, capacity);
+	if (mkdtemp(path) == NULL)
+	{
+		perror("create temporary fixture directory");
+		exit(2);
+	}
+	return path;
+}
+
+static int
+test_mkstemp(char *path, size_t capacity)
+{
+	int fd;
+
+	test_tmp_template(path, capacity);
+	fd = mkstemp(path);
+	if (fd < 0)
+	{
+		perror("create temporary fixture file");
+		exit(2);
+	}
+	return fd;
+}
+
 static int checks;
 static int failed;
 
@@ -767,10 +827,10 @@ expect_open_failure(const char *store)
 static void
 test_no_manifest_marker_only_rejected(void)
 {
-	char store[] = "/tmp/psforkmetanomftXXXXXX";
+	char store[512] = "psforkmetanomftXXXXXX";
 	TestForkMetaRecV2 marker;
 
-	check(mkdtemp(store) != NULL, "create no-manifest marker-only store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create no-manifest marker-only store");
 	memset(&marker, 0, sizeof(marker));
 	marker.magic = TEST_FORK_META_V2_MAGIC;
 	marker.rec_len = sizeof(marker);
@@ -790,7 +850,7 @@ test_no_manifest_marker_only_rejected(void)
 static void
 test_v1_bound_marker_snapshot(void)
 {
-	char store[] = "/tmp/psforkmetav1boundXXXXXX";
+	char store[512] = "psforkmetav1boundXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -812,7 +872,7 @@ test_v1_bound_marker_snapshot(void)
 	uint64_t offsets[4];
 	int n;
 
-	check(mkdtemp(store) != NULL, "create V1 bound-marker store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create V1 bound-marker store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots),
 		  "build V1 snapshot directory path");
@@ -971,7 +1031,7 @@ test_v1_bound_marker_snapshot(void)
 static void
 test_reclaimed_ordered_markers_pruned(void)
 {
-	char store[] = "/tmp/psforkmetamarkerpruneXXXXXX";
+	char store[512] = "psforkmetamarkerpruneXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -982,7 +1042,7 @@ test_reclaimed_ordered_markers_pruned(void)
 	int markers;
 	int n;
 
-	check(mkdtemp(store) != NULL, "create ordered-marker pruning store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create ordered-marker pruning store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots),
 		  "build marker-pruning snapshot path");
@@ -1055,7 +1115,7 @@ test_reclaimed_ordered_markers_pruned(void)
 static void
 test_inert_markers_compacted_after_cutover(void)
 {
-	char store[] = "/tmp/psforkmetamarkercompactXXXXXX";
+	char store[512] = "psforkmetamarkercompactXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -1075,7 +1135,7 @@ test_inert_markers_compacted_after_cutover(void)
 	int markers;
 	int n;
 
-	check(mkdtemp(store) != NULL, "create inert-marker compaction store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create inert-marker compaction store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots),
 		  "build compaction snapshot path");
@@ -1171,7 +1231,7 @@ test_inert_markers_compacted_after_cutover(void)
 static void
 test_inert_markers_kept_when_retained(void)
 {
-	char store[] = "/tmp/psforkmetamarkerretainXXXXXX";
+	char store[512] = "psforkmetamarkerretainXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -1190,7 +1250,7 @@ test_inert_markers_kept_when_retained(void)
 	PsRetentionPin pin;
 	int n;
 
-	check(mkdtemp(store) != NULL, "create inert-marker retention store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create inert-marker retention store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots),
 		  "build retention snapshot path");
@@ -1266,7 +1326,7 @@ test_inert_markers_kept_when_retained(void)
 static void
 test_inert_markers_kept_on_preserve_survivors(void)
 {
-	char store[] = "/tmp/psforkmetamarkerpreserveXXXXXX";
+	char store[512] = "psforkmetamarkerpreserveXXXXXX";
 	char manifest[1200];
 	PsKey key = {6, 6, 9, 0, PS_KLASS_RELATION};
 	PsKey del_key = {6, 6, 10, 0, PS_KLASS_RELATION};
@@ -1281,7 +1341,7 @@ test_inert_markers_kept_on_preserve_survivors(void)
 				ninert_after = 0;
 	int n;
 
-	check(mkdtemp(store) != NULL, "create preserve-survivors compaction store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create preserve-survivors compaction store");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_snapshots/forkmeta_manifest_v1",
 				 store);
 	check(n > 0 && (size_t) n < sizeof(manifest),
@@ -1340,7 +1400,7 @@ test_inert_markers_kept_on_preserve_survivors(void)
 static void
 test_deleting_fork_flags_cleared_on_failed_build_skip(void)
 {
-	char store[] = "/tmp/psforkmetaflagclearXXXXXX";
+	char store[512] = "psforkmetaflagclearXXXXXX";
 	char manifest[1200];
 	char frontier[1200];
 	PsKey key = {6, 6, 12, 0, PS_KLASS_RELATION};
@@ -1355,7 +1415,7 @@ test_deleting_fork_flags_cleared_on_failed_build_skip(void)
 				ninert_after = 0;
 	int n;
 
-	check(mkdtemp(store) != NULL, "create flag-clear-on-skip store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create flag-clear-on-skip store");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_snapshots/forkmeta_manifest_v1",
 				 store);
 	check(n > 0 && (size_t) n < sizeof(manifest), "build flag-clear manifest path");
@@ -1493,7 +1553,7 @@ static int generation_advances_past(const char *directory, uint64_t generation);
 static void
 test_fork_event_index_periodic_cutover_bounded(void)
 {
-	char store[] = "/tmp/psforkmetaperiodicboundXXXXXX";
+	char store[512] = "psforkmetaperiodicboundXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -1509,7 +1569,7 @@ test_fork_event_index_periodic_cutover_bounded(void)
 	int have_hdr = 0;
 	int n;
 
-	check(mkdtemp(store) != NULL, "create periodic-cutover bound store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create periodic-cutover bound store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots), "build periodic snapshot path");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -1635,7 +1695,7 @@ test_fork_event_index_periodic_cutover_bounded(void)
 static void
 test_legacy_only_deletion_filtered_forkmeta(void)
 {
-	char store[] = "/tmp/psforkmetadeletelegacyXXXXXX";
+	char store[512] = "psforkmetadeletelegacyXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	PsKey key = {10, 10, 10, 0, PS_KLASS_RELATION};
@@ -1643,7 +1703,7 @@ test_legacy_only_deletion_filtered_forkmeta(void)
 	TestSnapshotHeader header;
 	int n;
 
-	check(mkdtemp(store) != NULL &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL &&
 		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
 		  ps_core_open(store) == 0 && create_branch_request(1, 0, 1),
 		  "create timeline for legacy-only deletion cutover");
@@ -1695,8 +1755,8 @@ static int count_occurrences(const char *haystack, const char *needle);
 static void
 test_deletion_filtered_forkmeta_impl(int commit_shape)
 {
-	char store[] = "/tmp/psforkmetadeletefilterXXXXXX";
-	char failed_store[] = "/tmp/psforkmetadeletefailXXXXXX";
+	char store[512] = "psforkmetadeletefilterXXXXXX";
+	char failed_store[512] = "psforkmetadeletefailXXXXXX";
 	char snapshots[1024];
 	char frontier[1200];
 	char manifest[1200];
@@ -1727,7 +1787,7 @@ test_deletion_filtered_forkmeta_impl(int commit_shape)
 	use_layers = 1;
 	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0,
 		  "arm deletion-filter snapshot threshold below forced trigger");
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open deletion-filter forkmeta store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots),
@@ -1932,7 +1992,7 @@ test_deletion_filtered_forkmeta_impl(int commit_shape)
 	close_runtime();
 	remove_tree(store);
 
-	check(mkdtemp(failed_store) != NULL &&
+	check(test_mkdtemp(failed_store, sizeof(failed_store)) != NULL &&
 			  setenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME", "1", 1) == 0 &&
 			  ps_core_open(failed_store) == 0,
 		  "open deletion-filter failure-boundary store");
@@ -2014,7 +2074,7 @@ generation_advances_past(const char *directory, uint64_t generation)
 static void
 test_live_ordered_marker_survives_two_cutovers(void)
 {
-	char store[] = "/tmp/psforkmetalive2cutXXXXXX";
+	char store[512] = "psforkmetalive2cutXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -2028,7 +2088,7 @@ test_live_ordered_marker_survives_two_cutovers(void)
 	uint64_t seq = 0;
 	int n;
 
-	check(mkdtemp(store) != NULL, "create live-ordered two-cutover store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create live-ordered two-cutover store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots),
 		  "build live-ordered snapshot path");
@@ -2089,7 +2149,7 @@ test_live_ordered_marker_survives_two_cutovers(void)
 static void
 test_live_ordered_commit_marker_survives_two_cutovers(void)
 {
-	char store[] = "/tmp/psforkmetalive2cutcmtXXXXXX";
+	char store[512] = "psforkmetalive2cutcmtXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -2104,7 +2164,7 @@ test_live_ordered_commit_marker_survives_two_cutovers(void)
 	unsigned char page[8192];
 	int n;
 
-	check(mkdtemp(store) != NULL, "create live-ordered commit-marker store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create live-ordered commit-marker store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots),
 		  "build commit-marker snapshot path");
@@ -2173,7 +2233,7 @@ test_live_ordered_commit_marker_survives_two_cutovers(void)
 static void
 test_live_ordered_marker_walless_survives_two_cutovers(void)
 {
-	char store[] = "/tmp/psforkmetalive2cutwlXXXXXX";
+	char store[512] = "psforkmetalive2cutwlXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -2187,7 +2247,7 @@ test_live_ordered_marker_walless_survives_two_cutovers(void)
 	uint64_t seq = 0;
 	int n;
 
-	check(mkdtemp(store) != NULL, "create WAL-less live-ordered two-cutover store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create WAL-less live-ordered two-cutover store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots),
 		  "build WAL-less live-ordered snapshot path");
@@ -2251,7 +2311,7 @@ test_live_ordered_marker_walless_survives_two_cutovers(void)
 static void
 test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 {
-	char store[] = "/tmp/psforkmetaaftercutXXXXXX";
+	char store[512] = "psforkmetaaftercutXXXXXX";
 	char snapshots[1024], manifest[1200], frontier[1200];
 	PsKey key = {6, 6, 31, 1, PS_KLASS_RELATION};
 	PsKey floor_key = {6, 6, 33, 1, PS_KLASS_RELATION};
@@ -2266,7 +2326,7 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 	uint64_t seq = 0;
 	uint64_t lsn = walless ? 0 : 50;
 
-	check(mkdtemp(store) != NULL, "E6 create store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "E6 create store");
 	snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
 	snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
@@ -2465,7 +2525,7 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 static void
 test_ordered_parent_after_branch(int walless)
 {
-	char store[] = "/tmp/psforkmetabranchXXXXXX";
+	char store[512] = "psforkmetabranchXXXXXX";
 	char snapshots[1024], manifest[1200], frontier[1200];
 	PsKey key = {6, 6, 33, 1, PS_KLASS_RELATION};
 	PsKey pin_key = {6, 6, 34, 0, PS_KLASS_RELATION};
@@ -2477,7 +2537,7 @@ test_ordered_parent_after_branch(int walless)
 	uint64_t reader_seq[2];
 	uint64_t lsn = walless ? 0 : 50;
 
-	check(mkdtemp(store) != NULL, "E6 branch create store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "E6 branch create store");
 	snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
 	snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
@@ -2620,7 +2680,7 @@ test_fork_event_index_selftest(void)
 static void
 test_fork_event_index_scaling(void)
 {
-	char		store[] = "/tmp/psforkmetaeventscaleXXXXXX";
+	char		store[512] = "psforkmetaeventscaleXXXXXX";
 	char		snapshots[1024];
 	char		manifest[1200];
 	char		frontier[1200];
@@ -2641,7 +2701,7 @@ test_fork_event_index_scaling(void)
 				t1;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create fork-event scaling store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create fork-event scaling store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots),
 		  "build scaling snapshot path");
@@ -3013,8 +3073,8 @@ done:
 static int
 expect_open_failure_logs(const char *store, const char *needle)
 {
-	char logpath[] = "/tmp/psforkmetadiagXXXXXX";
-	int logfd = mkstemp(logpath);
+	char logpath[512] = "psforkmetadiagXXXXXX";
+	int logfd = test_mkstemp(logpath, sizeof(logpath));
 	pid_t pid;
 	int status;
 	int found = 0;
@@ -3063,8 +3123,8 @@ expect_open_failure_logs(const char *store, const char *needle)
 static int
 open_capture_stderr(const char *store, char *out, size_t out_cap, int *rc_out)
 {
-	char		logpath[] = "/tmp/psforkmetaopenlogXXXXXX";
-	int			logfd = mkstemp(logpath);
+	char		logpath[512] = "psforkmetaopenlogXXXXXX";
+	int			logfd = test_mkstemp(logpath, sizeof(logpath));
 	int			saved_stderr;
 	ssize_t		n;
 
@@ -3109,7 +3169,7 @@ count_occurrences(const char *haystack, const char *needle)
 static void
 test_orphaned_ordered_marker_adopted(void)
 {
-	char store[] = "/tmp/psforkmetaadoptokXXXXXX";
+	char store[512] = "psforkmetaadoptokXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -3123,7 +3183,7 @@ test_orphaned_ordered_marker_adopted(void)
 	uint64_t seq = 0;
 	int n;
 
-	check(mkdtemp(store) != NULL, "create orphaned-marker adoption store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create orphaned-marker adoption store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots),
 		  "build adoption snapshot path");
@@ -3200,7 +3260,7 @@ test_orphaned_ordered_marker_adopted(void)
 static void
 test_orphaned_ordered_marker_not_adopted_on_mismatch(void)
 {
-	char store[] = "/tmp/psforkmetaadoptbadXXXXXX";
+	char store[512] = "psforkmetaadoptbadXXXXXX";
 	char frontier[1200];
 	PsKey key = {6, 6, 6, 5, PS_KLASS_RELATION};
 	PsKey pin_key = {6, 6, 24, 0, PS_KLASS_RELATION};
@@ -3211,7 +3271,7 @@ test_orphaned_ordered_marker_not_adopted_on_mismatch(void)
 	uint64_t seq = 0;
 	int n;
 
-	check(mkdtemp(store) != NULL, "create orphaned-marker mismatch store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create orphaned-marker mismatch store");
 	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
 	check(n > 0 && (size_t) n < sizeof(frontier),
 		  "build mismatch frontier path");
@@ -3268,7 +3328,7 @@ test_orphaned_ordered_marker_not_adopted_on_mismatch(void)
 static void
 test_orphaned_commit_marker_adopted(void)
 {
-	char		store[] = "/tmp/psforkmetacmtadoptXXXXXX";
+	char		store[512] = "psforkmetacmtadoptXXXXXX";
 	char		snapshots[1024];
 	char		manifest[1200];
 	char		frontier[1200];
@@ -3285,7 +3345,7 @@ test_orphaned_commit_marker_adopted(void)
 	int			rc = -1;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create commit-orphan adoption store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create commit-orphan adoption store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots), "build commit-adopt snapshot path");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -3484,7 +3544,7 @@ build_segment_resident_commit_orphan(const char *store, const char *frontier,
 static void
 test_orphaned_commit_marker_segment_path(void)
 {
-	char		store[] = "/tmp/psforkmetacmtsegXXXXXX";
+	char		store[512] = "psforkmetacmtsegXXXXXX";
 	char		snapshots[1024];
 	char		manifest[1200];
 	char		frontier[1200];
@@ -3498,7 +3558,7 @@ test_orphaned_commit_marker_segment_path(void)
 	int			rc = -1;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create commit-orphan segment-path store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create commit-orphan segment-path store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots), "build segment-path snapshot path");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -3558,7 +3618,7 @@ test_orphaned_commit_marker_segment_path(void)
 static void
 test_orphaned_commit_marker_segment_path_last_is_retired(void)
 {
-	char		store[] = "/tmp/psforkmetacmtseglastXXXXXX";
+	char		store[512] = "psforkmetacmtseglastXXXXXX";
 	char		snapshots[1024];
 	char		manifest[1200];
 	char		frontier[1200];
@@ -3571,7 +3631,7 @@ test_orphaned_commit_marker_segment_path_last_is_retired(void)
 	int			rc = -1;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create commit-orphan last-in-segment store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create commit-orphan last-in-segment store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots), "build last-in-segment snapshot path");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -3617,7 +3677,7 @@ test_orphaned_commit_marker_segment_path_last_is_retired(void)
 static void
 test_orphaned_commit_marker_not_proven(void)
 {
-	char		store[] = "/tmp/psforkmetacmtunprovenXXXXXX";
+	char		store[512] = "psforkmetacmtunprovenXXXXXX";
 	char		snapshots[1024];
 	char		manifest[1200];
 	char		frontier[1200];
@@ -3632,7 +3692,7 @@ test_orphaned_commit_marker_not_proven(void)
 	unsigned char page[8192];
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create commit-orphan not-proven store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create commit-orphan not-proven store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots), "build not-proven snapshot path");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -3699,7 +3759,7 @@ test_orphaned_commit_marker_not_proven(void)
 static void
 test_orphaned_commit_marker_size_mismatch(void)
 {
-	char		store[] = "/tmp/psforkmetacmtsizeXXXXXX";
+	char		store[512] = "psforkmetacmtsizeXXXXXX";
 	char		snapshots[1024];
 	char		manifest[1200];
 	char		frontier[1200];
@@ -3714,7 +3774,7 @@ test_orphaned_commit_marker_size_mismatch(void)
 	unsigned char page[8192];
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create commit-orphan size-mismatch store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create commit-orphan size-mismatch store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots), "build size-mismatch snapshot path");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -3801,7 +3861,7 @@ test_orphaned_commit_marker_size_mismatch(void)
 static void
 test_torn_commit_append_never_adopted(void)
 {
-	char		store[] = "/tmp/psforkmetatorncommitXXXXXX";
+	char		store[512] = "psforkmetatorncommitXXXXXX";
 	char		snapshots[1024];
 	char		manifest[1200];
 	char		frontier[1200];
@@ -3816,7 +3876,7 @@ test_torn_commit_append_never_adopted(void)
 	uint64_t	new_seq = 0;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create torn-commit store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create torn-commit store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots), "build torn-commit snapshot path");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -3937,7 +3997,7 @@ test_torn_commit_append_never_adopted(void)
 static void
 test_torn_growth_append_never_adopted(void)
 {
-	char		store[] = "/tmp/psforkmetatorngrowthXXXXXX";
+	char		store[512] = "psforkmetatorngrowthXXXXXX";
 	char		snapshots[1024];
 	char		manifest[1200];
 	char		frontier[1200];
@@ -3952,7 +4012,7 @@ test_torn_growth_append_never_adopted(void)
 	int			rc = -1;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create torn-growth store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create torn-growth store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots), "build torn-growth snapshot path");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -4119,7 +4179,7 @@ artifact_read_at(const PsKey *key, uint64_t horizon, uint32_t block, int fill)
 static void
 test_artifact_generation_vs_cutoff(void)
 {
-	char		store[] = "/tmp/psforkmetaartifactcutoffXXXXXX";
+	char		store[512] = "psforkmetaartifactcutoffXXXXXX";
 	char		snapshots[1024];
 	char		manifest[1200];
 	char		frontier[1200];
@@ -4136,7 +4196,7 @@ test_artifact_generation_vs_cutoff(void)
 	PsArtifactRefuseReason reason;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "T5: create artifact-vs-cutoff store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "T5: create artifact-vs-cutoff store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots), "T5: build snapshot path");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -4258,7 +4318,7 @@ test_artifact_generation_vs_cutoff(void)
 static void
 test_artifact_forkmeta_cutoff_reason(void)
 {
-	char		store[] = "/tmp/psforkmetaartifactreasonXXXXXX";
+	char		store[512] = "psforkmetaartifactreasonXXXXXX";
 	char		snapshots[1024];
 	char		manifest[1200];
 	char		frontier[1200];
@@ -4273,7 +4333,7 @@ test_artifact_forkmeta_cutoff_reason(void)
 	PsArtifactRefuseReason reason;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "T6: create forkmeta-cutoff-reason store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "T6: create forkmeta-cutoff-reason store");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots), "T6: build snapshot path");
 	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -4352,7 +4412,7 @@ test_artifact_forkmeta_cutoff_reason(void)
 static void
 test_artifact_write_unfenced_after_pin_drop(void)
 {
-	char		store[] = "/tmp/psforkmetaartifactraceXXXXXX";
+	char		store[512] = "psforkmetaartifactraceXXXXXX";
 	char		frontier[1200];
 	PsKey		pin_key = {6, 6, 920, 0, PS_KLASS_RELATION};
 	PsKey		keyG = {0, 0, 921, 0, PS_KLASS_READER_SNAPSHOT};
@@ -4370,7 +4430,7 @@ test_artifact_write_unfenced_after_pin_drop(void)
 	PsArtifactRefuseReason reason;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "T7: create write-race store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "T7: create write-race store");
 	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
 	check(n > 0 && (size_t) n < sizeof(frontier), "T7: build frontier path");
 	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
@@ -4500,7 +4560,7 @@ test_artifact_write_unfenced_after_pin_drop(void)
 static void
 test_hole_record_skipped_on_reopen(void)
 {
-	char		store[] = "/tmp/psforkmetaholeXXXXXX";
+	char		store[512] = "psforkmetaholeXXXXXX";
 	PsKey		before_key = {9, 9, 101, 0, PS_KLASS_RELATION};
 	PsKey		hole_key = {9, 9, 102, 0, PS_KLASS_RELATION};
 	PsKey		after_key = {9, 9, 103, 0, PS_KLASS_RELATION};
@@ -4514,7 +4574,7 @@ test_hole_record_skipped_on_reopen(void)
 	uint64_t	offsets[3];
 	int			rc = -1;
 
-	check(mkdtemp(store) != NULL, "create hole-record store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create hole-record store");
 	check(ps_core_open(store) == 0, "bootstrap hole-record store");
 	close_runtime();
 	memset(&before_hdr, 0, sizeof(before_hdr));
@@ -4584,7 +4644,7 @@ test_hole_record_skipped_on_reopen(void)
 static void
 test_hole_record_bad_len_rejected(void)
 {
-	char		store[] = "/tmp/psforkmetaholebadlenXXXXXX";
+	char		store[512] = "psforkmetaholebadlenXXXXXX";
 	PsKey		before_key = {9, 9, 111, 0, PS_KLASS_RELATION};
 	PsKey		hole_key = {9, 9, 112, 0, PS_KLASS_RELATION};
 	TestSegRecHdr before_hdr;
@@ -4594,7 +4654,7 @@ test_hole_record_bad_len_rejected(void)
 	int64_t		seg_off;
 	uint64_t	offsets[2];
 
-	check(mkdtemp(store) != NULL, "create bad-len hole store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create bad-len hole store");
 	check(ps_core_open(store) == 0, "bootstrap bad-len hole store");
 	close_runtime();
 	memset(&before_hdr, 0, sizeof(before_hdr));
@@ -4647,13 +4707,13 @@ test_hole_record_bad_len_rejected(void)
 static void
 test_zeroextend_noop_does_not_report_seq(void)
 {
-	char		store[] = "/tmp/psforkmetazenoopXXXXXX";
+	char		store[512] = "psforkmetazenoopXXXXXX";
 	PsKey		key = {31, 31, 501, 0, PS_KLASS_RELATION};
 	PsChannel	reply;
 	uint64_t	grow_seq;
 	uint64_t	barrier;
 
-	check(mkdtemp(store) != NULL, "create zeroextend-noop-seq store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create zeroextend-noop-seq store");
 	check(ps_core_open(store) == 0, "bootstrap zeroextend-noop-seq store");
 
 	/* A real grow (0 -> 4) is durable and must return a nonzero seq. */
@@ -4716,7 +4776,7 @@ test_zeroextend_noop_does_not_report_seq(void)
 static void
 test_timeline_delete_keeps_offsets_variant(int variant)
 {
-	char		store[] = "/tmp/psq1XXXXXX";
+	char		store[512] = "psq1XXXXXX";
 	char		seg0[1200];
 	char		size_marker[1200];
 	char		snapshots[1024];
@@ -4735,7 +4795,7 @@ test_timeline_delete_keeps_offsets_variant(int variant)
 	int			rc = -1;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create Q1 offsets-kept store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create Q1 offsets-kept store");
 	n = snprintf(seg0, sizeof(seg0), "%s/seg_00000000", store);
 	check(n > 0 && (size_t) n < sizeof(seg0), "build Q1 seg0 path");
 	n = snprintf(size_marker, sizeof(size_marker),
@@ -4909,7 +4969,7 @@ test_timeline_delete_keeps_offsets(void)
 static void
 test_timeline_delete_reclaims_by_segment_gc(void)
 {
-	char		store[] = "/tmp/psq1gcXXXXXX";
+	char		store[512] = "psq1gcXXXXXX";
 	char		seg0[1200];
 	PsKey		target_key = {13, 13, 1, 0, PS_KLASS_RELATION};
 	PsKey		sibling_key = {13, 13, 2, 0, PS_KLASS_RELATION};
@@ -4918,7 +4978,7 @@ test_timeline_delete_reclaims_by_segment_gc(void)
 	PsTimelineState state = (PsTimelineState) -1;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create segment-GC reclaim store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create segment-GC reclaim store");
 	n = snprintf(seg0, sizeof(seg0), "%s/seg_00000000", store);
 	check(n > 0 && (size_t) n < sizeof(seg0), "build segment-GC seg0 path");
 	segment_size = 65536;
@@ -4990,7 +5050,7 @@ test_timeline_delete_reclaims_by_segment_gc(void)
 static void
 test_compaction_never_prunes_above_watermark(void)
 {
-	char		store[] = "/tmp/psforkmetawatermarkXXXXXX";
+	char		store[512] = "psforkmetawatermarkXXXXXX";
 	char		frontier[1200];
 	PsKey		key = {22, 22, 1, 0, PS_KLASS_RELATION};
 	PsRetentionPin pin;
@@ -4998,7 +5058,7 @@ test_compaction_never_prunes_above_watermark(void)
 	uint64_t	seq = 0;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create I3 watermark-prune store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create I3 watermark-prune store");
 	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
 	check(n > 0 && (size_t) n < sizeof(frontier),
 		  "build I3 watermark-prune frontier path");
@@ -5092,8 +5152,8 @@ crash_matrix_arm_fault(const char *fault_dir)
 static void
 test_timeline_delete_crash_matrix_case(const char *fault_name)
 {
-	char		store[] = "/tmp/psforkmetacrashXXXXXX";
-	char		fault_dir[] = "/tmp/psforkmetacrashctlXXXXXX";
+	char		store[512] = "psforkmetacrashXXXXXX";
+	char		fault_dir[512] = "psforkmetacrashctlXXXXXX";
 	char		snapshots[1024];
 	char		frontier[1200];
 	char		captured[16384];
@@ -5109,8 +5169,8 @@ test_timeline_delete_crash_matrix_case(const char *fault_name)
 	int			rc = -1;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create crash-matrix store");
-	check(mkdtemp(fault_dir) != NULL, "create crash-matrix fault control dir");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create crash-matrix store");
+	check(test_mkdtemp(fault_dir, sizeof(fault_dir)) != NULL, "create crash-matrix fault control dir");
 	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	check(n > 0 && (size_t) n < sizeof(snapshots),
 		  "build crash-matrix snapshot path");
@@ -5267,7 +5327,7 @@ test_timeline_delete_crash_matrix_case(const char *fault_name)
 	}
 	close_runtime();
 	remove_tree(store);
-	rmdir(fault_dir);
+	remove_tree(fault_dir);
 	unsetenv("PAGESTORE_TEST_FAULT_NAME");
 	unsetenv("PAGESTORE_TEST_FAULT_ACTION");
 	unsetenv("PAGESTORE_TEST_FAULT_HIT");
@@ -5303,7 +5363,7 @@ test_timeline_delete_crash_matrix(void)
 static void
 test_timeline_delete_torn_tail_crash_matrix(void)
 {
-	char		store[] = "/tmp/pstorntailcrashXXXXXX";
+	char		store[512] = "pstorntailcrashXXXXXX";
 	char		seg0[1200];
 	char		captured[16384];
 	PsKey		target_key = {23, 23, 1, 0, PS_KLASS_RELATION};
@@ -5319,7 +5379,7 @@ test_timeline_delete_torn_tail_crash_matrix(void)
 	int			fd;
 	int			n;
 
-	check(mkdtemp(store) != NULL, "create torn-tail crash-matrix store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create torn-tail crash-matrix store");
 	n = snprintf(seg0, sizeof(seg0), "%s/seg_00000000", store);
 	check(n > 0 && (size_t) n < sizeof(seg0), "build torn-tail crash seg0 path");
 	flush_pages = 1;
@@ -5453,7 +5513,7 @@ seal_v4_test_record(TestForkMetaRecV2 *rec)
 static void
 test_mixed_forkmeta_classification(void)
 {
-	char store[] = "/tmp/psforkmetamixedflagsXXXXXX";
+	char store[512] = "psforkmetamixedflagsXXXXXX";
 	char source[1024];
 	TestForkMetaRecV2 rec;
 	const uint32_t magics[] = {0x324d4b46U, 0x334d4b46U, 0x344d4b46U,
@@ -5465,7 +5525,7 @@ test_mixed_forkmeta_classification(void)
 	off_t valid_size;
 	int fd;
 
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open mixed forkmeta classification store");
 	close_runtime();
 	(void) snprintf(source, sizeof(source), "%s/forkmeta", store);
@@ -5514,7 +5574,7 @@ test_mixed_forkmeta_classification(void)
 static void
 test_persisted_event_classification(void)
 {
-	char store[] = "/tmp/psforkmetaflagsXXXXXX";
+	char store[512] = "psforkmetaflagsXXXXXX";
 	char snapshots[1024], manifest[1200], source[1200];
 	PsKey key = {6, 6, 987, 0, PS_KLASS_RELATION};
 	PsChannel reply, ch;
@@ -5526,7 +5586,7 @@ test_persisted_event_classification(void)
 	TestSnapshotHeader header;
 	int fd;
 
-	check(mkdtemp(store) != NULL, "create persisted classification store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create persisted classification store");
 	(void) snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	(void) snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
 	(void) snprintf(source, sizeof(source), "%s/forkmeta", store);
@@ -5665,7 +5725,7 @@ live_layer_has_version(const PsKey *key, uint32_t block, uint64_t lsn, uint64_t 
 static void
 test_closure_with_same_lsn_invalidation(void)
 {
-	char store[] = "/tmp/pagestore-closure-invalidation.XXXXXX";
+	char store[512] = "pagestore-closure-invalidation.XXXXXX";
 	char frontier[1024];
 	PsKey key = {1, 1, 32990, 0, PS_KLASS_RELATION};
 	unsigned char page[8192];
@@ -5673,7 +5733,7 @@ test_closure_with_same_lsn_invalidation(void)
 	PsChannel ch = {0};
 	uint64_t first = 0, last = 0, ignored = 0;
 
-	check(mkdtemp(store) != NULL, "create closure invalidation store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create closure invalidation store");
 	snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
 	flush_pages = 1;
 	compact_layers = 0;
@@ -5729,7 +5789,7 @@ test_closure_with_same_lsn_invalidation(void)
 static void
 test_invalidated_first_arrival_then_late_rewrite(void)
 {
-	char store[] = "/tmp/pagestore-closure-late.XXXXXX";
+	char store[512] = "pagestore-closure-late.XXXXXX";
 	char frontier[1024];
 	PsKey key = {1, 1, 32991, 0, PS_KLASS_RELATION};
 	unsigned char page[8192];
@@ -5737,7 +5797,7 @@ test_invalidated_first_arrival_then_late_rewrite(void)
 	PsChannel ch = {0};
 	uint64_t first = 0, late = 0, ignored = 0;
 
-	check(mkdtemp(store) != NULL, "create invalidated first-arrival store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create invalidated first-arrival store");
 	snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
 	flush_pages = 1;
 	compact_layers = 0;
@@ -5794,7 +5854,7 @@ test_invalidated_first_arrival_then_late_rewrite(void)
 static void
 test_finite_branch_cutovers(void)
 {
-	char		store[] = "/tmp/pagestore-finite-branch.XXXXXX";
+	char		store[512] = "pagestore-finite-branch.XXXXXX";
 	char		snapshots[1024],
 				manifest[2048],
 				frontier[1024];
@@ -5807,7 +5867,7 @@ test_finite_branch_cutovers(void)
 	TestSnapshotHeader header;
 	uint64_t	seq = 0;
 
-	check(mkdtemp(store) != NULL, "create finite-branch cutover store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create finite-branch cutover store");
 	snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
 	snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
@@ -5915,12 +5975,12 @@ test_finite_branch_cutovers(void)
 static void
 test_floor_growth_before_later_branch(void)
 {
-	char store[] = "/tmp/psfloorlaterbranchXXXXXX";
+	char store[512] = "psfloorlaterbranchXXXXXX";
 	PsKey key = {6, 6, 41, 1, PS_KLASS_RELATION};
 	PsChannel reply;
 	unsigned char page[8192];
 
-	check(mkdtemp(store) != NULL, "floor/later-branch create store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "floor/later-branch create store");
 	flush_pages = 1;
 	check(ps_core_open(store) == 0, "floor/later-branch open store");
 	check(meta_request_timeline(0, PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
@@ -5945,12 +6005,12 @@ test_floor_growth_before_later_branch(void)
 static void
 test_floor_growth_visible_to_future_branch(void)
 {
-	char store[] = "/tmp/psfloorfuturebranchXXXXXX";
+	char store[512] = "psfloorfuturebranchXXXXXX";
 	PsKey key = {6, 6, 44, 1, PS_KLASS_RELATION};
 	PsChannel reply;
 	unsigned char page[8192];
 
-	check(mkdtemp(store) != NULL, "floor/future-branch create store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "floor/future-branch create store");
 	flush_pages = 1;
 	check(ps_core_open(store) == 0, "floor/future-branch open store");
 	check(meta_request_timeline(0, PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
@@ -5977,12 +6037,12 @@ test_floor_growth_visible_to_future_branch(void)
 static void
 test_floor_rewrite_hidden_from_legacy_branch(void)
 {
-	char store[] = "/tmp/psfloorlegacybranchXXXXXX";
+	char store[512] = "psfloorlegacybranchXXXXXX";
 	PsKey key = {6, 6, 42, 1, PS_KLASS_RELATION};
 	PsChannel reply;
 	unsigned char page[8192];
 
-	check(mkdtemp(store) != NULL, "floor/legacy-branch create store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "floor/legacy-branch create store");
 	flush_pages = 1;
 	check(ps_core_open(store) == 0, "floor/legacy-branch open store");
 	check(meta_request_timeline(0, PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
@@ -6020,12 +6080,12 @@ test_floor_rewrite_hidden_from_legacy_branch(void)
 static void
 test_floor_rewrite_not_backdated(void)
 {
-	char store[] = "/tmp/psfloorbackdateXXXXXX";
+	char store[512] = "psfloorbackdateXXXXXX";
 	PsKey key = {6, 6, 43, 1, PS_KLASS_RELATION};
 	PsChannel reply;
 	unsigned char page[8192];
 
-	check(mkdtemp(store) != NULL, "floor/backdate create store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "floor/backdate create store");
 	flush_pages = 1;
 	check(ps_core_open(store) == 0, "floor/backdate open store");
 	check(meta_request_timeline(0, PS_OP_CREATE, &key, 100, 0, 0, 0, NULL),
@@ -6055,7 +6115,7 @@ test_floor_rewrite_not_backdated(void)
 int
 main(void)
 {
-	char store[] = "/tmp/psforkmetacutoverXXXXXX";
+	char store[512] = "psforkmetacutoverXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -6090,7 +6150,7 @@ main(void)
 	/* Needs no store; runs first. */
 	test_fork_event_index_selftest();
 
-	check(mkdtemp(store) != NULL, "create runtime cutover store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create runtime cutover store");
 	page_size = sizeof(page);
 	segment_size = 1024 * 1024;
 	flush_pages = 1;

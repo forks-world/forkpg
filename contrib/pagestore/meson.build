@@ -330,6 +330,13 @@ test('pagestore_forkmeta_cutover',
   timeout: 120,
 )
 
+test('pagestore_forkmeta_cutover_tmpdir',
+  find_program('python3'),
+  args: [files('test_forkmeta_tmpdir.py'), pagestore_forkmeta_cutover_test],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Focused POSIX process-crash matrix for runtime forkmeta cutover.  The shared
 # core probes are also safe for the optional SPDK frontend; this filesystem
 # matrix itself intentionally runs only with the POSIX storage implementation.
