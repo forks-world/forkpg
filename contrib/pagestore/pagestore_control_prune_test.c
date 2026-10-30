@@ -1275,7 +1275,8 @@ test_prune_abandon_conflict(int mode)
 			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
 			  "process exits after the abandoned-output tombstone");
 		check(ps_core_open(store) == 0 && count_live_image_layers() <= initial + 1 &&
-			  read_relation_asof(0, 5000, 1511) && read_relation_asof(1, 10000, 9001),
+			  read_relation_asof(0, 5000, 1511) && read_relation_asof(0, 10000, 7535) &&
+			  read_relation_asof(1, 10000, 9001),
 			  "abandoned-output tombstone recovers sources and foreground data");
 	}
 	else
@@ -1302,11 +1303,12 @@ test_prune_abandon_conflict(int mode)
 	}
 	run_maintenance(64);
 	compact_layers = 100;
-	check(read_relation_asof(0, 5000, 1511) && read_relation_asof(1, 10000, 9001),
+	check(read_relation_asof(0, 5000, 1511) && read_relation_asof(0, 10000, 7535) &&
+		  read_relation_asof(1, 10000, 9001),
 		  "abandonment boundary preserves required pages after retry");
 	close_store();
 	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 1511) &&
-		  read_relation_asof(1, 10000, 9001),
+		  read_relation_asof(0, 10000, 7535) && read_relation_asof(1, 10000, 9001),
 		  "abandonment boundary preserves pages after another restart");
 	close_store();
 	remove_tree(store);
