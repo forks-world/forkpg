@@ -295,6 +295,7 @@ extern uint64_t ps_test_page_gc_coverage_observation_count(void);
 typedef void (*PsForkmetaCutoverTestHook)(void *arg);
 extern void ps_test_set_compaction_unlocked_hook(void (*hook)(void *), void *arg);
 extern int ps_test_resize_empty_memtable(uint32_t shard, uint32_t threshold);
+extern void ps_test_set_prune_snapshot_swap_hook(void (*hook)(void *), void *arg);
 extern void ps_test_set_prune_snapshot_hook(void (*hook)(void *), void *arg);
 extern void ps_test_set_prune_index_hook(void (*hook)(void *), void *arg);
 extern void ps_test_set_prune_batch_hook(void (*hook)(void *), void *arg);

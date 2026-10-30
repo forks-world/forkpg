@@ -937,13 +937,15 @@ long_chain_snapshot_hook(void *arg)
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 
 	probe->called++;
-	probe->midpoint_ok = ps_test_page_version_count(0, &key, probe->block) == 2048 &&
+	probe->midpoint_ok = ps_test_page_version_count(0, &key, probe->block) ==
+		(probe->mode == 5 ? 1537U : 2048U) &&
 		read_relation_asof(probe->block, 5000, 1511) &&
 		read_relation_asof(probe->block, 10000, 7535);
 	ps_test_set_prune_snapshot_hook(NULL, NULL);
+	ps_test_set_prune_snapshot_swap_hook(NULL, NULL);
 	if (probe->mode == 2)
 		_exit(probe->midpoint_ok ? 86 : 87);
-	if (probe->mode == 1)
+	if (probe->mode == 1 || probe->mode == 5)
 		probe->wrote = write_relation(0, probe->block, 9000);
 	if (probe->mode == 3)
 	{
@@ -1031,10 +1033,14 @@ test_long_chain_prune_snapshot(int mode)
 		check(ok && (mode == 3 || long_chain_finish_setup(store, block)),
 			  "prepare a long page chain with a prunable durable prefix");
 		before = ps_test_bounded_prune_published_count();
-		ps_test_set_prune_snapshot_hook(long_chain_snapshot_hook, &probe);
+		if (mode == 5)
+			ps_test_set_prune_snapshot_swap_hook(long_chain_snapshot_hook, &probe);
+		else
+			ps_test_set_prune_snapshot_hook(long_chain_snapshot_hook, &probe);
 		for (int i = 0; i < 64 && !probe.called; i++)
 			(void) ps_core_maintenance();
 		ps_test_set_prune_snapshot_hook(NULL, NULL);
+		ps_test_set_prune_snapshot_swap_hook(NULL, NULL);
 		if (probe.worker_started)
 			(void) pthread_join(probe.worker, NULL);
 		segment_gc_enabled = 0;
@@ -1042,6 +1048,8 @@ test_long_chain_prune_snapshot(int mode)
 			  ps_test_bounded_prune_published_count() > before &&
 			  (mode != 1 || (probe.wrote && ps_test_page_prune_due(0, 0) &&
 						 ps_test_page_version_count(0, &key, block) == 2049)) &&
+			  (mode != 5 || (probe.wrote && ps_test_page_prune_due(0, 0) &&
+						 ps_test_page_version_count(0, &key, block) == 1538)) &&
 			  (mode != 3 || (probe.reclaimed && ps_test_page_prune_due(0, 0) &&
 						 ps_test_page_version_count(0, &key, block) == 2048)),
 			  "long chain is copied in chunks and rejects a concurrent mutation");
@@ -1052,12 +1060,12 @@ test_long_chain_prune_snapshot(int mode)
 	run_maintenance(64);
 	compact_layers = 100;
 	check(read_relation_asof(block, 5000, 1511) &&
-		  read_relation_asof(block, 10000, mode == 1 ? 9000 : 7535) &&
+		  read_relation_asof(block, 10000, (mode == 1 || mode == 5) ? 9000 : 7535) &&
 		  (mode != 4 || read_relation_asof(0, 5000, 2000)),
 		  "long-chain snapshot and retry preserve old and newest views");
 	close_store();
 	check(ps_core_open(store) == 0 && read_relation_asof(block, 5000, 1511) &&
-		  read_relation_asof(block, 10000, mode == 1 ? 9000 : 7535),
+		  read_relation_asof(block, 10000, (mode == 1 || mode == 5) ? 9000 : 7535),
 		  "long-chain snapshot survives a later restart");
 	close_store();
 	remove_tree(store);
@@ -2670,6 +2678,7 @@ main(void)
 	test_long_chain_prune_snapshot(2);
 	test_long_chain_prune_snapshot(3);
 	test_long_chain_prune_snapshot(4);
+	test_long_chain_prune_snapshot(5);
 	test_bounded_compaction_concurrent_write();
 	test_compaction_gather_rejects_concurrent_change(0);
 	test_compaction_gather_rejects_concurrent_change(1);

@@ -702,6 +702,16 @@ static uint64_t ps_test_compaction_pass_count;
 static unsigned segment_gc_compaction_turn;
 static void (*compaction_unlocked_test_hook)(void *);
 static void *compaction_unlocked_test_hook_arg;
+static void (*prune_snapshot_swap_test_hook)(void *);
+static void *prune_snapshot_swap_test_hook_arg;
+
+void
+ps_test_set_prune_snapshot_swap_hook(void (*hook)(void *), void *arg)
+{
+	prune_snapshot_swap_test_hook = hook;
+	prune_snapshot_swap_test_hook_arg = arg;
+}
+
 static void (*prune_snapshot_test_hook)(void *);
 static void *prune_snapshot_test_hook_arg;
 
@@ -7242,6 +7252,8 @@ page_prune_long_chain(uint32_t timeline, const PsImgRec *recs, uint32_t nrec,
 	epoch++;
 	page_snapshot_unlock();
 	free(old);
+	if (prune_snapshot_swap_test_hook != NULL)
+		prune_snapshot_swap_test_hook(prune_snapshot_swap_test_hook_arg);
 	valid = page_snapshot_lock_valid(timeline, &key, block, shard, epoch, kept,
 		inputs, ninputs, outputs, noutputs, captured);
 	return valid ? 1 : -1;
