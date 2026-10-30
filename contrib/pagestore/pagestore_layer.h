@@ -276,6 +276,20 @@ extern int ps_image_index_visit_groups(const PsLayerDesc *layers, uint32_t count
  * winning source; distinct logical versions are retained. This API does not
  * persist a transaction. */
 #define PS_IMAGE_PREPARE_MAX_OUTPUTS 64
+/* Seal one unpublished batch of already-selected source entries. Sources must
+ * stay immutable and pinned. Entries must be sorted and unique and come from
+ * those sources; this routine verifies source data checksums and descriptor
+ * bounds, but does not prove index membership or the pruning decision. The
+ * caller must independently verify both before publication, and must fence
+ * the snapshot and advance any durable frontier before retiring sources.
+ * On 0, out describes the sealed unpublished file. On -1 no create was
+ * attempted. On -2 the attempted ID has an uncertain outcome and must be
+ * reconciled, not blindly deleted. No manifest entry is written. */
+extern int ps_image_compaction_stage_selected_batch(const PsLayerDesc *layers,
+	uint32_t count, const PsImageGroupEntry *selected, uint32_t nselected,
+	uint64_t output_id, uint32_t page_size, PsLayerDesc *out,
+	uint64_t *uncertain_id);
+
 extern int ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 									  const uint64_t *output_ids, uint32_t capacity,
 									  uint32_t page_size, PsLayerDesc *outputs,

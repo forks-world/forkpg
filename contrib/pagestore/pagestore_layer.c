@@ -1152,6 +1152,102 @@ image_compaction_data_end(const PsLayerDesc *layer, uint32_t page_size,
 }
 
 int
+ps_image_compaction_stage_selected_batch(const PsLayerDesc *layers,
+	uint32_t count, const PsImageGroupEntry *selected, uint32_t nselected,
+	uint64_t output_id, uint32_t page_size, PsLayerDesc *out,
+	uint64_t *uncertain_id)
+{
+	uint64_t data_ends[PS_IMAGE_MERGE_MAX_INPUTS], max_id = 0;
+	PsImgRec *batch = NULL;
+	ImagePrepareSource *sources = NULL;
+	int rc = -1;
+
+	if (uncertain_id == NULL)
+		return -1;
+	*uncertain_id = 0;
+	if (layers == NULL || selected == NULL || out == NULL || count == 0 ||
+		count > PS_IMAGE_MERGE_MAX_INPUTS || nselected == 0 ||
+		nselected > PS_IMAGE_BATCH_MAX_RECORDS || page_size == 0 ||
+		page_size > IMAGE_STREAM_BYTES)
+		return -1;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		if (layers[i].kind != PS_LAYER_IMAGE || layers[i].deleting ||
+			layers[i].remote_durable || layers[i].legacy_shard_zero ||
+			layers[i].timeline != layers[0].timeline ||
+			(layers[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(layers[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT))
+			return -1;
+		for (uint32_t j = 0; j < i; j++)
+			if (layers[j].layer_id == layers[i].layer_id)
+				return -1;
+		if (layers[i].layer_id > max_id)
+			max_id = layers[i].layer_id;
+	}
+	if (output_id <= max_id ||
+		(output_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+		(layers[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT))
+		return -1;
+	for (uint32_t i = 0; i < count; i++)
+		if (image_compaction_data_end(&layers[i], page_size, &data_ends[i]) != 0)
+			return -1;
+	batch = calloc(nselected, sizeof(*batch));
+	sources = calloc(nselected, sizeof(*sources));
+	if (batch == NULL || sources == NULL)
+		goto done;
+	for (uint32_t i = 0; i < nselected; i++)
+	{
+		const PsImgIndexEnt *entry = &selected[i].entry;
+		uint32_t source;
+
+		for (source = 0; source < count &&
+			 layers[source].layer_id != selected[i].layer_id; source++)
+			;
+		if (source == count || data_ends[source] < page_size ||
+			entry->data_off > data_ends[source] - page_size ||
+			entry->data_off % page_size != 0 ||
+			!layer_covers(&layers[source], &entry->key, entry->block) ||
+			entry->lsn < layers[source].lsn_start ||
+			entry->lsn > layers[source].lsn_end)
+			goto done;
+		if (i != 0)
+		{
+			const PsImgIndexEnt *prev = &selected[i - 1].entry;
+			int c = key_cmp(&prev->key, &entry->key);
+
+			if (c > 0 || (c == 0 && (prev->block > entry->block ||
+				(prev->block == entry->block && (prev->lsn > entry->lsn ||
+				 (prev->lsn == entry->lsn && prev->admission_seq >= entry->admission_seq))))))
+				goto done;
+		}
+		batch[i].key = entry->key;
+		batch[i].block = entry->block;
+		batch[i].lsn = entry->lsn;
+		batch[i].admission_seq = entry->admission_seq;
+		batch[i].growth_lsn = entry->growth_lsn;
+		batch[i].order_id = entry->order_id;
+		batch[i].seg_off = entry->seg_off;
+		batch[i].seg_id = entry->seg_id;
+		batch[i].flags = entry->flags;
+		sources[i].layer = &layers[source];
+		sources[i].offset = entry->data_off;
+		batch[i].page = &sources[i];
+	}
+	if (ps_image_layer_write_sorted_batch(output_id, layers[0].timeline, batch,
+			nselected, page_size, image_prepare_read_page, &page_size, out) != 0)
+	{
+		*uncertain_id = output_id;
+		rc = -2;
+		goto done;
+	}
+	rc = 0;
+done:
+	free(batch);
+	free(sources);
+	return rc;
+}
+
+int
 ps_image_compaction_prepare_counted(const PsLayerDesc *layers, uint32_t count,
 							const uint64_t *output_ids, uint32_t capacity,
 							uint32_t page_size, PsLayerDesc *outputs,
