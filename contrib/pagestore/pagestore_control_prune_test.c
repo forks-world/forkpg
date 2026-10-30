@@ -582,6 +582,129 @@ test_bounded_shared_payload_capacity_fallback(void)
 	remove_tree(store);
 }
 
+typedef struct MultiOutputConflict
+{
+	int mode;
+	int called;
+	int wrote;
+} MultiOutputConflict;
+
+static void
+multi_output_conflict(void *arg)
+{
+	MultiOutputConflict *probe = arg;
+
+	probe->called++;
+	ps_test_set_prune_batch_hook(NULL, NULL);
+	if (probe->mode == 2)
+		_exit(86);
+	probe->wrote = write_relation(0, 1090, 4000);
+}
+
+static void
+test_bounded_prune_multiple_outputs(int mode)
+{
+	char store[] = "/tmp/pagestore-bounded-prune-multi-XXXXXX";
+	uint64_t before;
+	uint32_t live = 0, entries = 0;
+	int ok = 1;
+	MultiOutputConflict probe = {.mode = mode};
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open multi-output pruning fixture");
+		return;
+	}
+	ok = write_relation(0, 0, 1000) && write_relation(0, 0, 2000);
+	for (uint32_t i = 1; i <= 1087 && ok; i++)
+		ok = write_relation(0, i, 3000);
+	check(ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+						 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "write multi-output inputs and set retention floor");
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	if (mode == 2)
+	{
+		pid_t child;
+		int status = 0;
+
+		close_store();
+		child = fork();
+		if (child == 0)
+		{
+			if (ps_core_open(store) != 0)
+				_exit(87);
+			ps_test_set_prune_batch_hook(multi_output_conflict, &probe);
+			run_maintenance(64);
+			_exit(88);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "crash occurs after the first bounded output is published");
+		check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+			  read_relation_asof(1086, 5000, 3000),
+			  "partial output publication survives a crash");
+	}
+	else
+	{
+		if (mode == 1)
+			ps_test_set_prune_batch_hook(multi_output_conflict, &probe);
+		for (int i = 0; i < 64 && ps_test_bounded_prune_published_count() == before &&
+			 !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_batch_hook(NULL, NULL);
+		if (mode == 1)
+			check(probe.called && probe.wrote &&
+				  ps_test_bounded_prune_published_count() == before &&
+				  ps_test_page_prune_due(0, 0) && read_relation_asof(1090, 5000, 4000),
+				  "concurrent writer stops partial publication and leaves pruning due");
+	}
+	if (mode != 0)
+	{
+		uint32_t before_retry = 0;
+
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting)
+				before_retry++;
+		ps_unlock_map();
+		check(before_retry >= 18,
+			  "partial publication leaves every source layer live before retry");
+		run_maintenance(64);
+	}
+	compact_layers = 100;
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+		{
+			PsImgIndexEnt *index = NULL;
+			uint32_t n = 0;
+
+			live++;
+			if (ps_image_layer_read_index(&ps_layer_map.layers[i], &index, &n) == 0)
+				entries += n;
+			free(index);
+		}
+	ps_unlock_map();
+	if (mode == 0)
+		check(ps_test_bounded_prune_published_count() > before && live == 2 && entries == 1087,
+			  "bounded pruning publishes multiple outputs and drops the obsolete identity");
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(1086, 5000, 3000) &&
+		  (mode != 1 || read_relation_asof(1090, 5000, 4000)),
+		  "multi-output pruning preserves pages across batch boundary");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1086, 5000, 3000) &&
+		  (mode != 1 || read_relation_asof(1090, 5000, 4000)),
+		  "multi-output pruning survives restart");
+	close_store();
+	remove_tree(store);
+}
+
 typedef struct BoundedConflictProbe
 {
 	int called;
@@ -2175,6 +2298,9 @@ main(void)
 	test_segment_gc_does_not_starve_compaction();
 	test_bounded_compaction_maintenance();
 	test_bounded_shared_payload_capacity_fallback();
+	test_bounded_prune_multiple_outputs(0);
+	test_bounded_prune_multiple_outputs(1);
+	test_bounded_prune_multiple_outputs(2);
 	test_bounded_compaction_concurrent_write();
 	test_compaction_gather_rejects_concurrent_change(0);
 	test_compaction_gather_rejects_concurrent_change(1);

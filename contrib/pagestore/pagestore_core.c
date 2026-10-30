@@ -702,6 +702,16 @@ static uint64_t ps_test_compaction_pass_count;
 static unsigned segment_gc_compaction_turn;
 static void (*compaction_unlocked_test_hook)(void *);
 static void *compaction_unlocked_test_hook_arg;
+static void (*prune_batch_test_hook)(void *);
+static void *prune_batch_test_hook_arg;
+
+void
+ps_test_set_prune_batch_hook(void (*hook)(void *), void *arg)
+{
+	prune_batch_test_hook = hook;
+	prune_batch_test_hook_arg = arg;
+}
+
 static void (*prune_retired_test_hook)(void *);
 static void *prune_retired_test_hook_arg;
 
@@ -3938,8 +3948,9 @@ ps_test_bounded_zero_floor_count(void)
 	return __atomic_load_n(&test_bounded_zero_floor_count, __ATOMIC_RELAXED);
 }
 
-/* The first pruning integration is deliberately limited to one output and
- * bounded in-memory identity lists. Unsupported or oversized input falls back. */
+/* Bound total in-memory identities and split retained records into outputs. */
+#define PS_BOUNDED_PRUNE_MAX_OUTPUTS 8
+#define PS_BOUNDED_PRUNE_MAX_SELECTED (PS_BOUNDED_PRUNE_MAX_OUTPUTS * PS_IMAGE_BATCH_MAX_RECORDS)
 typedef struct BoundedPruneStage
 {
 	PsImageGroupEntry *selected, *dropped, *sel_group, *drop_group;
@@ -3959,7 +3970,7 @@ bounded_prune_collect(const PsImageGroupEntry *entries, uint32_t count,
 	if (ps_compaction_relation_select_group(entries, count, keep,
 			stage->sel_group, PS_IMAGE_GROUP_MAX_VERSIONS, &ns,
 			stage->drop_group, PS_IMAGE_GROUP_MAX_VERSIONS, &nd) != 0 ||
-		stage->nselected + ns > PS_IMAGE_BATCH_MAX_RECORDS ||
+		stage->nselected + ns > PS_BOUNDED_PRUNE_MAX_SELECTED ||
 		stage->ndropped + nd > PS_IMAGE_BATCH_MAX_RECORDS)
 		return -1;
 	memcpy(stage->selected + stage->nselected, stage->sel_group, (size_t) ns * sizeof(*stage->selected));
@@ -3996,9 +4007,9 @@ static int
 compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 								int *prune_deferred)
 {
-	PsLayerDesc inputs[PS_IMAGE_MERGE_MAX_INPUTS], output = {0};
-	uint32_t ninputs = 0, retired = 0;
-	uint64_t max_id = 0, output_id = 0, uncertain = 0, kept = 0, dropped = 0;
+	PsLayerDesc inputs[PS_IMAGE_MERGE_MAX_INPUTS], outputs[PS_BOUNDED_PRUNE_MAX_OUTPUTS] = {0};
+	uint32_t ninputs = 0, retired = 0, noutputs = 0;
+	uint64_t max_id = 0, output_ids[PS_BOUNDED_PRUNE_MAX_OUTPUTS], uncertain = 0, kept = 0, dropped = 0;
 	PsHistoryFence *fences = NULL, *storage_fences = NULL;
 	PsViewFence *views = NULL;
 	uint32_t nfences = 0, nstorage = 0;
@@ -4009,7 +4020,7 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 	PsCompactionRelationPlan *plan = NULL;
 	BoundedPruneStage stage = {0};
 	PsImgRec *dropped_recs = NULL;
-	int plan_rc = -1, staged = 0, published = 0, ambiguous = 0, result = -1;
+	int plan_rc = -1, staged = 0, published = 0, ambiguous = 0, publish_ambiguous = 0, result = -1;
 	uint32_t visited;
 
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
@@ -4049,16 +4060,19 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 	captured.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 	captured.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	captured.page_floor = floor;
-	stage.selected = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*stage.selected));
+	stage.selected = calloc(PS_BOUNDED_PRUNE_MAX_SELECTED, sizeof(*stage.selected));
 	stage.dropped = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*stage.dropped));
 	stage.sel_group = calloc(PS_IMAGE_GROUP_MAX_VERSIONS, sizeof(*stage.sel_group));
 	stage.drop_group = calloc(PS_IMAGE_GROUP_MAX_VERSIONS, sizeof(*stage.drop_group));
 	dropped_recs = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*dropped_recs));
 	if (!stage.selected || !stage.dropped || !stage.sel_group || !stage.drop_group || !dropped_recs)
 		goto before_unlock;
-	output_id = alloc_layer_id(&g_shards[shard]);
-	if (output_id <= max_id)
-		goto before_unlock;
+	for (uint32_t i = 0; i < PS_BOUNDED_PRUNE_MAX_OUTPUTS; i++)
+	{
+		output_ids[i] = alloc_layer_id(&g_shards[shard]);
+		if (output_ids[i] <= max_id || (i != 0 && output_ids[i] <= output_ids[i - 1]))
+			goto before_unlock;
+	}
 	for (uint32_t k = 0; k < ninputs; k++)
 		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 			if (ps_layer_map.layers[i].layer_id == inputs[k].layer_id)
@@ -4077,24 +4091,34 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 	plan = NULL;
 	if (plan_rc == 0 && stage.ndropped != 0 && stage.nselected != 0)
 	{
-		int write_rc = ps_image_compaction_stage_selected_batch(inputs, ninputs,
-			stage.selected, stage.nselected, output_id, page_size, &output, &uncertain);
-
-		if (write_rc == 0)
+		noutputs = (stage.nselected + PS_IMAGE_BATCH_MAX_RECORDS - 1) / PS_IMAGE_BATCH_MAX_RECORDS;
+		for (uint32_t i = 0; i < noutputs; i++)
 		{
-			staged = 1;
-			plan_rc = ps_compaction_verify_relation_plan(inputs, ninputs, &output, 1,
+			uint32_t offset = i * PS_IMAGE_BATCH_MAX_RECORDS;
+			uint32_t count = stage.nselected - offset;
+			int write_rc;
+
+			if (count > PS_IMAGE_BATCH_MAX_RECORDS)
+				count = PS_IMAGE_BATCH_MAX_RECORDS;
+			write_rc = ps_image_compaction_stage_selected_batch(inputs, ninputs,
+				stage.selected + offset, count, output_ids[i], page_size, &outputs[i], &uncertain);
+			if (write_rc != 0)
+			{
+				plan_rc = -1;
+				ambiguous = write_rc == -2;
+				break;
+			}
+			staged++;
+		}
+		if (plan_rc == 0)
+		{
+			plan_rc = ps_compaction_verify_relation_plan(inputs, ninputs, outputs, noutputs,
 				page_size, PS_IMAGE_GROUP_MAX_VERSIONS, (PsPruneFence) {floor, UINT64_MAX},
 				views, nstorage, inherited, has_inherited, bounded_prune_check_drops,
 				&stage, &kept, &dropped);
 			if (plan_rc == 0 && (kept != stage.nselected || dropped != stage.ndropped ||
 				stage.checked != stage.ndropped))
 				plan_rc = -1;
-		}
-		else
-		{
-			plan_rc = -1;
-			ambiguous = write_rc == -2;
 		}
 	}
 	else
@@ -4130,7 +4154,7 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 		 * and that the reserved output ID is still absent before fallback. */
 		PsLayerDesc unused_output = inputs[0];
 
-		unused_output.layer_id = output_id;
+		unused_output.layer_id = output_ids[0];
 		if (!ps_image_compaction_publication_valid(&ps_layer_map, inputs, ninputs,
 				&unused_output, 1, 0))
 		{
@@ -4141,7 +4165,7 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 		goto done;
 	}
 	if (plan_rc != 0 || !staged ||
-		!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, &output, 1,
+		!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
 			&captured, &current, 1, 0, 0, 0, 0, 0))
 		goto done;
 	for (uint32_t i = 0; i < stage.ndropped; i++)
@@ -4155,20 +4179,46 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 			captured.admission_epoch ? captured.admission_epoch - 1 : 0) != 0 ||
 		ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) != 0)
 		goto done;
-	if (!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, &output, 1,
-			&captured, &current, 1, 0, 0, 0, 1, 0))
-		goto done;
-	if (ps_manifest_publish_image_batch(inputs, ninputs, &output, 1, 0) != 0)
+	for (uint32_t k = 0; k < noutputs; k++)
 	{
-		ambiguous = 1;
-		goto done;
+		if (!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
+				&captured, &current, 1, 0, k, 0, 1, 0))
+			goto done;
+		if (ps_manifest_publish_image_batch(inputs, ninputs, outputs, noutputs, k) != 0)
+		{
+			ambiguous = 1;
+			publish_ambiguous = 1;
+			goto done;
+		}
+		published++;
+		inspection_metrics_changed();
+		if (k + 1 < noutputs)
+		{
+			ps_unlock_map();
+			pthread_rwlock_unlock(&page_prune_lock);
+			for (uint32_t sh = core_shards(); sh > 0; sh--)
+				ps_unlock_shard(sh - 1);
+			if (prune_batch_test_hook != NULL)
+				prune_batch_test_hook(prune_batch_test_hook_arg);
+			for (uint32_t sh = 0; sh < core_shards(); sh++)
+				ps_lock_shard_wr(sh);
+			pthread_rwlock_rdlock(&page_prune_lock);
+			ps_lock_map_wr();
+			if (ps_manifest_poisoned() ||
+				ps_retention_epoch(&current.retention_epoch) != 0 ||
+				!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
+				state != PS_TIMELINE_LIVE ||
+				retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+					&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+				goto done;
+			current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+			current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+		}
 	}
-	published = 1;
 	__atomic_fetch_add(&test_bounded_prune_published_count, 1, __ATOMIC_RELAXED);
-	inspection_metrics_changed();
 	if (ps_fault_probe(PS_FAULT_POINT_PAGE_COMPACTION_AFTER_PUBLISH) != 0 ||
-		!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, &output, 1,
-			&captured, &current, 1, 0, 1, 0, 1, 0))
+		!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
+			&captured, &current, 1, 0, noutputs, 0, 1, 0))
 		goto done;
 	page_remove_compacted_versions(timeline, dropped_recs, stage.ndropped);
 	if (metrics_header != NULL)
@@ -4182,9 +4232,9 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 	}
 	for (uint32_t k = 0; k < ninputs; k++)
 	{
-		if (!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, &output, 1,
-				&captured, &current, 1, 0, 1, k, 1, 1) ||
-			ps_manifest_retire_image_source(inputs, ninputs, &output, 1, k) != 0)
+		if (!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
+				&captured, &current, 1, 0, noutputs, k, 1, 1) ||
+			ps_manifest_retire_image_source(inputs, ninputs, outputs, noutputs, k) != 0)
 			goto done;
 		retired++;
 		inspection_metrics_changed();
@@ -4226,9 +4276,11 @@ done:
 				__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
 				break;
 			}
-	if (staged && !published && !ambiguous &&
-		ps_layer_store->delete_local_layer(&output) != 0)
-		g_shards[shard].staged_compaction_retries = 1;
+	/* Keep a possibly submitted batch for replay; later batches were never
+	 * submitted and can be removed even after a partial publication. */
+	for (uint32_t k = published + (publish_ambiguous ? 1 : 0); k < (uint32_t) staged; k++)
+		if (ps_layer_store->delete_local_layer(&outputs[k]) != 0)
+			g_shards[shard].staged_compaction_retries = 1;
 	if (ambiguous && !published)
 		g_shards[shard].staged_compaction_retries = 1;
 	if (retired != 0)
