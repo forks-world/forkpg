@@ -21,9 +21,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include "pagestore_artifact_format.h"
 #include "pagestore_core.h"
+#include "pagestore_fault.h"
 #include "pagestore_layer.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
@@ -381,7 +383,7 @@ static void
 test_nonzero_floor_bounded_plan(int prune_needed)
 {
 	char store[] = "/tmp/pagestore-bounded-floor-XXXXXX";
-	uint64_t before;
+	uint64_t before, prune_before;
 
 	configure_core(1);
 	segment_gc_enabled = 0;
@@ -396,6 +398,7 @@ test_nonzero_floor_bounded_plan(int prune_needed)
 		  write_relation(0, 2, 3000),
 		  "write relation-only input layers");
 	before = ps_test_bounded_nonzero_plan_count();
+	prune_before = ps_test_bounded_prune_published_count();
 	compact_layers = 1;
 	/* Count is process-global, so compare with the value before this store. */
 	for (int i = 0; i < 64 && !prune_needed &&
@@ -434,8 +437,10 @@ test_nonzero_floor_bounded_plan(int prune_needed)
 		ps_unlock_map();
 		check(ps_test_bounded_nonzero_plan_count() == before,
 			  "prunable history falls back from the bounded merge");
+		check(ps_test_bounded_prune_published_count() > prune_before,
+			  "prunable history publishes through the bounded pruning path");
 		check(old_versions == 0 && read_relation_asof(0, 5000, 2000),
-			  "fallback removes obsolete layer history and preserves its successor");
+			  "bounded pruning removes obsolete layer history and preserves its successor");
 	}
 	else
 		check(!ps_test_page_prune_due(0, 0),
@@ -577,6 +582,246 @@ test_bounded_shared_payload_capacity_fallback(void)
 	remove_tree(store);
 }
 
+typedef struct MultiOutputConflict
+{
+	int mode;
+	int called;
+	int wrote;
+} MultiOutputConflict;
+
+static void
+multi_output_conflict(void *arg)
+{
+	MultiOutputConflict *probe = arg;
+
+	probe->called++;
+	ps_test_set_prune_batch_hook(NULL, NULL);
+	if (probe->mode == 2)
+		_exit(86);
+	probe->wrote = write_relation(0, 1090, 4000);
+}
+
+static void
+test_bounded_prune_multiple_outputs(int mode)
+{
+	char store[] = "/tmp/pagestore-bounded-prune-multi-XXXXXX";
+	uint64_t before;
+	uint32_t live = 0, entries = 0;
+	int ok = 1;
+	MultiOutputConflict probe = {.mode = mode};
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open multi-output pruning fixture");
+		return;
+	}
+	ok = write_relation(0, 0, 1000) && write_relation(0, 0, 2000);
+	for (uint32_t i = 1; i <= 1087 && ok; i++)
+		ok = write_relation(0, i, 3000);
+	check(ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+						 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "write multi-output inputs and set retention floor");
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	if (mode == 2)
+	{
+		pid_t child;
+		int status = 0;
+
+		close_store();
+		child = fork();
+		if (child == 0)
+		{
+			if (ps_core_open(store) != 0)
+				_exit(87);
+			ps_test_set_prune_batch_hook(multi_output_conflict, &probe);
+			run_maintenance(64);
+			_exit(88);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "crash occurs after the first bounded output is published");
+		check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+			  read_relation_asof(1086, 5000, 3000),
+			  "partial output publication survives a crash");
+	}
+	else
+	{
+		if (mode == 1)
+			ps_test_set_prune_batch_hook(multi_output_conflict, &probe);
+		for (int i = 0; i < 64 && ps_test_bounded_prune_published_count() == before &&
+			 !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_batch_hook(NULL, NULL);
+		if (mode == 1)
+			check(probe.called && probe.wrote &&
+				  ps_test_bounded_prune_published_count() == before &&
+				  ps_test_page_prune_due(0, 0) && read_relation_asof(1090, 5000, 4000),
+				  "concurrent writer stops partial publication and leaves pruning due");
+	}
+	if (mode != 0)
+	{
+		uint32_t before_retry = 0;
+
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting)
+				before_retry++;
+		ps_unlock_map();
+		check(before_retry >= 18,
+			  "partial publication leaves every source layer live before retry");
+		run_maintenance(64);
+	}
+	compact_layers = 100;
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+		{
+			PsImgIndexEnt *index = NULL;
+			uint32_t n = 0;
+
+			live++;
+			if (ps_image_layer_read_index(&ps_layer_map.layers[i], &index, &n) == 0)
+				entries += n;
+			free(index);
+		}
+	ps_unlock_map();
+	if (mode == 0)
+		check(ps_test_bounded_prune_published_count() > before && live == 2 && entries == 1087,
+			  "bounded pruning publishes multiple outputs and drops the obsolete identity");
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(1086, 5000, 3000) &&
+		  (mode != 1 || read_relation_asof(1090, 5000, 4000)),
+		  "multi-output pruning preserves pages across batch boundary");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1086, 5000, 3000) &&
+		  (mode != 1 || read_relation_asof(1090, 5000, 4000)),
+		  "multi-output pruning survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+typedef struct PruneIndexProbe
+{
+	int mode, called, wrote;
+} PruneIndexProbe;
+
+static void
+prune_index_conflict(void *arg)
+{
+	PruneIndexProbe *probe = arg;
+
+	probe->called++;
+	ps_test_set_prune_index_hook(NULL, NULL);
+	if (probe->mode == 2)
+		_exit(86);
+	if (probe->mode == 1)
+		probe->wrote = write_relation(0, 1200, 4000);
+}
+
+static void
+test_bounded_prune_index_batches(int mode)
+{
+	char store[] = "/tmp/pagestore-prune-index-batches-XXXXXX";
+	PruneIndexProbe probe = {.mode = mode};
+	uint64_t before;
+	uint32_t live = 0;
+	int ok = 1;
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open batched index pruning store");
+		return;
+	}
+	for (uint32_t i = 0; i < 1152 && ok; i++)
+		ok = write_relation(0, i, 1000) && write_relation(0, i, 2000);
+	check(ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+						 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "prepare more than 1024 obsolete page identities");
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	if (mode == 2)
+	{
+		pid_t child;
+		int status = 0;
+
+		close_store();
+		child = fork();
+		if (child == 0)
+		{
+			if (ps_core_open(store) != 0)
+				_exit(87);
+			ps_test_set_prune_index_hook(prune_index_conflict, &probe);
+			run_maintenance(64);
+			_exit(88);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "crash after the first bounded page-index update");
+		check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+			  read_relation_asof(1151, 5000, 2000),
+			  "partial page-index update recovers after crash");
+	}
+	else
+	{
+		ps_test_set_prune_index_hook(prune_index_conflict, &probe);
+		for (int i = 0; i < 64 && !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_index_hook(NULL, NULL);
+		check(probe.called && ps_test_bounded_prune_published_count() > before &&
+			  (mode != 1 || (probe.wrote && ps_test_page_prune_due(0, 0))),
+			  "bounded pruning splits index updates and fences concurrent writes");
+	}
+	if (mode != 0)
+	{
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+				live++;
+		ps_unlock_map();
+		check(live >= 38, "partial index update retains all source layers");
+	}
+	run_maintenance(64);
+	compact_layers = 100;
+	if (mode == 0)
+	{
+		uint32_t obsolete = 0;
+
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			{
+				PsImgIndexEnt *index = NULL;
+				uint32_t count = 0;
+
+				if (ps_image_layer_read_index(&ps_layer_map.layers[i], &index, &count) == 0)
+					for (uint32_t j = 0; j < count; j++)
+						if (index[j].key.klass == PS_KLASS_RELATION && index[j].lsn == 1000)
+							obsolete++;
+				free(index);
+			}
+		ps_unlock_map();
+		check(obsolete == 0, "all 1152 obsolete identities are absent from live layers");
+	}
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(1151, 5000, 2000) &&
+		  (mode != 1 || read_relation_asof(1200, 5000, 4000)),
+		  "index pruning and retries preserve retained pages");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1151, 5000, 2000) &&
+		  (mode != 1 || read_relation_asof(1200, 5000, 4000)),
+		  "index pruning survives a subsequent restart");
+	close_store();
+	remove_tree(store);
+}
+
 typedef struct BoundedConflictProbe
 {
 	int called;
@@ -689,6 +934,203 @@ floor_plan_conflict_hook(void *arg)
 	ps_test_set_compaction_unlocked_hook(NULL, NULL);
 	if (pthread_create(&thread, NULL, floor_plan_foreground, arg) == 0)
 		(void) pthread_join(thread, NULL);
+}
+
+static void
+prune_retired_conflict_hook(void *arg)
+{
+	FloorPlanConflict *probe = arg;
+	pthread_t thread;
+
+	probe->called++;
+	ps_test_set_prune_retired_hook(NULL, NULL);
+	if (pthread_create(&thread, NULL, floor_plan_foreground, arg) == 0)
+		(void) pthread_join(thread, NULL);
+}
+
+/* The hook runs only after the bounded plan and replacement are verified. */
+static void
+bounded_prune_crash_marker(void *arg)
+{
+	int fd = *(int *) arg;
+	char marker = 'B';
+
+	if (write(fd, &marker, 1) != 1)
+		_exit(90);
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+}
+
+static void
+test_bounded_prune_crash(const char *fault_name)
+{
+	char store[] = "/tmp/pagestore-bounded-prune-crash-XXXXXX";
+	char control[] = "/tmp/pagestore-bounded-prune-fault-XXXXXX";
+	char arm[512], marker = 0;
+	FILE *arm_file;
+	int pipefd[2], status = 0;
+	pid_t child;
+	ssize_t marker_bytes;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (!mkdtemp(store) || !mkdtemp(control) ||
+		snprintf(arm, sizeof(arm), "%s/arm", control) >= (int) sizeof(arm) ||
+		(arm_file = fopen(arm, "w")) == NULL)
+	{
+		check(0, "prepare bounded-pruning crash fixture");
+		return;
+	}
+	fclose(arm_file);
+	if (ps_core_open(store) != 0)
+	{
+		check(0, "open bounded-pruning crash store");
+		return;
+	}
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
+		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
+		  write_relation(0, 2, 3000), "prepare bounded-pruning crash inputs");
+	close_store();
+	if (pipe(pipefd) != 0)
+	{
+		check(0, "create bounded-pruning crash marker pipe");
+		return;
+	}
+	child = fork();
+	if (child == 0)
+	{
+		close(pipefd[0]);
+		if (setenv("PAGESTORE_TEST_FAULT_NAME", fault_name, 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_DIR", control, 1) != 0 ||
+			ps_fault_init(store) != 0 || ps_core_open(store) != 0)
+			_exit(91);
+		ps_test_set_compaction_unlocked_hook(bounded_prune_crash_marker, &pipefd[1]);
+		compact_layers = 1;
+		run_maintenance(64);
+		_exit(92);
+	}
+	close(pipefd[1]);
+	if (child < 0 || waitpid(child, &status, 0) != child)
+	{
+		check(0, "wait for bounded-pruning crash");
+		close(pipefd[0]);
+		return;
+	}
+	marker_bytes = read(pipefd[0], &marker, 1);
+	close(pipefd[0]);
+	check(WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT &&
+		  marker_bytes == 1 && marker == 'B',
+		  "fault crashes after the bounded pruning plan was verified");
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000),
+		  "bounded pruning crash recovers all required pages");
+	compact_layers = 1;
+	run_maintenance(64);
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(2, 5000, 3000),
+		  "bounded pruning crash remains readable after reclamation retries");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000),
+		  "bounded pruning recovery and retries survive a second restart");
+	close_store();
+	remove_tree(store);
+	remove_tree(control);
+}
+
+static void
+test_bounded_prune_interrupted_retirement(void)
+{
+	char store[] = "/tmp/pagestore-bounded-prune-retirement-XXXXXX";
+	FloorPlanConflict probe = {0};
+	uint64_t before;
+	uint32_t live = 0;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
+		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
+		  write_relation(0, 2, 3000), "prepare bounded-pruning retirement conflict");
+	before = ps_test_bounded_prune_published_count();
+	ps_test_set_prune_retired_hook(prune_retired_conflict_hook, &probe);
+	compact_layers = 1;
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_prune_retired_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	check(probe.called && probe.changed &&
+		  ps_test_bounded_prune_published_count() > before && live >= 4 &&
+		  ps_test_page_prune_due(0, 0),
+		  "writer between source retirements stops the stale retirement prefix");
+	run_maintenance(64);
+	check(read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000) && read_relation_asof(3, 5000, 4000),
+		  "replanning after partial retirement preserves foreground data");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(3, 5000, 4000),
+		  "partial retirement recovery preserves pages after restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_bounded_prune_conflict(int mode)
+{
+	char store[] = "/tmp/pagestore-bounded-prune-conflict-XXXXXX";
+	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2};
+	uint64_t before;
+	uint32_t live = 0;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
+		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
+		  write_relation(0, 2, 3000), "prepare bounded-pruning conflict");
+	before = ps_test_bounded_prune_published_count();
+	ps_test_set_compaction_unlocked_hook(floor_plan_conflict_hook, &probe);
+	compact_layers = 1;
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	check(probe.called && probe.changed &&
+		  ps_test_bounded_prune_published_count() == before &&
+		  live >= (uint32_t) (mode ? 3 : 4),
+		  "concurrent mutation rejects a staged pruning replacement");
+	if (probe.remote_transition)
+	{
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == probe.layer_id)
+				ps_layer_map.layers[i].remote_durable = false;
+		ps_unlock_map();
+	}
+	run_maintenance(64);
+	check(read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000) &&
+		  (mode != 0 || read_relation_asof(3, 5000, 4000)),
+		  "bounded-pruning retry preserves required foreground data");
+	close_store();
+	remove_tree(store);
 }
 
 static void
@@ -1963,9 +2405,22 @@ main(void)
 	test_nonzero_bounded_plan_conflict(0);
 	test_nonzero_bounded_plan_conflict(1);
 	test_nonzero_bounded_plan_conflict(2);
+	test_bounded_prune_conflict(0);
+	test_bounded_prune_conflict(1);
+	test_bounded_prune_conflict(2);
+	test_bounded_prune_interrupted_retirement();
+	test_bounded_prune_crash("page_prune.after_frontier");
+	test_bounded_prune_crash("page_compaction.after_publish");
+	test_bounded_prune_crash("page_gc.after_mark_delete");
 	test_segment_gc_does_not_starve_compaction();
 	test_bounded_compaction_maintenance();
 	test_bounded_shared_payload_capacity_fallback();
+	test_bounded_prune_multiple_outputs(0);
+	test_bounded_prune_multiple_outputs(1);
+	test_bounded_prune_multiple_outputs(2);
+	test_bounded_prune_index_batches(0);
+	test_bounded_prune_index_batches(1);
+	test_bounded_prune_index_batches(2);
 	test_bounded_compaction_concurrent_write();
 	test_compaction_gather_rejects_concurrent_change(0);
 	test_compaction_gather_rejects_concurrent_change(1);
