@@ -666,6 +666,25 @@ typedef struct RelationPlanProbe
 	unsigned char closure[4];
 } RelationPlanProbe;
 
+typedef struct SelectedPlanProbe
+{
+	PsImageGroupEntry selected[4], dropped[4];
+	uint32_t nselected, ndropped, calls;
+} SelectedPlanProbe;
+
+static int
+select_relation_plan(const PsImageGroupEntry *entries, uint32_t count,
+					 const unsigned char *keep, const unsigned char *closure, void *arg)
+{
+	SelectedPlanProbe *probe = arg;
+
+	(void) closure;
+	probe->calls++;
+	return ps_compaction_relation_select_group(entries, count, keep,
+			probe->selected, 4, &probe->nselected,
+			probe->dropped, 4, &probe->ndropped);
+}
+
 static int
 visit_relation_plan(const PsImageGroupEntry *entries, uint32_t count,
 					const unsigned char *keep, const unsigned char *closure, void *arg)
@@ -683,6 +702,51 @@ visit_relation_plan(const PsImageGroupEntry *entries, uint32_t count,
 		probe->closure[i] = closure[i];
 	}
 	return 0;
+}
+
+static void
+relation_group_selection_test(void)
+{
+	PsImageGroupEntry entries[6] = {0}, selected[2], dropped[1];
+	unsigned char keep[6] = {1, 1, 0, 0, 0, 1};
+	uint32_t nselected, ndropped;
+	PsKey key = {1, 1, 12345, 0, PS_KLASS_RELATION};
+
+	for (uint32_t i = 0; i < 6; i++)
+	{
+		entries[i].entry.key = key;
+		entries[i].entry.block = 7;
+		entries[i].entry.lsn = i < 3 ? 100 : i < 5 ? 200 : 300;
+		entries[i].entry.admission_seq = i < 3 ? 1 : i < 5 ? 4 : 6;
+		entries[i].entry.data_off = 10 + i;
+		entries[i].layer_id = i < 2 ? 5 : i == 2 ? 9 : i == 3 ? 8 : 9;
+	}
+	check(ps_compaction_relation_select_group(entries, 6, keep,
+			selected, 2, &nselected, dropped, 1, &ndropped) == 0 &&
+		  nselected == 2 && ndropped == 1 && selected[0].layer_id == 5 &&
+		  selected[0].entry.data_off == 11 && selected[1].entry.lsn == 300 &&
+		  dropped[0].entry.lsn == 200 && dropped[0].layer_id == 8,
+		  "group selection preserves last kept duplicate and records each dropped identity once");
+	memset(selected, 0xA5, sizeof(selected));
+	memset(dropped, 0xA5, sizeof(dropped));
+	check(ps_compaction_relation_select_group(entries, 6, keep,
+			selected, 1, &nselected, dropped, 1, &ndropped) == -2 &&
+		  nselected == 0 && ndropped == 0 &&
+		  ((unsigned char *) selected)[0] == 0xA5 &&
+		  ((unsigned char *) dropped)[0] == 0xA5,
+		  "insufficient capacity leaves both staged outputs untouched");
+	entries[2].layer_id = 4;
+	check(ps_compaction_relation_select_group(entries, 6, keep,
+			selected, 2, &nselected, dropped, 1, &ndropped) == -1 &&
+		  nselected == 0 && ndropped == 0 &&
+		  ((unsigned char *) selected)[0] == 0xA5,
+		  "unordered duplicate sources fail before output is modified");
+	entries[2].layer_id = 9;
+	entries[5].entry.block++;
+	check(ps_compaction_relation_select_group(entries, 6, keep,
+			selected, 2, &nselected, dropped, 1, &ndropped) == -1 &&
+		  nselected == 0 && ndropped == 0,
+		  "selection rejects an incomplete or mixed page group");
 }
 
 static void
@@ -778,6 +842,7 @@ bounded_relation_plan_test(void)
 	PsImgRec rec = {.key = key, .block = 0, .lsn = 100, .page = page};
 	PsViewFence fence = {200, 1, PS_PRUNE_SEQ_UNBOUNDED};
 	RelationPlanProbe probe = {0};
+	SelectedPlanProbe selection = {0};
 	int ok;
 
 	rec.admission_seq = 1;
@@ -792,6 +857,13 @@ bounded_relation_plan_test(void)
 		  probe.ids[2] == 982 && probe.keep[0] && !probe.keep[1] && probe.keep[2] &&
 		  probe.closure[0],
 		  "bounded relation plan preserves finite-sequence closure and latest duplicate");
+	check(ps_compaction_plan_relation_groups(inputs, 3, 3,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
+			select_relation_plan, &selection) == 0 && selection.calls == 1 &&
+		  selection.nselected == 2 && selection.ndropped == 0 &&
+		  selection.selected[0].layer_id == 980 &&
+		  selection.selected[1].layer_id == 982,
+		  "planned duplicate identities select the winning retained source");
 	memset(&probe, 0, sizeof(probe));
 	check(ok && ps_compaction_plan_relation_groups(inputs, 3, 2,
 			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
@@ -1207,6 +1279,7 @@ main(void)
 	legacy_index_visitor_test();
 	bounded_relation_plan_test();
 	resumable_relation_plan_test();
+	relation_group_selection_test();
 	bounded_merge_test();
 	bounded_shared_payload_test();
 	bounded_sorted_batch_test();

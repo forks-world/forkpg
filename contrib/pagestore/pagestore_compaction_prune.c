@@ -85,6 +85,78 @@ same_page(const PsImgIndexEnt *a, const PsImgIndexEnt *b)
 		a->key.forkNum == b->key.forkNum && a->key.klass == b->key.klass;
 }
 
+int
+ps_compaction_relation_select_group(const PsImageGroupEntry *entries,
+	uint32_t count, const unsigned char *keep,
+	PsImageGroupEntry *selected, uint32_t selected_capacity, uint32_t *nselected,
+	PsImageGroupEntry *dropped, uint32_t dropped_capacity, uint32_t *ndropped)
+{
+	uint32_t nsel = 0, ndrop = 0;
+
+	if (nselected != NULL)
+		*nselected = 0;
+	if (ndropped != NULL)
+		*ndropped = 0;
+	if (entries == NULL || keep == NULL || nselected == NULL || ndropped == NULL ||
+		nselected == ndropped ||
+		count == 0 || count > PS_IMAGE_GROUP_MAX_VERSIONS ||
+		entries[0].entry.key.klass != PS_KLASS_RELATION)
+		return -1;
+	/* Validate the entire group and size both outputs before writing either. */
+	for (uint32_t i = 0; i < count;)
+	{
+		uint32_t next = i + 1;
+		int any_kept = keep[i] != 0;
+
+		if (!same_page(&entries[0].entry, &entries[i].entry) ||
+			(i != 0 && (entries[i - 1].entry.lsn > entries[i].entry.lsn ||
+			 (entries[i - 1].entry.lsn == entries[i].entry.lsn &&
+			  entries[i - 1].entry.admission_seq >= entries[i].entry.admission_seq))))
+			return -1;
+		while (next < count && entries[next].entry.lsn == entries[i].entry.lsn &&
+			   entries[next].entry.admission_seq == entries[i].entry.admission_seq)
+		{
+			if (!same_page(&entries[0].entry, &entries[next].entry) ||
+				entries[next - 1].layer_id > entries[next].layer_id)
+				return -1;
+			any_kept |= keep[next] != 0;
+			next++;
+		}
+		if (any_kept)
+			nsel++;
+		else
+			ndrop++;
+		i = next;
+	}
+	if (nsel > selected_capacity || ndrop > dropped_capacity)
+		return -2;
+	if ((nsel != 0 && selected == NULL) || (ndrop != 0 && dropped == NULL))
+		return -1;
+	nsel = ndrop = 0;
+	for (uint32_t i = 0; i < count;)
+	{
+		uint32_t next = i + 1, winner = UINT32_MAX;
+
+		while (next < count && entries[next].entry.lsn == entries[i].entry.lsn &&
+			   entries[next].entry.admission_seq == entries[i].entry.admission_seq)
+			next++;
+		for (uint32_t j = next; j > i; j--)
+			if (keep[j - 1])
+			{
+				winner = j - 1;
+				break;
+			}
+		if (winner != UINT32_MAX)
+			selected[nsel++] = entries[winner];
+		else
+			dropped[ndrop++] = entries[i];
+		i = next;
+	}
+	*nselected = nsel;
+	*ndropped = ndrop;
+	return 0;
+}
+
 static int
 emit_group(PsCompactionRelationPlan *plan, PsCompactionRelationVisitor visit,
 		   void *arg)
