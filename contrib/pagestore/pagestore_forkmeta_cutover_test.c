@@ -19,41 +19,64 @@
 #include "pagestore_prune.h"
 #include "pagestore_retention.h"
 
-/* These fixtures can be large; respect the caller's disk-backed TMPDIR. */
-static int
+/* Failure must stop the test: callers may otherwise use or remove a partial
+ * path. Resolve the root because fault injection requires an absolute path. */
+static void
 test_tmp_template(char *path, size_t capacity)
 {
 	const char *root = getenv("TMPDIR");
 	char name[256];
+	char *absolute;
 	int n;
 
 	if (root == NULL || *root == '\0')
 		root = "/tmp";
 	if (strlen(path) >= sizeof(name))
 	{
-		errno = EINVAL;
-		return 0;
+		fprintf(stderr, "temporary fixture name is too long\n");
+		exit(2);
 	}
 	strcpy(name, path);
-	n = snprintf(path, capacity, "%s/%s", root, name);
+	absolute = realpath(root, NULL);
+	if (absolute == NULL)
+	{
+		perror("resolve TMPDIR");
+		exit(2);
+	}
+	n = snprintf(path, capacity, "%s/%s", absolute, name);
+	free(absolute);
 	if (n < 0 || (size_t) n >= capacity)
 	{
-		errno = ENAMETOOLONG;
-		return 0;
+		fprintf(stderr, "temporary fixture path is too long\n");
+		exit(2);
 	}
-	return 1;
 }
 
 static char *
 test_mkdtemp(char *path, size_t capacity)
 {
-	return test_tmp_template(path, capacity) ? mkdtemp(path) : NULL;
+	test_tmp_template(path, capacity);
+	if (mkdtemp(path) == NULL)
+	{
+		perror("create temporary fixture directory");
+		exit(2);
+	}
+	return path;
 }
 
 static int
 test_mkstemp(char *path, size_t capacity)
 {
-	return test_tmp_template(path, capacity) ? mkstemp(path) : -1;
+	int fd;
+
+	test_tmp_template(path, capacity);
+	fd = mkstemp(path);
+	if (fd < 0)
+	{
+		perror("create temporary fixture file");
+		exit(2);
+	}
+	return fd;
 }
 
 static int checks;
