@@ -672,7 +672,7 @@ test_bounded_prune_multiple_outputs(int mode)
 				!ps_layer_map.layers[i].deleting)
 				before_retry++;
 		ps_unlock_map();
-		check(before_retry >= 18,
+		check(before_retry >= (mode == 1 ? 17U : 18U),
 			  "partial publication leaves every source layer live before retry");
 		run_maintenance(64);
 	}
@@ -1366,6 +1366,132 @@ test_prune_abandon_provider_gate(void)
 		unsetenv("PAGESTORE_OBJECT_DIR");
 	remove_tree(store);
 	remove_tree(objects);
+}
+
+typedef struct PartialOutputChurnProbe
+{
+	int called, wrote;
+} PartialOutputChurnProbe;
+
+static void
+partial_output_churn_hook(void *arg)
+{
+	PartialOutputChurnProbe *probe = arg;
+
+	probe->called++;
+	ps_test_set_prune_batch_hook(NULL, NULL);
+	probe->wrote = write_relation(0, 1090, 4000 + probe->called);
+}
+
+static void
+test_partial_output_conflict_churn(void)
+{
+	char store[] = "/tmp/pagestore-prune-partial-churn-XXXXXX";
+	PartialOutputChurnProbe probe = {0};
+	uint32_t initial, maximum = 0, maximum_deleting = 0;
+	int ok = 1;
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open partial-output conflict churn store");
+		return;
+	}
+	ok = write_relation(0, 0, 1000) && write_relation(0, 0, 2000);
+	for (uint32_t i = 1; i <= 1087 && ok; i++)
+		ok = write_relation(0, i, 3000);
+	check(ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+						 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "prepare multiple output batches for repeated conflicts");
+	initial = count_live_image_layers();
+	compact_layers = 1;
+	for (int attempt = 0; attempt < 5; attempt++)
+	{
+		int before = probe.called;
+		uint32_t live;
+
+		ps_test_set_prune_batch_hook(partial_output_churn_hook, &probe);
+		for (int i = 0; i < 128 && probe.called == before; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_batch_hook(NULL, NULL);
+		check(probe.called == before + 1 && probe.wrote && ps_test_page_prune_due(0, 0),
+			  "writer interrupts each partially published multi-output pass");
+		live = count_live_image_layers();
+		if (live > maximum)
+			maximum = live;
+		live = count_deleting_image_layers();
+		if (live > maximum_deleting)
+			maximum_deleting = live;
+	}
+	if (maximum > initial)
+		fprintf(stderr, "partial-output churn live layers: initial=%u maximum=%u\n", initial, maximum);
+	check(maximum <= initial,
+		  "repeated partial publication does not accumulate live outputs");
+	check(maximum_deleting <= 1,
+		  "normal GC drains each abandoned published batch");
+	run_maintenance(64);
+	compact_layers = 100;
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(1086, 5000, 3000) &&
+		  read_relation_asof(1090, 5000, 4005),
+		  "partial-output cleanup and retry preserve all required pages");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1090, 5000, 4005),
+		  "partial-output cleanup survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_partial_output_abandon_crash(void)
+{
+	char store[] = "/tmp/pagestore-prune-partial-crash-XXXXXX";
+	PartialOutputChurnProbe probe = {0};
+	int ok = 1;
+	int status = 0;
+	pid_t child;
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open partial-output crash store");
+		return;
+	}
+	ok = write_relation(0, 0, 1000) && write_relation(0, 0, 2000);
+	for (uint32_t i = 1; i <= 1087 && ok; i++)
+		ok = write_relation(0, i, 3000);
+	ok = ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+							PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000);
+	close_store();
+	compact_layers = 1;
+	child = fork();
+	if (child == 0)
+	{
+		if (!ok || ps_core_open(store) != 0)
+			_exit(88);
+		ps_test_set_prune_batch_hook(partial_output_churn_hook, &probe);
+		ps_test_set_prune_abandon_hook(prune_abandon_crash, NULL);
+		run_maintenance(128);
+		_exit(89);
+	}
+	check(child > 0 && waitpid(child, &status, 0) == child &&
+		  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+		  "process exits after partially published output tombstone");
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1086, 5000, 3000) && read_relation_asof(1090, 5000, 4001),
+		  "partial-output tombstone recovers sources and foreground data");
+	run_maintenance(64);
+	compact_layers = 100;
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1090, 5000, 4001),
+		  "partial-output crash recovery survives another restart");
+	close_store();
+	remove_tree(store);
 }
 
 typedef struct BoundedConflictProbe
@@ -2981,6 +3107,8 @@ main(void)
 	test_prune_abandon_conflict(1);
 	test_prune_abandon_conflict(2);
 	test_prune_abandon_provider_gate();
+	test_partial_output_conflict_churn();
+	test_partial_output_abandon_crash();
 	test_bounded_compaction_concurrent_write();
 	test_compaction_gather_rejects_concurrent_change(0);
 	test_compaction_gather_rejects_concurrent_change(1);

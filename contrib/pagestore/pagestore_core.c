@@ -4079,11 +4079,11 @@ ps_test_prune_abandon_local_only(void)
 	return prune_abandon_local_only();
 }
 
-/* A verified single output can be discarded only while the complete original
+/* One verified published output can be discarded only while the complete original
  * source set remains live and pinned. The exact publication check also rules
  * out new layers, tier changes and a changed replacement. Entry holds map-wr. */
 static int
-prune_single_output_abandonable(uint32_t timeline, const PsLayerDesc *inputs,
+prune_one_published_output_abandonable(uint32_t timeline, const PsLayerDesc *inputs,
 	uint32_t ninputs, const PsLayerDesc *output)
 {
 	uint32_t pinned = 0;
@@ -4431,11 +4431,11 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 
 done:
 	/* Before any source is retired, a complete pinned source set still covers
-	 * a verified single output. Retire it on an aborted attempt so repeated
+	 * one verified published output. Retire it on an aborted attempt so repeated
 	 * snapshot conflicts do not accumulate redundant live layers. Never guess
 	 * after an ambiguous manifest append or changed layer set. */
-	if (result < 0 && noutputs == 1 && published == 1 && retired == 0 && !ambiguous &&
-		prune_single_output_abandonable(timeline, inputs, ninputs, &outputs[0]))
+	if (result < 0 && published == 1 && retired == 0 && !ambiguous &&
+		prune_one_published_output_abandonable(timeline, inputs, ninputs, &outputs[0]))
 	{
 		if (ps_manifest_mark_delete(outputs[0].layer_id) == 0)
 		{
