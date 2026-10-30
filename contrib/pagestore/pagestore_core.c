@@ -702,6 +702,16 @@ static uint64_t ps_test_compaction_pass_count;
 static unsigned segment_gc_compaction_turn;
 static void (*compaction_unlocked_test_hook)(void *);
 static void *compaction_unlocked_test_hook_arg;
+static void (*prune_snapshot_test_hook)(void *);
+static void *prune_snapshot_test_hook_arg;
+
+void
+ps_test_set_prune_snapshot_hook(void (*hook)(void *), void *arg)
+{
+	prune_snapshot_test_hook = hook;
+	prune_snapshot_test_hook_arg = arg;
+}
+
 static void (*prune_index_test_hook)(void *);
 static void *prune_index_test_hook_arg;
 
@@ -2119,6 +2129,7 @@ struct WalIdxEnt;
 typedef struct Shard
 {
 	struct PageEnt *page_idx[IDX_BUCKETS];	/* (timeline,key,block) -> versions */
+	uint64_t page_index_epoch; /* changes under this shard write lock */
 	struct ForkEnt *fork_idx[IDX_BUCKETS];	/* (timeline,key) -> fork size */
 	struct WalIdxEnt *walidx[IDX_BUCKETS];	/* (timeline,key,block) -> WAL lsns */
 	PsMemtable *memtable;		/* staging -> image layers */
@@ -2143,6 +2154,15 @@ typedef struct Shard
 } Shard;
 
 static Shard g_shards[MAX_SHARDS];
+
+/* Saturation permanently disables optimistic snapshots on this shard. */
+static void
+page_index_changed(Shard *s)
+{
+	if (s->page_index_epoch != UINT64_MAX)
+		s->page_index_epoch++;
+}
+
 #ifdef PAGESTORE_BACKPRESSURE_TEST
 static uint64_t page_gc_coverage_observation_count;
 #endif
@@ -4013,6 +4033,16 @@ bounded_prune_check_drops(const PsImageGroupEntry *entries, uint32_t count, void
 	return 0;
 }
 
+/* Returns 1 after replacing a long chain, 0 when the ordinary bounded
+ * index update should handle it, or -1 when the snapshot became stale.
+ * Entry and exit hold all shard locks, page_prune_lock and map-wr. */
+static int page_prune_long_chain(uint32_t timeline, const PsImgRec *recs,
+	uint32_t nrec, const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	const PsCompactionPruneFence *captured);
+static uint32_t page_prune_fast_batch_count(uint32_t timeline,
+	const PsImgRec *recs, uint32_t nrec);
+
 /* Caller holds the same locks as compact_timeline. Input layers are pinned
  * while planning, writing and verifying outside those locks. */
 static int
@@ -4239,9 +4269,26 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 	{
 		uint32_t count = stage.ndropped - offset;
 
-		if (count > PS_BOUNDED_PRUNE_INDEX_BATCH)
-			count = PS_BOUNDED_PRUNE_INDEX_BATCH;
-		page_remove_compacted_versions(timeline, dropped_recs + offset, count);
+		uint32_t group = 1;
+		int long_chain;
+
+		while (offset + group < stage.ndropped &&
+			   dropped_recs[offset + group].block == dropped_recs[offset].block &&
+			   key_eq(&dropped_recs[offset + group].key, &dropped_recs[offset].key))
+			group++;
+		long_chain = page_prune_long_chain(timeline, dropped_recs + offset, group,
+			inputs, ninputs, outputs, noutputs, &captured);
+		if (long_chain < 0)
+			goto done;
+		if (long_chain > 0)
+			count = group;
+		else
+		{
+			count = page_prune_fast_batch_count(timeline, dropped_recs + offset, count);
+			if (count == 0)
+				goto done;
+			page_remove_compacted_versions(timeline, dropped_recs + offset, count);
+		}
 		offset += count;
 		if (offset < stage.ndropped)
 		{
@@ -6760,6 +6807,7 @@ page_cleanup_purge_timeline_locked(uint32_t timeline)
 					continue;
 				}
 				*link = e->next;
+				page_index_changed(&g_shards[sh]);
 				free(e->vers);
 				free(e);
 			}
@@ -6949,6 +6997,7 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 			}
 		}
 		e->nver = out;
+		page_index_changed(shard_for(&e->key));
 		r = end;
 	}
 	/*
@@ -6999,6 +7048,214 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 	}
 }
 
+/* Test fixture helper: change only an empty memtable's flush threshold. */
+int
+ps_test_resize_empty_memtable(uint32_t shard, uint32_t threshold)
+{
+	PsMemtable *replacement, *old;
+
+	if (shard >= core_shards() || threshold == 0)
+		return -1;
+	replacement = ps_memtable_create(page_size, threshold);
+	if (replacement == NULL)
+		return -1;
+	ps_lock_shard_wr(shard);
+	old = g_shards[shard].memtable;
+	if (old == NULL || ps_memtable_count(old) != 0)
+	{
+		ps_unlock_shard(shard);
+		ps_memtable_destroy(replacement);
+		return -1;
+	}
+	g_shards[shard].memtable = replacement;
+	ps_unlock_shard(shard);
+	ps_memtable_destroy(old);
+	return 0;
+}
+
+/* Long relation chains are copied under a sequence of short lock holds.
+ * The shard epoch makes any append, pruning update or GC retarget invalidate
+ * the snapshot, including changes that do not allocate an admission ID. */
+#define PS_LONG_CHAIN_MIN_VERSIONS 1024
+#define PS_LONG_CHAIN_MAX_VERSIONS 65536
+#define PS_LONG_CHAIN_COPY_BATCH 128
+
+/* Never let a regular batch pull a later eligible long chain into the
+ * locked array scan. Preserve the 128-identity cap for ordinary pages. */
+static uint32_t
+page_prune_fast_batch_count(uint32_t timeline, const PsImgRec *recs, uint32_t nrec)
+{
+	uint32_t count = 0;
+
+	while (count < nrec && count < PS_BOUNDED_PRUNE_INDEX_BATCH)
+	{
+		uint32_t group = 1;
+		PageEnt *e = page_find(timeline, &recs[count].key, recs[count].block);
+
+		if (e != NULL && e->nver > PS_LONG_CHAIN_MIN_VERSIONS &&
+			e->nver <= PS_LONG_CHAIN_MAX_VERSIONS &&
+			recs[count].key.klass == PS_KLASS_RELATION && recs[count].lsn != 0)
+			break;
+		while (count + group < nrec &&
+			   recs[count + group].block == recs[count].block &&
+			   key_eq(&recs[count + group].key, &recs[count].key))
+			group++;
+		if (group > PS_BOUNDED_PRUNE_INDEX_BATCH - count)
+			group = PS_BOUNDED_PRUNE_INDEX_BATCH - count;
+		count += group;
+	}
+	return count;
+}
+
+static int
+page_snapshot_dropped(const PsImgRec *recs, uint32_t count, const PageVer *v)
+{
+	uint32_t lo = 0, hi = count;
+
+	while (lo < hi)
+	{
+		uint32_t mid = lo + (hi - lo) / 2;
+
+		if (recs[mid].lsn < v->lsn ||
+			(recs[mid].lsn == v->lsn && recs[mid].admission_seq < v->admission_seq))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo < count && recs[lo].lsn == v->lsn &&
+		recs[lo].admission_seq == v->admission_seq;
+}
+
+static void
+page_snapshot_unlock(void)
+{
+	ps_unlock_map();
+	pthread_rwlock_unlock(&page_prune_lock);
+	for (uint32_t sh = core_shards(); sh > 0; sh--)
+		ps_unlock_shard(sh - 1);
+}
+
+/* Always returns holding the original locks, even on a failed validation. */
+static int
+page_snapshot_lock_valid(uint32_t timeline, const PsKey *key, uint32_t block,
+	uint32_t shard, uint64_t epoch, int nver,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	const PsCompactionPruneFence *captured)
+{
+	PsCompactionPruneFence current = {0};
+	PsTimelineState state;
+	PageEnt *e;
+
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		ps_lock_shard_wr(sh);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	if (ps_manifest_poisoned() ||
+		ps_retention_epoch(&current.retention_epoch) != 0 ||
+		!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
+		state != PS_TIMELINE_LIVE ||
+		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+			&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+		return 0;
+	current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	if (!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
+			captured, &current, 1, 0, noutputs, 0, 1, 0) ||
+		g_shards[shard].page_index_epoch != epoch)
+		return 0;
+	e = page_find(timeline, key, block);
+	return e != NULL && e->nver == nver;
+}
+
+static int
+page_prune_long_chain(uint32_t timeline, const PsImgRec *recs, uint32_t nrec,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	const PsCompactionPruneFence *captured)
+{
+	PsKey key = recs[0].key;
+	uint32_t block = recs[0].block, shard = ps_shard_of(&key);
+	PageEnt *e = page_find(timeline, &key, block);
+	PageVer *snapshot = NULL, *old = NULL;
+	uint64_t epoch;
+	int nver, kept = 0, valid;
+
+	if (e == NULL || e->nver <= PS_LONG_CHAIN_MIN_VERSIONS ||
+		e->nver > PS_LONG_CHAIN_MAX_VERSIONS || key.klass != PS_KLASS_RELATION)
+		return 0;
+	/* Removing an LSN-zero record also changes fork-level WAL-less state.
+	 * Keep that case on the existing path until it can be snapshotted too. */
+	for (uint32_t i = 0; i < nrec; i++)
+		if (recs[i].lsn == 0)
+			return 0;
+	nver = e->nver;
+	epoch = g_shards[shard].page_index_epoch;
+	if (epoch >= UINT64_MAX - 1 || (size_t) nver > SIZE_MAX / sizeof(*snapshot))
+		return -1;
+	page_snapshot_unlock();
+	snapshot = malloc((size_t) nver * sizeof(*snapshot));
+	valid = page_snapshot_lock_valid(timeline, &key, block, shard, epoch, nver,
+		inputs, ninputs, outputs, noutputs, captured);
+	if (!valid || snapshot == NULL)
+		goto fail;
+	for (int offset = 0; offset < nver;)
+	{
+		int count = nver - offset;
+
+		if (count > PS_LONG_CHAIN_COPY_BATCH)
+			count = PS_LONG_CHAIN_COPY_BATCH;
+		e = page_find(timeline, &key, block);
+		memcpy(snapshot + offset, e->vers + offset, (size_t) count * sizeof(*snapshot));
+#ifdef PAGESTORE_ASSERT_CHECKING
+		for (int i = offset; i < offset + count; i++)
+		{
+			const PageVer *v = &snapshot[i];
+			int remove = page_snapshot_dropped(recs, nrec, v);
+
+			PS_ASSERT(!remove || v->seg < 0 ||
+				(g_shards[v->shard].flush_watermark_valid &&
+				 ((uint32_t) v->seg < g_shards[v->shard].flush_watermark.seg_id ||
+				  ((uint32_t) v->seg == g_shards[v->shard].flush_watermark.seg_id &&
+				   v->off + page_size <= g_shards[v->shard].flush_watermark.seg_off))));
+		}
+#endif
+		page_snapshot_unlock();
+		for (int i = offset; i < offset + count; i++)
+			if (!page_snapshot_dropped(recs, nrec, &snapshot[i]))
+				snapshot[kept++] = snapshot[i];
+		offset += count;
+		if (prune_snapshot_test_hook != NULL)
+			prune_snapshot_test_hook(prune_snapshot_test_hook_arg);
+		valid = page_snapshot_lock_valid(timeline, &key, block, shard, epoch, nver,
+			inputs, ninputs, outputs, noutputs, captured);
+		if (!valid)
+			goto fail;
+	}
+	e = page_find(timeline, &key, block);
+	old = e->vers;
+	e->vers = snapshot;
+	e->nver = kept;
+	e->cap = nver;
+	snapshot = NULL;
+	page_index_changed(&g_shards[shard]);
+	epoch++;
+	page_snapshot_unlock();
+	free(old);
+	valid = page_snapshot_lock_valid(timeline, &key, block, shard, epoch, kept,
+		inputs, ninputs, outputs, noutputs, captured);
+	return valid ? 1 : -1;
+
+fail:
+	page_snapshot_unlock();
+	free(snapshot);
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		ps_lock_shard_wr(sh);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	return -1;
+}
+
 /*
  * Record a new version of (timeline, key, block).  Only ever appends to the
  * version chain -- existing versions are never dropped -- which is what makes
@@ -7034,6 +7291,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 		e->cap = e->cap ? e->cap * 2 : 2;
 		e->vers = realloc(e->vers, (size_t) e->cap * sizeof(PageVer));
 	}
+	page_index_changed(s);
 	e->vers[e->nver].shard = shard;
 	e->vers[e->nver].lsn = lsn;
 	e->vers[e->nver].admission_seq = admission_seq;
@@ -26663,6 +26921,7 @@ reclaim_one_segment(Shard *s, int layers_prepared, const GcVerifiedSet *verified
 					{
 						e->vers[i].seg = -1;
 						e->vers[i].off = 0;
+						page_index_changed(&g_shards[sh]);
 					}
 	/* Once a positive-size covered victim is known to be counted, remember it
 	 * before remove().  POSIX may unlink it and then fail the directory fsync;
