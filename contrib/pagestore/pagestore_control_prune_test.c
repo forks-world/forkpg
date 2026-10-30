@@ -705,6 +705,123 @@ test_bounded_prune_multiple_outputs(int mode)
 	remove_tree(store);
 }
 
+typedef struct PruneIndexProbe
+{
+	int mode, called, wrote;
+} PruneIndexProbe;
+
+static void
+prune_index_conflict(void *arg)
+{
+	PruneIndexProbe *probe = arg;
+
+	probe->called++;
+	ps_test_set_prune_index_hook(NULL, NULL);
+	if (probe->mode == 2)
+		_exit(86);
+	if (probe->mode == 1)
+		probe->wrote = write_relation(0, 1200, 4000);
+}
+
+static void
+test_bounded_prune_index_batches(int mode)
+{
+	char store[] = "/tmp/pagestore-prune-index-batches-XXXXXX";
+	PruneIndexProbe probe = {.mode = mode};
+	uint64_t before;
+	uint32_t live = 0;
+	int ok = 1;
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open batched index pruning store");
+		return;
+	}
+	for (uint32_t i = 0; i < 1152 && ok; i++)
+		ok = write_relation(0, i, 1000) && write_relation(0, i, 2000);
+	check(ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+						 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "prepare more than 1024 obsolete page identities");
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	if (mode == 2)
+	{
+		pid_t child;
+		int status = 0;
+
+		close_store();
+		child = fork();
+		if (child == 0)
+		{
+			if (ps_core_open(store) != 0)
+				_exit(87);
+			ps_test_set_prune_index_hook(prune_index_conflict, &probe);
+			run_maintenance(64);
+			_exit(88);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "crash after the first bounded page-index update");
+		check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+			  read_relation_asof(1151, 5000, 2000),
+			  "partial page-index update recovers after crash");
+	}
+	else
+	{
+		ps_test_set_prune_index_hook(prune_index_conflict, &probe);
+		for (int i = 0; i < 64 && !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_index_hook(NULL, NULL);
+		check(probe.called && ps_test_bounded_prune_published_count() > before &&
+			  (mode != 1 || (probe.wrote && ps_test_page_prune_due(0, 0))),
+			  "bounded pruning splits index updates and fences concurrent writes");
+	}
+	if (mode != 0)
+	{
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+				live++;
+		ps_unlock_map();
+		check(live >= 38, "partial index update retains all source layers");
+	}
+	run_maintenance(64);
+	compact_layers = 100;
+	if (mode == 0)
+	{
+		uint32_t obsolete = 0;
+
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			{
+				PsImgIndexEnt *index = NULL;
+				uint32_t count = 0;
+
+				if (ps_image_layer_read_index(&ps_layer_map.layers[i], &index, &count) == 0)
+					for (uint32_t j = 0; j < count; j++)
+						if (index[j].key.klass == PS_KLASS_RELATION && index[j].lsn == 1000)
+							obsolete++;
+				free(index);
+			}
+		ps_unlock_map();
+		check(obsolete == 0, "all 1152 obsolete identities are absent from live layers");
+	}
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(1151, 5000, 2000) &&
+		  (mode != 1 || read_relation_asof(1200, 5000, 4000)),
+		  "index pruning and retries preserve retained pages");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1151, 5000, 2000) &&
+		  (mode != 1 || read_relation_asof(1200, 5000, 4000)),
+		  "index pruning survives a subsequent restart");
+	close_store();
+	remove_tree(store);
+}
+
 typedef struct BoundedConflictProbe
 {
 	int called;
@@ -2301,6 +2418,9 @@ main(void)
 	test_bounded_prune_multiple_outputs(0);
 	test_bounded_prune_multiple_outputs(1);
 	test_bounded_prune_multiple_outputs(2);
+	test_bounded_prune_index_batches(0);
+	test_bounded_prune_index_batches(1);
+	test_bounded_prune_index_batches(2);
 	test_bounded_compaction_concurrent_write();
 	test_compaction_gather_rejects_concurrent_change(0);
 	test_compaction_gather_rejects_concurrent_change(1);
