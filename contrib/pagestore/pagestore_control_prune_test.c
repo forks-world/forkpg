@@ -915,6 +915,177 @@ test_hot_page_prune_batches(int mode)
 	remove_tree(store);
 }
 
+typedef struct LongChainProbe
+{
+	int mode, called, midpoint_ok, wrote, reclaimed, worker_started;
+	uint32_t block;
+	pthread_t worker;
+} LongChainProbe;
+
+static void *
+long_chain_gc_worker(void *arg)
+{
+	(void) arg;
+	(void) ps_core_maintenance();
+	return NULL;
+}
+
+static void
+long_chain_snapshot_hook(void *arg)
+{
+	LongChainProbe *probe = arg;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	probe->called++;
+	probe->midpoint_ok = ps_test_page_version_count(0, &key, probe->block) ==
+		(probe->mode == 5 ? 1537U : 2048U) &&
+		read_relation_asof(probe->block, 5000, 1511) &&
+		read_relation_asof(probe->block, 10000, 7535);
+	ps_test_set_prune_snapshot_hook(NULL, NULL);
+	ps_test_set_prune_snapshot_swap_hook(NULL, NULL);
+	if (probe->mode == 2)
+		_exit(probe->midpoint_ok ? 86 : 87);
+	if (probe->mode == 1 || probe->mode == 5)
+		probe->wrote = write_relation(0, probe->block, 9000);
+	if (probe->mode == 3)
+	{
+		segment_gc_enabled = 1;
+		probe->worker_started = pthread_create(&probe->worker, NULL, long_chain_gc_worker, NULL) == 0;
+		/* Wait for the actual unlink; this is a test watchdog, not a
+		 * production lock or reclamation deadline. */
+		for (int i = 0; probe->worker_started && i < 30000 &&
+			 ps_storage->seg_size(0, 0) >= 0; i++)
+			usleep(1000);
+		probe->reclaimed = ps_storage->seg_size(0, 0) < 0;
+	}
+}
+
+static int
+long_chain_finish_setup(const char *store, uint32_t block)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	int ok = ps_core_open(store) == 0;
+
+	for (uint32_t i = 0; i < 1536 && ok; i++)
+		ok = write_relation(0, block, 6000 + i);
+	return ok && ps_test_page_version_count(0, &key, block) == 2048 &&
+		reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000);
+}
+
+static void
+test_long_chain_prune_snapshot(int mode)
+{
+	char store[] = "/tmp/pagestore-prune-long-chain-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	LongChainProbe probe = {.mode = mode, .block = mode == 4 ? 1 : 0};
+	uint32_t block = probe.block;
+	uint64_t before;
+	int ok = 1;
+
+	configure_core(0);
+	if (mode == 3)
+		flush_pages = 512;
+	segment_size = (mode == 3 ? 4 : 32) * 1024 * 1024;
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open long-page-chain pruning store");
+		return;
+	}
+	if (mode == 4)
+		ok = write_relation(0, 0, 1000) && write_relation(0, 0, 2000);
+	for (uint32_t i = 0; i < 512 && ok; i++)
+		ok = write_relation(0, block, 1000 + i);
+	if (mode == 3)
+	{
+		ok = ok && ps_test_resize_empty_memtable(0, 100000) == 0;
+		for (uint32_t i = 0; i < 1536 && ok; i++)
+			ok = write_relation(0, 0, 6000 + i);
+		ok = ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+							 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000);
+	}
+	else
+		close_store();
+	flush_pages = 100000;
+	compact_layers = 1;
+	if (mode == 2)
+	{
+		pid_t child = fork();
+		int status = 0;
+
+		if (child == 0)
+		{
+			if (!ok || !long_chain_finish_setup(store, block))
+				_exit(88);
+			ps_test_set_prune_snapshot_hook(long_chain_snapshot_hook, &probe);
+			run_maintenance(64);
+			_exit(89);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "crash while copying a long chain after publication");
+		check(ps_core_open(store) == 0 && read_relation_asof(block, 5000, 1511) &&
+			  read_relation_asof(block, 10000, 7535),
+			  "long-chain snapshot crash recovers both retained views");
+	}
+	else
+	{
+		check(ok && (mode == 3 || long_chain_finish_setup(store, block)),
+			  "prepare a long page chain with a prunable durable prefix");
+		before = ps_test_bounded_prune_published_count();
+		if (mode == 5)
+			ps_test_set_prune_snapshot_swap_hook(long_chain_snapshot_hook, &probe);
+		else
+			ps_test_set_prune_snapshot_hook(long_chain_snapshot_hook, &probe);
+		for (int i = 0; i < 64 && !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_snapshot_hook(NULL, NULL);
+		ps_test_set_prune_snapshot_swap_hook(NULL, NULL);
+		if (probe.worker_started)
+			(void) pthread_join(probe.worker, NULL);
+		segment_gc_enabled = 0;
+		check(probe.called && probe.midpoint_ok &&
+			  ps_test_bounded_prune_published_count() > before &&
+			  (mode != 1 || (probe.wrote && ps_test_page_prune_due(0, 0) &&
+						 ps_test_page_version_count(0, &key, block) == 2049)) &&
+			  (mode != 5 || (probe.wrote && ps_test_page_prune_due(0, 0) &&
+						 ps_test_page_version_count(0, &key, block) == 1538)) &&
+			  (mode != 3 || (probe.reclaimed && ps_test_page_prune_due(0, 0) &&
+						 ps_test_page_version_count(0, &key, block) == 2048)),
+			  "long chain is copied in chunks and rejects a concurrent mutation");
+		if (mode == 0 || mode == 4)
+			check(ps_test_page_version_count(0, &key, block) == 1537,
+				  "snapshot replacement removes the complete obsolete prefix");
+		if (mode == 1 || mode == 3 || mode == 5)
+		{
+			uint32_t live = 0;
+
+			ps_lock_map_rd();
+			for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+				if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+					!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+					live++;
+			ps_unlock_map();
+			check(live >= (uint32_t) (mode == 3 ? 2 : 9),
+				  "snapshot conflict retains every source layer before retry");
+		}
+	}
+	run_maintenance(64);
+	compact_layers = 100;
+	check(read_relation_asof(block, 5000, 1511) &&
+		  read_relation_asof(block, 10000, (mode == 1 || mode == 5) ? 9000 : 7535) &&
+		  (mode != 4 || read_relation_asof(0, 5000, 2000)),
+		  "long-chain snapshot and retry preserve old and newest views");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(block, 5000, 1511) &&
+		  read_relation_asof(block, 10000, (mode == 1 || mode == 5) ? 9000 : 7535),
+		  "long-chain snapshot survives a later restart");
+	close_store();
+	remove_tree(store);
+}
+
 typedef struct BoundedConflictProbe
 {
 	int called;
@@ -2517,6 +2688,12 @@ main(void)
 	test_hot_page_prune_batches(0);
 	test_hot_page_prune_batches(1);
 	test_hot_page_prune_batches(2);
+	test_long_chain_prune_snapshot(0);
+	test_long_chain_prune_snapshot(1);
+	test_long_chain_prune_snapshot(2);
+	test_long_chain_prune_snapshot(3);
+	test_long_chain_prune_snapshot(4);
+	test_long_chain_prune_snapshot(5);
 	test_bounded_compaction_concurrent_write();
 	test_compaction_gather_rejects_concurrent_change(0);
 	test_compaction_gather_rejects_concurrent_change(1);
