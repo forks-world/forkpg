@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_storage.h"
 
 static int run;
@@ -58,11 +59,11 @@ segment_read_is(uint32_t shard, int segment, const char *expected, uint32_t len)
 int
 main(void)
 {
-	char directory[] = "/tmp/psflatwalXXXXXX";
+	char directory[PS_TEST_TEMP_PATH_MAX] = "psflatwalXXXXXX";
 	char temporary[1024];
 	int fd;
 
-	check(mkdtemp(directory) != NULL, "create flat-WAL test directory");
+	check(ps_test_mkdtemp(directory, sizeof(directory)) != NULL, "create flat-WAL test directory");
 	check(setenv("PAGESTORE_TEST_FAIL_WAL_REWRITE_BEFORE_RENAME", "1", 1) == 0 &&
 		  PsStoragePosix.open(directory, 0) == 0,
 		  "open POSIX store with pre-publication fault injection");
@@ -161,7 +162,7 @@ main(void)
 	unlink(temporary);
 	snprintf(temporary, sizeof(temporary), "%s/seg_2_00000003", directory);
 	unlink(temporary);
-	rmdir(directory);
+	ps_test_remove_tree(directory);
 	printf("storage_posix_wal_test: %d checks, %d failed\n", run, failed);
 	return failed != 0;
 }

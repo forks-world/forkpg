@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_wal_store.h"
 
 #define TEST_SEGMENT_BYTES (16u * 1024u * 1024u)
@@ -234,7 +235,7 @@ restore_metadata_atomically(const char *directory,
 int
 main(void)
 {
-	char directory[] = "/tmp/pswalstoreXXXXXX";
+	char directory[PS_TEST_TEMP_PATH_MAX] = "pswalstoreXXXXXX";
 	char path[1024];
 	char temporary_path[2048];
 	char retry_directory[512];
@@ -274,7 +275,7 @@ main(void)
 	PsWalStore unopened = {0};
 	int fd;
 
-	check(mkdtemp(directory) != NULL, "create WAL segment test directory");
+	check(ps_test_mkdtemp(directory, sizeof(directory)) != NULL, "create WAL segment test directory");
 	check(ps_wal_store_retained_base(NULL, &retained_base) != 0 &&
 		  retained_base == UINT64_MAX &&
 		  ps_wal_store_retained_base(&unopened, &retained_base) != 0 &&
@@ -1463,7 +1464,7 @@ main(void)
 	snprintf(path, sizeof(path), "%s/%s", directory,
 			 PS_WAL_STORE_IDENTITY_FILE);
 	unlink(path);
-	rmdir(directory);
+	ps_test_remove_tree(directory);
 	free(input);
 
 	printf("pagestore_wal_store_test: %d checks, %d failed\n", run, failed);
