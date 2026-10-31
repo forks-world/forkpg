@@ -12,6 +12,7 @@
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
+#include "pagestore_test_temp.h"
 #include "pagestore_storage.h"
 
 #define SEGMENTS 512
@@ -141,28 +142,11 @@ pinned_eviction_test(void)
 		  "pinned reader survives a full cache rotation with correct data");
 }
 
-static void
-cleanup(const char *path)
-{
-	DIR		   *dir = opendir(path);
-	struct dirent *entry;
-	char		file[1024];
 
-	if (!dir)
-		return;
-	while ((entry = readdir(dir)) != NULL)
-		if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
-		{
-			snprintf(file, sizeof(file), "%s/%s", path, entry->d_name);
-			unlink(file);
-		}
-	closedir(dir);
-	rmdir(path);
-}
 int
 main(void)
 {
-	char		dir[] = "/tmp/psfdcacheXXXXXX";
+	char		dir[PS_TEST_TEMP_PATH_MAX] = "psfdcacheXXXXXX";
 	struct rlimit original,
 				limited;
 	uint32_t	data[16],
@@ -173,7 +157,7 @@ main(void)
 	limited = original;
 	limited.rlim_cur = 128;
 	check(setrlimit(RLIMIT_NOFILE, &limited) == 0, "use an unchanged low descriptor ceiling");
-	check(mkdtemp(dir) != NULL && PsStoragePosix.open(dir, 65536) == 0, "open independent store");
+	check(ps_test_mkdtemp(dir, sizeof(dir)) != NULL && PsStoragePosix.open(dir, 65536) == 0, "open independent store");
 	check(PsStoragePosix.wal_append(0, "healthy", 7, NULL, 0) == 0, "store independent healthy WAL");
 	for (int i = 0; i < SEGMENTS; i++)
 	{
@@ -245,7 +229,7 @@ main(void)
 		unsetenv("PAGESTORE_TEST_FAIL_SEG_CACHE_SYNC");
 	}
 	check(setrlimit(RLIMIT_NOFILE, &original) == 0, "restore original descriptor limit");
-	cleanup(dir);
+	ps_test_remove_tree(dir);
 	fprintf(stderr, "%d checks, %d failures\n", checks, failures);
 	return failures != 0;
 }

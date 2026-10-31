@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_layer.h"
 #include "pagestore_manifest.h"
 #include "pagestore_storage.h"
@@ -34,14 +35,14 @@ check(int condition, const char *name)
 int
 main(void)
 {
-	char store[] = "/tmp/pagestore-fork-owner-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-fork-owner-XXXXXX";
 	char path[1024];
 	char got[sizeof("parent")];
 	PsLayerDesc manifest_layer;
 	pid_t pid;
 	int status = 0;
 
-	check(mkdtemp(store) != NULL, "create fork-owner store");
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL, "create fork-owner store");
 	check(PsStoragePosix.open(store, 0) == 0, "open fork-owner store");
 	check(PsStoragePosix.seg_write(0, 0, 0, "parent", 6) == 0,
 		  "write parent segment bytes");
@@ -112,7 +113,7 @@ main(void)
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/.pagestore.lock", store);
 	unlink(path);
-	rmdir(store);
+	ps_test_remove_tree(store);
 	printf("storage_posix_fork_owner_test: %d checks, %d failed\n",
 		   checks, failed);
 	return failed != 0;
