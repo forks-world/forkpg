@@ -276,6 +276,29 @@ extern int ps_image_index_visit_groups(const PsLayerDesc *layers, uint32_t count
  * winning source; distinct logical versions are retained. This API does not
  * persist a transaction. */
 #define PS_IMAGE_PREPARE_MAX_OUTPUTS 64
+/* Seal one unpublished batch of already-selected source entries. Sources must
+ * stay immutable and pinned. Entries must be sorted and unique and come from
+ * those sources; this routine verifies source data checksums and descriptor
+ * bounds, but does not prove index membership or the pruning decision. The
+ * caller must independently verify both before publication, and must fence
+ * the snapshot and advance any durable frontier before retiring sources.
+ * On 0, out describes the sealed unpublished file. On -1 no create was
+ * attempted. On -2 the attempted ID has an uncertain outcome and must be
+ * reconciled, not blindly deleted. No manifest entry is written. */
+extern int ps_image_compaction_stage_selected_batch(const PsLayerDesc *layers,
+	uint32_t count, const PsImageGroupEntry *selected, uint32_t nselected,
+	uint64_t output_id, uint32_t page_size, PsLayerDesc *out,
+	uint64_t *uncertain_id);
+
+/* Independently verify that each selected entry is present in its named
+ * source index and that the sealed output contains exactly those identities,
+ * metadata and page bytes. All files remain pinned and immutable. This does
+ * not prove the selection is complete or that omitted history is reclaimable;
+ * caller must separately validate the full pruning plan and fence publication. */
+extern int ps_image_compaction_verify_selected_batch(const PsLayerDesc *layers,
+	uint32_t count, const PsImageGroupEntry *selected, uint32_t nselected,
+	const PsLayerDesc *output, uint32_t page_size);
+
 extern int ps_image_compaction_prepare(const PsLayerDesc *layers, uint32_t count,
 									  const uint64_t *output_ids, uint32_t capacity,
 									  uint32_t page_size, PsLayerDesc *outputs,
@@ -303,6 +326,12 @@ extern int ps_image_compaction_verify_coverage(const PsLayerDesc *inputs,
 extern int ps_image_compaction_snapshot_valid(const PsLayerMap *map,
 	const PsLayerDesc *inputs, uint32_t ninputs,
 	const PsLayerDesc *outputs, uint32_t noutputs);
+/* As above, additionally require exactly outputs[0..published_prefix) to be
+ * present. This is a metadata check; callers must separately prove contents,
+ * durability, owned pins and concurrent-state fencing. */
+extern int ps_image_compaction_publication_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t published_prefix);
 /* Validate a pinned, partially retired input set and all published outputs.
  * The caller must hold its own pin on every input throughout retirement; a
  * nonzero reader count alone does not establish ownership. It must also hold

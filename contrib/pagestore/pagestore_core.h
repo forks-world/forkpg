@@ -263,6 +263,8 @@ extern uint32_t ps_test_wal_reclaim_watch_count(uint32_t timeline);
 extern uint64_t ps_test_compaction_count(void);
 extern uint64_t ps_test_bounded_compaction_count(void);
 extern uint64_t ps_test_bounded_zero_floor_count(void);
+extern uint64_t ps_test_bounded_nonzero_plan_count(void);
+extern uint64_t ps_test_bounded_prune_published_count(void);
 extern int ps_test_page_prune_due(uint32_t timeline, uint32_t shard);
 /* Test-only: when nonzero, both wal_reclaim_watch fire sites (flush_memtable
  * and walidx_add_batch_locked) return without checking for a match --
@@ -292,6 +294,15 @@ extern uint64_t ps_test_page_gc_coverage_observation_count(void);
  * Production frontends never install these hooks. */
 typedef void (*PsForkmetaCutoverTestHook)(void *arg);
 extern void ps_test_set_compaction_unlocked_hook(void (*hook)(void *), void *arg);
+extern int ps_test_resize_empty_memtable(uint32_t shard, uint32_t threshold);
+extern int ps_test_prune_abandon_local_only(void);
+extern void ps_test_set_prune_abandon_hook(void (*hook)(void *), void *arg);
+extern void ps_test_set_prune_snapshot_swap_hook(void (*hook)(void *), void *arg);
+extern void ps_test_set_prune_snapshot_hook(void (*hook)(void *), void *arg);
+extern void ps_test_set_prune_index_hook(void (*hook)(void *), void *arg);
+extern void ps_test_set_prune_batch_hook(void (*hook)(void *), void *arg);
+extern void ps_test_set_prune_retired_hook(void (*hook)(void *), void *arg);
+extern void ps_test_set_compaction_gather_hook(void (*hook)(void *), void *arg);
 /* Called after a forkmeta GC cursor reports SCAN_INCOMPLETE and maintenance
  * continues into the later WAL/timeline/segment/compaction phases. */
 typedef void (*PsForkmetaPostGcTestHook)(void *arg);

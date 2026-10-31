@@ -7087,7 +7087,7 @@ bootstrap(void)
 int
 main(int argc, char **argv)
 {
-	const char *base = argc >= 3 ? argv[2] : "/tmp";
+	const char *base = argc >= 3 ? argv[2] : getenv("TMPDIR");
 	const char *env;
 	uint64_t	seed = FZ_DEFAULT_SEED;
 	long long	ops = FZ_DEFAULT_OPS;
@@ -7131,6 +7131,8 @@ main(int argc, char **argv)
 		return 0;
 	}
 
+	if (base == NULL || (argc < 3 && *base == '\0'))
+		base = "/tmp";
 	g_argv = argv;
 	g_store_base = base;
 	resolve_self_exe(argv[0]);

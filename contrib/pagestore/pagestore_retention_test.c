@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_retention.h"
 
 static int failed;
@@ -170,13 +171,13 @@ write_registry(const char *dir, uint32_t version, uint32_t kind)
 static void
 test_checkpoint_owner(void)
 {
-	char dir[] = "/tmp/psretentionv2XXXXXX";
+	char dir[PS_TEST_TEMP_PATH_MAX] = "psretentionv2XXXXXX";
 	PsRetentionPin pin = {7, PS_RETENTION_OWNER_CHECKPOINT_FENCE,
 		PS_RETENTION_RESOURCE_ALL, 1, 9001, 400, 24};
 	PsRetentionPin got;
 	uint64_t seq;
 
-	check(mkdtemp(dir) != NULL &&
+	check(ps_test_mkdtemp(dir, sizeof(dir)) != NULL &&
 		  write_registry(dir, 2, PS_RETENTION_OWNER_READER) == 0,
 		  "write committed original v2 registry");
 	check(ps_retention_open(dir) == 0 &&
@@ -208,34 +209,37 @@ test_checkpoint_owner(void)
 		  "checkpoint release survives restart without releasing a reader");
 	ps_retention_close();
 	{
-		char bad[] = "/tmp/psretentionbadv1XXXXXX";
-		check(mkdtemp(bad) != NULL &&
+		char bad[PS_TEST_TEMP_PATH_MAX] = "psretentionbadv1XXXXXX";
+		check(ps_test_mkdtemp(bad, sizeof(bad)) != NULL &&
 			write_v1_registry(bad, PS_RETENTION_OWNER_CHECKPOINT_FENCE) == 0,
 			"write valid-CRC v1 checkpoint owner");
 		check(ps_retention_open(bad) != 0,
 			"v1 migration cannot assign a previously undefined owner");
 		ps_retention_close();
+		ps_test_remove_tree(bad);
 	}
 	for (uint32_t version = 2; version <= 4; version++)
 	{
-		char bad[] = "/tmp/psretentionbadownerXXXXXX";
-		check(mkdtemp(bad) != NULL && write_registry(bad, version,
+		char bad[PS_TEST_TEMP_PATH_MAX] = "psretentionbadownerXXXXXX";
+		check(ps_test_mkdtemp(bad, sizeof(bad)) != NULL && write_registry(bad, version,
 			version == 3 ? 99 : PS_RETENTION_OWNER_CHECKPOINT_FENCE) == 0,
 			"write valid-CRC invalid owner or version");
 		check(ps_retention_open(bad) != 0,
 			"reject legacy checkpoint owner, unknown owner and future version");
 		ps_retention_close();
+		ps_test_remove_tree(bad);
 	}
+	ps_test_remove_tree(dir);
 }
 
 int
 main(int argc, char **argv)
 {
-	char		dir[] = "/tmp/psretentionXXXXXX";
-	char		faildir[] = "/tmp/psretentionfailXXXXXX";
-	char		legacydir[] = "/tmp/psretentionlegacyXXXXXX";
-	char		migratedir[] = "/tmp/psretentionmigrateXXXXXX";
-	char		clearpendingdir[] = "/tmp/psretentionclearpendingXXXXXX";
+	char		dir[PS_TEST_TEMP_PATH_MAX] = "psretentionXXXXXX";
+	char		faildir[PS_TEST_TEMP_PATH_MAX] = "psretentionfailXXXXXX";
+	char		legacydir[PS_TEST_TEMP_PATH_MAX] = "psretentionlegacyXXXXXX";
+	char		migratedir[PS_TEST_TEMP_PATH_MAX] = "psretentionmigrateXXXXXX";
+	char		clearpendingdir[PS_TEST_TEMP_PATH_MAX] = "psretentionclearpendingXXXXXX";
 	char		path[512];
 	char		tmp[520];
 	char		backup[520];
@@ -282,12 +286,12 @@ main(int argc, char **argv)
 		return 2;
 	test_checkpoint_owner();
 
-	if (mkdtemp(dir) == NULL)
+	if (ps_test_mkdtemp(dir, sizeof(dir)) == NULL)
 	{
 		perror("mkdtemp");
 		return 2;
 	}
-	check(mkdtemp(migratedir) != NULL, "create v1 migration directory");
+	check(ps_test_mkdtemp(migratedir, sizeof(migratedir)) != NULL, "create v1 migration directory");
 	check(write_v1_registry(migratedir, PS_RETENTION_OWNER_READER) == 0, "write committed v1 registry");
 	check(ps_retention_open(migratedir) == 0, "migrate committed v1 registry");
 	check(ps_retention_get(0, &got, &count) == 1 && count == 1 &&
@@ -484,7 +488,7 @@ main(int argc, char **argv)
 		  "an initialized store fails closed when its registry is missing");
 	ps_retention_close();
 
-	check(mkdtemp(faildir) != NULL, "create rollback-failure test directory");
+	check(ps_test_mkdtemp(faildir, sizeof(faildir)) != NULL, "create rollback-failure test directory");
 	check(ps_retention_open(faildir) == 0,
 		  "open registry for rollback-failure test");
 	pin.lsn = 500;
@@ -529,7 +533,7 @@ main(int argc, char **argv)
 	 * successful unlink is exactly the window where the marker's directory
 	 * entry could reappear after a machine crash, so an append/compact that
 	 * hits it must never be acknowledged as committed. */
-	check(mkdtemp(clearpendingdir) != NULL,
+	check(ps_test_mkdtemp(clearpendingdir, sizeof(clearpendingdir)) != NULL,
 		  "create clear-pending-fsync-failure test directory");
 	check(setenv("PS_TEST_FAIL_RETENTION_CLEAR_PENDING_DIR_FSYNC", "1", 1) == 0,
 		  "enable clear-pending directory-fsync fault injection");
@@ -551,7 +555,7 @@ main(int argc, char **argv)
 		  "directory fsync could not be proven durable");
 	ps_retention_close();
 
-	check(mkdtemp(legacydir) != NULL, "create legacy-guard test directory");
+	check(ps_test_mkdtemp(legacydir, sizeof(legacydir)) != NULL, "create legacy-guard test directory");
 	check(ps_retention_open(legacydir) == 0,
 		  "open registry for legacy-guard test");
 	check(ps_retention_set(&pin) == 0,
@@ -579,7 +583,7 @@ main(int argc, char **argv)
 	unlink(tmp);
 	snprintf(tmp, sizeof(tmp), "%s/retention.pending", dir);
 	unlink(tmp);
-	rmdir(dir);
+	ps_test_remove_tree(dir);
 	snprintf(path, sizeof(path), "%s/retention.meta", faildir);
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/retention.initialized", faildir);
@@ -590,7 +594,7 @@ main(int argc, char **argv)
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/retention.state.tmp", faildir);
 	unlink(path);
-	rmdir(faildir);
+	ps_test_remove_tree(faildir);
 	snprintf(path, sizeof(path), "%s/retention.meta", clearpendingdir);
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/retention.initialized", clearpendingdir);
@@ -603,7 +607,7 @@ main(int argc, char **argv)
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/retention.failed", clearpendingdir);
 	unlink(path);
-	rmdir(clearpendingdir);
+	ps_test_remove_tree(clearpendingdir);
 	snprintf(path, sizeof(path), "%s/retention.meta", legacydir);
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/retention.initialized", legacydir);
@@ -612,7 +616,7 @@ main(int argc, char **argv)
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/retention.failed", legacydir);
 	unlink(path);
-	rmdir(legacydir);
+	ps_test_remove_tree(legacydir);
 	snprintf(path, sizeof(path), "%s/retention.meta", migratedir);
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/retention.initialized", migratedir);
@@ -623,7 +627,7 @@ main(int argc, char **argv)
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/retention.pending", migratedir);
 	unlink(path);
-	rmdir(migratedir);
+	ps_test_remove_tree(migratedir);
 	if (!failed)
 		fprintf(stderr, "retention registry test: PASS\n");
 	return failed;

@@ -15,18 +15,69 @@
 #define _GNU_SOURCE
 #endif
 
+#include <dirent.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include "pagestore_artifact_format.h"
 #include "pagestore_core.h"
+#include "pagestore_fault.h"
 #include "pagestore_layer.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
+
+#define TEST_TEMP_PATH_MAX 192
+
+/* Failure must stop the test: callers may otherwise use or remove a partial
+ * path. Resolve the root because fault injection requires an absolute path. */
+static void
+test_tmp_template(char *path, size_t capacity)
+{
+	const char *root = getenv("TMPDIR");
+	char name[256];
+	char *absolute;
+	int n;
+
+	if (root == NULL || *root == '\0')
+		root = "/tmp";
+	if (strlen(path) >= sizeof(name))
+	{
+		fprintf(stderr, "temporary fixture name is too long\n");
+		exit(2);
+	}
+	strcpy(name, path);
+	absolute = realpath(root, NULL);
+	if (absolute == NULL)
+	{
+		perror("resolve TMPDIR");
+		exit(2);
+	}
+	n = snprintf(path, capacity, "%s/%s", absolute, name);
+	free(absolute);
+	if (n < 0 || (size_t) n >= capacity)
+	{
+		fprintf(stderr, "temporary fixture path is too long\n");
+		exit(2);
+	}
+}
+
+static char *
+test_mkdtemp(char *path, size_t capacity)
+{
+	test_tmp_template(path, capacity);
+	if (mkdtemp(path) == NULL)
+	{
+		perror("create temporary fixture directory");
+		exit(2);
+	}
+	return path;
+}
 
 static int checks;
 static int failed;
@@ -45,12 +96,35 @@ check(int ok, const char *name)
 static void
 remove_tree(const char *path)
 {
-	char command[512];
+	DIR *dir = opendir(path);
+	struct dirent *entry;
 
-	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) > 0 &&
-		system(command) != 0)
-		fprintf(stderr, "warning: could not remove %s\n", path);
+	if (dir == NULL)
+	{
+		(void) unlink(path);
+		return;
+	}
+	while ((entry = readdir(dir)) != NULL)
+	{
+		char child[1024];
+		struct stat st;
+		int n;
+
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		n = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+		if (n < 0 || (size_t) n >= sizeof(child) || lstat(child, &st) != 0)
+			continue;
+		if (S_ISDIR(st.st_mode))
+			remove_tree(child);
+		else
+			(void) unlink(child);
+	}
+	closedir(dir);
+	if (rmdir(path) != 0)
+		fprintf(stderr, "note: could not remove %s\n", path);
 }
+
 
 static void
 configure_core(int flush_every_page)
@@ -323,7 +397,7 @@ close_store(void)
 }
 
 static int
-read_relation_at(uint32_t block, uint64_t lsn)
+read_relation_asof(uint32_t block, uint64_t lsn, uint64_t expected)
 {
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	unsigned char page[8192];
@@ -339,19 +413,25 @@ read_relation_at(uint32_t block, uint64_t lsn)
 		return 0;
 	memcpy(&hi, page, sizeof(hi));
 	memcpy(&lo, page + sizeof(hi), sizeof(lo));
-	return (((uint64_t) hi << 32) | lo) == lsn;
+	return (((uint64_t) hi << 32) | lo) == expected;
+}
+
+static int
+read_relation_at(uint32_t block, uint64_t lsn)
+{
+	return read_relation_asof(block, lsn, lsn);
 }
 
 static void
 test_segment_gc_does_not_starve_compaction(void)
 {
-	char store[] = "/tmp/pagestore-gc-compaction-fairness-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-compaction-fairness-XXXXXX";
 	uint64_t before;
 	int wrote = 1;
 
 	configure_core(1);
 	compact_layers = 1;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open segment GC and compaction fairness store");
 	for (uint32_t block = 0; block < 24; block++)
 		wrote &= write_relation(0, block, 1000 + block);
@@ -372,16 +452,91 @@ test_segment_gc_does_not_starve_compaction(void)
 }
 
 static void
+test_nonzero_floor_bounded_plan(int prune_needed)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-floor-XXXXXX";
+	uint64_t before, prune_before;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
+		  "open nonzero-floor compaction store");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "set nonzero page-history floor");
+	check(write_relation(0, 0, 1000) &&
+		  write_relation(0, prune_needed ? 0 : 1, 2000) &&
+		  write_relation(0, 2, 3000),
+		  "write relation-only input layers");
+	before = ps_test_bounded_nonzero_plan_count();
+	prune_before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	/* Count is process-global, so compare with the value before this store. */
+	for (int i = 0; i < 64 && !prune_needed &&
+		 ps_test_bounded_nonzero_plan_count() == before; i++)
+		(void) ps_core_maintenance();
+	if (!prune_needed)
+	{
+		check(ps_test_bounded_nonzero_plan_count() > before &&
+			  ps_test_page_prune_due(0, 0),
+			  "nonzero bounded merge preserves a later pruning request");
+		check(read_relation_at(0, 1000) && read_relation_at(1, 2000) &&
+			  read_relation_at(2, 3000),
+			  "bounded nonzero-floor merge preserves every page");
+	}
+	run_maintenance(64);
+	if (prune_needed)
+	{
+		uint32_t old_versions = 0;
+
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		{
+			PsImgIndexEnt *idx = NULL;
+			uint32_t n = 0;
+
+			if (ps_layer_map.layers[i].kind != PS_LAYER_IMAGE ||
+				ps_layer_map.layers[i].deleting)
+				continue;
+			if (ps_image_layer_read_index(&ps_layer_map.layers[i], &idx, &n) == 0)
+				for (uint32_t j = 0; j < n; j++)
+					if (idx[j].key.klass == PS_KLASS_RELATION &&
+						idx[j].block == 0 && idx[j].lsn == 1000)
+						old_versions++;
+			free(idx);
+		}
+		ps_unlock_map();
+		check(ps_test_bounded_nonzero_plan_count() == before,
+			  "prunable history falls back from the bounded merge");
+		check(ps_test_bounded_prune_published_count() > prune_before,
+			  "prunable history publishes through the bounded pruning path");
+		check(old_versions == 0 && read_relation_asof(0, 5000, 2000),
+			  "bounded pruning removes obsolete layer history and preserves its successor");
+	}
+	else
+		check(!ps_test_page_prune_due(0, 0),
+			  "deferred pruning eventually completes");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000,
+											prune_needed ? 2000 : 1000) &&
+		  read_relation_asof(2, 5000, 3000),
+		  "nonzero-floor result survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_bounded_compaction_maintenance(void)
 {
-	char store[] = "/tmp/pagestore-bounded-core-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-core-XXXXXX";
 	uint64_t before, zero_before;
 	uint32_t live = 0;
 	int shared = 0;
 
 	configure_core(1);
 	compact_layers = 100;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open bounded compaction store");
 	check(write_relation(0, 0, 1000), "seed bounded compaction store");
 	run_maintenance(32); /* consume startup pruning request */
@@ -442,7 +597,7 @@ read_fixture_page(const PsImgRec *rec, void *out, void *arg)
 static void
 test_bounded_shared_payload_capacity_fallback(void)
 {
-	char store[] = "/tmp/pagestore-bounded-capacity-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-capacity-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	PsImgRec *recs = calloc(1100, sizeof(*recs));
 	PsLayerDesc first, second;
@@ -453,7 +608,7 @@ test_bounded_shared_payload_capacity_fallback(void)
 
 	configure_core(1);
 	compact_layers = 1;
-	check(ok && mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(ok && test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open shared-payload capacity store");
 	if (!ok)
 		return;
@@ -499,6 +654,918 @@ test_bounded_shared_payload_capacity_fallback(void)
 	remove_tree(store);
 }
 
+typedef struct MultiOutputConflict
+{
+	int mode;
+	int called;
+	int wrote;
+} MultiOutputConflict;
+
+static void
+multi_output_conflict(void *arg)
+{
+	MultiOutputConflict *probe = arg;
+
+	probe->called++;
+	ps_test_set_prune_batch_hook(NULL, NULL);
+	if (probe->mode == 2)
+		_exit(86);
+	probe->wrote = write_relation(0, 1090, 4000);
+}
+
+static void
+test_bounded_prune_multiple_outputs(int mode)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-multi-XXXXXX";
+	uint64_t before;
+	uint32_t live = 0, entries = 0;
+	int ok = 1;
+	MultiOutputConflict probe = {.mode = mode};
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open multi-output pruning fixture");
+		return;
+	}
+	ok = write_relation(0, 0, 1000) && write_relation(0, 0, 2000);
+	for (uint32_t i = 1; i <= 1087 && ok; i++)
+		ok = write_relation(0, i, 3000);
+	check(ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+						 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "write multi-output inputs and set retention floor");
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	if (mode == 2)
+	{
+		pid_t child;
+		int status = 0;
+
+		close_store();
+		child = fork();
+		if (child == 0)
+		{
+			if (ps_core_open(store) != 0)
+				_exit(87);
+			ps_test_set_prune_batch_hook(multi_output_conflict, &probe);
+			run_maintenance(64);
+			_exit(88);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "crash occurs after the first bounded output is published");
+		check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+			  read_relation_asof(1086, 5000, 3000),
+			  "partial output publication survives a crash");
+	}
+	else
+	{
+		if (mode == 1)
+			ps_test_set_prune_batch_hook(multi_output_conflict, &probe);
+		for (int i = 0; i < 64 && ps_test_bounded_prune_published_count() == before &&
+			 !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_batch_hook(NULL, NULL);
+		if (mode == 1)
+			check(probe.called && probe.wrote &&
+				  ps_test_bounded_prune_published_count() == before &&
+				  ps_test_page_prune_due(0, 0) && read_relation_asof(1090, 5000, 4000),
+				  "concurrent writer stops partial publication and leaves pruning due");
+	}
+	if (mode != 0)
+	{
+		uint32_t before_retry = 0;
+
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting)
+				before_retry++;
+		ps_unlock_map();
+		check(before_retry >= (mode == 1 ? 17U : 18U),
+			  "partial publication leaves every source layer live before retry");
+		run_maintenance(64);
+	}
+	compact_layers = 100;
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+		{
+			PsImgIndexEnt *index = NULL;
+			uint32_t n = 0;
+
+			live++;
+			if (ps_image_layer_read_index(&ps_layer_map.layers[i], &index, &n) == 0)
+				entries += n;
+			free(index);
+		}
+	ps_unlock_map();
+	if (mode == 0)
+		check(ps_test_bounded_prune_published_count() > before && live == 2 && entries == 1087,
+			  "bounded pruning publishes multiple outputs and drops the obsolete identity");
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(1086, 5000, 3000) &&
+		  (mode != 1 || read_relation_asof(1090, 5000, 4000)),
+		  "multi-output pruning preserves pages across batch boundary");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1086, 5000, 3000) &&
+		  (mode != 1 || read_relation_asof(1090, 5000, 4000)),
+		  "multi-output pruning survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+typedef struct PruneIndexProbe
+{
+	int mode, called, wrote;
+} PruneIndexProbe;
+
+static void
+prune_index_conflict(void *arg)
+{
+	PruneIndexProbe *probe = arg;
+
+	probe->called++;
+	ps_test_set_prune_index_hook(NULL, NULL);
+	if (probe->mode == 2)
+		_exit(86);
+	if (probe->mode == 1)
+		probe->wrote = write_relation(0, 1200, 4000);
+}
+
+static void
+test_bounded_prune_index_batches(int mode)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-index-batches-XXXXXX";
+	PruneIndexProbe probe = {.mode = mode};
+	uint64_t before;
+	uint32_t live = 0;
+	int ok = 1;
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open batched index pruning store");
+		return;
+	}
+	for (uint32_t i = 0; i < 1152 && ok; i++)
+		ok = write_relation(0, i, 1000) && write_relation(0, i, 2000);
+	check(ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+						 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "prepare more than 1024 obsolete page identities");
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	if (mode == 2)
+	{
+		pid_t child;
+		int status = 0;
+
+		close_store();
+		child = fork();
+		if (child == 0)
+		{
+			if (ps_core_open(store) != 0)
+				_exit(87);
+			ps_test_set_prune_index_hook(prune_index_conflict, &probe);
+			run_maintenance(64);
+			_exit(88);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "crash after the first bounded page-index update");
+		check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+			  read_relation_asof(1151, 5000, 2000),
+			  "partial page-index update recovers after crash");
+	}
+	else
+	{
+		ps_test_set_prune_index_hook(prune_index_conflict, &probe);
+		for (int i = 0; i < 64 && !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_index_hook(NULL, NULL);
+		check(probe.called && ps_test_bounded_prune_published_count() > before &&
+			  (mode != 1 || (probe.wrote && ps_test_page_prune_due(0, 0))),
+			  "bounded pruning splits index updates and fences concurrent writes");
+	}
+	if (mode != 0)
+	{
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+				live++;
+		ps_unlock_map();
+		check(live >= 38, "partial index update retains all source layers");
+	}
+	run_maintenance(64);
+	compact_layers = 100;
+	if (mode == 0)
+	{
+		uint32_t obsolete = 0;
+
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			{
+				PsImgIndexEnt *index = NULL;
+				uint32_t count = 0;
+
+				if (ps_image_layer_read_index(&ps_layer_map.layers[i], &index, &count) == 0)
+					for (uint32_t j = 0; j < count; j++)
+						if (index[j].key.klass == PS_KLASS_RELATION && index[j].lsn == 1000)
+							obsolete++;
+				free(index);
+			}
+		ps_unlock_map();
+		check(obsolete == 0, "all 1152 obsolete identities are absent from live layers");
+	}
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(1151, 5000, 2000) &&
+		  (mode != 1 || read_relation_asof(1200, 5000, 4000)),
+		  "index pruning and retries preserve retained pages");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1151, 5000, 2000) &&
+		  (mode != 1 || read_relation_asof(1200, 5000, 4000)),
+		  "index pruning survives a subsequent restart");
+	close_store();
+	remove_tree(store);
+}
+
+typedef struct HotPagePruneProbe
+{
+	int mode, called, midpoint_ok, wrote;
+} HotPagePruneProbe;
+
+static void
+hot_page_prune_hook(void *arg)
+{
+	HotPagePruneProbe *probe = arg;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	probe->called++;
+	probe->midpoint_ok = ps_test_page_version_count(0, &key, 0) == 128 &&
+		read_relation_asof(0, 5000, 1255);
+	ps_test_set_prune_index_hook(NULL, NULL);
+	if (probe->mode == 2)
+		_exit(probe->midpoint_ok ? 86 : 87);
+	if (probe->mode == 1)
+		probe->wrote = write_relation(0, 0, 2000);
+}
+
+static void
+test_hot_page_prune_batches(int mode)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-hot-page-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	HotPagePruneProbe probe = {.mode = mode};
+	uint64_t before;
+	int ok = 1;
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open hot-page pruning store");
+		return;
+	}
+	for (uint32_t i = 0; i < 256 && ok; i++)
+		ok = write_relation(0, 0, 1000 + i);
+	check(ok && ps_test_page_version_count(0, &key, 0) == 256 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "prepare one page with 256 durable versions");
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	if (mode == 2)
+	{
+		pid_t child;
+		int status = 0;
+
+		close_store();
+		child = fork();
+		if (child == 0)
+		{
+			if (ps_core_open(store) != 0)
+				_exit(88);
+			ps_test_set_prune_index_hook(hot_page_prune_hook, &probe);
+			run_maintenance(64);
+			_exit(89);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "crash after the first hot-page index batch remains readable");
+		check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 1255),
+			  "hot-page pruning recovers after the partial index update");
+	}
+	else
+	{
+		ps_test_set_prune_index_hook(hot_page_prune_hook, &probe);
+		for (int i = 0; i < 64 && !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_index_hook(NULL, NULL);
+		check(probe.called && probe.midpoint_ok &&
+			  ps_test_bounded_prune_published_count() > before &&
+			  (mode != 1 || (probe.wrote && ps_test_page_prune_due(0, 0))),
+			  "hot-page versions remain readable between index batches");
+	}
+	run_maintenance(64);
+	compact_layers = 100;
+	check(read_relation_asof(0, 5000, mode == 1 ? 2000 : 1255),
+		  "hot-page pruning and retry preserve the newest version");
+	if (mode == 0)
+		check(ps_test_page_version_count(0, &key, 0) == 1,
+			  "all obsolete hot-page versions are removed");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  read_relation_asof(0, 5000, mode == 1 ? 2000 : 1255),
+		  "hot-page pruning preserves the newest version across restart");
+	close_store();
+	remove_tree(store);
+}
+
+typedef struct LongChainProbe
+{
+	int mode, called, midpoint_ok, wrote, reclaimed, worker_started;
+	uint32_t block;
+	pthread_t worker;
+} LongChainProbe;
+
+static void *
+long_chain_gc_worker(void *arg)
+{
+	(void) arg;
+	(void) ps_core_maintenance();
+	return NULL;
+}
+
+static void
+long_chain_snapshot_hook(void *arg)
+{
+	LongChainProbe *probe = arg;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	probe->called++;
+	probe->midpoint_ok = ps_test_page_version_count(0, &key, probe->block) ==
+		(probe->mode == 5 ? 1537U : 2048U) &&
+		read_relation_asof(probe->block, 5000, 1511) &&
+		read_relation_asof(probe->block, 10000, 7535);
+	ps_test_set_prune_snapshot_hook(NULL, NULL);
+	ps_test_set_prune_snapshot_swap_hook(NULL, NULL);
+	if (probe->mode == 2)
+		_exit(probe->midpoint_ok ? 86 : 87);
+	if (probe->mode == 1 || probe->mode == 5)
+		probe->wrote = write_relation(0, probe->block, 9000);
+	if (probe->mode == 3)
+	{
+		segment_gc_enabled = 1;
+		probe->worker_started = pthread_create(&probe->worker, NULL, long_chain_gc_worker, NULL) == 0;
+		/* Wait for the actual unlink; this is a test watchdog, not a
+		 * production lock or reclamation deadline. */
+		for (int i = 0; probe->worker_started && i < 30000 &&
+			 ps_storage->seg_size(0, 0) >= 0; i++)
+			usleep(1000);
+		probe->reclaimed = ps_storage->seg_size(0, 0) < 0;
+	}
+}
+
+static int
+long_chain_finish_setup(const char *store, uint32_t block)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	int ok = ps_core_open(store) == 0;
+
+	for (uint32_t i = 0; i < 1536 && ok; i++)
+		ok = write_relation(0, block, 6000 + i);
+	return ok && ps_test_page_version_count(0, &key, block) == 2048 &&
+		reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000);
+}
+
+static void
+test_long_chain_prune_snapshot(int mode)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-long-chain-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	LongChainProbe probe = {.mode = mode, .block = mode == 4 ? 1 : 0};
+	uint32_t block = probe.block;
+	uint64_t before;
+	int ok = 1;
+
+	configure_core(0);
+	if (mode == 3)
+		flush_pages = 512;
+	segment_size = (mode == 3 ? 4 : 32) * 1024 * 1024;
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open long-page-chain pruning store");
+		return;
+	}
+	if (mode == 4)
+		ok = write_relation(0, 0, 1000) && write_relation(0, 0, 2000);
+	for (uint32_t i = 0; i < 512 && ok; i++)
+		ok = write_relation(0, block, 1000 + i);
+	if (mode == 3)
+	{
+		ok = ok && ps_test_resize_empty_memtable(0, 100000) == 0;
+		for (uint32_t i = 0; i < 1536 && ok; i++)
+			ok = write_relation(0, 0, 6000 + i);
+		ok = ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+							 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000);
+	}
+	else
+		close_store();
+	flush_pages = 100000;
+	compact_layers = 1;
+	if (mode == 2)
+	{
+		pid_t child = fork();
+		int status = 0;
+
+		if (child == 0)
+		{
+			if (!ok || !long_chain_finish_setup(store, block))
+				_exit(88);
+			ps_test_set_prune_snapshot_hook(long_chain_snapshot_hook, &probe);
+			run_maintenance(64);
+			_exit(89);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "crash while copying a long chain after publication");
+		check(ps_core_open(store) == 0 && read_relation_asof(block, 5000, 1511) &&
+			  read_relation_asof(block, 10000, 7535),
+			  "long-chain snapshot crash recovers both retained views");
+	}
+	else
+	{
+		check(ok && (mode == 3 || long_chain_finish_setup(store, block)),
+			  "prepare a long page chain with a prunable durable prefix");
+		before = ps_test_bounded_prune_published_count();
+		if (mode == 5)
+			ps_test_set_prune_snapshot_swap_hook(long_chain_snapshot_hook, &probe);
+		else
+			ps_test_set_prune_snapshot_hook(long_chain_snapshot_hook, &probe);
+		for (int i = 0; i < 64 && !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_snapshot_hook(NULL, NULL);
+		ps_test_set_prune_snapshot_swap_hook(NULL, NULL);
+		if (probe.worker_started)
+			(void) pthread_join(probe.worker, NULL);
+		segment_gc_enabled = 0;
+		check(probe.called && probe.midpoint_ok &&
+			  ps_test_bounded_prune_published_count() > before &&
+			  (mode != 1 || (probe.wrote && ps_test_page_prune_due(0, 0) &&
+						 ps_test_page_version_count(0, &key, block) == 2049)) &&
+			  (mode != 5 || (probe.wrote && ps_test_page_prune_due(0, 0) &&
+						 ps_test_page_version_count(0, &key, block) == 1538)) &&
+			  (mode != 3 || (probe.reclaimed && ps_test_page_prune_due(0, 0) &&
+						 ps_test_page_version_count(0, &key, block) == 2048)),
+			  "long chain is copied in chunks and rejects a concurrent mutation");
+		if (mode == 0 || mode == 4)
+			check(ps_test_page_version_count(0, &key, block) == 1537,
+				  "snapshot replacement removes the complete obsolete prefix");
+		if (mode == 1 || mode == 3 || mode == 5)
+		{
+			uint32_t live = 0;
+
+			ps_lock_map_rd();
+			for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+				if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+					!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+					live++;
+			ps_unlock_map();
+			check(live >= (uint32_t) (mode == 3 ? 1 : 8),
+				  "snapshot conflict retains every source layer before retry");
+		}
+	}
+	run_maintenance(64);
+	compact_layers = 100;
+	check(read_relation_asof(block, 5000, 1511) &&
+		  read_relation_asof(block, 10000, (mode == 1 || mode == 5) ? 9000 : 7535) &&
+		  (mode != 4 || read_relation_asof(0, 5000, 2000)),
+		  "long-chain snapshot and retry preserve old and newest views");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(block, 5000, 1511) &&
+		  read_relation_asof(block, 10000, (mode == 1 || mode == 5) ? 9000 : 7535),
+		  "long-chain snapshot survives a later restart");
+	close_store();
+	remove_tree(store);
+}
+
+typedef struct PruneChurnProbe
+{
+	int called, wrote, pin_output, mutate_source;
+	uint64_t pinned_layer, changed_source;
+} PruneChurnProbe;
+
+static void
+prune_churn_hook(void *arg)
+{
+	PruneChurnProbe *probe = arg;
+
+	probe->called++;
+	ps_test_set_prune_snapshot_hook(NULL, NULL);
+	if (probe->pin_output)
+	{
+		PsLayerDesc *latest = NULL;
+
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting &&
+				(!latest || ps_layer_map.layers[i].layer_id > latest->layer_id))
+				latest = &ps_layer_map.layers[i];
+		if (latest != NULL)
+		{
+			probe->pinned_layer = latest->layer_id;
+			__atomic_add_fetch(&latest->cache_readers, 1, __ATOMIC_ACQ_REL);
+		}
+		ps_unlock_map();
+	}
+	if (probe->mutate_source)
+	{
+		PsLayerDesc *earliest = NULL;
+
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting &&
+				(!earliest || ps_layer_map.layers[i].layer_id < earliest->layer_id))
+				earliest = &ps_layer_map.layers[i];
+		if (earliest != NULL)
+		{
+			probe->changed_source = earliest->layer_id;
+			earliest->remote_durable = true;
+		}
+		ps_unlock_map();
+	}
+	probe->wrote = write_relation(0, 1, 9000 + probe->called);
+}
+
+static uint32_t
+count_live_image_layers(void)
+{
+	uint32_t live = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	return live;
+}
+
+static uint32_t
+count_deleting_image_layers(void)
+{
+	uint32_t deleting = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			deleting++;
+	ps_unlock_map();
+	return deleting;
+}
+
+static void
+test_prune_snapshot_conflict_churn(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-conflict-churn-XXXXXX";
+	PruneChurnProbe probe = {0};
+	uint32_t initial, maximum = 0, maximum_deleting = 0;
+	int ok = 1;
+
+	configure_core(0);
+	segment_size = 32 * 1024 * 1024;
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open pruning-conflict churn store");
+		return;
+	}
+	for (uint32_t i = 0; i < 512 && ok; i++)
+		ok = write_relation(0, 0, 1000 + i);
+	close_store();
+	flush_pages = 100000;
+	check(ok && long_chain_finish_setup(store, 0),
+		  "prepare prunable long chain for repeated conflicts");
+	initial = count_live_image_layers();
+	compact_layers = 1;
+	for (int attempt = 0; attempt < 5; attempt++)
+	{
+		int old_called = probe.called;
+		uint32_t live;
+
+		ps_test_set_prune_snapshot_hook(prune_churn_hook, &probe);
+		for (int i = 0; i < 128 && probe.called == old_called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_snapshot_hook(NULL, NULL);
+		check(probe.called == old_called + 1 && probe.wrote &&
+			  ps_test_page_prune_due(0, 0),
+			  "foreground mutation interrupts each published pruning attempt");
+		live = count_live_image_layers();
+		if (live > maximum)
+			maximum = live;
+		live = count_deleting_image_layers();
+		if (live > maximum_deleting)
+			maximum_deleting = live;
+	}
+	if (maximum > initial)
+		fprintf(stderr, "pruning churn live layers: initial=%u maximum=%u\n", initial, maximum);
+	check(maximum <= initial,
+		  "repeated failed pruning does not accumulate live output layers");
+	check(maximum_deleting <= 1,
+		  "normal GC drains abandoned outputs before the next conflict");
+	run_maintenance(64);
+	compact_layers = 100;
+	check(read_relation_asof(0, 5000, 1511) && read_relation_asof(0, 10000, 7535) &&
+		  read_relation_asof(1, 10000, 9005),
+		  "churn cleanup and retry preserve old and foreground versions");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 1511) &&
+		  read_relation_asof(1, 10000, 9005),
+		  "churn cleanup remains readable after restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+prune_abandon_crash(void *arg)
+{
+	(void) arg;
+	_exit(86);
+}
+
+static void
+test_prune_abandon_conflict(int mode)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-abandon-XXXXXX";
+	PruneChurnProbe probe = {.pin_output = mode == 0, .mutate_source = mode == 2};
+	uint32_t initial;
+	int ok = 1;
+
+	configure_core(0);
+	segment_size = 32 * 1024 * 1024;
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open pruning abandonment boundary store");
+		return;
+	}
+	for (uint32_t i = 0; i < 512 && ok; i++)
+		ok = write_relation(0, 0, 1000 + i);
+	initial = count_live_image_layers();
+	close_store();
+	flush_pages = 100000;
+	compact_layers = 1;
+	if (mode == 1)
+	{
+		pid_t child = fork();
+		int status = 0;
+
+		if (child == 0)
+		{
+			if (!ok || !long_chain_finish_setup(store, 0))
+				_exit(88);
+			ps_test_set_prune_snapshot_hook(prune_churn_hook, &probe);
+			ps_test_set_prune_abandon_hook(prune_abandon_crash, NULL);
+			run_maintenance(64);
+			_exit(89);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "process exits after the abandoned-output tombstone");
+		check(ps_core_open(store) == 0 && count_live_image_layers() <= initial + 1 &&
+			  read_relation_asof(0, 5000, 1511) && read_relation_asof(0, 10000, 7535) &&
+			  read_relation_asof(1, 10000, 9001),
+			  "abandoned-output tombstone recovers sources and foreground data");
+	}
+	else
+	{
+		check(ok && long_chain_finish_setup(store, 0),
+			  "prepare a pinned replacement during a pruning conflict");
+		ps_test_set_prune_snapshot_hook(prune_churn_hook, &probe);
+		for (int i = 0; i < 128 && !probe.called; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_snapshot_hook(NULL, NULL);
+		check(probe.called && probe.wrote &&
+			  (mode == 0 ? probe.pinned_layer != 0 : probe.changed_source != 0) &&
+			  count_live_image_layers() == initial + 1 && ps_test_page_prune_due(0, 0),
+			  "a pinned output or changed source prevents abandonment");
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		{
+			if (ps_layer_map.layers[i].layer_id == probe.pinned_layer)
+				__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+			if (ps_layer_map.layers[i].layer_id == probe.changed_source)
+				ps_layer_map.layers[i].remote_durable = false;
+		}
+		ps_unlock_map();
+	}
+	run_maintenance(64);
+	compact_layers = 100;
+	check(read_relation_asof(0, 5000, 1511) && read_relation_asof(0, 10000, 7535) &&
+		  read_relation_asof(1, 10000, 9001),
+		  "abandonment boundary preserves required pages after retry");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 1511) &&
+		  read_relation_asof(0, 10000, 7535) && read_relation_asof(1, 10000, 9001),
+		  "abandonment boundary preserves pages after another restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_prune_abandon_provider_gate(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-provider-XXXXXX";
+	char objects[TEST_TEMP_PATH_MAX] = "pagestore-prune-objects-XXXXXX";
+	const char *old_env = getenv("PAGESTORE_OBJECT_DIR");
+	char *saved = old_env != NULL ? strdup(old_env) : NULL;
+	PsLayerStore unknown;
+
+	configure_core(1);
+	if ((old_env != NULL && saved == NULL) || test_mkdtemp(store, sizeof(store)) == NULL ||
+		test_mkdtemp(objects, sizeof(objects)) == NULL || setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0 ||
+		ps_core_open(store) != 0)
+	{
+		check(0, "open pruning provider-gate fixture");
+		if (saved != NULL)
+			setenv("PAGESTORE_OBJECT_DIR", saved, 1);
+		else if (old_env == NULL)
+			unsetenv("PAGESTORE_OBJECT_DIR");
+		free(saved);
+		if (strstr(store, "XXXXXX") == NULL)
+			remove_tree(store);
+		if (strstr(objects, "XXXXXX") == NULL)
+			remove_tree(objects);
+		return;
+	}
+	check(!ps_test_prune_abandon_local_only(),
+		  "configured object tier disables output abandonment");
+	close_store();
+	check(!ps_test_prune_abandon_local_only(),
+		  "closed local provider cannot establish the cleanup gate");
+	unsetenv("PAGESTORE_OBJECT_DIR");
+	check(ps_core_open(store) == 0 && ps_test_prune_abandon_local_only(),
+		  "local-only provider permits guarded output abandonment");
+	check(setenv("PAGESTORE_OBJECT_DIR", objects, 1) == 0 &&
+		  ps_test_prune_abandon_local_only(),
+		  "gate reflects the open provider rather than a later environment change");
+	unknown = *ps_layer_store;
+	ps_layer_store = &unknown;
+	check(!ps_test_prune_abandon_local_only(),
+		  "unknown layer providers fail closed");
+	ps_layer_store = &PsLayerStoreLocal;
+	close_store();
+	if (saved != NULL)
+	{
+		setenv("PAGESTORE_OBJECT_DIR", saved, 1);
+		free(saved);
+	}
+	else
+		unsetenv("PAGESTORE_OBJECT_DIR");
+	remove_tree(store);
+	remove_tree(objects);
+}
+
+typedef struct PartialOutputChurnProbe
+{
+	int called, wrote;
+} PartialOutputChurnProbe;
+
+static void
+partial_output_churn_hook(void *arg)
+{
+	PartialOutputChurnProbe *probe = arg;
+
+	probe->called++;
+	ps_test_set_prune_batch_hook(NULL, NULL);
+	probe->wrote = write_relation(0, 1090, 4000 + probe->called);
+}
+
+static void
+test_partial_output_conflict_churn(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-partial-churn-XXXXXX";
+	PartialOutputChurnProbe probe = {0};
+	uint32_t initial, maximum = 0, maximum_deleting = 0;
+	int ok = 1;
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open partial-output conflict churn store");
+		return;
+	}
+	ok = write_relation(0, 0, 1000) && write_relation(0, 0, 2000);
+	for (uint32_t i = 1; i <= 1087 && ok; i++)
+		ok = write_relation(0, i, 3000);
+	check(ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+						 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000),
+		  "prepare multiple output batches for repeated conflicts");
+	initial = count_live_image_layers();
+	compact_layers = 1;
+	for (int attempt = 0; attempt < 5; attempt++)
+	{
+		int before = probe.called;
+		uint32_t live;
+
+		ps_test_set_prune_batch_hook(partial_output_churn_hook, &probe);
+		for (int i = 0; i < 128 && probe.called == before; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_prune_batch_hook(NULL, NULL);
+		check(probe.called == before + 1 && probe.wrote && ps_test_page_prune_due(0, 0),
+			  "writer interrupts each partially published multi-output pass");
+		live = count_live_image_layers();
+		if (live > maximum)
+			maximum = live;
+		live = count_deleting_image_layers();
+		if (live > maximum_deleting)
+			maximum_deleting = live;
+	}
+	if (maximum > initial)
+		fprintf(stderr, "partial-output churn live layers: initial=%u maximum=%u\n", initial, maximum);
+	check(maximum <= initial,
+		  "repeated partial publication does not accumulate live outputs");
+	check(maximum_deleting <= 1,
+		  "normal GC drains each abandoned published batch");
+	run_maintenance(64);
+	compact_layers = 100;
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(1086, 5000, 3000) &&
+		  read_relation_asof(1090, 5000, 4005),
+		  "partial-output cleanup and retry preserve all required pages");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1090, 5000, 4005),
+		  "partial-output cleanup survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_partial_output_abandon_crash(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-prune-partial-crash-XXXXXX";
+	PartialOutputChurnProbe probe = {0};
+	int ok = 1;
+	int status = 0;
+	pid_t child;
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open partial-output crash store");
+		return;
+	}
+	ok = write_relation(0, 0, 1000) && write_relation(0, 0, 2000);
+	for (uint32_t i = 1; i <= 1087 && ok; i++)
+		ok = write_relation(0, i, 3000);
+	ok = ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+							PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000);
+	close_store();
+	compact_layers = 1;
+	child = fork();
+	if (child == 0)
+	{
+		if (!ok || ps_core_open(store) != 0)
+			_exit(88);
+		ps_test_set_prune_batch_hook(partial_output_churn_hook, &probe);
+		ps_test_set_prune_abandon_hook(prune_abandon_crash, NULL);
+		run_maintenance(128);
+		_exit(89);
+	}
+	check(child > 0 && waitpid(child, &status, 0) == child &&
+		  WIFEXITED(status) && WEXITSTATUS(status) == 86,
+		  "process exits after partially published output tombstone");
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1086, 5000, 3000) && read_relation_asof(1090, 5000, 4001),
+		  "partial-output tombstone recovers sources and foreground data");
+	run_maintenance(64);
+	compact_layers = 100;
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(1090, 5000, 4001),
+		  "partial-output crash recovery survives another restart");
+	close_store();
+	remove_tree(store);
+}
+
 typedef struct BoundedConflictProbe
 {
 	int called;
@@ -529,14 +1596,14 @@ bounded_conflict_hook(void *arg)
 static void
 test_bounded_compaction_concurrent_write(void)
 {
-	char store[] = "/tmp/pagestore-bounded-conflict-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-conflict-XXXXXX";
 	BoundedConflictProbe probe = {0};
 	uint64_t before;
 	uint32_t live = 0;
 
 	configure_core(1);
 	compact_layers = 100;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  write_control(0, 1000, 800), "open bounded conflict store");
 	run_maintenance(32);
 	check(write_relation(0, 1, 2000) && write_relation(0, 2, 3000),
@@ -561,6 +1628,298 @@ test_bounded_compaction_concurrent_write(void)
 	run_maintenance(64);
 	check(read_relation_at(1, 2000) && read_relation_at(2, 3000) &&
 		  read_relation_at(3, 4000), "bounded retry preserves concurrent write");
+	close_store();
+	remove_tree(store);
+}
+
+typedef struct FloorPlanConflict
+{
+	int called;
+	int changed;
+	int pin_only;
+	int remote_transition;
+	uint64_t layer_id;
+} FloorPlanConflict;
+
+static void *
+floor_plan_foreground(void *arg)
+{
+	FloorPlanConflict *probe = arg;
+
+	if (probe->remote_transition)
+	{
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting)
+			{
+				probe->layer_id = ps_layer_map.layers[i].layer_id;
+				ps_layer_map.layers[i].remote_durable = true;
+				probe->changed = 1;
+				break;
+			}
+		ps_unlock_map();
+		return NULL;
+	}
+	probe->changed = probe->pin_only ?
+		reserve_pin(0, PS_RETENTION_OWNER_READER, 77, 1,
+					PS_RETENTION_RESOURCE_PAGE_HISTORY, 4500) :
+		write_relation(0, 3, 4000);
+	return NULL;
+}
+
+static void
+floor_plan_conflict_hook(void *arg)
+{
+	FloorPlanConflict *probe = arg;
+	pthread_t thread;
+
+	probe->called++;
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	if (pthread_create(&thread, NULL, floor_plan_foreground, arg) == 0)
+		(void) pthread_join(thread, NULL);
+}
+
+static void
+prune_retired_conflict_hook(void *arg)
+{
+	FloorPlanConflict *probe = arg;
+	pthread_t thread;
+
+	probe->called++;
+	ps_test_set_prune_retired_hook(NULL, NULL);
+	if (pthread_create(&thread, NULL, floor_plan_foreground, arg) == 0)
+		(void) pthread_join(thread, NULL);
+}
+
+/* The hook runs only after the bounded plan and replacement are verified. */
+static void
+bounded_prune_crash_marker(void *arg)
+{
+	int fd = *(int *) arg;
+	char marker = 'B';
+
+	if (write(fd, &marker, 1) != 1)
+		_exit(90);
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+}
+
+static void
+test_bounded_prune_crash(const char *fault_name)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-crash-XXXXXX";
+	char control[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-fault-XXXXXX";
+	char arm[512], marker = 0;
+	FILE *arm_file;
+	int pipefd[2], status = 0;
+	pid_t child;
+	ssize_t marker_bytes;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (!test_mkdtemp(store, sizeof(store)) || !test_mkdtemp(control, sizeof(control)) ||
+		snprintf(arm, sizeof(arm), "%s/arm", control) >= (int) sizeof(arm) ||
+		(arm_file = fopen(arm, "w")) == NULL)
+	{
+		check(0, "prepare bounded-pruning crash fixture");
+		return;
+	}
+	fclose(arm_file);
+	if (ps_core_open(store) != 0)
+	{
+		check(0, "open bounded-pruning crash store");
+		return;
+	}
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
+		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
+		  write_relation(0, 2, 3000), "prepare bounded-pruning crash inputs");
+	close_store();
+	if (pipe(pipefd) != 0)
+	{
+		check(0, "create bounded-pruning crash marker pipe");
+		return;
+	}
+	child = fork();
+	if (child == 0)
+	{
+		close(pipefd[0]);
+		if (setenv("PAGESTORE_TEST_FAULT_NAME", fault_name, 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_DIR", control, 1) != 0 ||
+			ps_fault_init(store) != 0 || ps_core_open(store) != 0)
+			_exit(91);
+		ps_test_set_compaction_unlocked_hook(bounded_prune_crash_marker, &pipefd[1]);
+		compact_layers = 1;
+		run_maintenance(64);
+		_exit(92);
+	}
+	close(pipefd[1]);
+	if (child < 0 || waitpid(child, &status, 0) != child)
+	{
+		check(0, "wait for bounded-pruning crash");
+		close(pipefd[0]);
+		return;
+	}
+	marker_bytes = read(pipefd[0], &marker, 1);
+	close(pipefd[0]);
+	check(WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT &&
+		  marker_bytes == 1 && marker == 'B',
+		  "fault crashes after the bounded pruning plan was verified");
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000),
+		  "bounded pruning crash recovers all required pages");
+	compact_layers = 1;
+	run_maintenance(64);
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(2, 5000, 3000),
+		  "bounded pruning crash remains readable after reclamation retries");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000),
+		  "bounded pruning recovery and retries survive a second restart");
+	close_store();
+	remove_tree(store);
+	remove_tree(control);
+}
+
+static void
+test_bounded_prune_interrupted_retirement(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-retirement-XXXXXX";
+	FloorPlanConflict probe = {0};
+	uint64_t before;
+	uint32_t live = 0;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
+		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
+		  write_relation(0, 2, 3000), "prepare bounded-pruning retirement conflict");
+	before = ps_test_bounded_prune_published_count();
+	ps_test_set_prune_retired_hook(prune_retired_conflict_hook, &probe);
+	compact_layers = 1;
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_prune_retired_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	check(probe.called && probe.changed &&
+		  ps_test_bounded_prune_published_count() > before && live >= 4 &&
+		  ps_test_page_prune_due(0, 0),
+		  "writer between source retirements stops the stale retirement prefix");
+	run_maintenance(64);
+	check(read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000) && read_relation_asof(3, 5000, 4000),
+		  "replanning after partial retirement preserves foreground data");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(3, 5000, 4000),
+		  "partial retirement recovery preserves pages after restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_bounded_prune_conflict(int mode)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-conflict-XXXXXX";
+	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2};
+	uint64_t before;
+	uint32_t live = 0;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
+		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
+		  write_relation(0, 2, 3000), "prepare bounded-pruning conflict");
+	before = ps_test_bounded_prune_published_count();
+	ps_test_set_compaction_unlocked_hook(floor_plan_conflict_hook, &probe);
+	compact_layers = 1;
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	check(probe.called && probe.changed &&
+		  ps_test_bounded_prune_published_count() == before &&
+		  live >= (uint32_t) (mode ? 3 : 4),
+		  "concurrent mutation rejects a staged pruning replacement");
+	if (probe.remote_transition)
+	{
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == probe.layer_id)
+				ps_layer_map.layers[i].remote_durable = false;
+		ps_unlock_map();
+	}
+	run_maintenance(64);
+	check(read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000) &&
+		  (mode != 0 || read_relation_asof(3, 5000, 4000)),
+		  "bounded-pruning retry preserves required foreground data");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_nonzero_bounded_plan_conflict(int mode)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-floor-conflict-XXXXXX";
+	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2};
+	uint32_t live = 0;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
+		  write_relation(0, 0, 1000) && write_relation(0, 1, 2000) &&
+		  write_relation(0, 2, 3000),
+		  "prepare nonzero-floor conflict sources");
+	ps_test_set_compaction_unlocked_hook(floor_plan_conflict_hook, &probe);
+	compact_layers = 1;
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			live++;
+	ps_unlock_map();
+	check(probe.called && probe.changed && live >= (uint32_t) (mode ? 3 : 4),
+		  "concurrent change rejects the nonzero-floor staged plan");
+	if (probe.remote_transition)
+	{
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == probe.layer_id)
+				ps_layer_map.layers[i].remote_durable = false;
+		ps_unlock_map();
+	}
+	run_maintenance(64);
+	check(read_relation_asof(0, 5000, 1000) &&
+		  read_relation_asof(1, 5000, 2000) &&
+		  read_relation_asof(2, 5000, 3000) &&
+		  (mode != 0 || read_relation_asof(3, 5000, 4000)),
+		  "nonzero-floor retry preserves foreground data");
 	close_store();
 	remove_tree(store);
 }
@@ -636,12 +1995,12 @@ staged_compaction_foreground(void *arg)
 static void
 test_staged_compaction_rejects_remote_transition(void)
 {
-	char store[] = "/tmp/pagestore-staged-remote-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-staged-remote-XXXXXX";
 	StagedCompactionProbe probe = {.remote_transition = 1};
 	int restored = 0;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open staged remote transition store");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "prepare staged remote transition sources");
@@ -670,7 +2029,7 @@ test_staged_compaction_rejects_remote_transition(void)
 static void
 test_staged_compaction_preserves_pinned_reader(void)
 {
-	char store[] = "/tmp/pagestore-staged-reader-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-staged-reader-XXXXXX";
 	StagedCompactionProbe probe = {.hold_reader = 1};
 	int released = 0;
 	int marked = 0;
@@ -679,7 +2038,7 @@ test_staged_compaction_preserves_pinned_reader(void)
 	uint64_t found_lsn = 0, found_seq = 0;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open staged reader store");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "prepare staged reader sources");
@@ -733,15 +2092,58 @@ staged_compaction_concurrent_write(void *arg)
 }
 
 static void
+gather_compaction_concurrent_change(void *arg)
+{
+	StagedCompactionProbe *probe = arg;
+	pthread_t thread;
+
+	probe->called++;
+	ps_test_set_compaction_gather_hook(NULL, NULL);
+	if (pthread_create(&thread, NULL, staged_compaction_foreground, arg) == 0)
+		(void) pthread_join(thread, NULL);
+}
+
+static void
+test_compaction_gather_rejects_concurrent_change(int pin_only)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gather-conflict-XXXXXX";
+	StagedCompactionProbe probe = {.pin_only = pin_only};
+	uint64_t version = 0;
+
+	configure_core(1);
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
+		  "open compaction gather conflict store");
+	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
+		  "prepare compaction gather sources");
+	ps_test_set_compaction_gather_hook(gather_compaction_concurrent_change, &probe);
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_gather_hook(NULL, NULL);
+	check(probe.called == 1 && probe.read_ok && probe.write_ok,
+		  "foreground operation proceeds after unlocked gathering and sorting");
+	ps_lock_map_rd();
+	check(ps_layer_map_count(&ps_layer_map) == probe.layers_after_write,
+		  "changed snapshot rejects gathered compaction inputs");
+	ps_unlock_map();
+	run_maintenance(64);
+	check(read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 2000, &version) && version == 2000,
+		  "gather retry preserves the control image");
+	if (!pin_only)
+		check(read_relation_at(1, 3000), "gather retry preserves the concurrent write");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_staged_compaction_makes_progress_after_conflicts(void)
 {
-	char store[] = "/tmp/pagestore-staged-retry-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-staged-retry-XXXXXX";
 	StagedCompactionProbe probe = {.max_calls = 1};
 	uint64_t version = 0;
 	uint32_t layers;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open staged compaction retry store");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "prepare sources for staged retry");
@@ -762,13 +2164,13 @@ test_staged_compaction_makes_progress_after_conflicts(void)
 static void
 test_staged_compaction_rejects_concurrent_write(uint32_t nshards)
 {
-	char store[] = "/tmp/pagestore-staged-compaction-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-staged-compaction-XXXXXX";
 	StagedCompactionProbe probe = {0};
 	uint64_t version = 0;
 
 	configure_core(1);
 	ps_nshards = nshards;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open staged compaction store");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "prepare staged compaction sources");
@@ -792,12 +2194,12 @@ test_staged_compaction_rejects_concurrent_write(uint32_t nshards)
 static void
 test_staged_compaction_rejects_new_retention_pin(void)
 {
-	char store[] = "/tmp/pagestore-staged-pin-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-staged-pin-XXXXXX";
 	StagedCompactionProbe probe = {.pin_only = 1};
 	uint64_t version = 0;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open staged retention store");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "prepare staged retention sources");
@@ -823,10 +2225,10 @@ test_staged_compaction_rejects_new_retention_pin(void)
 static void
 test_floor_retires_older_checkpoints(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-floor-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-floor-XXXXXX";
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for floor test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -866,10 +2268,10 @@ test_floor_retires_older_checkpoints(void)
 static void
 test_note_identity_trailer(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-trailer-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-trailer-XXXXXX";
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the note trailer test");
 	check(write_relation(0, 0, 900) && write_note(0, 1000, 800),
 		  "a legacy note without a trailer");
@@ -894,10 +2296,10 @@ test_note_identity_trailer(void)
 static void
 test_reader_pin_retains_its_checkpoint(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-reader-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-reader-XXXXXX";
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for reader test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -931,10 +2333,10 @@ test_reader_pin_retains_its_checkpoint(void)
 static void
 test_branch_cap_retains_its_checkpoint(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-branch-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-branch-XXXXXX";
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for branch test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -963,7 +2365,7 @@ test_branch_cap_retains_its_checkpoint(void)
 static void
 test_split_pair_is_never_unnoted(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-split-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-split-XXXXXX";
 	PsKey key = control_key();
 	unsigned char page[8192];
 
@@ -971,7 +2373,7 @@ test_split_pair_is_never_unnoted(void)
 	 * its image stays in the page log. */
 	configure_core(0);
 	flush_pages = 2;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for split-pair test");
 	check(write_control(0, 1000, 800) && write_control(0, 2000, 1800),
 		  "two complete checkpoints flushed into layers");
@@ -1011,11 +2413,11 @@ test_split_pair_is_never_unnoted(void)
 static void
 test_retry_copies_collapse(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-retry-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-retry-XXXXXX";
 	PsKey key = control_key();
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for retry test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_control(0, 1000, 800) && write_control(0, 1000, 800) &&
@@ -1053,11 +2455,11 @@ test_retry_copies_collapse(void)
 static void
 test_in_flight_note_retries_collapse(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-inflight-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-inflight-XXXXXX";
 	PsKey key = control_key();
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the in-flight note test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -1101,11 +2503,11 @@ test_in_flight_note_retries_collapse(void)
 static void
 test_wal_only_pin_release_reschedules(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-walpin-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-walpin-XXXXXX";
 
 	configure_core(1);
 	compact_layers = 1;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for WAL-only pin test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -1134,12 +2536,12 @@ test_wal_only_pin_release_reschedules(void)
 static void
 test_slru_seed_keeps_its_control_image(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-seed-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-seed-XXXXXX";
 	PsKey seed = {0, 0, 7, 0, PS_KLASS_SLRU};
 	unsigned char page[8192];
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the SLRU seed test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -1192,14 +2594,14 @@ test_slru_seed_keeps_its_control_image(void)
 static void
 test_late_artifact_below_frontier_is_refused(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-late-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-late-XXXXXX";
 	PsKey seed = {0, 0, 7, 0, PS_KLASS_SLRU};
 	PsKey snapshot = {0, 0, 9, 0, PS_KLASS_READER_SNAPSHOT};
 	unsigned char page[8192];
 	int rc_below, rc_snapshot_below, rc_at;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the late artifact test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -1242,13 +2644,13 @@ test_late_artifact_below_frontier_is_refused(void)
 static void
 test_failed_artifact_append_releases_its_fence(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-release-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-release-XXXXXX";
 	PsKey seed = {0, 0, 7, 0, PS_KLASS_SLRU};
 	unsigned char page[8192];
 	int rc;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the released fence test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -1292,12 +2694,12 @@ test_failed_artifact_append_releases_its_fence(void)
 static void
 test_materializer_pin_is_the_page_cutoff(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-marker-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-marker-XXXXXX";
 	PsKey rel = {1, 1, 1, 0, PS_KLASS_RELATION};
 	uint64_t version = 0;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the materializer cutoff test");
 	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_WAL |
@@ -1348,12 +2750,12 @@ test_materializer_pin_is_the_page_cutoff(void)
 static void
 test_checkpoint_note_is_the_page_cutoff(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-note-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-note-XXXXXX";
 	PsKey rel = {1, 1, 1, 0, PS_KLASS_RELATION};
 	uint64_t version = 0;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the note cutoff test");
 	check(write_relation(0, 0, 900) && write_checkpoint(0, 800, 1000) &&
 		  write_relation(0, 0, 1900) && write_checkpoint(0, 1800, 2000) &&
@@ -1373,8 +2775,8 @@ test_checkpoint_note_is_the_page_cutoff(void)
 	/* With a materializer owner present, the writer's newer checkpoint notes
 	 * do not move the cutoff ahead of materialization. */
 	configure_core(1);
-	strcpy(store, "/tmp/pagestore-control-prune-note-XXXXXX");
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	strcpy(store, "pagestore-control-prune-note-XXXXXX");
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the materializer-owned note test");
 	check(write_relation(0, 0, 900) && write_checkpoint(0, 800, 1000) &&
 		  write_relation(0, 0, 1900) && write_checkpoint(0, 1800, 2000) &&
@@ -1436,12 +2838,12 @@ object_version_at(uint32_t timeline, uint32_t klass, uint32_t object,
 static void
 test_stale_artifacts_are_retired(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-artifact-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-artifact-XXXXXX";
 	PsKey rel = {1, 1, 1, 0, PS_KLASS_RELATION};
 	PsKey seed7 = {0, 0, 7, 0, PS_KLASS_SLRU};
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the artifact retention test");
 	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_WAL |
@@ -1530,13 +2932,13 @@ test_stale_artifacts_are_retired(void)
 static void
 test_live_slru_mirror_follows_page_history(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-slrulive-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-slrulive-XXXXXX";
 	PsKey live = {0, 0, 7, 0, PS_KLASS_SLRU_LIVE};
 	PsKey tomb = {0, 0, 7, 0, PS_KLASS_SLRU_TOMB};
 	PsKey wm = {0, 0, 0, 0, PS_KLASS_SLRU_WM};
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the live SLRU retention test");
 	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_WAL |
@@ -1585,7 +2987,7 @@ test_live_slru_mirror_follows_page_history(void)
 static void
 test_same_version_twin_supersedes_pre_checkpoint_image(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-twin-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-twin-XXXXXX";
 	PsKey key = control_key();
 	unsigned char page[8192];
 	uint64_t version = 0;
@@ -1594,7 +2996,7 @@ test_same_version_twin_supersedes_pre_checkpoint_image(void)
 	const uint64_t prev_redo = 2800;
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the exact-redo twin test");
 
 	/* The pre-checkpoint state image: its note names the previous
@@ -1635,12 +3037,12 @@ test_same_version_twin_supersedes_pre_checkpoint_image(void)
 static void
 test_independent_blocks_keep_their_newest(void)
 {
-	char store[] = "/tmp/pagestore-control-prune-marker-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-marker-XXXXXX";
 	PsKey key = control_key();
 	unsigned char page[8192];
 
 	configure_core(1);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open store for the marker test");
 	check(write_relation(0, 0, 900) && write_control(0, 1000, 800) &&
 		  write_relation(0, 0, 1900) && write_control(0, 2000, 1800) &&
@@ -1691,7 +3093,7 @@ compact_counted_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t
 static void
 test_compaction_source_read_batch(void)
 {
-	char store[] = "/tmp/pagestore-compact-read-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-compact-read-XXXXXX";
 	PsLayerStore counted = PsLayerStoreLocal;
 	PsImgRec recs[32] = {0};
 	unsigned char pages[32][8192];
@@ -1701,7 +3103,7 @@ test_compaction_source_read_batch(void)
 	int rc;
 
 	configure_core(0);
-	if (out == NULL || mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (out == NULL || test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open compaction source-read fixture");
 		free(out);
@@ -1742,10 +3144,46 @@ test_compaction_source_read_batch(void)
 int
 main(void)
 {
+	test_nonzero_floor_bounded_plan(0);
+	test_nonzero_floor_bounded_plan(1);
+	test_nonzero_bounded_plan_conflict(0);
+	test_nonzero_bounded_plan_conflict(1);
+	test_nonzero_bounded_plan_conflict(2);
+	test_bounded_prune_conflict(0);
+	test_bounded_prune_conflict(1);
+	test_bounded_prune_conflict(2);
+	test_bounded_prune_interrupted_retirement();
+	test_bounded_prune_crash("page_prune.after_frontier");
+	test_bounded_prune_crash("page_compaction.after_publish");
+	test_bounded_prune_crash("page_gc.after_mark_delete");
 	test_segment_gc_does_not_starve_compaction();
 	test_bounded_compaction_maintenance();
 	test_bounded_shared_payload_capacity_fallback();
+	test_bounded_prune_multiple_outputs(0);
+	test_bounded_prune_multiple_outputs(1);
+	test_bounded_prune_multiple_outputs(2);
+	test_bounded_prune_index_batches(0);
+	test_bounded_prune_index_batches(1);
+	test_bounded_prune_index_batches(2);
+	test_hot_page_prune_batches(0);
+	test_hot_page_prune_batches(1);
+	test_hot_page_prune_batches(2);
+	test_long_chain_prune_snapshot(0);
+	test_long_chain_prune_snapshot(1);
+	test_long_chain_prune_snapshot(2);
+	test_long_chain_prune_snapshot(3);
+	test_long_chain_prune_snapshot(4);
+	test_long_chain_prune_snapshot(5);
+	test_prune_snapshot_conflict_churn();
+	test_prune_abandon_conflict(0);
+	test_prune_abandon_conflict(1);
+	test_prune_abandon_conflict(2);
+	test_prune_abandon_provider_gate();
+	test_partial_output_conflict_churn();
+	test_partial_output_abandon_crash();
 	test_bounded_compaction_concurrent_write();
+	test_compaction_gather_rejects_concurrent_change(0);
+	test_compaction_gather_rejects_concurrent_change(1);
 	test_staged_compaction_rejects_concurrent_write(1);
 	test_staged_compaction_rejects_concurrent_write(2);
 	test_staged_compaction_rejects_new_retention_pin();

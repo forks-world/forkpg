@@ -20,7 +20,6 @@
  */
 #include <errno.h>
 #include <fcntl.h>
-#include <glob.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -32,6 +31,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_ipc.h"
 #include "pagestore_shm.h"
 
@@ -65,13 +65,7 @@ check(int cond, const char *fmt, ...)
 static void
 rm_rf(const char *path)
 {
-	char		cmd[512];
-
-	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-	if (system(cmd) != 0)
-	{
-		/* ignore: cleanup is best-effort */
-	}
+	ps_test_remove_tree(path);
 }
 
 /*
@@ -546,11 +540,21 @@ wait_for_daemon_exit(pid_t pid, int expected_status)
 static void
 remove_lsm_metadata(const char *store)
 {
-	char		cmd[768];
+	DIR *dir = opendir(store);
+	struct dirent *entry;
+	int ok = dir != NULL;
 
-	snprintf(cmd, sizeof(cmd), "rm -f '%s'/layer_* '%s'/layers.manifest",
-			 store, store);
-	check(system(cmd) == 0, "removed derived LSM metadata for offline migration");
+	if (dir != NULL)
+	{
+		while ((entry = readdir(dir)) != NULL)
+			if (strncmp(entry->d_name, "layer_", 6) == 0 ||
+				strcmp(entry->d_name, "layers.manifest") == 0)
+				if (unlinkat(dirfd(dir), entry->d_name, 0) != 0 && errno != ENOENT)
+					ok = 0;
+		if (closedir(dir) != 0)
+			ok = 0;
+	}
+	check(ok, "removed derived LSM metadata for offline migration");
 }
 
 /* ===================== client side of the IPC protocol ================= */
@@ -2055,6 +2059,33 @@ spawn_daemon_gc(const char *daemon_path, const char *shm, const char *store,
 							  0, 0, 0, 1);
 }
 
+static pid_t
+spawn_daemon_gc_paused(const char *daemon_path, const char *shm, const char *store,
+					   uint32_t page_size, uint32_t nshards, const char *pause_file)
+{
+	pid_t pid = fork();
+
+	if (pid < 0)
+	{
+		perror("fork paused GC daemon");
+		exit(2);
+	}
+	if (pid == 0)
+	{
+		char psbuf[16], shbuf[16];
+
+		snprintf(psbuf, sizeof(psbuf), "%u", page_size);
+		snprintf(shbuf, sizeof(shbuf), "%u", nshards);
+		execl(daemon_path, daemon_path, "--shm", shm, "--store", store,
+			  "--page-size", psbuf, "--segment-size", "65536", "--nshards", shbuf,
+			  "--flush-pages", "8", "--compact-layers", "3", "--segment-gc", "1",
+			  "--test-maintenance-pause-file", pause_file, (char *) NULL);
+		perror("execl paused GC daemon");
+		_exit(127);
+	}
+	return pid;
+}
+
 /* Two-phase shipped-WAL backpressure setup.  The pause file is deliberately
  * test-only: phase one seeds a proof-complete WAL prefix with the controller
  * disabled, and phase two recovers it with the real controller enabled. */
@@ -2708,38 +2739,37 @@ segment_exists(const char *store, uint32_t shard, int seg)
 static int
 local_layer_count(const char *store)
 {
-	char		pattern[512];
-	glob_t		matches;
-	int			count;
+	DIR *dir = opendir(store);
+	struct dirent *entry;
+	int count = 0;
 
-	snprintf(pattern, sizeof(pattern), "%s/layer_*", store);
-	memset(&matches, 0, sizeof(matches));
-	if (glob(pattern, 0, NULL, &matches) == GLOB_NOMATCH)
+	if (dir == NULL)
 		return 0;
-	count = (int) matches.gl_pathc;
-	globfree(&matches);
+	while ((entry = readdir(dir)) != NULL)
+		if (strncmp(entry->d_name, "layer_", 6) == 0)
+			count++;
+	closedir(dir);
 	return count;
 }
 
 static uint64_t
 local_layer_bytes(const char *store)
 {
-	char		pattern[512];
-	glob_t		matches;
-	uint64_t	bytes = 0;
+	DIR *dir = opendir(store);
+	struct dirent *entry;
+	uint64_t bytes = 0;
 
-	snprintf(pattern, sizeof(pattern), "%s/layer_*", store);
-	memset(&matches, 0, sizeof(matches));
-	if (glob(pattern, 0, NULL, &matches) == GLOB_NOMATCH)
+	if (dir == NULL)
 		return 0;
-	for (size_t i = 0; i < matches.gl_pathc; i++)
+	while ((entry = readdir(dir)) != NULL)
 	{
 		struct stat st;
 
-		if (stat(matches.gl_pathv[i], &st) == 0)
+		if (strncmp(entry->d_name, "layer_", 6) == 0 &&
+			fstatat(dirfd(dir), entry->d_name, &st, 0) == 0)
 			bytes += (uint64_t) st.st_size;
 	}
-	globfree(&matches);
+	closedir(dir);
 	return bytes;
 }
 
@@ -3417,6 +3447,7 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	unsigned char *readback = malloc(ps);
 	int			crashed_layer_count;
 	char		marker[512];
+	char		pause_file[512];
 	pid_t		pid;
 	const char *fault_name;
 
@@ -3427,6 +3458,14 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	rm_rf(store);
 	rm_rf(fault_dir);
 	check(mkdir(fault_dir, 0700) == 0, "create fault control directory %s", phase);
+	snprintf(pause_file, sizeof(pause_file), "%s/pause", fault_dir);
+	{
+		int fd = open(pause_file, O_CREAT | O_EXCL | O_WRONLY, 0600);
+
+		check(fd >= 0, "pause maintenance before pruning fixture %s", phase);
+		if (fd >= 0)
+			close(fd);
+	}
 	ps_shm_unlink(shm);
 
 	fault_name = strcmp(phase, "after_publish") == 0 ?
@@ -3439,7 +3478,8 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 		  setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) == 0 &&
 		  setenv("PAGESTORE_TEST_FAULT_DIR", fault_dir, 1) == 0,
 		  "configure guarded compaction fault %s", phase);
-	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	pid = spawn_daemon_gc_paused(daemon_path, shm, store, ps, test_nshards,
+								 pause_file);
 	unsetenv("PAGESTORE_TEST_FAULT_NAME");
 	unsetenv("PAGESTORE_TEST_FAULT_ACTION");
 	unsetenv("PAGESTORE_TEST_FAULT_HIT");
@@ -3461,6 +3501,10 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	}
 	fill_page(page, ps, 4000, 40);
 	op_write_tl(0, rel, 0, 0, page);
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED,
+						   23000 + (uint64_t) case_no, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 3500) == PS_STATUS_OK,
+		  "persist the pruning cutoff before arming fault %s", phase);
 	{
 		int fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
 
@@ -3468,9 +3512,7 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 		if (fd >= 0)
 			close(fd);
 	}
-	submit_request(prepare_retention_set(0, PS_RETENTION_OWNER_CONFIGURED,
-									23000 + (uint64_t) case_no, 1,
-									PS_RETENTION_RESOURCE_PAGE_HISTORY, 3500));
+	check(unlink(pause_file) == 0, "resume maintenance after arming fault %s", phase);
 	check(wait_for_daemon_exit(pid, 88),
 		  "compaction crashes at deterministic phase %s", phase);
 	client_detach();
@@ -6875,7 +6917,7 @@ int
 main(int argc, char **argv)
 {
 	const char *daemon_path;
-	char		tmpl[] = "/tmp/pstestXXXXXX";
+	char		tmpl[PS_TEST_TEMP_PATH_MAX] = "pstestXXXXXX";
 	char	   *tmpbase;
 	uint32_t	sizes[] = {4096, 8192, 16384};
 
@@ -6894,7 +6936,7 @@ main(int argc, char **argv)
 	if (test_nshards > PS_MAX_CHANNELS)
 		test_nshards = PS_MAX_CHANNELS;
 
-	tmpbase = mkdtemp(tmpl);
+	tmpbase = ps_test_mkdtemp(tmpl, sizeof(tmpl));
 	if (!tmpbase)
 	{
 		perror("mkdtemp");
@@ -6968,7 +7010,7 @@ main(int argc, char **argv)
 	/* stress the per-shard + map locking under sustained flush/compaction load */
 	run_stress_suite(daemon_path, tmpbase);
 
-	rmdir(tmpbase);
+	rm_rf(tmpbase);
 
 	fprintf(stderr, "\n%d checks, %d failed\n", tests_run, tests_failed);
 	return tests_failed ? 1 : 0;

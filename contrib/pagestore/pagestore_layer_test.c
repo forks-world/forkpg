@@ -10,6 +10,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -353,6 +354,81 @@ streaming_layer_test(void)
 			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 0,
 				  "output ID collision on another timeline is rejected");
 			{
+				PsLayerDesc sources[2] = {layer, layer}, entries[6];
+				PsLayerMap guarded = {.layers = entries, .nlayers = 2, .capacity = 6};
+				PsCompactionPruneFence captured = {11, 12, 13, 1, 5000};
+				PsCompactionPruneFence current = captured;
+
+				sources[1].layer_id = 911;
+				entries[0] = sources[0];
+				entries[1] = sources[1];
+				entries[0].cache_readers = entries[1].cache_readers = 1;
+				check(ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "pinned captured set passes before frontier publication");
+				entries[0].cache_readers = 0;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "pruned publication fencing rejects an unpinned source");
+				entries[0].cache_readers = 1;
+				sources[0].remote_durable = true;
+				entries[0].remote_durable = true;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "pruned publication fencing rejects remote-durable inputs");
+				sources[0].remote_durable = false;
+				entries[0].remote_durable = false;
+				current.retention_epoch++;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "a changed retention epoch invalidates the pruning fence");
+				current = captured;
+				current.admission_epoch++;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "a concurrent write invalidates the pruning fence");
+				current = captured;
+				current.timeline_incarnation++;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "timeline reuse invalidates the pruning fence");
+				current = captured;
+				current.page_floor++;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0) &&
+					  !ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &captured, 0, 0, 0, 0, 0, 0),
+					  "a changed floor or non-live timeline invalidates the pruning fence");
+				current = captured;
+				entries[2] = outputs[1];
+				guarded.nlayers = 3;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 1, 0, 1, 0),
+					  "published outputs must form the exact prefix");
+				entries[2] = outputs[0];
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 1, 0, 0, 0) &&
+					  ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 1, 0, 1, 0),
+					  "a partial output prefix requires a durable frontier");
+				memcpy(&entries[2], outputs, sizeof(legacy_outputs));
+				guarded.nlayers = 6;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 4, 1, 1, 0),
+					  "retiring a source requires the page index update");
+				entries[0].deleting = true;
+				check(ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 4, 1, 1, 1),
+					  "completed outputs and index update allow the next source retirement check");
+				current = captured;
+				current.timeline_epoch++;
+				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 4, 1, 1, 1) &&
+					  !ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &captured, 1, 1, 4, 1, 1, 1),
+					  "retirement rejects changed timeline and poisoned manifest");
+			}
+			{
 				PsLayerDesc entries[5], remote = layer;
 				PsLayerMap retirement = {.layers = entries, .nlayers = 5, .capacity = 5};
 
@@ -666,6 +742,25 @@ typedef struct RelationPlanProbe
 	unsigned char closure[4];
 } RelationPlanProbe;
 
+typedef struct SelectedPlanProbe
+{
+	PsImageGroupEntry selected[4], dropped[4];
+	uint32_t nselected, ndropped, calls;
+} SelectedPlanProbe;
+
+static int
+select_relation_plan(const PsImageGroupEntry *entries, uint32_t count,
+					 const unsigned char *keep, const unsigned char *closure, void *arg)
+{
+	SelectedPlanProbe *probe = arg;
+
+	(void) closure;
+	probe->calls++;
+	return ps_compaction_relation_select_group(entries, count, keep,
+			probe->selected, 4, &probe->nselected,
+			probe->dropped, 4, &probe->ndropped);
+}
+
 static int
 visit_relation_plan(const PsImageGroupEntry *entries, uint32_t count,
 					const unsigned char *keep, const unsigned char *closure, void *arg)
@@ -685,6 +780,409 @@ visit_relation_plan(const PsImageGroupEntry *entries, uint32_t count,
 	return 0;
 }
 
+static int
+stage_pruned_bad_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
+{
+	int rc = PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
+
+	if (rc == 0 && layer->layer_id == 31980 && off == 0 && len != 0)
+		((unsigned char *) buf)[0] ^= 1;
+	return rc;
+}
+
+static void
+stage_pruned_batch_test(void)
+{
+	PsKey key = {1, 1, 31415, 0, PS_KLASS_RELATION};
+	unsigned char pages[3][PSZ], out_page[PSZ];
+	PsImgRec recs[2] = {0}, newer = {0};
+	PsLayerDesc layers[2], output, ignored;
+	PsImgIndexEnt *index0 = NULL, *index1 = NULL;
+	PsImageGroupEntry selected[2], bad[2];
+	uint32_t n0 = 0, n1 = 0;
+	uint64_t uncertain = 0, found_lsn = 0, found_seq = 0;
+	int ok;
+
+	memset(pages[0], 0x11, PSZ);
+	memset(pages[1], 0x22, PSZ);
+	memset(pages[2], 0x33, PSZ);
+	for (uint32_t i = 0; i < 2; i++)
+	{
+		recs[i].key = key;
+		recs[i].block = i;
+		recs[i].lsn = 100;
+		recs[i].admission_seq = i + 1;
+		recs[i].page = pages[i];
+	}
+	newer = recs[0];
+	newer.lsn = 200;
+	newer.admission_seq = 3;
+	newer.page = pages[2];
+	ok = ps_image_layer_write(31980, 0, recs, 2, PSZ, &layers[0]) == 0 &&
+		ps_image_layer_write(31981, 0, &newer, 1, PSZ, &layers[1]) == 0 &&
+		ps_image_layer_read_index(&layers[0], &index0, &n0) == 0 && n0 == 2 &&
+		ps_image_layer_read_index(&layers[1], &index1, &n1) == 0 && n1 == 1;
+	check(ok, "prepare selected staging source layers");
+	if (!ok)
+		goto done;
+	selected[0].entry = index1[0];
+	selected[0].layer_id = layers[1].layer_id;
+	selected[1].entry = index0[1];
+	selected[1].layer_id = layers[0].layer_id;
+	check(ps_image_compaction_stage_selected_batch(layers, 2, selected,
+			PS_IMAGE_BATCH_MAX_RECORDS + 1, 31983, PSZ, &ignored, &uncertain) == -1 &&
+		  uncertain == 0 && ps_layer_store->layer_exists_local(31983) == 0,
+		  "selected output batch refuses more than the record bound");
+	check(ps_image_compaction_stage_selected_batch(layers, 2, selected, 2,
+			31982, PSZ, &output, &uncertain) == 0 && uncertain == 0,
+		  "seal one unpublished selected batch");
+	check(ps_image_layer_lookup_exact(&output, &key, 0, 200, 3, out_page,
+			PSZ, &found_lsn, &found_seq) == 1 &&
+		  memcmp(out_page, pages[2], PSZ) == 0 &&
+		  ps_image_layer_lookup_exact(&output, &key, 0, 100, 1, out_page,
+			PSZ, NULL, NULL) == 0 &&
+		  ps_image_layer_lookup_exact(&output, &key, 1, 100, 2, out_page,
+			PSZ, NULL, NULL) == 1 && memcmp(out_page, pages[1], PSZ) == 0,
+		  "staged output contains only the selected versions and bytes");
+	check(ps_image_compaction_verify_selected_batch(layers, 2, selected, 2,
+			&output, PSZ) == 0,
+		  "independent verification matches selected sources and output bytes");
+	bad[0] = selected[0];
+	bad[1] = selected[1];
+	bad[0].entry.growth_lsn++;
+	check(ps_image_compaction_verify_selected_batch(layers, 2, bad, 2,
+			&output, PSZ) == -1,
+		  "verification rejects selected metadata absent from the source index");
+	bad[0] = selected[0];
+	bad[0].layer_id = layers[0].layer_id;
+	check(ps_image_compaction_verify_selected_batch(layers, 2, bad, 2,
+			&output, PSZ) == -1,
+		  "verification rejects an identity attributed to the wrong source layer");
+	bad[0] = selected[0];
+	bad[1].entry.data_off = index0[0].data_off;
+	check(ps_image_compaction_verify_selected_batch(layers, 2, bad, 2,
+			&output, PSZ) == -1,
+		  "verification rejects an in-range offset not belonging to the selected identity");
+	check(ps_image_compaction_verify_selected_batch(layers, 2, selected, 1,
+			&output, PSZ) == -1,
+		  "verification rejects an extra output identity");
+	{
+		PsImgRec incorrect[2] = {newer, recs[1]};
+		PsLayerDesc wrong, missing;
+
+		incorrect[0].page = pages[0];
+		check(ps_image_layer_write(31986, 0, incorrect, 2, PSZ, &wrong) == 0 &&
+			  ps_image_compaction_verify_selected_batch(layers, 2, selected, 2,
+				&wrong, PSZ) == -1,
+			  "verification rejects validly checksummed output with wrong page bytes");
+		check(ps_image_layer_write(31987, 0, &newer, 1, PSZ, &missing) == 0 &&
+			  ps_image_compaction_verify_selected_batch(layers, 2, selected, 2,
+				&missing, PSZ) == -1,
+			  "verification rejects output missing a selected identity");
+	}
+	check(ps_image_compaction_stage_selected_batch(layers, 2, selected, 2,
+			31982, PSZ, &ignored, &uncertain) == -2 && uncertain == 31982 &&
+		  ps_image_layer_lookup_exact(&output, &key, 0, 200, 3, out_page,
+			PSZ, NULL, NULL) == 1 && memcmp(out_page, pages[2], PSZ) == 0,
+		  "failed create reports uncertainty without deleting an occupied output");
+	bad[0] = selected[1];
+	bad[1] = selected[0];
+	check(ps_image_compaction_stage_selected_batch(layers, 2, bad, 2,
+			31983, PSZ, &ignored, &uncertain) == -1 && uncertain == 0 &&
+		  ps_layer_store->layer_exists_local(31983) == 0,
+		  "unsorted selections fail before creating output");
+	bad[0] = selected[0];
+	bad[0].entry.data_off = layers[1].locations[0].size;
+	check(ps_image_compaction_stage_selected_batch(layers, 2, bad, 1,
+			31983, PSZ, &ignored, &uncertain) == -1 && uncertain == 0 &&
+		  ps_layer_store->layer_exists_local(31983) == 0,
+		  "out-of-range source offset fails before creating output");
+	{
+		PsLayerStore injected = PsLayerStoreLocal;
+		const PsLayerStore *saved = ps_layer_store;
+
+		injected.read_layer_block = stage_pruned_bad_read;
+		ps_layer_store = &injected;
+		check(ps_image_compaction_stage_selected_batch(layers, 2, selected, 2,
+				31983, PSZ, &ignored, &uncertain) == -1 && uncertain == 0 &&
+			  ps_layer_store->layer_exists_local(31983) == 0,
+			  "corrupt source data is rejected before output creation");
+		injected.read_layer_block = PsLayerStoreLocal.read_layer_block;
+		injected.write_local_layer_at = bounded_write;
+		prepare_fail_write_id = 31984;
+		check(ps_image_compaction_stage_selected_batch(layers, 2, selected, 2,
+				31984, PSZ, &ignored, &uncertain) == -2 && uncertain == 31984,
+			  "failed output write reports its identity for reconciliation");
+		prepare_fail_write_id = 0;
+		injected.delete_local_layer = bounded_delete;
+		prepare_fail_write_id = 31985;
+		prepare_fail_delete_id = 31985;
+		check(ps_image_compaction_stage_selected_batch(layers, 2, selected, 2,
+				31985, PSZ, &ignored, &uncertain) == -2 && uncertain == 31985 &&
+			  ps_layer_store->layer_exists_local(31985) == 1,
+			  "failed cleanup leaves the uncertain partial file for reconciliation");
+		prepare_fail_write_id = 0;
+		prepare_fail_delete_id = 0;
+		{
+			PsLayerDesc partial = {.layer_id = 31985};
+
+			check(PsLayerStoreLocal.delete_local_layer(&partial) == 0,
+				  "test reconciles the reported partial file");
+		}
+		ps_layer_store = saved;
+	}
+done:
+	free(index0);
+	free(index1);
+}
+
+static void
+verify_pruned_plan_duplicate_test(void)
+{
+	PsKey key = {1, 1, 31801, 0, PS_KLASS_RELATION};
+	unsigned char pages[3][PSZ];
+	PsImgRec recs[3] = {0}, selected[2], wrong[2];
+	PsLayerDesc inputs[3], output, bad_output;
+	PsViewFence fence = {200, 1, PS_PRUNE_SEQ_UNBOUNDED};
+	uint64_t kept, dropped;
+	int ok;
+
+	for (uint32_t i = 0; i < 3; i++)
+	{
+		memset(pages[i], (int) (0x51 + i), PSZ);
+		recs[i].key = key;
+		recs[i].lsn = 100;
+		recs[i].admission_seq = i == 0 ? 1 : 2;
+		recs[i].page = pages[i];
+	}
+	selected[0] = recs[0];
+	selected[1] = recs[2];
+	wrong[0] = recs[0];
+	wrong[1] = recs[1];
+	ok = ps_image_layer_write(32010, 0, &recs[0], 1, PSZ, &inputs[0]) == 0 &&
+		ps_image_layer_write(32011, 0, &recs[1], 1, PSZ, &inputs[1]) == 0 &&
+		ps_image_layer_write(32012, 0, &recs[2], 1, PSZ, &inputs[2]) == 0 &&
+		ps_image_layer_write(32013, 0, selected, 2, PSZ, &output) == 0 &&
+		ps_image_layer_write(32014, 0, wrong, 2, PSZ, &bad_output) == 0;
+	check(ok, "create duplicate-source full-plan fixture");
+	if (!ok)
+		return;
+	check(ps_compaction_verify_relation_plan(inputs, 3, &output, 1, PSZ, 3,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
+			NULL, NULL, &kept, &dropped) == 0 && kept == 2 && dropped == 0,
+		  "full plan retains closure and selects the highest kept duplicate");
+	check(ps_compaction_verify_relation_plan(inputs, 3, &bad_output, 1, PSZ, 3,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
+			NULL, NULL, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "full plan rejects bytes from the lower-priority duplicate");
+}
+
+static void
+verify_pruned_plan_test(void)
+{
+	PsKey key = {1, 1, 31800, 0, PS_KLASS_RELATION};
+	unsigned char pages[4][PSZ];
+	PsImgRec records[4] = {0}, first[2], second[1], extra[3], wrong[1];
+	PsLayerDesc input, outputs[2], excessive[2], bad_page[2];
+	uint64_t kept, dropped;
+	GroupProbe drops = {0};
+	PsViewFence historical = {100, 1, PS_PRUNE_SEQ_UNBOUNDED};
+	int ok;
+
+	for (uint32_t i = 0; i < 4; i++)
+	{
+		memset(pages[i], (int) (0x31 + i), PSZ);
+		records[i].key = key;
+		records[i].block = i < 2 ? 0 : i - 1;
+		records[i].lsn = i == 1 ? 200 : 100;
+		records[i].admission_seq = i + 1;
+		records[i].page = pages[i];
+	}
+	first[0] = records[1];
+	first[1] = records[2];
+	second[0] = records[3];
+	extra[0] = records[0];
+	extra[1] = records[1];
+	extra[2] = records[2];
+	wrong[0] = records[3];
+	wrong[0].page = pages[0];
+	ok = ps_image_layer_write(32000, 0, records, 4, PSZ, &input) == 0 &&
+		ps_image_layer_write(32001, 0, first, 2, PSZ, &outputs[0]) == 0 &&
+		ps_image_layer_write(32002, 0, second, 1, PSZ, &outputs[1]) == 0 &&
+		ps_image_layer_write(32003, 0, extra, 3, PSZ, &excessive[0]) == 0 &&
+		ps_image_layer_write(32004, 0, second, 1, PSZ, &excessive[1]) == 0 &&
+		ps_image_layer_write(32005, 0, first, 2, PSZ, &bad_page[0]) == 0 &&
+		ps_image_layer_write(32006, 0, wrong, 1, PSZ, &bad_page[1]) == 0;
+	check(ok, "create complete pruned-plan verification fixture");
+	if (!ok)
+		return;
+	check(ps_compaction_verify_relation_plan(&input, 1, outputs, 2, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == 0 && kept == 3 && dropped == 1 &&
+		  drops.groups == 1 && drops.entries == 1 && drops.source_sum == 32000,
+		  "complete plan verifies multiple output batches and stages exact dropped identities");
+	memset(&drops, 0, sizeof(drops));
+	check(ps_compaction_verify_relation_plan(&input, 1, outputs, 1, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "missing output batch invalidates the whole staged plan");
+	memset(&drops, 0, sizeof(drops));
+	check(ps_compaction_verify_relation_plan(&input, 1, excessive, 2, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "an output containing a version the plan drops is rejected");
+	memset(&drops, 0, sizeof(drops));
+	check(ps_compaction_verify_relation_plan(&input, 1, bad_page, 2, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -1 && kept == 0 && dropped == 0 &&
+		  drops.entries == 1,
+		  "later wrong bytes invalidate even previously staged drop callbacks");
+	memset(&drops, 0, sizeof(drops));
+	check(ps_compaction_verify_relation_plan(&input, 1, outputs, 2, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, &historical, 1, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "a retained historical fence rejects output that omits its version");
+	memset(&drops, 0, sizeof(drops));
+	check(ps_compaction_verify_relation_plan(&input, 1, outputs, 2, PSZ, 1,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -2 && kept == 0 && dropped == 0,
+		  "oversized page history invalidates the full plan");
+	drops.reject = 1;
+	check(ps_compaction_verify_relation_plan(&input, 1, outputs, 2, PSZ, 4,
+			(PsPruneFence) {250, UINT64_MAX}, NULL, 0, 0, 0,
+			visit_group, &drops, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "drop staging failure invalidates the full plan");
+}
+
+static void
+relation_group_selection_test(void)
+{
+	PsImageGroupEntry entries[6] = {0}, selected[2], dropped[1];
+	unsigned char keep[6] = {1, 1, 0, 0, 0, 1};
+	uint32_t nselected, ndropped;
+	PsKey key = {1, 1, 12345, 0, PS_KLASS_RELATION};
+
+	for (uint32_t i = 0; i < 6; i++)
+	{
+		entries[i].entry.key = key;
+		entries[i].entry.block = 7;
+		entries[i].entry.lsn = i < 3 ? 100 : i < 5 ? 200 : 300;
+		entries[i].entry.admission_seq = i < 3 ? 1 : i < 5 ? 4 : 6;
+		entries[i].entry.data_off = 10 + i;
+		entries[i].layer_id = i < 2 ? 5 : i == 2 ? 9 : i == 3 ? 8 : 9;
+	}
+	check(ps_compaction_relation_select_group(entries, 6, keep,
+			selected, 2, &nselected, dropped, 1, &ndropped) == 0 &&
+		  nselected == 2 && ndropped == 1 && selected[0].layer_id == 5 &&
+		  selected[0].entry.data_off == 11 && selected[1].entry.lsn == 300 &&
+		  dropped[0].entry.lsn == 200 && dropped[0].layer_id == 8,
+		  "group selection preserves last kept duplicate and records each dropped identity once");
+	memset(selected, 0xA5, sizeof(selected));
+	memset(dropped, 0xA5, sizeof(dropped));
+	check(ps_compaction_relation_select_group(entries, 6, keep,
+			selected, 1, &nselected, dropped, 1, &ndropped) == -2 &&
+		  nselected == 0 && ndropped == 0 &&
+		  ((unsigned char *) selected)[0] == 0xA5 &&
+		  ((unsigned char *) dropped)[0] == 0xA5,
+		  "insufficient capacity leaves both staged outputs untouched");
+	entries[2].layer_id = 4;
+	check(ps_compaction_relation_select_group(entries, 6, keep,
+			selected, 2, &nselected, dropped, 1, &ndropped) == -1 &&
+		  nselected == 0 && ndropped == 0 &&
+		  ((unsigned char *) selected)[0] == 0xA5,
+		  "unordered duplicate sources fail before output is modified");
+	entries[2].layer_id = 9;
+	entries[5].entry.block++;
+	check(ps_compaction_relation_select_group(entries, 6, keep,
+			selected, 2, &nselected, dropped, 1, &ndropped) == -1 &&
+		  nselected == 0 && ndropped == 0,
+		  "selection rejects an incomplete or mixed page group");
+}
+
+static void
+resumable_relation_plan_test(void)
+{
+	PsKey key = {1, 1, 956, 0, PS_KLASS_RELATION};
+	unsigned char page[PSZ] = {0};
+	PsImgRec recs[3], big[5];
+	PsLayerDesc layer, mixed, oversized;
+	PsCompactionRelationPlan *plan = NULL;
+	PsViewFence fence = {200, 1, PS_PRUNE_SEQ_UNBOUNDED};
+	RelationPlanProbe probe = {0};
+	uint32_t visited = 99;
+	int ok;
+
+	memset(recs, 0, sizeof(recs));
+	for (uint32_t i = 0; i < 3; i++)
+	{
+		recs[i].key = key;
+		recs[i].block = i == 2 ? 1 : 0;
+		recs[i].lsn = 100;
+		recs[i].admission_seq = i + 1;
+		recs[i].page = page;
+	}
+	ok = ps_image_layer_write(30984, 0, recs, 3, PSZ, &layer) == 0;
+	check(ok && ps_compaction_relation_plan_open(&layer, 1, 2,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0, &plan) == 0,
+		  "open resumable relation plan");
+	fence.seq = 2; /* The plan must use the copied fence, not this mutation. */
+	check(plan && ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 1 && visited == 1 && probe.count == 2 &&
+		  probe.keep[0] && probe.keep[1] && probe.closure[0],
+		  "one-step budget retains copied finite fence and leaves a next group");
+	memset(&probe, 0, sizeof(probe));
+	check(ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 0 && visited == 1 && probe.count == 1 &&
+		  probe.ids[0] == 30984,
+		  "next step completes exactly the remaining group");
+	check(ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 0 && visited == 0,
+		  "completed plan stays complete without another callback");
+	ps_compaction_relation_plan_close(plan);
+	plan = NULL;
+	recs[2].key.klass = PS_KLASS_CONTROL;
+	check(ps_image_layer_write(30985, 0, recs, 3, PSZ, &mixed) == 0 &&
+		  ps_compaction_relation_plan_open(&mixed, 1, 2,
+			(PsPruneFence) {150, UINT64_MAX}, NULL, 0, 0, 0, &plan) == 0,
+		  "open plan with a later unsupported group");
+	memset(&probe, 0, sizeof(probe));
+	check(plan && ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 1 && visited == 1,
+		  "first group is staged before the later unsupported group");
+	memset(&probe, 0, sizeof(probe));
+	check(ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == -1 && visited == 0 && probe.calls == 0 &&
+		  ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == -1,
+		  "later unsupported group invalidates all staged work and fails permanently");
+	ps_compaction_relation_plan_close(plan);
+	plan = NULL;
+	memset(big, 0, sizeof(big));
+	for (uint32_t i = 0; i < 5; i++)
+	{
+		big[i].key = key;
+		big[i].block = i < 2 ? 0 : 1;
+		big[i].lsn = 100 + i;
+		big[i].admission_seq = i + 1;
+		big[i].page = page;
+	}
+	check(ps_image_layer_write(30986, 0, big, 5, PSZ, &oversized) == 0 &&
+		  ps_compaction_relation_plan_open(&oversized, 1, 2,
+			(PsPruneFence) {150, UINT64_MAX}, NULL, 0, 0, 0, &plan) == 0,
+		  "open plan with later oversized history");
+	memset(&probe, 0, sizeof(probe));
+	check(plan && ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 1 && visited == 1,
+		  "stage complete group before oversized history");
+	memset(&probe, 0, sizeof(probe));
+	check(ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == -2 && visited == 0 && probe.calls == 0 &&
+		  ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == -1,
+		  "later oversized history fails closed and invalidates the plan");
+	ps_compaction_relation_plan_close(plan);
+}
+
 static void
 bounded_relation_plan_test(void)
 {
@@ -694,6 +1192,7 @@ bounded_relation_plan_test(void)
 	PsImgRec rec = {.key = key, .block = 0, .lsn = 100, .page = page};
 	PsViewFence fence = {200, 1, PS_PRUNE_SEQ_UNBOUNDED};
 	RelationPlanProbe probe = {0};
+	SelectedPlanProbe selection = {0};
 	int ok;
 
 	rec.admission_seq = 1;
@@ -708,6 +1207,13 @@ bounded_relation_plan_test(void)
 		  probe.ids[2] == 982 && probe.keep[0] && !probe.keep[1] && probe.keep[2] &&
 		  probe.closure[0],
 		  "bounded relation plan preserves finite-sequence closure and latest duplicate");
+	check(ps_compaction_plan_relation_groups(inputs, 3, 3,
+			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
+			select_relation_plan, &selection) == 0 && selection.calls == 1 &&
+		  selection.nselected == 2 && selection.ndropped == 0 &&
+		  selection.selected[0].layer_id == 980 &&
+		  selection.selected[1].layer_id == 982,
+		  "planned duplicate identities select the winning retained source");
 	memset(&probe, 0, sizeof(probe));
 	check(ok && ps_compaction_plan_relation_groups(inputs, 3, 2,
 			(PsPruneFence) {150, UINT64_MAX}, &fence, 1, 0, 0,
@@ -1102,10 +1608,32 @@ prepared_finite_sequence_test(void)
 	}
 }
 
+static int
+remove_test_directory(const char *path)
+{
+	DIR *dir = opendir(path);
+	struct dirent *entry;
+	int ok = 1;
+
+	if (dir == NULL)
+		return 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		if (unlinkat(dirfd(dir), entry->d_name, 0) != 0)
+			ok = 0;
+	}
+	if (closedir(dir) != 0 || rmdir(path) != 0)
+		ok = 0;
+	return ok;
+}
+
 int
 main(void)
 {
-	char		dir[] = "/tmp/pslayertestXXXXXX";
+	char        dir[4096];
+	const char *tmpdir = getenv("TMPDIR");
 	uint32_t	psz = PSZ;
 	static unsigned char pg[5][PSZ];
 	PsKey		k5 = {1, 1, 5, 0, PS_KLASS_RELATION};	/* relation 5, block 0 */
@@ -1115,13 +1643,27 @@ main(void)
 	unsigned char out[PSZ];
 	int			r;
 
-	if (!mkdtemp(dir) || ps_layer_store->open(dir) != 0)
+	if (tmpdir == NULL || *tmpdir == '\0')
+		tmpdir = "/tmp";
+	if (snprintf(dir, sizeof(dir), "%s/pslayertestXXXXXX", tmpdir) >= (int) sizeof(dir) ||
+		!mkdtemp(dir))
 	{
-		fprintf(stderr, "setup failed\n");
+		fprintf(stderr, "temporary directory setup failed\n");
+		return 2;
+	}
+	if (ps_layer_store->open(dir) != 0)
+	{
+		fprintf(stderr, "layer store setup failed\n");
+		(void) remove_test_directory(dir);
 		return 2;
 	}
 	legacy_index_visitor_test();
 	bounded_relation_plan_test();
+	resumable_relation_plan_test();
+	relation_group_selection_test();
+	stage_pruned_batch_test();
+	verify_pruned_plan_test();
+	verify_pruned_plan_duplicate_test();
 	bounded_merge_test();
 	bounded_shared_payload_test();
 	bounded_sorted_batch_test();
@@ -1441,6 +1983,8 @@ main(void)
 	streaming_layer_test();
 	index_cache_pressure_test();
 	index_direct_read_test();
+	ps_layer_store->close();
+	check(remove_test_directory(dir), "remove temporary layer test directory");
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }

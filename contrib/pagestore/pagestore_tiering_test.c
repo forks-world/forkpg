@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "pagestore_core.h"
+#include "pagestore_test_temp.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
 
@@ -96,7 +97,7 @@ mock_storage_failed_open_no_errno(const char *path, uint64_t size)
 static void
 test_core_provider_lifecycle(void)
 {
-	char dir[] = "/tmp/ps-core-owner-XXXXXX";
+	char dir[PS_TEST_TEMP_PATH_MAX] = "ps-core-owner-XXXXXX";
 	PsStorage mock = PsStoragePosix;
 	PsLayerStore mock_layer = PsLayerStoreLocal;
 	PsKey key = {1, 1, 5, 0, PS_KLASS_RELATION};
@@ -105,7 +106,7 @@ test_core_provider_lifecycle(void)
 	int status;
 	int rc;
 
-	if (mkdtemp(dir) == NULL)
+	if (ps_test_mkdtemp(dir, sizeof(dir)) == NULL)
 	{
 		check(0, "create core lifecycle test store");
 		return;
@@ -197,12 +198,13 @@ test_core_provider_lifecycle(void)
 	ps_core_close();
 	check(ps_core_open(dir) == 0, "POSIX core reopens after repeated close");
 	ps_core_close();
+	ps_test_remove_tree(dir);
 }
 
 static void
 test_legacy_local_uri_reopen(void)
 {
-	char root[] = "/tmp/ps-legacy-uri-XXXXXX";
+	char root[PS_TEST_TEMP_PATH_MAX] = "ps-legacy-uri-XXXXXX";
 	char *canonical_root;
 	char store[PATH_MAX];
 	char previous_cwd[PATH_MAX];
@@ -212,7 +214,7 @@ test_legacy_local_uri_reopen(void)
 	unsigned char out[PSZ];
 
 	if (getcwd(previous_cwd, sizeof(previous_cwd)) == NULL ||
-		mkdtemp(root) == NULL)
+		ps_test_mkdtemp(root, sizeof(root)) == NULL)
 	{
 		check(0, "prepare legacy URI fixture");
 		return;
@@ -292,6 +294,7 @@ test_legacy_local_uri_reopen(void)
 		ps_core_close();
 	}
 	check(chdir(previous_cwd) == 0, "restore test working directory");
+	ps_test_remove_tree(root);
 }
 
 static int
@@ -631,8 +634,8 @@ wait_local_evicted(uint64_t layer_id)
 int
 main(void)
 {
-	char		store[] = "/tmp/pstieringstoreXXXXXX";
-	char		objects[] = "/tmp/pstieringobjectsXXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pstieringstoreXXXXXX";
+	char		objects[PS_TEST_TEMP_PATH_MAX] = "pstieringobjectsXXXXXX";
 	unsigned char page[PSZ];
 	unsigned char out[PSZ];
 	PsKey		key = {1, 1, 1, 0, PS_KLASS_RELATION};
@@ -646,7 +649,7 @@ main(void)
 	int		durable_found = 0;
 	int		verification_entered = 0;
 
-	if (mkdtemp(store) == NULL || mkdtemp(objects) == NULL ||
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL || ps_test_mkdtemp(objects, sizeof(objects)) == NULL ||
 		setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0)
 	{
 		fprintf(stderr, "setup failed\n");
@@ -785,6 +788,8 @@ main(void)
 	pthread_cond_destroy(&verification_gate.cond);
 	pthread_mutex_destroy(&verification_gate.mutex);
 	unsetenv("PAGESTORE_OBJECT_DIR");
+	ps_test_remove_tree(store);
+	ps_test_remove_tree(objects);
 	test_core_provider_lifecycle();
 	test_legacy_local_uri_reopen();
 	printf("pagestore_tiering_test: %d checks, %d failed\n", run, failed);

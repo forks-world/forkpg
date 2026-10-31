@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_manifest.h"
 #include "pagestore_layer.h"
 
@@ -167,8 +168,8 @@ make_slru_layer(uint64_t id)
 int
 main(void)
 {
-	char		dir[] = "/tmp/psmanifesttestXXXXXX";
-	char		legacy_dir[] = "/tmp/psmanifestlegacyXXXXXX";
+	char		dir[PS_TEST_TEMP_PATH_MAX] = "psmanifesttestXXXXXX";
+	char		legacy_dir[PS_TEST_TEMP_PATH_MAX] = "psmanifestlegacyXXXXXX";
 	char		mpath[4096];
 	char		legacy_path[4096];
 	PsLayerDesc rel,
@@ -177,7 +178,7 @@ main(void)
 	PsFlushWatermark watermark;
 	PsLayerLocation remote;
 
-	if (!mkdtemp(dir))
+	if (!ps_test_mkdtemp(dir, sizeof(dir)))
 	{
 		fprintf(stderr, "setup failed\n");
 		return 2;
@@ -218,7 +219,7 @@ main(void)
 		  "reject regressing flush watermark");
 	ps_manifest_close();
 	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
-	if (!mkdtemp(legacy_dir))
+	if (!ps_test_mkdtemp(legacy_dir, sizeof(legacy_dir)))
 	{
 		fprintf(stderr, "legacy setup failed\n");
 		return 2;
@@ -328,9 +329,9 @@ main(void)
 
 	/* best-effort cleanup */
 	unlink(mpath);
-	rmdir(dir);
+	ps_test_remove_tree(dir);
 	unlink(legacy_path);
-	rmdir(legacy_dir);
+	ps_test_remove_tree(legacy_dir);
 
 	printf("pagestore_manifest_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
