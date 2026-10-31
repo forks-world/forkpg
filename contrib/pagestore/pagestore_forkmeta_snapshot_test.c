@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_forkmeta_snapshot.h"
 
 static int runs;
@@ -263,7 +264,7 @@ prepare_two(PsForkmetaSnapshotPrepared *prepared, const char *directory,
 int
 main(void)
 {
-	char root[] = "/tmp/psforkmetasnapXXXXXX";
+	char root[PS_TEST_TEMP_PATH_MAX] = "psforkmetasnapXXXXXX";
 	char directory[1024];
 	char path[1200];
 	unsigned char checkpoint[] = "checkpoint-v1";
@@ -282,7 +283,7 @@ main(void)
 	};
 	PsForkmetaSnapshotInput empty_input = {.data = NULL, .len = 0};
 
-	check(mkdtemp(root) != NULL, "create snapshot test root");
+	check(ps_test_mkdtemp(root, sizeof(root)) != NULL, "create snapshot test root");
 	check(make_dir(root, "main", directory, sizeof(directory)) == 0,
 		  "create main directory");
 	check(ps_forkmeta_snapshot_publish(directory, 1, 100, 7, &cp_input,
@@ -1433,7 +1434,8 @@ main(void)
 									   &stream_input) != 0,
 			  "publication rejects symlink final part");
 	}
-	check(remove_tree(root) == 0, "remove snapshot test tree");
+	ps_test_remove_tree(root);
+	check(access(root, F_OK) != 0 && errno == ENOENT, "remove snapshot test tree");
 
 	if (failures != 0)
 		fprintf(stderr, "%d/%d checks failed\n", failures, runs);
