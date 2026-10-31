@@ -15,6 +15,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_core.h"
 #include "pagestore_fault.h"
 #include "pagestore_forkmeta_snapshot.h"
@@ -150,44 +151,6 @@ check(int ok, const char *name)
 		fprintf(stderr, "FAIL: %s\n", name);
 		failures++;
 	}
-}
-
-static int
-remove_tree(const char *path)
-{
-	DIR *dir = opendir(path);
-	struct dirent *entry;
-	int ok = 1;
-
-	if (dir == NULL)
-	{
-		return unlink(path) == 0 || errno == ENOENT;
-	}
-	while ((entry = readdir(dir)) != NULL)
-	{
-		char child[1600];
-		struct stat st;
-
-		if (strcmp(entry->d_name, ".") == 0 ||
-			strcmp(entry->d_name, "..") == 0)
-			continue;
-		if (snprintf(child, sizeof(child), "%s/%s", path, entry->d_name) < 0 ||
-			lstat(child, &st) != 0)
-		{
-			ok = 0;
-			continue;
-		}
-		if (S_ISDIR(st.st_mode))
-			ok = remove_tree(child) && ok;
-		else
-			if (unlink(child) != 0 && errno != ENOENT)
-				ok = 0;
-	}
-	if (closedir(dir) != 0)
-		ok = 0;
-	if (rmdir(path) != 0 && errno != ENOENT)
-		ok = 0;
-	return ok;
 }
 
 static void
@@ -1379,7 +1342,7 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 static int
 run_case(CrashCase which)
 {
-	char store[] = "/tmp/psforkmetacrashXXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "psforkmetacrashXXXXXX";
 	char fault_dir[1600];
 	char snapshots[1600];
 	PsKey keys[MATRIX_KEYS];
@@ -1390,20 +1353,20 @@ run_case(CrashCase which)
 	int report_ok = 0;
 	int ok;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 0;
 	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
 		mkdir(fault_dir, 0700) != 0)
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	ledger = mmap(NULL, sizeof(*ledger), PROT_READ | PROT_WRITE,
 				  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 	if (ledger == MAP_FAILED)
 	{
-		remove_tree(fault_dir);
-		remove_tree(store);
+		ps_test_remove_tree(fault_dir);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	memset(ledger, 0, sizeof(*ledger));
@@ -1442,18 +1405,18 @@ run_case(CrashCase which)
 			dprintf(STDERR_FILENO, "parent reopen failed case=%d store=%s errno=%d\n",
 					(int) which, store, errno);
 			check(0, "parent reopens the crashed child store");
-			remove_tree(store);
+			ps_test_remove_tree(store);
 		}
 		use_layers = 1;
 	}
 	else
-		remove_tree(store);
+		ps_test_remove_tree(store);
 	if (ledger != MAP_FAILED)
 		(void) munmap(ledger, sizeof(*ledger));
 	if (access(fault_dir, F_OK) == 0)
-		remove_tree(fault_dir);
+		ps_test_remove_tree(fault_dir);
 	if (access(store, F_OK) == 0)
-		remove_tree(store);
+		ps_test_remove_tree(store);
 	return ok;
 }
 
