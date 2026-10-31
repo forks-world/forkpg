@@ -20,7 +20,6 @@
  */
 #include <errno.h>
 #include <fcntl.h>
-#include <glob.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -32,6 +31,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_ipc.h"
 #include "pagestore_shm.h"
 
@@ -65,13 +65,7 @@ check(int cond, const char *fmt, ...)
 static void
 rm_rf(const char *path)
 {
-	char		cmd[512];
-
-	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-	if (system(cmd) != 0)
-	{
-		/* ignore: cleanup is best-effort */
-	}
+	ps_test_remove_tree(path);
 }
 
 /*
@@ -546,11 +540,21 @@ wait_for_daemon_exit(pid_t pid, int expected_status)
 static void
 remove_lsm_metadata(const char *store)
 {
-	char		cmd[768];
+	DIR *dir = opendir(store);
+	struct dirent *entry;
+	int ok = dir != NULL;
 
-	snprintf(cmd, sizeof(cmd), "rm -f '%s'/layer_* '%s'/layers.manifest",
-			 store, store);
-	check(system(cmd) == 0, "removed derived LSM metadata for offline migration");
+	if (dir != NULL)
+	{
+		while ((entry = readdir(dir)) != NULL)
+			if (strncmp(entry->d_name, "layer_", 6) == 0 ||
+				strcmp(entry->d_name, "layers.manifest") == 0)
+				if (unlinkat(dirfd(dir), entry->d_name, 0) != 0 && errno != ENOENT)
+					ok = 0;
+		if (closedir(dir) != 0)
+			ok = 0;
+	}
+	check(ok, "removed derived LSM metadata for offline migration");
 }
 
 /* ===================== client side of the IPC protocol ================= */
@@ -2735,38 +2739,37 @@ segment_exists(const char *store, uint32_t shard, int seg)
 static int
 local_layer_count(const char *store)
 {
-	char		pattern[512];
-	glob_t		matches;
-	int			count;
+	DIR *dir = opendir(store);
+	struct dirent *entry;
+	int count = 0;
 
-	snprintf(pattern, sizeof(pattern), "%s/layer_*", store);
-	memset(&matches, 0, sizeof(matches));
-	if (glob(pattern, 0, NULL, &matches) == GLOB_NOMATCH)
+	if (dir == NULL)
 		return 0;
-	count = (int) matches.gl_pathc;
-	globfree(&matches);
+	while ((entry = readdir(dir)) != NULL)
+		if (strncmp(entry->d_name, "layer_", 6) == 0)
+			count++;
+	closedir(dir);
 	return count;
 }
 
 static uint64_t
 local_layer_bytes(const char *store)
 {
-	char		pattern[512];
-	glob_t		matches;
-	uint64_t	bytes = 0;
+	DIR *dir = opendir(store);
+	struct dirent *entry;
+	uint64_t bytes = 0;
 
-	snprintf(pattern, sizeof(pattern), "%s/layer_*", store);
-	memset(&matches, 0, sizeof(matches));
-	if (glob(pattern, 0, NULL, &matches) == GLOB_NOMATCH)
+	if (dir == NULL)
 		return 0;
-	for (size_t i = 0; i < matches.gl_pathc; i++)
+	while ((entry = readdir(dir)) != NULL)
 	{
 		struct stat st;
 
-		if (stat(matches.gl_pathv[i], &st) == 0)
+		if (strncmp(entry->d_name, "layer_", 6) == 0 &&
+			fstatat(dirfd(dir), entry->d_name, &st, 0) == 0)
 			bytes += (uint64_t) st.st_size;
 	}
-	globfree(&matches);
+	closedir(dir);
 	return bytes;
 }
 
@@ -6914,7 +6917,7 @@ int
 main(int argc, char **argv)
 {
 	const char *daemon_path;
-	char		tmpl[] = "/tmp/pstestXXXXXX";
+	char		tmpl[PS_TEST_TEMP_PATH_MAX] = "pstestXXXXXX";
 	char	   *tmpbase;
 	uint32_t	sizes[] = {4096, 8192, 16384};
 
@@ -6933,7 +6936,7 @@ main(int argc, char **argv)
 	if (test_nshards > PS_MAX_CHANNELS)
 		test_nshards = PS_MAX_CHANNELS;
 
-	tmpbase = mkdtemp(tmpl);
+	tmpbase = ps_test_mkdtemp(tmpl, sizeof(tmpl));
 	if (!tmpbase)
 	{
 		perror("mkdtemp");
@@ -7007,7 +7010,7 @@ main(int argc, char **argv)
 	/* stress the per-shard + map locking under sustained flush/compaction load */
 	run_stress_suite(daemon_path, tmpbase);
 
-	rmdir(tmpbase);
+	rm_rf(tmpbase);
 
 	fprintf(stderr, "\n%d checks, %d failed\n", tests_run, tests_failed);
 	return tests_failed ? 1 : 0;
