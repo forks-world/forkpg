@@ -33,6 +33,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_ipc.h"
 #include "pagestore_shm.h"
 
@@ -170,7 +171,7 @@ main(int argc, char **argv)
 {
 	const char *daemon = argc > 1 ? argv[1] : NULL;
 	uint64_t	total_mib = argc > 2 ? strtoull(argv[2], NULL, 10) : 256;
-	const char *base = argc > 3 ? argv[3] : "/tmp";
+	const char *base = argc > 3 ? argv[3] : getenv("TMPDIR");
 	const char *shm = "/psbench";
 	char		store[1024];
 	uint32_t	npages = (uint32_t) (total_mib * 1024 * 1024 / PAGE);
@@ -181,7 +182,13 @@ main(int argc, char **argv)
 				wsec,
 				rsec;
 
-	snprintf(store, sizeof(store), "%s/psbenchstoreXXXXXX", base);
+	if (base == NULL || (argc <= 3 && *base == '\0'))
+		base = "/tmp";
+	if (snprintf(store, sizeof(store), "%s/psbenchstoreXXXXXX", base) >= (int) sizeof(store))
+	{
+		fprintf(stderr, "bench: store path too long\n");
+		return 2;
+	}
 	if (!daemon || !mkdtemp(store))
 	{
 		fprintf(stderr, "usage: %s <daemon-path> [total-MiB] [store-base-dir]\n",
@@ -302,13 +309,7 @@ main(int argc, char **argv)
 	kill(pid, SIGTERM);
 	waitpid(pid, NULL, 0);
 
-	/* best-effort cleanup of the store dir we created */
-	{
-		char		cmd[1100];
-
-		snprintf(cmd, sizeof(cmd), "rm -rf '%s'", store);
-		if (system(cmd) != 0)
-			fprintf(stderr, "bench: cleanup of %s failed\n", store);
-	}
+	/* Remove only the private store created above. */
+	ps_test_remove_tree(store);
 	return 0;
 }
