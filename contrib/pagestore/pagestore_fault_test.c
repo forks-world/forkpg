@@ -1,4 +1,5 @@
 #include "pagestore_fault.h"
+#include "pagestore_test_temp.h"
 
 #include <fcntl.h>
 #include <limits.h>
@@ -127,28 +128,21 @@ daemon_probe(void *result)
 int
 main(void)
 {
-	char root[PATH_MAX];
+	char root[PS_TEST_TEMP_PATH_MAX] = "pagestore-fault-test-XXXXXX";
 	char control[PATH_MAX];
 	char store[PATH_MAX];
 	char report[PATH_MAX];
 	char outside[PATH_MAX];
 	PsFaultPoint point;
 	PsFaultStatus status;
-	int root_length;
 
-	root_length = snprintf(root, sizeof(root), "/tmp/pagestore-fault-test-%ld", (long) getpid());
-	check(root_length > 0 && (size_t) root_length < sizeof(root) &&
-		join_path(control, sizeof(control), root, "control") &&
+	ps_test_mkdtemp(root, sizeof(root));
+	check(join_path(control, sizeof(control), root, "control") &&
 		join_path(store, sizeof(store), root, "store") &&
 		join_path(report, sizeof(report), control, "report.jsonl") &&
 		join_path(outside, sizeof(outside), root, "outside"), "construct paths");
-	(void) unlink(report);
-	(void) unlink(outside);
-	(void) rmdir(control);
-	(void) rmdir(store);
-	(void) rmdir(root);
-	check(mkdir(root, 0700) == 0 && mkdir(control, 0700) == 0 &&
-		mkdir(store, 0700) == 0, "create store and control directories");
+	check(mkdir(control, 0700) == 0 && mkdir(store, 0700) == 0,
+		"create store and control directories");
 
 	clear_config();
 	check(ps_fault_init(store) == 0 &&
@@ -342,6 +336,6 @@ main(void)
 	(void) unlink(outside);
 	(void) rmdir(control);
 	(void) rmdir(store);
-	(void) rmdir(root);
+	ps_test_remove_tree(root);
 	return failures == 0 ? 0 : 1;
 }
