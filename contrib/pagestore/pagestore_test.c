@@ -20,7 +20,6 @@
  */
 #include <errno.h>
 #include <fcntl.h>
-#include <glob.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -2740,38 +2739,37 @@ segment_exists(const char *store, uint32_t shard, int seg)
 static int
 local_layer_count(const char *store)
 {
-	char		pattern[512];
-	glob_t		matches;
-	int			count;
+	DIR *dir = opendir(store);
+	struct dirent *entry;
+	int count = 0;
 
-	snprintf(pattern, sizeof(pattern), "%s/layer_*", store);
-	memset(&matches, 0, sizeof(matches));
-	if (glob(pattern, 0, NULL, &matches) == GLOB_NOMATCH)
+	if (dir == NULL)
 		return 0;
-	count = (int) matches.gl_pathc;
-	globfree(&matches);
+	while ((entry = readdir(dir)) != NULL)
+		if (strncmp(entry->d_name, "layer_", 6) == 0)
+			count++;
+	closedir(dir);
 	return count;
 }
 
 static uint64_t
 local_layer_bytes(const char *store)
 {
-	char		pattern[512];
-	glob_t		matches;
-	uint64_t	bytes = 0;
+	DIR *dir = opendir(store);
+	struct dirent *entry;
+	uint64_t bytes = 0;
 
-	snprintf(pattern, sizeof(pattern), "%s/layer_*", store);
-	memset(&matches, 0, sizeof(matches));
-	if (glob(pattern, 0, NULL, &matches) == GLOB_NOMATCH)
+	if (dir == NULL)
 		return 0;
-	for (size_t i = 0; i < matches.gl_pathc; i++)
+	while ((entry = readdir(dir)) != NULL)
 	{
 		struct stat st;
 
-		if (stat(matches.gl_pathv[i], &st) == 0)
+		if (strncmp(entry->d_name, "layer_", 6) == 0 &&
+			fstatat(dirfd(dir), entry->d_name, &st, 0) == 0)
 			bytes += (uint64_t) st.st_size;
 	}
-	globfree(&matches);
+	closedir(dir);
 	return bytes;
 }
 
