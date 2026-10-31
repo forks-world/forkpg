@@ -12,7 +12,7 @@
 /* Leave room for derived paths in the test binaries' existing buffers. */
 #define PS_TEST_TEMP_PATH_MAX 192
 
-static char *
+static inline char *
 ps_test_mkdtemp(char *path, size_t capacity)
 {
 	const char *root = getenv("TMPDIR");
@@ -50,7 +50,7 @@ ps_test_mkdtemp(char *path, size_t capacity)
 }
 
 /* Never follow a symlink, including one passed as the root of a subtree. */
-static void
+static inline void
 ps_test_remove_tree(const char *path)
 {
 	struct stat st;
