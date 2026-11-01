@@ -446,6 +446,8 @@ print_compaction(PsShmHeader *hdr)
 
 	printf("{\"daemon_instance\":%llu,\"prune_snapshot_conflicts\":%llu,\"prune_admission_changed\":%llu,"
 		   "\"prune_relation_page_admission_observed\":%llu,"
+		   "\"prune_relation_page_same_shard_observed\":%llu,"
+		   "\"prune_relation_page_other_shard_observed\":%llu,"
 		   "\"prune_retention_changed\":%llu,\"prune_timeline_changed\":%llu,"
 		   "\"prune_floor_changed\":%llu,\"prune_layer_count_changed\":%llu,"
 		   "\"prune_manifest_poisoned\":%llu,\"prune_state_unavailable\":%llu,"
@@ -459,6 +461,8 @@ print_compaction(PsShmHeader *hdr)
 		   (unsigned long long) ps_load_acquire_u64(&m->prune_snapshot_conflicts),
 		   (unsigned long long) ps_load_acquire_u64(&m->prune_admission_changed),
 		   (unsigned long long) ps_load_acquire_u64(&m->prune_relation_page_admission_observed),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_relation_page_same_shard_observed),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_relation_page_other_shard_observed),
 		   (unsigned long long) ps_load_acquire_u64(&m->prune_retention_changed),
 		   (unsigned long long) ps_load_acquire_u64(&m->prune_timeline_changed),
 		   (unsigned long long) ps_load_acquire_u64(&m->prune_floor_changed),

@@ -471,7 +471,6 @@ static PsShmHeader *metrics_header;
 /* Count relation-page admissions only while at least one pruning snapshot is
  * unlocked. This is diagnostic evidence, not a pruning or correctness fence. */
 static uint32_t prune_diagnostic_windows;
-static uint64_t prune_relation_page_admissions;
 
 typedef struct PsBackpressureController
 {
@@ -2182,6 +2181,7 @@ typedef struct Shard
 	int			coverage_broken;	/* a record was not staged; do not advance */
 	uint64_t	next_layer_id;		/* next layer-local id for this shard */
 	unsigned	staged_compaction_retries;
+	uint64_t	prune_relation_page_admissions; /* diagnostics, per shard */
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
 				rr_seg;
@@ -4144,9 +4144,9 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 	PsImgRec *dropped_recs = NULL;
 	int plan_rc = -1, staged = 0, published = 0, ambiguous = 0, publish_ambiguous = 0, result = -1;
 	uint32_t visited;
-	uint64_t relation_page_before = 0;
+	uint64_t relation_page_before[PS_MAX_CHANNELS] = {0};
 	int track_page_admissions = 0;
-	int relation_page_observed = 0;
+	int relation_page_same_shard = 0, relation_page_other_shard = 0;
 
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 	{
@@ -4204,7 +4204,9 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 				__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
 	if (metrics_header != NULL)
 	{
-		relation_page_before = __atomic_load_n(&prune_relation_page_admissions, __ATOMIC_ACQUIRE);
+		for (uint32_t s = 0; s < core_shards(); s++)
+			relation_page_before[s] = __atomic_load_n(
+				&g_shards[s].prune_relation_page_admissions, __ATOMIC_ACQUIRE);
 		__atomic_add_fetch(&prune_diagnostic_windows, 1, __ATOMIC_ACQ_REL);
 		track_page_admissions = 1;
 	}
@@ -4272,8 +4274,15 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 	ps_lock_map_wr();
 	if (track_page_admissions)
 	{
-		relation_page_observed = __atomic_load_n(&prune_relation_page_admissions,
-			__ATOMIC_ACQUIRE) != relation_page_before;
+		for (uint32_t s = 0; s < core_shards(); s++)
+			if (__atomic_load_n(&g_shards[s].prune_relation_page_admissions,
+								__ATOMIC_ACQUIRE) != relation_page_before[s])
+			{
+				if (s == shard)
+					relation_page_same_shard = 1;
+				else
+					relation_page_other_shard = 1;
+			}
 		__atomic_sub_fetch(&prune_diagnostic_windows, 1, __ATOMIC_ACQ_REL);
 	}
 	if (ps_retention_epoch(&current.retention_epoch) != 0 ||
@@ -4307,8 +4316,12 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 				ps_fetch_add_u64(&m->prune_snapshot_conflicts, 1);
 				if (admission_changed)
 					ps_fetch_add_u64(&m->prune_admission_changed, 1);
-				if (relation_page_observed)
+				if (relation_page_same_shard || relation_page_other_shard)
 					ps_fetch_add_u64(&m->prune_relation_page_admission_observed, 1);
+				if (relation_page_same_shard)
+					ps_fetch_add_u64(&m->prune_relation_page_same_shard_observed, 1);
+				if (relation_page_other_shard)
+					ps_fetch_add_u64(&m->prune_relation_page_other_shard_observed, 1);
 				if (retention_changed)
 					ps_fetch_add_u64(&m->prune_retention_changed, 1);
 				if (timeline_changed)
@@ -20722,10 +20735,10 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 		return -1;
 	}
 	admission_seq = admission_seq_alloc();
+	s = shard_for(key);
 	if (admission_seq != 0 && key->klass == PS_KLASS_RELATION &&
 		__atomic_load_n(&prune_diagnostic_windows, __ATOMIC_ACQUIRE) != 0)
-		__atomic_fetch_add(&prune_relation_page_admissions, 1, __ATOMIC_ACQ_REL);
-	s = shard_for(key);
+		__atomic_fetch_add(&s->prune_relation_page_admissions, 1, __ATOMIC_ACQ_REL);
 	fe = fork_find(timeline, key);
 	growth_floor = fe ? fe->last_def_lsn : 0;
 	if (admission_seq == 0)

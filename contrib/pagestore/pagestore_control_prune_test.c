@@ -1723,6 +1723,7 @@ typedef struct FloorPlanConflict
 	int changed;
 	int pin_only;
 	int remote_transition;
+	int other_shard;
 	uint64_t layer_id;
 } FloorPlanConflict;
 
@@ -1746,10 +1747,25 @@ floor_plan_foreground(void *arg)
 		ps_unlock_map();
 		return NULL;
 	}
-	probe->changed = probe->pin_only ?
-		reserve_pin(0, PS_RETENTION_OWNER_READER, 77, 1,
-					PS_RETENTION_RESOURCE_PAGE_HISTORY, 4500) :
-		write_relation(0, 3, 4000);
+	if (probe->other_shard)
+	{
+		PsKey original = {1, 1, 1, 0, PS_KLASS_RELATION};
+		PsKey key = original;
+		unsigned char page[8192] = {0};
+		uint32_t lo = 4000;
+
+		while (ps_shard_of(&key) == ps_shard_of(&original))
+			key.relNumber++;
+		memcpy(page + sizeof(uint32_t), &lo, sizeof(lo));
+		ps_lock_shard_wr(ps_shard_of(&key));
+		probe->changed = append_page(0, &key, 3, page, 4000, NULL) == 0;
+		ps_unlock_shard(ps_shard_of(&key));
+	}
+	else
+		probe->changed = probe->pin_only ?
+			reserve_pin(0, PS_RETENTION_OWNER_READER, 77, 1,
+						PS_RETENTION_RESOURCE_PAGE_HISTORY, 4500) :
+			write_relation(0, 3, 4000);
 	return NULL;
 }
 
@@ -1935,7 +1951,8 @@ static void
 test_bounded_prune_conflict(int mode)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-conflict-XXXXXX";
-	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2};
+	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2,
+		.other_shard = mode == 3};
 	uint64_t before;
 	uint32_t live = 0;
 	PsShmHeader *metrics = calloc(1, sizeof(*metrics));
@@ -1948,6 +1965,8 @@ test_bounded_prune_conflict(int mode)
 	}
 
 	configure_core(1);
+	if (mode == 3)
+		ps_nshards = 2;
 	segment_gc_enabled = 0;
 	compact_layers = 100;
 	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
@@ -1976,6 +1995,8 @@ test_bounded_prune_conflict(int mode)
 		check(metrics->compaction.prune_snapshot_conflicts == 1 &&
 			  metrics->compaction.prune_admission_changed == 1 &&
 			  metrics->compaction.prune_relation_page_admission_observed == 1 &&
+			  metrics->compaction.prune_relation_page_same_shard_observed == 1 &&
+			  metrics->compaction.prune_relation_page_other_shard_observed == 0 &&
 			  metrics->compaction.prune_layer_count_changed == 1,
 			  "pruning metrics report admission and added-layer conflict");
 	else if (mode == 1)
@@ -1983,9 +2004,17 @@ test_bounded_prune_conflict(int mode)
 			  metrics->compaction.prune_retention_changed == 1 &&
 			  metrics->compaction.prune_relation_page_admission_observed == 0,
 			  "pruning metrics report retention conflict");
-	else
+	else if (mode == 2)
 		check(metrics->compaction.prune_descriptor_rejected == 1,
 			  "pruning metrics report changed source descriptor");
+	else
+		check(metrics->compaction.prune_snapshot_conflicts == 1 &&
+			  metrics->compaction.prune_admission_changed == 1 &&
+			  metrics->compaction.prune_relation_page_admission_observed == 1 &&
+			  metrics->compaction.prune_relation_page_same_shard_observed == 0 &&
+			  metrics->compaction.prune_relation_page_other_shard_observed == 1 &&
+			  metrics->compaction.prune_layer_count_changed == 0,
+			  "pruning metrics distinguish an other-shard page admission");
 	if (probe.remote_transition)
 	{
 		ps_lock_map_wr();
@@ -3296,6 +3325,7 @@ main(void)
 	test_bounded_prune_conflict(0);
 	test_bounded_prune_conflict(1);
 	test_bounded_prune_conflict(2);
+	test_bounded_prune_conflict(3);
 	test_bounded_prune_interrupted_retirement();
 	test_bounded_prune_crash("page_prune.after_frontier");
 	test_bounded_prune_crash("page_compaction.after_publish");

@@ -420,7 +420,9 @@ not exclusive causes: for example, an admission sequence change does not by
 itself identify a page write, and one conflict can change several fields.
 `prune_relation_page_admission_observed` counts conflicts whose unlocked window
 included at least one successfully allocated relation-page admission anywhere in
-the process; the write may still fail, and it need not be on the same shard.
+the process; the write may still fail. `prune_relation_page_same_shard_observed`
+and `prune_relation_page_other_shard_observed` distinguish its shard, but not
+its timeline or whether it caused the conflict. Reasons are not exclusive.
 `locked_fallback_ns` and `locked_fallback_max_ns` measure the locked portion
 of completed fallback attempts (not time waiting to acquire the locks); source
 snapshotting before the fallback timer and earlier unlocked work are excluded.

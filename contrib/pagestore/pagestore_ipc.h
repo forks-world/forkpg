@@ -628,6 +628,8 @@ typedef struct PsCompactionMetrics
 	uint64_t prune_snapshot_conflicts;
 	uint64_t prune_admission_changed;
 	uint64_t prune_relation_page_admission_observed;
+	uint64_t prune_relation_page_same_shard_observed;
+	uint64_t prune_relation_page_other_shard_observed;
 	uint64_t prune_retention_changed;
 	uint64_t prune_timeline_changed;
 	uint64_t prune_floor_changed;
