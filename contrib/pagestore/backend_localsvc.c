@@ -1430,7 +1430,8 @@ pagestore_localsvc_admission_fence_active(uint64 token)
 }
 
 uint64
-pagestore_localsvc_admission_barrier_timeout(uint64 lsn, int timeout_ms)
+pagestore_localsvc_admission_barrier_timeout(uint64 lsn, int timeout_ms,
+											 bool *reclaimed)
 {
 	PageStoreRelKey key = {0};
 	PsChannel  *ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL,
@@ -1442,7 +1443,20 @@ pagestore_localsvc_admission_barrier_timeout(uint64 lsn, int timeout_ms)
 	ch->opcode = PS_OP_ADMISSION_BARRIER;
 	ch->req_lsn = lsn;
 	ch->is_redo = PS_BARRIER_REGISTER;
-	ls_exec_timeout(ch, timeout_ms);
+	*reclaimed = false;
+	if (ls_exec_wait(ch, timeout_ms) != PS_STATUS_OK)
+	{
+		if (ch->status == PS_STATUS_ERROR && ch->result == PS_BARRIER_RECLAIMED)
+		{
+			*reclaimed = true;
+			return 0;
+		}
+		ereport(ERROR,
+				(errmsg("pagestore localsvc: daemon reported error for op %u",
+						ch->opcode),
+				 errdetail("Timeline %u, LSN %X/%08X, result %u.",
+						   ch->timeline, LSN_FORMAT_ARGS(ch->req_lsn), ch->result)));
+	}
 	return ch->req_seq;
 }
 

@@ -1084,11 +1084,16 @@ run_request(uint32_t channel, PsChannel *ch)
 		 * while its inner admission-wr establishes the sequence.
 		 * BEGIN_DELETE is the sole lifecycle-wr exception.
 		 */
+		int reclaimed = 0;
+
 		ps_lifecycle_read_lock();
 		ch->status = PS_STATUS_OK;
 		ch->result = 0;
 		ch->req_seq = ch->is_redo == PS_BARRIER_REGISTER ?
-			ps_admission_barrier_register(ch->timeline, ch->req_lsn) : 0;
+			ps_admission_barrier_register_ex(ch->timeline, ch->req_lsn,
+										 &reclaimed) : 0;
+		if (reclaimed)
+			ch->result = PS_BARRIER_RECLAIMED;
 		if (ch->req_seq == 0)
 			ch->status = PS_STATUS_ERROR;
 		ps_store_release(&ch->state, PS_STATE_DONE);

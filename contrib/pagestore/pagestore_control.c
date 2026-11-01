@@ -338,8 +338,24 @@ ps_control_drain(void)
 
 			if (p->fence_token != 0 &&
 				pagestore_localsvc_admission_fence_active(p->fence_token))
+			{
+				bool reclaimed = false;
+
 				fence_seq = pagestore_localsvc_admission_barrier_timeout(
-								p->image.checkPointCopy.redo, PS_CONTROL_SHIP_TIMEOUT_MS);
+					p->image.checkPointCopy.redo, PS_CONTROL_SHIP_TIMEOUT_MS,
+					&reclaimed);
+				if (reclaimed)
+				{
+					/* This checkpoint cannot name a new reader. Release its gate
+					 * and keep shipping its ordinary writer control image. */
+					pagestore_localsvc_admission_fence_end(p->fence_token);
+					p->fence_token = 0;
+					ereport(WARNING,
+							(errmsg("pagestore: checkpoint reader fence skipped because WAL index history was reclaimed"),
+							 errdetail("Checkpoint redo is %X/%08X.",
+									   LSN_FORMAT_ARGS(p->image.checkPointCopy.redo))));
+				}
+			}
 
 			/*
 			 * Publish only when the hook established a gate at this

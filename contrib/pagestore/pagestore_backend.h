@@ -339,7 +339,7 @@ extern void pagestore_localsvc_store_sync_timeout(int timeout_ms);
 extern bool pagestore_localsvc_admission_fence_begin(uint64 redo_lsn,
 													  uint64 *token);
 extern bool pagestore_localsvc_admission_fence_active(uint64 token);
-extern uint64 pagestore_localsvc_admission_barrier_timeout(uint64 lsn, int timeout_ms);
+extern uint64 pagestore_localsvc_admission_barrier_timeout(uint64 lsn, int timeout_ms, bool *reclaimed);
 extern void pagestore_localsvc_admission_fence_end(uint64 token);
 extern BlockNumber pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
 																 const PageStoreRelKey *key,
