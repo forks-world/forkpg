@@ -2316,7 +2316,8 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 	PsKey key = {6, 6, 31, 1, PS_KLASS_RELATION};
 	PsKey floor_key = {6, 6, 33, 1, PS_KLASS_RELATION};
 	PsKey rec_key = {6, 6, 45, 1, PS_KLASS_RELATION};
-	PsKey rec_order_key = {6, 6, 46, 1, PS_KLASS_RELATION};
+	PsKey rec_order_key = {6, 6, 46, 0, PS_KLASS_RELATION};
+	PsKey rec_fsm_key = {6, 6, 48, 1, PS_KLASS_RELATION};
 	PsKey rec_equal_key = {6, 6, 47, 1, PS_KLASS_RELATION};
 	PsKey pin_key = {6, 6, 32, 0, PS_KLASS_RELATION};
 	PsRetentionPin pin;
@@ -2421,6 +2422,12 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 			  "E6 recovery flush is ordered after the durable forkmeta cutoff");
 		if (timeline == 0)
 		{
+			check(meta_request_timeline(timeline, PS_OP_CREATE, &rec_fsm_key, 300, 0, 0, 0, NULL) &&
+				  append_relation_timeline_tag(timeline, &rec_fsm_key, 2, 400, page, 0x4a, NULL) == 0 &&
+				  meta_request_timeline(timeline, PS_OP_TRUNCATE, &rec_fsm_key, 425, 0, 1, 0, NULL) &&
+				  append_relation_recovery_timeline_tag(timeline, &rec_fsm_key, 2, 400, page, 0x4b, NULL) == 0 &&
+				  read_resolve(timeline, &rec_fsm_key, 2, UINT64_MAX, 0, page, NULL) == 0,
+				  "same-LSN FSM hint flush does not resurrect a truncated block");
 			check(append_relation_timeline_tag(timeline, &rec_order_key, 2, 400, page, 0x7d, NULL) == 0 &&
 				  meta_request_timeline(timeline, PS_OP_TRUNCATE, &rec_order_key, 425, 0, 1, 0, NULL) &&
 				  append_relation_timeline_tag(timeline, &rec_order_key, 0, 500, page, 0x7f, NULL) == 0,
@@ -2432,6 +2439,13 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 				  read_resolve(timeline, &rec_order_key, 2, UINT64_MAX, 0, page, NULL) == 1 &&
 				  page[128] == 0x7e,
 				  "stale pre-truncate recovery flush cannot mask later WAL page");
+			check(append_relation_recovery_timeline_tag(timeline, &rec_order_key, 2, 410, page, 0x7c, NULL) == 0 &&
+				  read_resolve(timeline, &rec_order_key, 2, 410, 0, page, NULL) == 1 && page[128] == 0x7c &&
+				  read_resolve(timeline, &rec_order_key, 2, 425, 0, page, NULL) == 0 &&
+				  read_resolve(timeline, &rec_order_key, 2, UINT64_MAX, 0, page, NULL) == 1 && page[128] == 0x7e,
+				  "new historical recovery page stays before truncate and later WAL");
+			check(append_relation_recovery_timeline_tag(timeline, &rec_order_key, 3, 410, page, 0x7b, NULL) != 0,
+				  "historical recovery cannot create a block absent at its WAL position");
 			check(append_relation_timeline_tag(timeline, &rec_equal_key, 2, 400, page, 0x6d, NULL) == 0 &&
 				  meta_request_timeline(timeline, PS_OP_TRUNCATE, &rec_equal_key, 400, 0, 1, 0, NULL) &&
 				  append_relation_timeline_tag(timeline, &rec_equal_key, 0, 500, page, 0x6f, NULL) == 0 &&
@@ -2509,7 +2523,9 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 			  "E6 ordered bytes and size survive repeated reopen");
 		if (timeline == 0 && !walless)
 			check(read_resolve(timeline, &rec_order_key, 2, UINT64_MAX, 0, page, NULL) == 1 &&
-				  page[128] == 0x7e,
+				  page[128] == 0x7e &&
+				  read_resolve(timeline, &rec_order_key, 2, 410, 0, page, NULL) == 1 && page[128] == 0x7c &&
+				  read_resolve(timeline, &rec_order_key, 2, 425, 0, page, NULL) == 0,
 				  "later WAL page survives recovery and metadata cutover");
 		if (timeline)
 			check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 0 &&

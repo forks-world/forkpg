@@ -20731,6 +20731,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	int			zero_version = 0;
 	int			recovery_ordered = 0;
 	int			skip_grow_event = 0;
+	int			historical_recovery_page = 0;
 	int			addressable_now = 0;
 	uint64_t	ordering_floor = 0;
 	Shard	   *s;
@@ -20870,8 +20871,9 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * after the store has already learned that truncate from later replay.
 	 * During active WAL recovery, promoting those stale bytes past the
 	 * truncate resurrects them and can
-	 * mask a later WAL page.  Suppress only an exact, already stored copy;
-	 * when that cannot be established, refuse instead of guessing. */
+	 * mask a later WAL page. Suppress exact copies; a new version can retain
+	 * its original WAL position only when the block was already addressable
+	 * at that position and the forkmeta cutoff has not passed it. */
 	if (key->klass == PS_KLASS_RELATION && floor_mode == 1 && version != 0 &&
 		hdr.lsn != 0 && fe && fe->last_def_lsn >= hdr.lsn)
 	{
@@ -20904,7 +20906,9 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 					ps_unlock_map();
 				}
 			}
-			if (found && memcmp(page, bytes, page_size) == 0)
+			/* FSM contents are rebuildable hints and can change without a WAL
+			 * LSN change. Reuse the existing same-version hint after a truncate. */
+			if (found && (memcmp(page, bytes, page_size) == 0 || key->forkNum == 1))
 			{
 				free(bytes);
 				if (out_admission_seq)
@@ -20912,8 +20916,16 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 				return 0;
 			}
 			free(bytes);
-			*outcome = PS_APPEND_REFUSED_INVALID;
-			return -1;
+			if ((!old || old->lsn < hdr.lsn) &&
+				hdr.lsn > fork_meta_snapshot_cutoff_lsn &&
+				(branch_floor == 0 || hdr.lsn >= branch_floor) &&
+				fork_size_asof_hop(fe, hdr.lsn, 0) > block)
+				historical_recovery_page = 1;
+			else
+			{
+				*outcome = PS_APPEND_REFUSED_INVALID;
+				return -1;
+			}
 		}
 	}
 
@@ -20927,7 +20939,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * that horizon.  If the page's own pd_lsn is at/after the cutoff, it is
 	 * already an ordinary position and needs no promotion.
 	 */
-	if (key->klass == PS_KLASS_RELATION && floor_mode == 1)
+	if (key->klass == PS_KLASS_RELATION && floor_mode == 1 && !historical_recovery_page)
 	{
 		uint64_t	cutoff = fork_meta_snapshot_cutoff_lsn;
 
@@ -20978,7 +20990,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 *   fork-meta commit marker at recovery, even when it rewrites an existing
 	 *   block: a later same-LSN truncate/unlink must stay ordered after it.
 	 */
-	if (key->klass == PS_KLASS_RELATION)
+	if (key->klass == PS_KLASS_RELATION && !historical_recovery_page)
 	{
 		if (hdr.lsn != 0 && hdr.lsn < growth_floor)
 		{
@@ -21169,7 +21181,11 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * size remains growth and was clamped/ordered above.
 	 */
 	if (key->klass == PS_KLASS_RELATION && floor_mode == 1)
-		extends_uncapped = !addressable_now;
+	{
+		extends_uncapped = !historical_recovery_page && !addressable_now;
+		if (historical_recovery_page)
+			skip_grow_event = 1;
+	}
 	else
 	{
 		growth_check_lsn = hdr_grow_lsn;
