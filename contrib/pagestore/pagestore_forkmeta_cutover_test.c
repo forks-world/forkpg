@@ -6128,6 +6128,73 @@ test_floor_rewrite_not_backdated(void)
 	remove_tree(store);
 }
 
+static void
+test_wal_proven_historical_growth(void)
+{
+	char store[512] = "pswalhistoricalgrowXXXXXX";
+	PsKey key = {8, 8, 8, 0, PS_KLASS_RELATION};
+	PsChannel ch;
+	PsWalIndexEntry entry;
+	unsigned char page[8192];
+
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
+		  "open WAL-proven historical growth store");
+	check(meta_request(PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
+		  append_relation_tag(&key, 0, 100, page, 0x41, NULL) == 0 &&
+		  meta_request(PS_OP_TRUNCATE, &key, 425, 0, 0, 0, NULL),
+		  "prepare later truncate after one historical block");
+	check(append_relation_recovery_timeline_tag(0, &key, 1, 410, page, 0x42, NULL) != 0,
+		  "unproven historical growth is refused");
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_APPEND;
+	ch.datalen = 1024;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	check(ch.status == PS_STATUS_OK, "ship WAL covering historical page record");
+	memset(&ch, 0, sizeof(ch));
+	memset(&entry, 0, sizeof(entry));
+	entry.key = key;
+	entry.block = 1;
+	entry.lsn = 400;
+	entry.end_lsn = 410;
+	entry.flags = PS_WAL_INDEX_FLAG_KNOWN;
+	ch.opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+	ch.key = key;
+	ch.nblocks = 1;
+	ch.datalen = sizeof(entry);
+	memcpy(ch.data, &entry, sizeof(entry));
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	(void) ps_handle_meta(&ch);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	check(ch.status == PS_STATUS_OK &&
+		  append_relation_recovery_timeline_tag(0, &key, 1, 410, page, 0x42, NULL) != 0,
+		  "uncommitted WAL index is not proof");
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch.req_seq = 1024;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	check(ch.status == PS_STATUS_OK &&
+		  append_relation_recovery_timeline_tag(0, &key, 1, 410, page, 0x42, NULL) == 0 &&
+		  read_resolve(0, &key, 1, 410, 0, page, NULL) == 1 && page[128] == 0x42 &&
+		  read_resolve(0, &key, 1, UINT64_MAX, 0, page, NULL) == 0,
+		  "committed exact WAL proof admits growth without resurrecting the page");
+	close_runtime();
+	check(ps_core_open(store) == 0 &&
+		  read_resolve(0, &key, 1, 410, 0, page, NULL) == 1 && page[128] == 0x42 &&
+		  read_resolve(0, &key, 1, UINT64_MAX, 0, page, NULL) == 0,
+		  "WAL-proven growth and later truncate survive restart");
+	close_runtime();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -6712,6 +6779,7 @@ main(void)
 	test_floor_growth_visible_to_future_branch();
 	test_floor_rewrite_hidden_from_legacy_branch();
 	test_floor_rewrite_not_backdated();
+	test_wal_proven_historical_growth();
 	for (uint32_t timeline = 0; timeline <= 1; timeline++)
 		for (int walless = 0; walless <= 1; walless++)
 			test_ordered_write_after_cutoff(timeline, walless);

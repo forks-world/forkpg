@@ -20645,6 +20645,45 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 	return nout;
 }
 
+/* Caller holds the key's shard write lock. A committed index record ending at
+ * the page LSN proves this exact block was modified by WAL at that position;
+ * a copied page carrying another block's old LSN cannot supply that proof. */
+static bool
+walidx_proves_page_lsn(uint32_t timeline, const PsKey *key, uint32_t block,
+					   uint64_t page_lsn)
+{
+	WalIdxEnt *entry;
+	bool found = false;
+
+	ps_lock_map_rd();
+	walidx_publish_rdlock();
+	if (walidx_progress_read(timeline) >= page_lsn &&
+		walidx_frontier_ancestry_allows(timeline, page_lsn) &&
+		(entry = walidx_find(timeline, key, block)) != NULL)
+	{
+		int pos = walidx_upper_bound(entry, page_lsn);
+
+		while (pos > 0)
+		{
+			WalIdxItem *item = &entry->items[--pos];
+
+			if ((item->flags & PS_WAL_INDEX_FLAG_KNOWN) &&
+				item->end_lsn == page_lsn && item->lsn < page_lsn)
+			{
+				found = true;
+				break;
+			}
+			/* Records do not overlap; an earlier completed record cannot end
+			 * at this position once a later record ended before it. */
+			if (item->end_lsn != 0 && item->end_lsn < page_lsn)
+				break;
+		}
+	}
+	walidx_publish_rdunlock();
+	ps_unlock_map();
+	return found;
+}
+
 /* ===================== write / read primitives ========================= */
 
 /* The page's own pd_lsn lives in its first 8 bytes (xlogid, xrecoff). */
@@ -20732,6 +20771,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	int			recovery_ordered = 0;
 	int			skip_grow_event = 0;
 	int			historical_recovery_page = 0;
+	int			historical_recovery_growth = 0;
 	int			addressable_now = 0;
 	uint64_t	ordering_floor = 0;
 	Shard	   *s;
@@ -20921,6 +20961,15 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 				(branch_floor == 0 || hdr.lsn >= branch_floor) &&
 				fork_size_asof_hop(fe, hdr.lsn, 0) > block)
 				historical_recovery_page = 1;
+			else if ((!old || old->lsn < hdr.lsn) &&
+					 hdr.lsn > fork_meta_snapshot_cutoff_lsn &&
+					 (branch_floor == 0 || hdr.lsn >= branch_floor) &&
+					 fork_size_asof_hop(fe, hdr.lsn, 0) == block &&
+					 walidx_proves_page_lsn(timeline, key, block, hdr.lsn))
+			{
+				historical_recovery_page = 1;
+				historical_recovery_growth = 1;
+			}
 			else
 			{
 				fprintf(stderr, "pagestore: refused historical recovery write timeline=%u rel=%u fork=%u block=%u page_lsn=%llu replay_lsn=%llu cutoff=%llu old_lsn=%llu old_readable=%d historical_size=%u\n",
@@ -21188,8 +21237,9 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	 */
 	if (key->klass == PS_KLASS_RELATION && floor_mode == 1)
 	{
-		extends_uncapped = !historical_recovery_page && !addressable_now;
-		if (historical_recovery_page)
+		extends_uncapped = historical_recovery_growth ||
+			(!historical_recovery_page && !addressable_now);
+		if (historical_recovery_page && !historical_recovery_growth)
 			skip_grow_event = 1;
 	}
 	else
