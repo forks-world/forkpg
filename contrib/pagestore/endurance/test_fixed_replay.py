@@ -3,9 +3,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from pagestore_endurance import Failure
-from pagestore_fixed_replay import assert_separate, tree_hash, validate_fixture
+from pagestore_fixed_replay import assert_separate, installed_module, tree_hash, validate_fixture, workload
 
 
 class FixtureIntegrityTest(unittest.TestCase):
@@ -62,6 +64,36 @@ class FixtureIntegrityTest(unittest.TestCase):
         with self.assertRaises(Failure):
             assert_separate(self.root, self.root.parent)
         assert_separate(self.root, self.root.parent / "other")
+
+    def test_module_uses_pg_config_package_directory(self):
+        lib = self.root / "lib" / "postgresql"
+        lib.mkdir(parents=True)
+        module = lib / "pagestore.so"
+        module.write_bytes(b"module")
+        run = SimpleNamespace(bin=self.root, env={})
+        with patch("pagestore_fixed_replay.subprocess.run", return_value=SimpleNamespace(stdout=str(lib) + "\n")):
+            self.assertEqual(installed_module(run), module)
+
+    def test_workload_terminates_and_reaps_on_health_failure(self):
+        class Process:
+            returncode = None
+            def poll(self):
+                return self.returncode
+            def terminate(self):
+                self.returncode = -15
+            def wait(self, timeout=None):
+                self.waited = True
+        process = Process()
+        def failed():
+            raise Failure("disk_free", "budget exceeded")
+        run = SimpleNamespace(bin=self.root, writer=SimpleNamespace(port=1),
+                              args=SimpleNamespace(clients=1), naccts=1, ndocs=1,
+                              root=self.root, env={}, check_health=failed)
+        with patch("pagestore_fixed_replay.subprocess.Popen", return_value=process):
+            with self.assertRaises(Failure):
+                workload(run, 1)
+        self.assertEqual(process.returncode, -15)
+        self.assertTrue(process.waited)
 
 
 if __name__ == "__main__":

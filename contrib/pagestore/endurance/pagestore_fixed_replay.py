@@ -93,11 +93,38 @@ def workload(run, per_client):
             "-D", f"ndocs={run.ndocs}"]
     for name, (weight, _) in WORKLOAD.items():
         argv += ["-f", f"{run.root / 'workload' / (name + '.sql')}@{weight}"]
-    result = subprocess.run(argv + ["postgres"], env=run.env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, timeout=1800)
-    (run.root / "pgbench.log").write_text(result.stdout)
-    if result.returncode != 0:
-        raise Failure("workload_failed", f"pgbench rc={result.returncode}: {result.stdout[-2000:]}")
+    with (run.root / "pgbench.log").open("w") as log:
+        process = subprocess.Popen(argv + ["postgres"], env=run.env, stdout=log,
+                                   stderr=subprocess.STDOUT, text=True)
+        deadline = time.monotonic() + 1800
+        try:
+            while process.poll() is None:
+                run.check_health()
+                if time.monotonic() >= deadline:
+                    raise Failure("workload_timeout", "pgbench exceeded 1800 seconds")
+                time.sleep(0.2)
+            run.check_health()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+    if process.returncode != 0:
+        output = (run.root / "pgbench.log").read_text(errors="replace")
+        raise Failure("workload_failed", f"pgbench rc={process.returncode}: {output[-2000:]}")
+
+
+def installed_module(run):
+    result = subprocess.run([str(run.bin / "pg_config"), "--pkglibdir"], env=run.env,
+                            check=True, capture_output=True, text=True, timeout=30)
+    directory = Path(result.stdout.strip())
+    module = directory / "pagestore.so"
+    if not directory.is_absolute() or not module.is_file():
+        raise Failure("build_incomplete", f"pagestore module is absent from {directory}")
+    return module
 
 
 def start_sampling(run):
@@ -205,10 +232,7 @@ def replay(run, args):
     run.stop_sampling()
     run.check_health()
     run.stop_daemon()
-    module = next((p for p in (run.bin.parent / "lib64/pagestore.so",
-                               run.bin.parent / "lib/pagestore.so") if p.is_file()), None)
-    if module is None:
-        raise Failure("build_incomplete", "pagestore module is absent from the PostgreSQL installation")
+    module = installed_module(run)
     return {"target_lsn": target, "replay_seconds": round(elapsed, 3), "checksums": got,
             "daemon_args": args.daemon_arg, "sample_interval": args.sample_interval,
             "fixture_manifest_sha256": file_hash(meta_path),
