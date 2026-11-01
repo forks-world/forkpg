@@ -72,6 +72,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_core.h"
 #include "fuzz_common.h"
 #include "fuzz_crc_fixup.h"
@@ -120,6 +121,14 @@ static unsigned g_mask_count = 2;
 	"fuzz/corpus/page_segment/posix-mvp-baseline_seg_00000000"
 
 static char work_dir[4096];
+static char sweep_scratch[PS_TEST_TEMP_PATH_MAX] = "psfuzz-gatesweep-XXXXXX";
+
+static void
+cleanup_sweep_scratch(void)
+{
+	ps_test_remove_tree(sweep_scratch);
+}
+
 static char pagestore_dir[4096];
 
 static void
@@ -330,8 +339,15 @@ run_one(const char *name, const char *relpath, const uint8_t *seed,
 	 * nothing and reported every mutation as "opened".
 	 */
 	{
-		char		capture_path[] = "/tmp/psfuzz-gatesweep-capture-XXXXXX";
-		int			capture_fd = mkstemp(capture_path);
+		char		capture_path[512];
+		int			capture_fd;
+
+		if (snprintf(capture_path, sizeof(capture_path), "%s/capture-XXXXXX", sweep_scratch) >= (int) sizeof(capture_path) ||
+			(capture_fd = mkstemp(capture_path)) < 0)
+		{
+			perror("create gate-sweep capture");
+			exit(1);
+		}
 
 		fflush(stderr);
 		saved_stderr = dup(fileno(stderr));
@@ -604,7 +620,6 @@ horizon_framing_regression(void)
 int
 main(int argc, char **argv)
 {
-	char		scratch_template[] = "/tmp/psfuzz-gatesweep-XXXXXX";
 	char	   *scratch;
 	int			i;
 	int			mode_check;
@@ -657,13 +672,18 @@ main(int argc, char **argv)
 	if (g_mask_count > 2)
 		g_mask_count = 2;
 
-	scratch = mkdtemp(scratch_template);
-	if (scratch == NULL)
+	scratch = ps_test_mkdtemp(sweep_scratch, sizeof(sweep_scratch));
+	if (atexit(cleanup_sweep_scratch) != 0)
 	{
-		perror("mkdtemp");
+		ps_test_remove_tree(scratch);
+		fprintf(stderr, "cannot register gate-sweep cleanup\n");
 		return 1;
 	}
-	setenv("TMPDIR", scratch, 1);
+	if (setenv("TMPDIR", scratch, 1) != 0)
+	{
+		perror("set TMPDIR");
+		return 1;
+	}
 	/* Every run_one() call below goes through ps_fuzz_crc_fixup() directly
 	 * (not ps_fuzz_run_one()/should_fixup_this_iteration()), so no
 	 * PS_FUZZ_CRC_FIXUP mode selection applies here -- this tool always
