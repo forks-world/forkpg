@@ -296,6 +296,8 @@ extern uint64_t ps_test_page_gc_coverage_observation_count(void);
  * Production frontends never install these hooks. */
 typedef void (*PsForkmetaCutoverTestHook)(void *arg);
 extern void ps_test_set_compaction_unlocked_hook(void (*hook)(void *), void *arg);
+/* Invoked with shard/map locks held: the callback must not acquire them. */
+extern void ps_test_set_compaction_fallback_hook(void (*hook)(void *), void *arg);
 extern int ps_test_resize_empty_memtable(uint32_t shard, uint32_t threshold);
 extern int ps_test_prune_abandon_local_only(void);
 extern void ps_test_set_prune_abandon_hook(void (*hook)(void *), void *arg);

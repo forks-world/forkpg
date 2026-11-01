@@ -32,7 +32,7 @@ static void
 usage(const char *prog)
 {
 	fprintf(stderr, "usage: %s --shm NAME health|timeline ID|manifest|gc|"
-			"owners|backpressure|pruning|relation TIMELINE INCARNATION "
+			"owners|backpressure|pruning|compaction|relation TIMELINE INCARNATION "
 			"SPC DB REL LSN\n",
 			prog);
 }
@@ -437,6 +437,51 @@ print_pruning(PsShmHeader *hdr)
 		   (unsigned long long) deleted);
 }
 
+/* Independently sampled monotonic counters; a conflict can increment several
+ * reasons and a read during publication may see intermediate values. */
+static void
+print_compaction(PsShmHeader *hdr)
+{
+	PsCompactionMetrics *m = &hdr->compaction;
+
+	printf("{\"daemon_instance\":%llu,\"prune_snapshot_conflicts\":%llu,\"prune_admission_changed\":%llu,"
+		   "\"prune_relation_page_admission_observed\":%llu,"
+		   "\"prune_relation_page_same_shard_observed\":%llu,"
+		   "\"prune_relation_page_other_shard_observed\":%llu,"
+		   "\"prune_retention_changed\":%llu,\"prune_timeline_changed\":%llu,"
+		   "\"prune_floor_changed\":%llu,\"prune_layer_count_changed\":%llu,"
+		   "\"prune_manifest_poisoned\":%llu,\"prune_state_unavailable\":%llu,"
+		   "\"prune_descriptor_rejected\":%llu,\"bounded_merge_conflicts\":%llu,"
+		   "\"legacy_gather_conflicts\":%llu,\"legacy_output_conflicts\":%llu,"
+		   "\"locked_fallback_attempts\":%llu,"
+		   "\"locked_fallback_ns\":%llu,\"locked_fallback_max_ns\":%llu,"
+		   "\"locked_fallback_clock_errors\":%llu,\"locked_fallback_active_since_ns\":%llu,"
+		   "\"locked_fallback_active_timeline\":%llu,\"locked_fallback_active_shard\":%llu}\n",
+		   (unsigned long long) ps_load_acquire_u64(&hdr->daemon_instance),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_snapshot_conflicts),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_admission_changed),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_relation_page_admission_observed),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_relation_page_same_shard_observed),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_relation_page_other_shard_observed),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_retention_changed),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_timeline_changed),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_floor_changed),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_layer_count_changed),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_manifest_poisoned),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_state_unavailable),
+		   (unsigned long long) ps_load_acquire_u64(&m->prune_descriptor_rejected),
+		   (unsigned long long) ps_load_acquire_u64(&m->bounded_merge_conflicts),
+		   (unsigned long long) ps_load_acquire_u64(&m->legacy_gather_conflicts),
+		   (unsigned long long) ps_load_acquire_u64(&m->legacy_output_conflicts),
+		   (unsigned long long) ps_load_acquire_u64(&m->locked_fallback_attempts),
+		   (unsigned long long) ps_load_acquire_u64(&m->locked_fallback_ns),
+		   (unsigned long long) ps_load_acquire_u64(&m->locked_fallback_max_ns),
+		   (unsigned long long) ps_load_acquire_u64(&m->locked_fallback_clock_errors),
+		   (unsigned long long) ps_load_acquire_u64(&m->locked_fallback_active_since_ns),
+		   (unsigned long long) ps_load_acquire_u64(&m->locked_fallback_active_timeline),
+		   (unsigned long long) ps_load_acquire_u64(&m->locked_fallback_active_shard));
+}
+
 static void
 read_inspection_metrics(PsShmHeader *hdr, PsInspectionMetrics *metrics)
 {
@@ -790,6 +835,7 @@ main(int argc, char **argv)
 		 strcmp(operation, "owners") != 0 &&
 		 strcmp(operation, "backpressure") != 0 &&
 		 strcmp(operation, "pruning") != 0 &&
+		 strcmp(operation, "compaction") != 0 &&
 		 strcmp(operation, "relation") != 0))
 	{
 		usage(argv[0]);
@@ -905,6 +951,8 @@ main(int argc, char **argv)
 		print_owners(hdr);
 	else if (strcmp(operation, "backpressure") == 0)
 		print_backpressure(shm, hdr);
+	else if (strcmp(operation, "compaction") == 0)
+		print_compaction(hdr);
 	else
 		print_pruning(hdr);
 	munmap(shm, PS_SHM_SIZE);

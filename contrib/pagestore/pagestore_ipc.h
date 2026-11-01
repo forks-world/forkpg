@@ -30,7 +30,8 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		52	/* 52: recovery writes carry the active replay
+#define PS_SHM_VERSION		53	/* 53: compaction conflict and fallback metrics.
+								 * 52: recovery writes carry the active replay
 								 * position in req_lsn, enabling safe stale-page
 								 * suppression; mixed versions must not attach.
 								 * 51: finite index views can depend on retained
@@ -620,6 +621,34 @@ typedef struct PsInspectionMetrics
 	PsInspectionTimeline timeline_entries[PS_INSPECTION_MAX_TIMELINES];
 } PsInspectionMetrics;
 
+/* Independent, process-lifetime diagnostic counters. A conflict may change
+ * more than one field; readers must not add the reasons as exclusive events. */
+typedef struct PsCompactionMetrics
+{
+	uint64_t prune_snapshot_conflicts;
+	uint64_t prune_admission_changed;
+	uint64_t prune_relation_page_admission_observed;
+	uint64_t prune_relation_page_same_shard_observed;
+	uint64_t prune_relation_page_other_shard_observed;
+	uint64_t prune_retention_changed;
+	uint64_t prune_timeline_changed;
+	uint64_t prune_floor_changed;
+	uint64_t prune_layer_count_changed;
+	uint64_t prune_manifest_poisoned;
+	uint64_t prune_state_unavailable;
+	uint64_t prune_descriptor_rejected;
+	uint64_t bounded_merge_conflicts;
+	uint64_t legacy_gather_conflicts;
+	uint64_t legacy_output_conflicts;
+	uint64_t locked_fallback_attempts;
+	uint64_t locked_fallback_ns;
+	uint64_t locked_fallback_max_ns;
+	uint64_t locked_fallback_clock_errors;
+	uint64_t locked_fallback_active_since_ns;
+	uint64_t locked_fallback_active_timeline;
+	uint64_t locked_fallback_active_shard;
+} PsCompactionMetrics;
+
 typedef struct PsShmHeader
 {
 	uint32_t	magic;
@@ -653,6 +682,7 @@ typedef struct PsShmHeader
 	uint64_t	inspection_metrics_seq;
 	PsInspectionMetrics inspection;
 	PsInspectionRequest inspection_request;
+	PsCompactionMetrics compaction;
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)

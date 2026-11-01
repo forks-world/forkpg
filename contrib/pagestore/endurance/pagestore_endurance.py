@@ -1368,13 +1368,15 @@ recovery_target_action = 'promote'
                 out.write(json.dumps(rec) + "\n")
                 return
             if self.daemon_expected_up:
-                for operation in ("backpressure", "gc", "pruning", "owners"):
+                for operation in ("backpressure", "gc", "pruning", "owners", "compaction"):
                     try:
                         probe = subprocess.run(
                             [str(self.inspect_bin), "--shm", self.shm, operation],
                             capture_output=True, text=True, timeout=10)
                         if probe.returncode == 0:
                             rec[operation] = json.loads(probe.stdout)
+                            if operation == "compaction":
+                                rec["compaction_sample_monotonic_ns"] = time.monotonic_ns()
                     except (OSError, subprocess.TimeoutExpired, ValueError):
                         # A coordinated restart may invalidate READY during a sample.
                         pass
@@ -1401,7 +1403,8 @@ recovery_target_action = 'promote'
         for pg in self.computes():
             pg.halt()
         timelines = [("timeline", str(tl)) for tl in [0] + [b[0] for b in self.branches]]
-        for what in [("health",), ("backpressure",), ("gc",), ("owners",), ("manifest",)] + timelines:
+        for what in [("health",), ("backpressure",), ("gc",), ("owners",),
+                     ("manifest",), ("compaction",)] + timelines:
             try:
                 (d / f"{stamp}-inspect-{'-'.join(what)}.txt").write_text(self.inspect(*what))
             except (OSError, subprocess.TimeoutExpired):

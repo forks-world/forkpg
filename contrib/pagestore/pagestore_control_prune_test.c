@@ -1723,6 +1723,7 @@ typedef struct FloorPlanConflict
 	int changed;
 	int pin_only;
 	int remote_transition;
+	int other_shard;
 	uint64_t layer_id;
 } FloorPlanConflict;
 
@@ -1746,10 +1747,25 @@ floor_plan_foreground(void *arg)
 		ps_unlock_map();
 		return NULL;
 	}
-	probe->changed = probe->pin_only ?
-		reserve_pin(0, PS_RETENTION_OWNER_READER, 77, 1,
-					PS_RETENTION_RESOURCE_PAGE_HISTORY, 4500) :
-		write_relation(0, 3, 4000);
+	if (probe->other_shard)
+	{
+		PsKey original = {1, 1, 1, 0, PS_KLASS_RELATION};
+		PsKey key = original;
+		unsigned char page[8192] = {0};
+		uint32_t lo = 4000;
+
+		while (ps_shard_of(&key) == ps_shard_of(&original))
+			key.relNumber++;
+		memcpy(page + sizeof(uint32_t), &lo, sizeof(lo));
+		ps_lock_shard_wr(ps_shard_of(&key));
+		probe->changed = append_page(0, &key, 3, page, 4000, NULL) == 0;
+		ps_unlock_shard(ps_shard_of(&key));
+	}
+	else
+		probe->changed = probe->pin_only ?
+			reserve_pin(0, PS_RETENTION_OWNER_READER, 77, 1,
+						PS_RETENTION_RESOURCE_PAGE_HISTORY, 4500) :
+			write_relation(0, 3, 4000);
 	return NULL;
 }
 
@@ -1913,15 +1929,44 @@ test_bounded_prune_interrupted_retirement(void)
 	remove_tree(store);
 }
 
+typedef struct FallbackMetricProbe
+{
+	PsShmHeader *metrics;
+	int observed;
+} FallbackMetricProbe;
+
+static void
+observe_active_fallback(void *arg)
+{
+	FallbackMetricProbe *probe = arg;
+
+	probe->observed = ps_load_acquire_u64(
+		&probe->metrics->compaction.locked_fallback_active_since_ns) != 0 &&
+		ps_load_acquire_u64(&probe->metrics->compaction.locked_fallback_active_timeline) == 0 &&
+		ps_load_acquire_u64(&probe->metrics->compaction.locked_fallback_active_shard) == 0;
+	ps_test_set_compaction_fallback_hook(NULL, NULL);
+}
+
 static void
 test_bounded_prune_conflict(int mode)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-conflict-XXXXXX";
-	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2};
+	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2,
+		.other_shard = mode == 3};
 	uint64_t before;
 	uint32_t live = 0;
+	PsShmHeader *metrics = calloc(1, sizeof(*metrics));
+	FallbackMetricProbe fallback_probe = {.metrics = metrics};
+
+	if (metrics == NULL)
+	{
+		check(0, "allocate compaction metrics");
+		return;
+	}
 
 	configure_core(1);
+	if (mode == 3)
+		ps_nshards = 2;
 	segment_gc_enabled = 0;
 	compact_layers = 100;
 	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
@@ -1929,6 +1974,7 @@ test_bounded_prune_conflict(int mode)
 					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) &&
 		  write_relation(0, 0, 1000) && write_relation(0, 0, 2000) &&
 		  write_relation(0, 2, 3000), "prepare bounded-pruning conflict");
+	ps_core_set_metrics_header(metrics);
 	before = ps_test_bounded_prune_published_count();
 	ps_test_set_compaction_unlocked_hook(floor_plan_conflict_hook, &probe);
 	compact_layers = 1;
@@ -1945,6 +1991,30 @@ test_bounded_prune_conflict(int mode)
 		  ps_test_bounded_prune_published_count() == before &&
 		  live >= (uint32_t) (mode ? 3 : 4),
 		  "concurrent mutation rejects a staged pruning replacement");
+	if (mode == 0)
+		check(metrics->compaction.prune_snapshot_conflicts == 1 &&
+			  metrics->compaction.prune_admission_changed == 1 &&
+			  metrics->compaction.prune_relation_page_admission_observed == 1 &&
+			  metrics->compaction.prune_relation_page_same_shard_observed == 1 &&
+			  metrics->compaction.prune_relation_page_other_shard_observed == 0 &&
+			  metrics->compaction.prune_layer_count_changed == 1,
+			  "pruning metrics report admission and added-layer conflict");
+	else if (mode == 1)
+		check(metrics->compaction.prune_snapshot_conflicts == 1 &&
+			  metrics->compaction.prune_retention_changed == 1 &&
+			  metrics->compaction.prune_relation_page_admission_observed == 0,
+			  "pruning metrics report retention conflict");
+	else if (mode == 2)
+		check(metrics->compaction.prune_descriptor_rejected == 1,
+			  "pruning metrics report changed source descriptor");
+	else
+		check(metrics->compaction.prune_snapshot_conflicts == 1 &&
+			  metrics->compaction.prune_admission_changed == 1 &&
+			  metrics->compaction.prune_relation_page_admission_observed == 1 &&
+			  metrics->compaction.prune_relation_page_same_shard_observed == 0 &&
+			  metrics->compaction.prune_relation_page_other_shard_observed == 1 &&
+			  metrics->compaction.prune_layer_count_changed == 0,
+			  "pruning metrics distinguish an other-shard page admission");
 	if (probe.remote_transition)
 	{
 		ps_lock_map_wr();
@@ -1953,11 +2023,24 @@ test_bounded_prune_conflict(int mode)
 				ps_layer_map.layers[i].remote_durable = false;
 		ps_unlock_map();
 	}
+	if (mode == 0)
+		ps_test_set_compaction_fallback_hook(observe_active_fallback, &fallback_probe);
 	run_maintenance(64);
+	ps_test_set_compaction_fallback_hook(NULL, NULL);
+	if (mode == 0)
+		check(fallback_probe.observed &&
+			  metrics->compaction.locked_fallback_active_since_ns == 0 &&
+			  metrics->compaction.locked_fallback_attempts > 0 &&
+			  metrics->compaction.locked_fallback_ns >= metrics->compaction.locked_fallback_max_ns &&
+			  metrics->compaction.locked_fallback_max_ns > 0 &&
+			  metrics->compaction.locked_fallback_clock_errors == 0,
+			  "locked fallback attempts and duration are measured");
 	check(read_relation_asof(0, 5000, 2000) &&
 		  read_relation_asof(2, 5000, 3000) &&
 		  (mode != 0 || read_relation_asof(3, 5000, 4000)),
 		  "bounded-pruning retry preserves required foreground data");
+	ps_core_set_metrics_header(NULL);
+	free(metrics);
 	close_store();
 	remove_tree(store);
 }
@@ -3242,6 +3325,7 @@ main(void)
 	test_bounded_prune_conflict(0);
 	test_bounded_prune_conflict(1);
 	test_bounded_prune_conflict(2);
+	test_bounded_prune_conflict(3);
 	test_bounded_prune_interrupted_retirement();
 	test_bounded_prune_crash("page_prune.after_frontier");
 	test_bounded_prune_crash("page_compaction.after_publish");
