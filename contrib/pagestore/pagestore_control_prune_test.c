@@ -2056,7 +2056,7 @@ test_bounded_prune_conflict(int mode)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-conflict-XXXXXX";
 	FloorPlanConflict probe = {.pin_only = mode == 1, .remote_transition = mode == 2,
-		.other_shard = mode == 3};
+		.other_shard = mode >= 3};
 	uint64_t before;
 	uint32_t live = 0;
 	PsShmHeader *metrics = calloc(1, sizeof(*metrics));
@@ -2069,7 +2069,7 @@ test_bounded_prune_conflict(int mode)
 	}
 
 	configure_core(1);
-	if (mode == 3)
+	if (mode >= 3)
 		ps_nshards = 2;
 	segment_gc_enabled = 0;
 	compact_layers = 100;
@@ -2127,11 +2127,21 @@ test_bounded_prune_conflict(int mode)
 				ps_layer_map.layers[i].remote_durable = false;
 		ps_unlock_map();
 	}
-	if (mode == 0)
+	if (mode == 4)
+	{
+		ps_test_set_compaction_unlocked_hook(floor_plan_conflict_hook, &probe);
+		for (int i = 0; i < 64 && probe.called < 2; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_compaction_unlocked_hook(NULL, NULL);
+		check(probe.called == 2 && probe.changed &&
+			  metrics->compaction.prune_admission_changed == 2,
+			  "repeated admission conflicts exhaust the unlocked retry");
+	}
+	if (mode == 0 || mode == 4)
 		ps_test_set_compaction_fallback_hook(observe_active_fallback, &fallback_probe);
 	run_maintenance(64);
 	ps_test_set_compaction_fallback_hook(NULL, NULL);
-	if (mode == 0)
+	if (mode == 0 || mode == 4)
 		check(fallback_probe.observed &&
 			  metrics->compaction.locked_fallback_active_since_ns == 0 &&
 			  metrics->compaction.locked_fallback_attempts > 0 &&
@@ -2139,6 +2149,10 @@ test_bounded_prune_conflict(int mode)
 			  metrics->compaction.locked_fallback_max_ns > 0 &&
 			  metrics->compaction.locked_fallback_clock_errors == 0,
 			  "locked fallback attempts and duration are measured");
+	if (mode == 3)
+		check(ps_test_bounded_prune_published_count() > before &&
+			  metrics->compaction.locked_fallback_attempts == 0,
+			  "a transient admission conflict retries pruning without locked fallback");
 	check(read_relation_asof(0, 5000, 2000) &&
 		  read_relation_asof(2, 5000, 3000) &&
 		  (mode != 0 || read_relation_asof(3, 5000, 4000)),
@@ -3430,6 +3444,7 @@ main(void)
 	test_bounded_prune_conflict(1);
 	test_bounded_prune_conflict(2);
 	test_bounded_prune_conflict(3);
+	test_bounded_prune_conflict(4);
 	test_bounded_prune_interrupted_retirement();
 	test_bounded_prune_crash("page_prune.after_frontier");
 	test_bounded_prune_crash("page_compaction.after_publish");
