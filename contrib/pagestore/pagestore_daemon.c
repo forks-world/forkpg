@@ -1149,6 +1149,7 @@ shard_worker(void *arg)
 	void	   *shm = wa->shm;
 	uint32_t	nchannels = wa->nchannels;
 	uint32_t	nshards = wa->nshards;
+	unsigned int active_polls = 0;
 
 	while (!stop_requested)
 	{
@@ -1165,7 +1166,18 @@ shard_worker(void *arg)
 				did_work = 1;
 		}
 
-		if (!did_work)
+		if (did_work)
+			active_polls = 64;
+		else if (active_polls != 0)
+		{
+			/* Synchronous clients often submit their next request immediately.
+			 * Poll only after completed work and exhaust the budget at idle. */
+			active_polls--;
+#if defined(__x86_64__) || defined(__i386__)
+			__builtin_ia32_pause();
+#endif
+		}
+		else
 		{
 			struct timespec ts = {0, 20000};	/* 20us */
 
