@@ -507,5 +507,6 @@ extern int ps_test_walidx_snapshot_horizon_header(uint32_t version, uint64_t seq
 
 extern int ps_test_gc_verified_local(uint32_t shard, uint32_t victim,
 									 void (*interpose)(void *), void *arg);
+extern void ps_test_set_gc_batch_hook(void (*hook)(void *), void *arg);
 
 #endif							/* PAGESTORE_CORE_H */
