@@ -485,6 +485,19 @@ typedef struct PsBackpressureController
 
 static pthread_mutex_t backpressure_lock = PTHREAD_MUTEX_INITIALIZER;
 static PsBackpressureController page_backpressure;
+/* Prevent an older aggregate observation from undoing a synchronous arm. */
+static uint64_t page_pressure_arm_epoch;
+#ifdef PAGESTORE_BACKPRESSURE_TEST
+static void (*page_pressure_observed_hook)(void *);
+static void *page_pressure_observed_hook_arg;
+
+void
+ps_test_set_page_pressure_observed_hook(void (*hook)(void *), void *arg)
+{
+	page_pressure_observed_hook = hook;
+	page_pressure_observed_hook_arg = arg;
+}
+#endif
 static PsBackpressureController wal_backpressure;
 static PsBackpressureController walidx_backpressure;
 static PsBackpressureController forkmeta_backpressure;
@@ -1651,6 +1664,7 @@ ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
 	__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 0,
 					 __ATOMIC_RELEASE);
 	pthread_mutex_lock(&backpressure_lock);
+	__atomic_add_fetch(&page_pressure_arm_epoch, 1, __ATOMIC_RELEASE);
 	memset(&page_backpressure, 0, sizeof(page_backpressure));
 	memset(&wal_backpressure, 0, sizeof(wal_backpressure));
 	memset(&walidx_backpressure, 0, sizeof(walidx_backpressure));
@@ -2350,6 +2364,39 @@ account_page_gc_coverage(Shard *s, uint32_t old_boundary,
 	}
 }
 
+/* Called under this shard's write lock after a durable flush. One shard's
+ * covered debt is a lower bound on the aggregate. Arm early only when that
+ * lower bound alone reaches the high-water mark; normal maintenance still
+ * observes the aggregate and owns throttle release. */
+static void
+page_pressure_arm_covered_debt(Shard *s)
+{
+	uint64_t lag;
+
+	if (page_reclaim_high_water_bytes == 0)
+		return;
+	if (s->gc_storage_error || s->gc_debt_unavailable ||
+		(segment_size != 0 && s->gc_debt_segments > UINT64_MAX / segment_size))
+		lag = UINT64_MAX;
+	else
+		lag = s->gc_debt_segments * segment_size;
+	if (lag < page_reclaim_high_water_bytes)
+		return;
+	pthread_mutex_lock(&backpressure_lock);
+	/* Recheck the controller under its lock in case configuration changed. */
+	if (page_backpressure.high_water_bytes != 0 &&
+		lag >= page_backpressure.high_water_bytes)
+	{
+		__atomic_add_fetch(&page_pressure_arm_epoch, 1, __ATOMIC_RELEASE);
+		if (lag < page_backpressure.lag_bytes)
+			lag = page_backpressure.lag_bytes;
+		backpressure_update_locked(&page_backpressure, lag,
+			page_backpressure.high_water_bytes, page_backpressure.catchup_bytes);
+		backpressure_publish_locked();
+	}
+	pthread_mutex_unlock(&backpressure_lock);
+}
+
 /*
  * Concurrency.  A per-shard rwlock guards each shard's in-memory state
  * (g_shards[i]: the page/fork/walidx indexes, memtable, append cursor and
@@ -2891,7 +2938,10 @@ flush_memtable(Shard *s, uint32_t seg_id, uint64_t seg_off)
 	if (seg_id > old_boundary)
 	{
 		if (page_reclaim_high_water_bytes != 0)
+		{
 			account_page_gc_coverage(s, old_boundary, seg_id);
+			page_pressure_arm_covered_debt(s);
+		}
 		else
 			s->gc_debt_unavailable = 1;
 	}
@@ -24454,6 +24504,7 @@ ps_backpressure_refresh_internal(int automatic)
 		(!automatic || walidx_auto_observation_claim());
 	int observe_forkmeta = forkmeta_reclaim_high_water_bytes != 0 &&
 		(!automatic || forkmeta_auto_observation_claim());
+	uint64_t page_arm_epoch = __atomic_load_n(&page_pressure_arm_epoch, __ATOMIC_ACQUIRE);
 	uint64_t page_lag = page_reclaim_high_water_bytes != 0 ?
 		page_reclaim_lag_bytes() : 0;
 	uint64_t wal_lag = observe_wal ?
@@ -24464,6 +24515,10 @@ ps_backpressure_refresh_internal(int automatic)
 	uint64_t forkmeta_lag = observe_forkmeta ?
 		forkmeta_reclaim_lag_bytes() : 0;
 
+#ifdef PAGESTORE_BACKPRESSURE_TEST
+	if (page_pressure_observed_hook != NULL)
+		page_pressure_observed_hook(page_pressure_observed_hook_arg);
+#endif
 	if (observe_wal)
 	{
 		__atomic_fetch_add(&wal_observation_count, 1, __ATOMIC_RELAXED);
@@ -24481,7 +24536,8 @@ ps_backpressure_refresh_internal(int automatic)
 	}
 
 	pthread_mutex_lock(&backpressure_lock);
-	backpressure_update_locked(&page_backpressure, page_lag,
+	if (page_arm_epoch == __atomic_load_n(&page_pressure_arm_epoch, __ATOMIC_ACQUIRE))
+		backpressure_update_locked(&page_backpressure, page_lag,
 							   page_reclaim_high_water_bytes,
 							   page_reclaim_catchup_bytes);
 	if (observe_wal)
