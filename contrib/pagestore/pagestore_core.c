@@ -26915,6 +26915,65 @@ gc_same_file(const struct stat *a, const struct stat *b)
 #endif
 }
 
+/* Each immutable layer is checked through its own fd. Limit concurrency so a
+ * maintenance pass cannot create unbounded threads or simultaneous reads. */
+#define PS_GC_VERIFY_WORKERS 4
+static int gc_verify_test_thread_limit = -1;
+
+void
+ps_test_gc_verify_thread_limit(int limit)
+{
+	__atomic_store_n(&gc_verify_test_thread_limit, limit, __ATOMIC_RELAXED);
+}
+
+typedef struct GcPrepareWork
+{
+	GcVerifiedSet *set;
+	uint32_t victim;
+	uint32_t next;
+	int failed;
+} GcPrepareWork;
+
+static void *
+gc_prepare_worker(void *arg)
+{
+	GcPrepareWork *work = arg;
+	uint32_t i;
+
+	while ((i = __atomic_fetch_add(&work->next, 1, __ATOMIC_RELAXED)) < work->set->count)
+	{
+		GcVerifiedLayer *v = &work->set->layers[i];
+		const PsLayerLocation *loc = tier_local_location(&v->desc);
+		PsImgIndexEnt *idx = NULL;
+		uint32_t n = 0;
+		struct stat after, path;
+		int fd = -1;
+		bool ok = false;
+
+		if (!loc || !loc->uri[0] || (fd = open(loc->uri, O_RDONLY)) < 0)
+			goto done;
+		if (fstat(fd, &v->identity) != 0 || !S_ISREG(v->identity.st_mode) ||
+			v->identity.st_size < 0 || (uint64_t) v->identity.st_size != loc->size ||
+			ps_image_layer_read_index_fd(&v->desc, fd, &idx, &n) != 0)
+			goto done;
+		for (uint32_t j = 0; j < n; j++)
+			if ((idx[j].flags & PS_IMG_REC_SEG_VALID) && idx[j].seg_id == work->victim)
+			{ v->covers = true; break; }
+		if ((v->covers && ps_image_layer_verify_fd(fd, loc->size, page_size) != 0) ||
+			fstat(fd, &after) != 0 || stat(loc->uri, &path) != 0 ||
+			!gc_same_file(&v->identity, &after) || !gc_same_file(&after, &path))
+			goto done;
+		ok = true;
+done:
+		free(idx);
+		if (fd >= 0)
+			close(fd);
+		if (!ok)
+			__atomic_store_n(&work->failed, 1, __ATOMIC_RELAXED);
+	}
+	return NULL;
+}
+
 /* Return false for unsupported stores or any stale/corrupt observation.
  * In that case the caller retains the original locked verification path. */
 static bool
@@ -26922,6 +26981,9 @@ gc_prepare_local(uint32_t shard, uint32_t victim, GcVerifiedSet *set)
 {
 	uint32_t count = 0;
 	bool ok = false;
+	pthread_t threads[PS_GC_VERIFY_WORKERS - 1];
+	uint32_t nthreads = 0;
+	GcPrepareWork work = {.set = set, .victim = victim};
 
 	if (ps_layer_store != &PsLayerStoreLocal)
 		return false;
@@ -26947,38 +27009,22 @@ gc_prepare_local(uint32_t shard, uint32_t victim, GcVerifiedSet *set)
 			set->layers[set->count++].desc = *d;
 	}
 	ps_unlock_map();
-	for (uint32_t i = 0; i < set->count; i++)
+	while (nthreads < PS_GC_VERIFY_WORKERS - 1 && nthreads + 1 < set->count)
 	{
-		GcVerifiedLayer *v = &set->layers[i];
-		const PsLayerLocation *loc = tier_local_location(&v->desc);
-		PsImgIndexEnt *idx = NULL;
-		uint32_t n = 0;
-		struct stat after, path;
-		int fd;
+		int test_limit = __atomic_load_n(&gc_verify_test_thread_limit, __ATOMIC_RELAXED);
 
-		if (!loc || !loc->uri[0] || (fd = open(loc->uri, O_RDONLY)) < 0)
-			goto out;
-		if (fstat(fd, &v->identity) != 0 || !S_ISREG(v->identity.st_mode) ||
-			v->identity.st_size < 0 || (uint64_t) v->identity.st_size != loc->size ||
-			ps_image_layer_read_index_fd(&v->desc, fd, &idx, &n) != 0)
-		{
-			close(fd);
-			free(idx);
-			goto out;
-		}
-		for (uint32_t j = 0; j < n; j++)
-			if ((idx[j].flags & PS_IMG_REC_SEG_VALID) && idx[j].seg_id == victim)
-			{ v->covers = true; break; }
-		free(idx);
-		if ((v->covers && ps_image_layer_verify_fd(fd, loc->size, page_size) != 0) ||
-			fstat(fd, &after) != 0 || stat(loc->uri, &path) != 0 ||
-			!gc_same_file(&v->identity, &after) || !gc_same_file(&after, &path))
-		{
-			close(fd);
-			goto out;
-		}
-		close(fd);
+		if (test_limit >= 0 && nthreads >= (uint32_t) test_limit)
+			break;
+		if (pthread_create(&threads[nthreads], NULL, gc_prepare_worker, &work) != 0)
+			break; /* The caller safely completes unclaimed layers. */
+		nthreads++;
 	}
+	(void) gc_prepare_worker(&work);
+	for (uint32_t i = 0; i < nthreads; i++)
+		if (pthread_join(threads[i], NULL) != 0)
+			abort(); /* Never free a snapshot while a worker may still use it. */
+	if (__atomic_load_n(&work.failed, __ATOMIC_RELAXED))
+		goto out;
 	set->ready = ok = true;
 out:
 	if (!ok)
