@@ -341,6 +341,18 @@ extern int ps_image_compaction_publication_valid(const PsLayerMap *map,
 extern int ps_image_compaction_retirement_valid(const PsLayerMap *map,
 	const PsLayerDesc *inputs, uint32_t ninputs,
 	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t retired_prefix);
+/* All-versions-preserving variants permit additional same-shard layers only
+ * when their IDs sort after every reserved output. The caller must prove full
+ * input coverage and own the input pins, just as for the strict variants. */
+extern int ps_image_compaction_snapshot_valid_newer(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs);
+extern int ps_image_compaction_publication_valid_newer(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t published_prefix);
+extern int ps_image_compaction_retirement_valid_newer(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t retired_prefix);
 /* Force a fresh data-section checksum verification (ignores cached state). */
 /* Empty the process-wide image index cache; the layer store calls it on close. */
 extern void ps_image_layer_cache_reset(void);

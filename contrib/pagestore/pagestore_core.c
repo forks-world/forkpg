@@ -4716,7 +4716,7 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	}
 	/* A failed conservative plan may fall back to the ordinary path.  Its
 	 * pre-unlock source snapshot must still name the entire live set. */
-	if (count_image_layers(timeline, shard) != ninputs)
+	if (!eligible && count_image_layers(timeline, shard) != ninputs)
 	{
 		if (metrics_header != NULL)
 			ps_fetch_add_u64(&metrics_header->compaction.bounded_merge_conflicts, 1);
@@ -4751,9 +4751,9 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	for (uint32_t k = 0; k < noutputs; k++)
 	{
 		if (!ps_timeline_live(timeline) ||
-			!ps_image_compaction_snapshot_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs))
+			!ps_image_compaction_snapshot_valid_newer(&ps_layer_map, inputs, ninputs, outputs, noutputs))
 			goto done;
-		if (ps_manifest_publish_image_batch(inputs, ninputs, outputs, noutputs, k) != 0)
+		if (ps_manifest_publish_image_batch_newer(inputs, ninputs, outputs, noutputs, k) != 0)
 		{
 			ambiguous = 1;
 			goto done;
@@ -4775,7 +4775,7 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	for (uint32_t k = 0; k < ninputs; k++)
 	{
 		if (!ps_timeline_live(timeline) ||
-			ps_manifest_retire_image_source(inputs, ninputs, outputs, noutputs, k) != 0)
+			ps_manifest_retire_image_source_newer(inputs, ninputs, outputs, noutputs, k) != 0)
 			goto done;
 		retired++;
 		inspection_metrics_changed();
