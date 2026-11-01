@@ -122,6 +122,7 @@ BAD_LOG = re.compile(
     r"PANIC:|TRAP:|invalid page in block|could not read block|"
     r"unexpected data beyond EOF|terminated by signal (6|7|9|11)\b|"
     r"AddressSanitizer|stack smashing|"
+    r"ERROR:\s+pagestore localsvc: daemon reported error for op 8\b|"
     r"pagestore materializer retention advance (was rejected|failed)"
 )
 INJECTED_KILL = re.compile(r"\(PID (\d+)\) was terminated by signal 9\b")

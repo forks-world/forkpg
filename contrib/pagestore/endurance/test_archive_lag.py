@@ -69,6 +69,12 @@ class ArchiveLagTests(unittest.TestCase):
         self.assertFalse(policy.should_restart(80, '0/300', '0/100'))
         self.assertFalse(policy.should_restart(110, '0/300', '0/300'))
 
+    def test_checkpointer_write_error_is_not_mistaken_for_idle_archive(self):
+        self.assertIsNotNone(endurance.BAD_LOG.search(
+            'ERROR:  pagestore localsvc: daemon reported error for op 8'))
+        self.assertIsNone(endurance.BAD_LOG.search(
+            'ERROR:  pagestore localsvc: daemon reported error for op 80'))
+
     def test_restartpoint_does_not_repeat_without_progress(self):
         policy = endurance.ArchiveRestartpointPolicy(idle_seconds=30)
         self.assertFalse(policy.should_restart(0, '0/200', '0/100'))
