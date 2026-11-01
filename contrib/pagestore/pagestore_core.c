@@ -20923,6 +20923,12 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 				historical_recovery_page = 1;
 			else
 			{
+				fprintf(stderr, "pagestore: refused historical recovery write timeline=%u rel=%u fork=%u block=%u page_lsn=%llu replay_lsn=%llu cutoff=%llu old_lsn=%llu old_readable=%d historical_size=%u\n",
+						timeline, key->relNumber, key->forkNum, block,
+						(unsigned long long) hdr.lsn, (unsigned long long) version,
+						(unsigned long long) fork_meta_snapshot_cutoff_lsn,
+						(unsigned long long) (old ? old->lsn : 0), found,
+						fork_size_asof_hop(fe, hdr.lsn, 0));
 				*outcome = PS_APPEND_REFUSED_INVALID;
 				return -1;
 			}
