@@ -54,6 +54,33 @@ class Failure(Exception):
         self.detail = detail
 
 
+class ArchiveRestartpointPolicy:
+    """Bounded equivalent of the materializer supervisor's idle policy."""
+
+    def __init__(self, idle_seconds: float = 30):
+        self.idle_seconds = idle_seconds
+        self.last_replay = None
+        self.changed_at = None
+        self.retry_after = 0.0
+
+    def should_restart(self, now: float, replay: str, marker: str) -> bool:
+        def lsn(value: str) -> int:
+            hi, lo = value.split("/", 1)
+            return (int(hi, 16) << 32) | int(lo, 16)
+
+        replay_value, marker_value = lsn(replay), lsn(marker)
+        if self.last_replay != replay_value:
+            self.last_replay = replay_value
+            self.changed_at = now
+        if replay_value <= marker_value or self.changed_at is None:
+            return False
+        if now < self.retry_after or now - self.changed_at < self.idle_seconds:
+            return False
+        self.retry_after = now + self.idle_seconds
+        self.changed_at = now
+        return True
+
+
 def directory_kb(path: Path) -> int:
     """Allocated bytes, including hidden files; never follow external symlinks."""
     result = subprocess.run(["du", "-sk", "--", str(path)],
@@ -765,8 +792,33 @@ CREATE INDEX ev_k ON ev(k);
         switch = self.writer.sql("SELECT pg_switch_wal();")
         seg = self.writer.sql(f"SELECT pg_walfile_name('{switch}'::pg_lsn - 1);")
         done = self.writer.datadir / "pg_wal/archive_status" / f"{seg}.done"
-        self.wait_for(f"archive of {seg}", lambda: done.exists() or not
-                      (self.writer.datadir / "pg_wal" / seg).exists(), self.args.sync_timeout)
+        policy = ArchiveRestartpointPolicy()
+        next_probe = 0.0
+
+        def archived() -> bool:
+            nonlocal next_probe
+            if done.exists() or not (self.writer.datadir / "pg_wal" / seg).exists():
+                return True
+            # The production supervisor advances a stalled durable watermark
+            # by restarting an idle, healthy worker. This driver owns the
+            # materializer directly, so apply that policy while waiting for
+            # bounded archive shipping as well.
+            now = time.monotonic()
+            if (getattr(self.args, "materializer_max_lag_mb", 0) > 0 and
+                    self.mat.expected_up and now >= next_probe):
+                next_probe = now + 5
+                progress = self.mat.sql(
+                    "SELECT COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn), "
+                    "COALESCE(pagestore_ext.pagestore_materialized_wal_lsn(), '0/0'::pg_lsn);",
+                    timeout=self.probe_timeout())
+                replay, marker = progress.split("|", 1)
+                if marker != "0/0" and policy.should_restart(now, replay, marker):
+                    self.event("archive_restartpoint", replay=replay, marker=marker, segment=seg)
+                    self.mat.stop("fast")
+                    self.mat.start()
+            return False
+
+        self.wait_for(f"archive of {seg}", archived, self.args.sync_timeout)
         return switch
 
     def sync_materializer(self) -> str:

@@ -134,6 +134,11 @@ segment alignment and a latched checkpoint crossing; WAL-index limits reserve
 maximum-record/padding headroom, so neither setting is an exact byte ceiling.
 Warnings that archiving is paused are expected while the worker catches up;
 failure to catch up within `--sync-timeout` remains a finding.
+While waiting for bounded archiving, the driver also applies the materializer
+supervisor's progress policy: if replay is ahead of the durable marker but has
+stopped advancing, it performs a fast restart to publish a restartpoint. The
+driver records each attempt as `archive_restartpoint`; it never bypasses either
+lag limiter or treats an unavailable marker as progress.
 
 ## Exit notifications and persistent status
 
