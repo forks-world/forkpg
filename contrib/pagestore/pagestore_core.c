@@ -20964,7 +20964,7 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 			else if ((!old || old->lsn < hdr.lsn) &&
 					 hdr.lsn > fork_meta_snapshot_cutoff_lsn &&
 					 (branch_floor == 0 || hdr.lsn >= branch_floor) &&
-					 fork_size_asof_hop(fe, hdr.lsn, 0) == block &&
+					 fork_size_asof_hop(fe, hdr.lsn, 0) <= block &&
 					 walidx_proves_page_lsn(timeline, key, block, hdr.lsn))
 			{
 				historical_recovery_page = 1;

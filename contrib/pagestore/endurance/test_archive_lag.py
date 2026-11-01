@@ -69,11 +69,13 @@ class ArchiveLagTests(unittest.TestCase):
         self.assertFalse(policy.should_restart(80, '0/300', '0/100'))
         self.assertFalse(policy.should_restart(110, '0/300', '0/300'))
 
-    def test_restartpoint_retries_if_watermark_stays_stalled(self):
+    def test_restartpoint_does_not_repeat_without_progress(self):
         policy = endurance.ArchiveRestartpointPolicy(idle_seconds=30)
         self.assertFalse(policy.should_restart(0, '0/200', '0/100'))
         self.assertTrue(policy.should_restart(30, '0/200', '0/100'))
-        self.assertTrue(policy.should_restart(60, '0/200', '0/100'))
+        self.assertFalse(policy.should_restart(60, '0/200', '0/100'))
+        self.assertFalse(policy.should_restart(61, '0/300', '0/100'))
+        self.assertTrue(policy.should_restart(91, '0/300', '0/100'))
 
     def test_archive_wait_restarts_stalled_worker_without_skipping_archive(self):
         wal = self.root / 'pg_wal'

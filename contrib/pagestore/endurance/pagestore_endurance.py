@@ -62,6 +62,7 @@ class ArchiveRestartpointPolicy:
         self.last_replay = None
         self.changed_at = None
         self.retry_after = 0.0
+        self.last_restart = None
 
     def should_restart(self, now: float, replay: str, marker: str) -> bool:
         def lsn(value: str) -> int:
@@ -74,10 +75,13 @@ class ArchiveRestartpointPolicy:
             self.changed_at = now
         if replay_value <= marker_value or self.changed_at is None:
             return False
+        if self.last_restart == (replay_value, marker_value):
+            return False
         if now < self.retry_after or now - self.changed_at < self.idle_seconds:
             return False
         self.retry_after = now + self.idle_seconds
         self.changed_at = now
+        self.last_restart = (replay_value, marker_value)
         return True
 
 

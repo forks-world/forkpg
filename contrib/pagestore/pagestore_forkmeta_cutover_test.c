@@ -6143,7 +6143,7 @@ test_wal_proven_historical_growth(void)
 		  append_relation_tag(&key, 0, 100, page, 0x41, NULL) == 0 &&
 		  meta_request(PS_OP_TRUNCATE, &key, 425, 0, 0, 0, NULL),
 		  "prepare later truncate after one historical block");
-	check(append_relation_recovery_timeline_tag(0, &key, 1, 410, page, 0x42, NULL) != 0,
+	check(append_relation_recovery_timeline_tag(0, &key, 3, 410, page, 0x42, NULL) != 0,
 		  "unproven historical growth is refused");
 	memset(&ch, 0, sizeof(ch));
 	ch.opcode = PS_OP_WAL_APPEND;
@@ -6156,7 +6156,7 @@ test_wal_proven_historical_growth(void)
 	memset(&ch, 0, sizeof(ch));
 	memset(&entry, 0, sizeof(entry));
 	entry.key = key;
-	entry.block = 1;
+	entry.block = 3;
 	entry.lsn = 400;
 	entry.end_lsn = 410;
 	entry.flags = PS_WAL_INDEX_FLAG_KNOWN;
@@ -6172,7 +6172,7 @@ test_wal_proven_historical_growth(void)
 	ps_unlock_shard(ps_shard_of(&key));
 	ps_lifecycle_read_unlock();
 	check(ch.status == PS_STATUS_OK &&
-		  append_relation_recovery_timeline_tag(0, &key, 1, 410, page, 0x42, NULL) != 0,
+		  append_relation_recovery_timeline_tag(0, &key, 3, 410, page, 0x42, NULL) != 0,
 		  "uncommitted WAL index is not proof");
 	memset(&ch, 0, sizeof(ch));
 	ch.opcode = PS_OP_WAL_INDEX_PROGRESS;
@@ -6182,14 +6182,14 @@ test_wal_proven_historical_growth(void)
 	(void) ps_handle_meta(&ch);
 	ps_lifecycle_read_unlock();
 	check(ch.status == PS_STATUS_OK &&
-		  append_relation_recovery_timeline_tag(0, &key, 1, 410, page, 0x42, NULL) == 0 &&
-		  read_resolve(0, &key, 1, 410, 0, page, NULL) == 1 && page[128] == 0x42 &&
-		  read_resolve(0, &key, 1, UINT64_MAX, 0, page, NULL) == 0,
+		  append_relation_recovery_timeline_tag(0, &key, 3, 410, page, 0x42, NULL) == 0 &&
+		  read_resolve(0, &key, 3, 410, 0, page, NULL) == 1 && page[128] == 0x42 &&
+		  read_resolve(0, &key, 3, UINT64_MAX, 0, page, NULL) == 0,
 		  "committed exact WAL proof admits growth without resurrecting the page");
 	close_runtime();
 	check(ps_core_open(store) == 0 &&
-		  read_resolve(0, &key, 1, 410, 0, page, NULL) == 1 && page[128] == 0x42 &&
-		  read_resolve(0, &key, 1, UINT64_MAX, 0, page, NULL) == 0,
+		  read_resolve(0, &key, 3, 410, 0, page, NULL) == 1 && page[128] == 0x42 &&
+		  read_resolve(0, &key, 3, UINT64_MAX, 0, page, NULL) == 0,
 		  "WAL-proven growth and later truncate survive restart");
 	close_runtime();
 	remove_tree(store);
