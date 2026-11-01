@@ -1586,6 +1586,7 @@ typedef struct BoundedConflictProbe
 	int called;
 	int wrote;
 	int same_lsn;
+	uint32_t live_after_write;
 } BoundedConflictProbe;
 
 static void *
@@ -1620,13 +1621,19 @@ bounded_conflict_hook(void *arg)
 	ps_test_set_compaction_unlocked_hook(NULL, NULL);
 	if (pthread_create(&thread, NULL, bounded_conflict_writer, probe) == 0)
 		(void) pthread_join(thread, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
+			probe->live_after_write++;
+	ps_unlock_map();
 }
 
 static void
-test_bounded_compaction_concurrent_write(void)
+test_bounded_compaction_concurrent_write(int same_lsn)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-conflict-XXXXXX";
-	BoundedConflictProbe probe = {0};
+	BoundedConflictProbe probe = {.same_lsn = same_lsn};
 	uint64_t before;
 	uint32_t live = 0;
 
@@ -1651,12 +1658,20 @@ test_bounded_compaction_concurrent_write(void)
 	ps_unlock_map();
 	check(probe.called && probe.wrote && ps_test_bounded_compaction_count() > before,
 		  "writer runs while bounded compaction prepares");
-	check(live >= 3 && read_relation_at(1, 2000) && read_relation_at(2, 3000) &&
-		  read_relation_at(3, 4000),
-		  "concurrent layer invalidates bounded publication and preserves data");
+	check(live < probe.live_after_write && read_relation_at(1, 2000) &&
+		  read_relation_at(2, 3000) && (same_lsn || read_relation_at(3, 4000)),
+		  "bounded merge retires inputs while preserving the newer layer");
+	if (same_lsn)
+		check(read_relation_byte(1, 2000, 0xA7),
+			  "newer layer wins a concurrent same-LSN write");
 	run_maintenance(64);
 	check(read_relation_at(1, 2000) && read_relation_at(2, 3000) &&
-		  read_relation_at(3, 4000), "bounded retry preserves concurrent write");
+		  (same_lsn || read_relation_at(3, 4000)), "later maintenance preserves concurrent write");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(1, 2000) &&
+		  read_relation_at(2, 3000) && (same_lsn || read_relation_at(3, 4000)) &&
+		  (!same_lsn || read_relation_byte(1, 2000, 0xA7)),
+		  "newer layer and bounded merge survive restart");
 	close_store();
 	remove_tree(store);
 }
@@ -1715,6 +1730,95 @@ test_bounded_compaction_concurrent_memtable_write(int same_lsn)
 			  "same-LSN write remains newest after restart");
 	close_store();
 	remove_tree(store);
+}
+
+typedef struct NewerLayerCrashProbe
+{
+	BoundedConflictProbe conflict;
+	int marker_fd;
+} NewerLayerCrashProbe;
+
+static void
+newer_layer_crash_hook(void *arg)
+{
+	NewerLayerCrashProbe *probe = arg;
+	char marker = 'N';
+
+	bounded_conflict_hook(&probe->conflict);
+	if (!probe->conflict.wrote || write(probe->marker_fd, &marker, 1) != 1)
+		_exit(90);
+}
+
+/* A newer same-LSN layer must win even if the process crashes after the
+ * bounded outputs are durable but before their old inputs are retired. */
+static void
+test_bounded_newer_layer_crash(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-newer-layer-crash-XXXXXX";
+	char control[TEST_TEMP_PATH_MAX] = "pagestore-newer-layer-fault-XXXXXX";
+	char arm[512], marker = 0;
+	FILE *arm_file;
+	int pipefd[2], status = 0;
+	pid_t child;
+	ssize_t marker_bytes;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	if (!test_mkdtemp(store, sizeof(store)) || !test_mkdtemp(control, sizeof(control)) ||
+		snprintf(arm, sizeof(arm), "%s/arm", control) >= (int) sizeof(arm) ||
+		(arm_file = fopen(arm, "w")) == NULL)
+	{
+		check(0, "prepare newer-layer crash fixture");
+		return;
+	}
+	fclose(arm_file);
+	check(ps_core_open(store) == 0 && write_control(0, 1000, 800) &&
+		  write_relation(0, 1, 2000) && write_relation(0, 2, 3000),
+		  "seed newer-layer crash fixture");
+	close_store();
+	if (pipe(pipefd) != 0)
+	{
+		check(0, "create newer-layer crash marker pipe");
+		return;
+	}
+	child = fork();
+	if (child == 0)
+	{
+		NewerLayerCrashProbe probe = {.conflict = {.same_lsn = 1}, .marker_fd = pipefd[1]};
+
+		close(pipefd[0]);
+		if (setenv("PAGESTORE_TEST_FAULT_NAME", "page_compaction.after_publish", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_DIR", control, 1) != 0 ||
+			ps_fault_init(store) != 0 || ps_core_open(store) != 0)
+			_exit(91);
+		ps_test_set_compaction_unlocked_hook(newer_layer_crash_hook, &probe);
+		compact_layers = 1;
+		run_maintenance(64);
+		_exit(92);
+	}
+	close(pipefd[1]);
+	if (child < 0 || waitpid(child, &status, 0) != child)
+	{
+		check(0, "wait for newer-layer crash");
+		close(pipefd[0]);
+		return;
+	}
+	marker_bytes = read(pipefd[0], &marker, 1);
+	close(pipefd[0]);
+	check(WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT &&
+		  marker_bytes == 1 && marker == 'N', "crash after output with a newer layer");
+	check(ps_core_open(store) == 0 && read_relation_byte(1, 2000, 0xA7) &&
+		  read_relation_at(2, 3000), "newer write and old input survive publication crash");
+	run_maintenance(64);
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_byte(1, 2000, 0xA7) &&
+		  read_relation_at(2, 3000), "crash recovery and retry preserve layer priority");
+	close_store();
+	remove_tree(store);
+	remove_tree(control);
 }
 
 typedef struct FloorPlanConflict
@@ -1989,8 +2093,12 @@ test_nonzero_bounded_plan_conflict(int mode)
 			!ps_layer_map.layers[i].deleting && ps_layer_map.layers[i].timeline == 0)
 			live++;
 	ps_unlock_map();
-	check(probe.called && probe.changed && live >= (uint32_t) (mode ? 3 : 4),
-		  "concurrent change rejects the nonzero-floor staged plan");
+	if (mode == 0)
+		check(probe.called && probe.changed && live < 4,
+			  "nonzero-floor all-versions merge permits a newer layer");
+	else
+		check(probe.called && probe.changed && live >= 3,
+			  "pin or remote transition rejects the nonzero-floor staged plan");
 	if (probe.remote_transition)
 	{
 		ps_lock_map_wr();
@@ -2266,12 +2374,8 @@ test_staged_compaction_rejects_concurrent_write(uint32_t nshards)
 	check(probe.called == 1 && probe.read_ok && probe.write_ok,
 		  "foreground reads and writes proceed during staged output");
 	ps_lock_map_rd();
-	if (nshards == 1)
-		check(ps_layer_map_count(&ps_layer_map) == probe.layers_after_write,
-			  "new input layer invalidates staged replacement");
-	else
-		check(ps_layer_map_count(&ps_layer_map) > probe.layers_after_write,
-			  "write to another shard does not invalidate the bounded merge");
+	check(ps_layer_map_count(&ps_layer_map) > probe.layers_after_write,
+		  "concurrent newer layer does not invalidate the bounded merge");
 	ps_unlock_map();
 	run_maintenance(64);
 	check(read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 2000, &version) && version == 2000,
@@ -3271,7 +3375,9 @@ main(void)
 	test_prune_abandon_provider_gate();
 	test_partial_output_conflict_churn();
 	test_partial_output_abandon_crash();
-	test_bounded_compaction_concurrent_write();
+	test_bounded_compaction_concurrent_write(0);
+	test_bounded_compaction_concurrent_write(1);
+	test_bounded_newer_layer_crash();
 	test_bounded_compaction_concurrent_memtable_write(0);
 	test_bounded_compaction_concurrent_memtable_write(1);
 	test_compaction_gather_rejects_concurrent_change(0);

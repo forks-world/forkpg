@@ -1585,7 +1585,7 @@ static int
 image_compaction_snapshot_valid(const PsLayerMap *map,
 								   const PsLayerDesc *inputs, uint32_t ninputs,
 								   const PsLayerDesc *outputs, uint32_t noutputs,
-	uint32_t retired_prefix, int retiring)
+	uint32_t retired_prefix, int retiring, int allow_newer)
 {
 	uint64_t max_id = 0;
 	uint32_t seen_inputs = 0, seen_outputs = 0;
@@ -1666,7 +1666,9 @@ image_compaction_snapshot_valid(const PsLayerMap *map,
 				matched = 1;
 				break;
 			}
-		if (!matched && !current->deleting)
+		if (!matched && !current->deleting &&
+			(!allow_newer || current->legacy_shard_zero ||
+			 current->layer_id <= outputs[noutputs - 1].layer_id))
 			return 0;
 	}
 	return seen_inputs == ninputs && (!retiring || seen_outputs == noutputs);
@@ -1677,7 +1679,7 @@ ps_image_compaction_snapshot_valid(const PsLayerMap *map,
 	const PsLayerDesc *inputs, uint32_t ninputs,
 	const PsLayerDesc *outputs, uint32_t noutputs)
 {
-	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs, 0, 0);
+	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs, 0, 0, 0);
 }
 
 int
@@ -1711,7 +1713,50 @@ ps_image_compaction_retirement_valid(const PsLayerMap *map,
 	uint32_t retired_prefix)
 {
 	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs,
-	retired_prefix, 1);
+	retired_prefix, 1, 0);
+}
+
+/* These variants are only for an all-versions-preserving merge with reserved
+ * output IDs: any added layer must sort after every replacement, so it keeps
+ * the same priority over a tied input version as before compaction. */
+int
+ps_image_compaction_snapshot_valid_newer(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs)
+{
+	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs, 0, 0, 1);
+}
+
+int
+ps_image_compaction_publication_valid_newer(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t published_prefix)
+{
+	if (published_prefix > noutputs ||
+		!ps_image_compaction_snapshot_valid_newer(map, inputs, ninputs, outputs, noutputs))
+		return 0;
+	for (uint32_t k = 0; k < noutputs; k++)
+	{
+		int present = 0;
+		for (uint32_t i = 0; i < map->nlayers; i++)
+			if (map->layers[i].layer_id == outputs[k].layer_id)
+			{
+				present = 1;
+				break;
+			}
+		if (present != (k < published_prefix))
+			return 0;
+	}
+	return 1;
+}
+
+int
+ps_image_compaction_retirement_valid_newer(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t retired_prefix)
+{
+	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs,
+		retired_prefix, 1, 1);
 }
 
 int
