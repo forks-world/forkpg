@@ -894,6 +894,12 @@ test('pagestore_endurance_space_budget',
   suite: ['pagestore'],
   timeout: 60,
 )
+test('pagestore_fixed_replay',
+  pagestore_harness_python,
+  args: [files('endurance/test_fixed_replay.py')],
+  suite: ['pagestore'],
+  timeout: 60,
+)
 test('pagestore_store_owner_recovery',
   pagestore_harness_python,
   args: [files('harness/tests/test_store_owner_recovery.py'),
