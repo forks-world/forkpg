@@ -1719,6 +1719,9 @@ assert "$($P -c "SELECT prepared_count FROM pagestore_branch_window_open();")" "
 $P -c "CREATE FUNCTION pagestore_test_control_error(regclass) RETURNS boolean
        AS '$BUILD/contrib/pagestore/pagestore_mirror_error_test',
           'pagestore_test_control_error' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_test_control_reclaimed() RETURNS boolean
+       AS '$BUILD/contrib/pagestore/pagestore_mirror_error_test',
+          'pagestore_test_control_reclaimed' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_test_slru_error(regclass) RETURNS boolean
        AS '$BUILD/contrib/pagestore/pagestore_mirror_error_test',
           'pagestore_test_slru_error' LANGUAGE C STRICT;
@@ -1733,6 +1736,8 @@ $P -c "CREATE FUNCTION pagestore_test_control_error(regclass) RETURNS boolean
           'pagestore_test_recovery_read' LANGUAGE C STRICT;" >/dev/null
 assert "$($P -c "SELECT pagestore_test_control_error('pg_class');")" "t" \
     "control mirror failure preserves buffer-lock interrupt holdoffs and queued image"
+assert "$($P -c "SELECT pagestore_test_control_reclaimed();")" "t" \
+    "reclaimed checkpoint releases its gate without a reader fence; transient errors retain it"
 assert "$($P -c "SELECT pagestore_test_slru_error('pg_class');")" "t" \
     "SLRU mirror failure preserves buffer-lock interrupt holdoffs and staged image"
 

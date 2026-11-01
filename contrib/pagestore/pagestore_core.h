@@ -172,6 +172,8 @@ extern int ps_admission_write_lock(void);
 extern void ps_admission_write_unlock(void);
 extern uint64_t ps_admission_barrier(void);
 extern uint64_t ps_admission_barrier_register(uint32_t timeline, uint64_t lsn);
+extern uint64_t ps_admission_barrier_register_ex(uint32_t timeline, uint64_t lsn,
+												  int *reclaimed);
 extern int ps_backpressure_configure(uint64_t page_high_water,
 									 uint64_t page_catchup,
 										 uint64_t wal_high_water,

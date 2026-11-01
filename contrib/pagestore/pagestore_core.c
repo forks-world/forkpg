@@ -23514,7 +23514,7 @@ control_view_registered(uint32_t timeline, const ViewCap *cap)
  * owner tombstones. Updating the older slot atomically keeps the previous
  * checkpoint protected for readers handing off from it. */
 uint64_t
-ps_admission_barrier_register(uint32_t timeline, uint64_t lsn)
+ps_admission_barrier_register_ex(uint32_t timeline, uint64_t lsn, int *reclaimed)
 {
 	PsRetentionPin slots[2] = {{0}}, pin = {0};
 	int			found[2],
@@ -23522,6 +23522,8 @@ ps_admission_barrier_register(uint32_t timeline, uint64_t lsn)
 	unsigned	slot;
 	uint64_t	seq = 0;
 
+	if (reclaimed != NULL)
+		*reclaimed = 0;
 	if (timeline >= MAX_TIMELINES || admission_write_lock() != 0)
 		return 0;
 	pthread_rwlock_wrlock(&page_prune_lock);
@@ -23552,6 +23554,14 @@ ps_admission_barrier_register(uint32_t timeline, uint64_t lsn)
 		wal_reclaim_frontier_ancestry_allows(timeline, lsn) &&
 		walidx_frontier_ancestry_allows(timeline, lsn) &&
 		!walidx_frontier_ancestry_pending(timeline);
+	/* A published WAL-index frontier beyond this redo makes this checkpoint
+	 * unsuitable for a new reader. A pending cutover is transient, so do
+	 * not classify it as a reclaimed checkpoint. */
+	if (!allowed && reclaimed != NULL && timelines[timeline].defined &&
+		timelines[timeline].state == PS_TIMELINE_LIVE &&
+		!walidx_frontier_ancestry_pending(timeline) &&
+		!walidx_frontier_ancestry_allows(timeline, lsn))
+		*reclaimed = 1;
 	ps_unlock_map();
 	if (!allowed)
 		goto fail;
@@ -23576,6 +23586,12 @@ out:
 	pthread_rwlock_unlock(&page_prune_lock);
 	ps_admission_write_unlock();
 	return seq;
+}
+
+uint64_t
+ps_admission_barrier_register(uint32_t timeline, uint64_t lsn)
+{
+	return ps_admission_barrier_register_ex(timeline, lsn, NULL);
 }
 
 /* Caller holds map-rd and the WAL-index prune read fence. */

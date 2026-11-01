@@ -2075,6 +2075,17 @@ test_timeline_incarnation_frontiers(void)
 		"publish a nonzero page frontier for incarnation 1");
 	check(old_walidx_frontier,
 		"publish a nonzero WAL-index frontier for incarnation 1");
+	{
+		int reclaimed = 0;
+
+		check(ps_admission_barrier_register_ex(1, 500, &reclaimed) == 0 &&
+			  reclaimed == 1,
+			  "checkpoint below reclaimed WAL-index frontier is classified");
+		reclaimed = 1;
+		check(ps_admission_barrier_register_ex(UINT32_MAX, 500, &reclaimed) == 0 &&
+			  reclaimed == 0,
+			  "invalid timeline is not classified as reclaimed history");
+	}
 	check(ps_retention_drop(pin.timeline, pin.owner_kind, pin.owner_id,
 							 pin.generation) == PS_RETENTION_OK &&
 		  begin_delete(1, 1, NULL),

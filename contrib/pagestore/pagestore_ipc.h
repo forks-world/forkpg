@@ -366,6 +366,8 @@ typedef struct PsWalIndexEntry
 #define PS_FRONTEND_CAP_WAL_BASE_STATE (UINT32_C(1) << 5)
 #define PS_WAL_BASE_VIEW_UNREGISTERED 1u
 #define PS_BARRIER_REGISTER UINT32_C(0x50494e35)
+/* PS_OP_ADMISSION_BARRIER error: checkpoint WAL-index history is gone. */
+#define PS_BARRIER_RECLAIMED UINT32_C(1)
 #define PS_ARTIFACT_BEGIN_CAPPED_READ UINT32_C(0x43415035)
 /* WRITEV/EXTEND: the materializer marks recovery-floor writes with this value.
  * For relation pages req_lsn is the current replay position while recovery is
