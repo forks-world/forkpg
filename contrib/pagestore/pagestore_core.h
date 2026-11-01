@@ -288,6 +288,7 @@ extern uint64_t ps_test_backpressure_forkmeta_observation_count(void);
 extern uint64_t ps_test_page_gc_debt_segments(uint32_t shard);
 extern int ps_test_page_gc_debt_unavailable(uint32_t shard);
 #ifdef PAGESTORE_BACKPRESSURE_TEST
+extern void ps_test_set_page_pressure_observed_hook(void (*hook)(void *), void *arg);
 extern uint64_t ps_test_page_gc_coverage_observation_count(void);
 #endif
 

@@ -2833,6 +2833,82 @@ sentinel_segment_size(uint32_t shard, int seg)
 }
 
 static void
+append_debt_after_observation(void *arg)
+{
+	int *appended = arg;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+
+	ps_test_set_page_pressure_observed_hook(NULL, NULL);
+	*appended = 1;
+	for (uint32_t block = 0; block < 5; block++)
+	{
+		fill_page(page, (unsigned char) (10 + block));
+		ps_lock_shard_wr(0);
+		if (append_page(0, &key, block, page, 0, NULL) != 0)
+			*appended = 0;
+		ps_unlock_shard(0);
+	}
+}
+
+static void
+test_page_debt_arms_without_maintenance(void)
+{
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-page-debt-fast-arm-XXXXXX";
+	volatile sig_atomic_t stop = 0;
+	uint32_t causes = 0;
+
+	configure_page_core();
+	check(ps_backpressure_configure(segment_size, 0, 0, 0) == 0,
+		  "configure PAGE high-water for immediate debt observation");
+	if (!make_page_debt_store(store))
+	{
+		check(0, "construct PAGE debt without maintenance");
+		return;
+	}
+	check(ps_test_page_gc_debt_segments(0) > 0 &&
+		  ps_backpressure_try_admit(&stop, &causes) == 0 &&
+		  (causes & PS_BACKPRESSURE_PAGE) != 0,
+		  "covered debt arms PAGE backpressure before maintenance runs");
+	for (int i = 0; i < 64 && ps_test_page_gc_debt_segments(0) != 0; i++)
+		(void) ps_core_maintenance();
+	check(ps_test_page_gc_debt_segments(0) == 0 &&
+		  ps_backpressure_try_admit(&stop, &causes) == 1,
+		  "maintenance releases the early PAGE throttle after catch-up");
+	ps_core_close();
+	ps_storage->close();
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+		  "disable PAGE controller after immediate debt observation");
+	ps_test_remove_tree(store);
+}
+
+static void
+test_page_debt_stale_refresh(void)
+{
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-page-debt-stale-XXXXXX";
+	volatile sig_atomic_t stop = 0;
+	uint32_t causes = 0;
+	int appended = 0;
+
+	configure_page_core();
+	check(ps_backpressure_configure(segment_size, 0, 0, 0) == 0 &&
+		  ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
+		  "prepare stale PAGE pressure observation");
+	ps_test_set_page_pressure_observed_hook(append_debt_after_observation, &appended);
+	ps_backpressure_refresh();
+	ps_test_set_page_pressure_observed_hook(NULL, NULL);
+	check(appended && ps_test_page_gc_debt_segments(0) > 0 &&
+		  ps_backpressure_try_admit(&stop, &causes) == 0 &&
+		  (causes & PS_BACKPRESSURE_PAGE) != 0,
+		  "older PAGE observation cannot clear newly armed backpressure");
+	ps_core_close();
+	ps_storage->close();
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+		  "disable PAGE controller after stale observation");
+	ps_test_remove_tree(store);
+}
+
+static void
 test_page_debt_disabled_fast_path(void)
 {
 	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-page-debt-disabled-XXXXXX";
@@ -2906,6 +2982,8 @@ test_page_debt_partial_account_unavailable(void)
 	PsStorage faulting_storage = PsStoragePosix;
 	int appended = 1;
 	int removed = 0;
+	volatile sig_atomic_t stop = 0;
+	uint32_t causes = 0;
 
 	configure_page_core();
 	flush_pages = 9;
@@ -2928,6 +3006,9 @@ test_page_debt_partial_account_unavailable(void)
 	check(appended && ps_test_page_gc_debt_unavailable(0) &&
 		  ps_test_page_gc_debt_segments(0) == 1,
 		  "partial coverage observation preserves its prefix count as unavailable");
+	check(ps_backpressure_try_admit(&stop, &causes) == 0 &&
+		  (causes & PS_BACKPRESSURE_PAGE) != 0,
+		  "coverage error arms PAGE pressure before maintenance runs");
 	memset(&metrics, 0, sizeof(metrics));
 	ps_core_set_metrics_header(&metrics);
 	check(metrics.inspection.page_debt_unavailable &&
@@ -3161,6 +3242,8 @@ main(void)
 	test_wal_automatic_observation_rate();
 	test_walidx_automatic_observation_rate();
 	test_admission_writer_preference();
+	test_page_debt_arms_without_maintenance();
+	test_page_debt_stale_refresh();
 	test_page_debt_disabled_fast_path();
 	test_page_debt_partial_account_unavailable();
 	test_page_storage_fail_closed();
