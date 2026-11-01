@@ -48,6 +48,9 @@ typedef struct PsLayerStore
 	int			(*verify_remote_layer) (const PsLayerDesc *layer);
 } PsLayerStore;
 
+/* 1 if the local provider's object tier is configured, 0 if disabled,
+ * -1 if the currently open provider cannot be validated. */
+extern int ps_layer_store_local_object_enabled(void);
 extern const PsLayerStore PsLayerStoreLocal;
 extern const PsLayerStore *ps_layer_store;
 extern void ps_layer_store_set_page_size(uint32_t value);

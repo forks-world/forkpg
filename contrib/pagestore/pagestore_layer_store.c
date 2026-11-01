@@ -1589,6 +1589,14 @@ local_verify_remote_layer(const PsLayerDesc *layer)
 	return -1;
 }
 
+int
+ps_layer_store_local_object_enabled(void)
+{
+	if (!local_owner_current())
+		return -1;
+	return object_dir[0] != '\0';
+}
+
 const PsLayerStore PsLayerStoreLocal = {
 	.name = "local",
 	.open = local_open,

@@ -39,6 +39,7 @@
 #include <unistd.h>
 
 #include "pagestore_fault.h"
+#include "pagestore_test_temp.h"
 #include "pagestore_retention.h"
 
 static int checks = 0;
@@ -53,40 +54,6 @@ check(int condition, const char *message)
 		fprintf(stderr, "FAIL: %s\n", message);
 		failures++;
 	}
-}
-
-static int
-remove_tree(const char *path)
-{
-	DIR		   *dir = opendir(path);
-	struct dirent *entry;
-	int			ok = 1;
-
-	if (dir == NULL)
-		return unlink(path) == 0 || errno == ENOENT;
-	while ((entry = readdir(dir)) != NULL)
-	{
-		char		child[1600];
-		struct stat st;
-
-		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-			continue;
-		if (snprintf(child, sizeof(child), "%s/%s", path, entry->d_name) < 0 ||
-			lstat(child, &st) != 0)
-		{
-			ok = 0;
-			continue;
-		}
-		if (S_ISDIR(st.st_mode))
-			ok = remove_tree(child) && ok;
-		else if (unlink(child) != 0 && errno != ENOENT)
-			ok = 0;
-	}
-	if (closedir(dir) != 0)
-		ok = 0;
-	if (rmdir(path) != 0 && errno != ENOENT)
-		ok = 0;
-	return ok;
 }
 
 static int
@@ -279,18 +246,18 @@ run_child(const RetentionCrashCase *tc, const char *store,
 static int
 run_case(const RetentionCrashCase *tc)
 {
-	char		store[] = "/tmp/psretentioncrashXXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "psretentioncrashXXXXXX";
 	char		fault_dir[1600];
 	pid_t		pid;
 	int			status;
 	int			ok;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 0;
 	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
 		mkdir(fault_dir, 0700) != 0)
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	pid = fork();
@@ -310,15 +277,15 @@ run_case(const RetentionCrashCase *tc)
 		check(snapshot_matches_expected(store, expect_d),
 			  "second restart is idempotent");
 	}
-	remove_tree(fault_dir);
-	remove_tree(store);
+	ps_test_remove_tree(fault_dir);
+	ps_test_remove_tree(store);
 	return ok;
 }
 
 static int
 run_fresh_case(const RetentionCrashCase *tc)
 {
-	char		store[] = "/tmp/psretentioncrashfreshXXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "psretentioncrashfreshXXXXXX";
 	char		fault_dir[1600];
 	pid_t		pid;
 	int			status;
@@ -326,12 +293,12 @@ run_fresh_case(const RetentionCrashCase *tc)
 	PsRetentionPin *pins = NULL;
 	uint32_t	count = 0;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 0;
 	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
 		mkdir(fault_dir, 0700) != 0)
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	pid = fork();
@@ -356,8 +323,8 @@ run_fresh_case(const RetentionCrashCase *tc)
 		free(pins);
 		ps_retention_close();
 	}
-	remove_tree(fault_dir);
-	remove_tree(store);
+	ps_test_remove_tree(fault_dir);
+	ps_test_remove_tree(store);
 	return ok;
 }
 
@@ -386,18 +353,18 @@ run_empty_compact_child(const char *store, const char *fault_dir)
 static int
 run_empty_compact_case(void)
 {
-	char		store[] = "/tmp/psretentioncrashemptyXXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "psretentioncrashemptyXXXXXX";
 	char		fault_dir[1600];
 	pid_t		pid;
 	int			status;
 	int			ok;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 0;
 	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
 		mkdir(fault_dir, 0700) != 0)
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	pid = fork();
@@ -425,8 +392,8 @@ run_empty_compact_case(void)
 		free(pins);
 		ps_retention_close();
 	}
-	remove_tree(fault_dir);
-	remove_tree(store);
+	ps_test_remove_tree(fault_dir);
+	ps_test_remove_tree(store);
 	return ok;
 }
 
@@ -480,24 +447,24 @@ setup_state_stripped_store(const char *store)
 static int
 run_bootstrap_torn_tail_case(void)
 {
-	char		store[] = "/tmp/psretentioncrashbstornXXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "psretentioncrashbstornXXXXXX";
 	char		meta_path[1700];
 	char		fault_dir[1600];
 	pid_t		pid;
 	int			status;
 	int			ok;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 0;
 	if (!setup_state_stripped_store(store))
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	if (snprintf(meta_path, sizeof(meta_path), "%s/retention.meta",
 				 store) < 0)
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	{
@@ -511,14 +478,14 @@ run_bootstrap_torn_tail_case(void)
 			  "(test setup)");
 		if (!wrote)
 		{
-			remove_tree(store);
+			ps_test_remove_tree(store);
 			return 0;
 		}
 	}
 	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
 		mkdir(fault_dir, 0700) != 0)
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	pid = fork();
@@ -536,31 +503,31 @@ run_bootstrap_torn_tail_case(void)
 			  "second restart after an interrupted torn-tail bootstrap is "
 			  "idempotent");
 	}
-	remove_tree(fault_dir);
-	remove_tree(store);
+	ps_test_remove_tree(fault_dir);
+	ps_test_remove_tree(store);
 	return ok;
 }
 
 static int
 run_bootstrap_case(void)
 {
-	char		store[] = "/tmp/psretentioncrashbootstrapXXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "psretentioncrashbootstrapXXXXXX";
 	char		fault_dir[1600];
 	pid_t		pid;
 	int			status;
 	int			ok;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 0;
 	if (!setup_state_stripped_store(store))
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
 		mkdir(fault_dir, 0700) != 0)
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	pid = fork();
@@ -578,8 +545,8 @@ run_bootstrap_case(void)
 			  "second restart after an interrupted state bootstrap is "
 			  "idempotent");
 	}
-	remove_tree(fault_dir);
-	remove_tree(store);
+	ps_test_remove_tree(fault_dir);
+	ps_test_remove_tree(store);
 	return ok;
 }
 
@@ -601,30 +568,30 @@ run_bootstrap_case(void)
 static int
 run_bootstrap_mismatch_case(void)
 {
-	char		store[] = "/tmp/psretentioncrashbsmismatchXXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "psretentioncrashbsmismatchXXXXXX";
 	char		meta_path[1700];
 	char		fault_dir[1600];
 	pid_t		pid;
 	int			status;
 	int			ok;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 0;
 	if (!setup_state_stripped_store(store))
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	if (snprintf(meta_path, sizeof(meta_path), "%s/retention.meta",
 				 store) < 0)
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
 		mkdir(fault_dir, 0700) != 0)
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	pid = fork();
@@ -665,8 +632,8 @@ run_bootstrap_mismatch_case(void)
 				ps_retention_close();
 		}
 	}
-	remove_tree(fault_dir);
-	remove_tree(store);
+	ps_test_remove_tree(fault_dir);
+	ps_test_remove_tree(store);
 	return ok;
 }
 
@@ -678,19 +645,19 @@ run_bootstrap_mismatch_case(void)
 static int
 run_pending_trailing_bytes_case(void)
 {
-	char		store[] = "/tmp/psretentioncrashtrailingXXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "psretentioncrashtrailingXXXXXX";
 	char		fault_dir[1600];
 	char		pending_path[1700];
 	pid_t		pid;
 	int			status;
 	int			ok;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 0;
 	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
 		mkdir(fault_dir, 0700) != 0)
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	pid = fork();
@@ -728,8 +695,8 @@ run_pending_trailing_bytes_case(void)
 			}
 		}
 	}
-	remove_tree(fault_dir);
-	remove_tree(store);
+	ps_test_remove_tree(fault_dir);
+	ps_test_remove_tree(store);
 	return ok;
 }
 
@@ -765,19 +732,19 @@ run_pending_tmp_leftover_child(const char *store, const char *fault_dir,
 static int
 run_pending_tmp_leftover_case(const char *fault_name, const char *label)
 {
-	char		store[] = "/tmp/psretentioncrashtmpleftoverXXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "psretentioncrashtmpleftoverXXXXXX";
 	char		fault_dir[1600];
 	char		tmp_path[1700];
 	pid_t		pid;
 	int			status;
 	int			ok;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 0;
 	if (snprintf(fault_dir, sizeof(fault_dir), "%s.fault", store) < 0 ||
 		mkdir(fault_dir, 0700) != 0)
 	{
-		remove_tree(store);
+		ps_test_remove_tree(store);
 		return 0;
 	}
 	pid = fork();
@@ -812,8 +779,8 @@ run_pending_tmp_leftover_case(const char *fault_name, const char *label)
 		free(pins);
 		ps_retention_close();
 	}
-	remove_tree(fault_dir);
-	remove_tree(store);
+	ps_test_remove_tree(fault_dir);
+	ps_test_remove_tree(store);
 	return ok;
 }
 
@@ -844,13 +811,13 @@ run_pending_tmp_leftover_case(const char *fault_name, const char *label)
 static int
 run_short_pending_fails_closed_case(void)
 {
-	char		store[] = "/tmp/psretentioncrashshortpendXXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "psretentioncrashshortpendXXXXXX";
 	char		pending_path[1700];
 	int			fd;
 	int			ok;
 	int			open_rc;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 0;
 	ok = populate_store(store);
 	check(ok, "populate a store for the short-pending fail-closed case");
@@ -879,7 +846,7 @@ run_short_pending_fails_closed_case(void)
 			  "the 0-byte retention.pending is left in place for manual "
 			  "inspection, not removed");
 	}
-	remove_tree(store);
+	ps_test_remove_tree(store);
 	return ok;
 }
 
@@ -896,13 +863,13 @@ run_short_pending_fails_closed_case(void)
 static int
 run_legacy_guard_unacked_drop_case(void)
 {
-	char		store[] = "/tmp/psretentioncrashlegacydropXXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "psretentioncrashlegacydropXXXXXX";
 	char		pending_path[1700];
 	PsRetentionPin pin;
 	int			fd;
 	int			ok;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 0;
 	ok = ps_retention_open(store) == 0;
 	check(ok, "open a store for the legacy-guard unacked-DROP case");
@@ -952,7 +919,7 @@ run_legacy_guard_unacked_drop_case(void)
 		check(access(pending_path, F_OK) == 0,
 			  "the legacy guard is left in place, not silently removed");
 	}
-	remove_tree(store);
+	ps_test_remove_tree(store);
 	return ok;
 }
 

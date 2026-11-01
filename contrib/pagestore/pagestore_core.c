@@ -50,6 +50,7 @@
 #include "pagestore_artifact_format.h"
 #include "pagestore_compat.h"
 #include "pagestore_core.h"
+#include "pagestore_compaction_prune.h"
 #include "pagestore_format.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
@@ -701,6 +702,74 @@ static uint64_t ps_test_compaction_pass_count;
 static unsigned segment_gc_compaction_turn;
 static void (*compaction_unlocked_test_hook)(void *);
 static void *compaction_unlocked_test_hook_arg;
+static void (*prune_snapshot_swap_test_hook)(void *);
+static void *prune_snapshot_swap_test_hook_arg;
+
+void
+ps_test_set_prune_snapshot_swap_hook(void (*hook)(void *), void *arg)
+{
+	prune_snapshot_swap_test_hook = hook;
+	prune_snapshot_swap_test_hook_arg = arg;
+}
+
+static void (*prune_abandon_test_hook)(void *);
+static void *prune_abandon_test_hook_arg;
+
+void
+ps_test_set_prune_abandon_hook(void (*hook)(void *), void *arg)
+{
+	prune_abandon_test_hook = hook;
+	prune_abandon_test_hook_arg = arg;
+}
+
+static void (*prune_snapshot_test_hook)(void *);
+static void *prune_snapshot_test_hook_arg;
+
+void
+ps_test_set_prune_snapshot_hook(void (*hook)(void *), void *arg)
+{
+	prune_snapshot_test_hook = hook;
+	prune_snapshot_test_hook_arg = arg;
+}
+
+static void (*prune_index_test_hook)(void *);
+static void *prune_index_test_hook_arg;
+
+void
+ps_test_set_prune_index_hook(void (*hook)(void *), void *arg)
+{
+	prune_index_test_hook = hook;
+	prune_index_test_hook_arg = arg;
+}
+
+static void (*prune_batch_test_hook)(void *);
+static void *prune_batch_test_hook_arg;
+
+void
+ps_test_set_prune_batch_hook(void (*hook)(void *), void *arg)
+{
+	prune_batch_test_hook = hook;
+	prune_batch_test_hook_arg = arg;
+}
+
+static void (*prune_retired_test_hook)(void *);
+static void *prune_retired_test_hook_arg;
+
+void
+ps_test_set_prune_retired_hook(void (*hook)(void *), void *arg)
+{
+	prune_retired_test_hook = hook;
+	prune_retired_test_hook_arg = arg;
+}
+static void (*compaction_gather_test_hook)(void *);
+static void *compaction_gather_test_hook_arg;
+
+void
+ps_test_set_compaction_gather_hook(void (*hook)(void *), void *arg)
+{
+	compaction_gather_test_hook = hook;
+	compaction_gather_test_hook_arg = arg;
+}
 
 void
 ps_test_set_compaction_unlocked_hook(void (*hook)(void *), void *arg)
@@ -2080,6 +2149,7 @@ struct WalIdxEnt;
 typedef struct Shard
 {
 	struct PageEnt *page_idx[IDX_BUCKETS];	/* (timeline,key,block) -> versions */
+	uint64_t page_index_epoch; /* changes under this shard write lock */
 	struct ForkEnt *fork_idx[IDX_BUCKETS];	/* (timeline,key) -> fork size */
 	struct WalIdxEnt *walidx[IDX_BUCKETS];	/* (timeline,key,block) -> WAL lsns */
 	PsMemtable *memtable;		/* staging -> image layers */
@@ -2104,6 +2174,15 @@ typedef struct Shard
 } Shard;
 
 static Shard g_shards[MAX_SHARDS];
+
+/* Saturation permanently disables optimistic snapshots on this shard. */
+static void
+page_index_changed(Shard *s)
+{
+	if (s->page_index_epoch != UINT64_MAX)
+		s->page_index_epoch++;
+}
+
 #ifdef PAGESTORE_BACKPRESSURE_TEST
 static uint64_t page_gc_coverage_observation_count;
 #endif
@@ -3249,6 +3328,27 @@ compact_order_cmp(const void *va, const void *vb)
 	return a->source < b->source ? -1 : (a->source > b->source ? 1 : 0);
 }
 
+/* Sorting depends only on the immutable gathered records, not on pruning
+ * state. The caller owns the returned order until its pass is finished. */
+static CompactOrder *
+compact_build_order(const PsImgRec *recs, uint32_t nrec)
+{
+	CompactOrder *order = malloc((size_t) nrec * sizeof(*order));
+
+	if (order == NULL)
+		return NULL;
+	for (uint32_t i = 0; i < nrec; i++)
+	{
+		order[i].key = recs[i].key;
+		order[i].block = recs[i].block;
+		order[i].version.lsn = recs[i].lsn;
+		order[i].version.admission_seq = recs[i].admission_seq;
+		order[i].source = i;
+	}
+	qsort(order, nrec, sizeof(*order), compact_order_cmp);
+	return order;
+}
+
 static int
 compact_same_page(const CompactOrder *a, const CompactOrder *b)
 {
@@ -3425,10 +3525,9 @@ compact_emit_grouped(const CompactOrder *order, uint32_t first, uint32_t end,
 
 static int
 prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
-						 uint64_t floor,
+						 uint64_t floor, const CompactOrder *order,
 						 PsImgRec **dropped_out, uint32_t *ndropped_out)
 {
-	CompactOrder *order;
 	PsPruneVersion *versions;
 	unsigned char *keep;
 	PsImgRec   *selected;
@@ -3471,7 +3570,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 		return -1;
 	}
 
-	order = malloc((size_t) *nrec * sizeof(*order));
 	versions = malloc((size_t) *nrec * sizeof(*versions));
 	keep = malloc(*nrec);
 	selected = malloc((size_t) *nrec * sizeof(*selected));
@@ -3482,11 +3580,10 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	closure_protect = malloc((size_t) *nrec);
 	if (nrelation_fences > 8)
 		vfences = malloc((size_t) nrelation_fences * sizeof(*vfences));
-	if (!order || !versions || !keep || !selected || !dropped ||
+	if (!versions || !keep || !selected || !dropped ||
 		!obj_generations || !obj_required || !closure_protect ||
 		(nrelation_fences > 8 && !vfences))
 	{
-		free(order);
 		free(versions);
 		free(keep);
 		free(selected);
@@ -3504,15 +3601,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	}
 	for (uint32_t i = 0; i < nrelation_fences; i++)
 		vfences[i] = history_fence_view(relation_fences[i]);
-	for (uint32_t i = 0; i < *nrec; i++)
-	{
-		order[i].key = recs[i].key;
-		order[i].block = recs[i].block;
-		order[i].version.lsn = recs[i].lsn;
-		order[i].version.admission_seq = recs[i].admission_seq;
-		order[i].source = i;
-	}
-	qsort(order, *nrec, sizeof(*order), compact_order_cmp);
 	for (uint32_t first = 0; first < *nrec;)
 	{
 		uint32_t end = first + 1;
@@ -3674,7 +3762,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 								   floor, control_fences, ncontrol_fences,
 								   &plan) != 0)
 			{
-				free(order);
 				free(versions);
 				free(keep);
 				free(selected);
@@ -3732,7 +3819,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 										   closure_protect);
 			if (rc < 0)
 			{
-				free(order);
 				free(versions);
 				free(keep);
 				free(selected);
@@ -3762,7 +3848,6 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	memcpy(recs, selected, (size_t) out * sizeof(*recs));
 	free(obj_generations);
 	free(obj_required);
-	free(order);
 	free(versions);
 	free(keep);
 	free(selected);
@@ -3886,6 +3971,20 @@ ps_test_compact_read_batch(const PsLayerDesc *layer, uint32_t npages,
 
 static uint64_t test_bounded_compaction_count;
 static uint64_t test_bounded_zero_floor_count;
+static uint64_t test_bounded_nonzero_plan_count;
+static uint64_t test_bounded_prune_published_count;
+
+uint64_t
+ps_test_bounded_prune_published_count(void)
+{
+	return __atomic_load_n(&test_bounded_prune_published_count, __ATOMIC_RELAXED);
+}
+
+uint64_t
+ps_test_bounded_nonzero_plan_count(void)
+{
+	return __atomic_load_n(&test_bounded_nonzero_plan_count, __ATOMIC_RELAXED);
+}
 
 uint64_t
 ps_test_bounded_compaction_count(void)
@@ -3899,11 +3998,506 @@ ps_test_bounded_zero_floor_count(void)
 	return __atomic_load_n(&test_bounded_zero_floor_count, __ATOMIC_RELAXED);
 }
 
+/* Bound total in-memory identities and split retained records into outputs. */
+#define PS_BOUNDED_PRUNE_MAX_OUTPUTS 8
+#define PS_BOUNDED_PRUNE_MAX_SELECTED (PS_BOUNDED_PRUNE_MAX_OUTPUTS * PS_IMAGE_BATCH_MAX_RECORDS)
+#define PS_BOUNDED_PRUNE_MAX_DROPPED 8192
+#define PS_BOUNDED_PRUNE_INDEX_BATCH 128
+typedef struct BoundedPruneStage
+{
+	PsImageGroupEntry *selected, *dropped, *sel_group, *drop_group;
+	uint32_t nselected, ndropped, checked;
+	uint64_t scanned;
+} BoundedPruneStage;
+
+static int
+bounded_prune_collect(const PsImageGroupEntry *entries, uint32_t count,
+		const unsigned char *keep, const unsigned char *closure, void *arg)
+{
+	BoundedPruneStage *stage = arg;
+	uint32_t ns, nd;
+
+	(void) closure;
+	stage->scanned += count;
+	if (ps_compaction_relation_select_group(entries, count, keep,
+			stage->sel_group, PS_IMAGE_GROUP_MAX_VERSIONS, &ns,
+			stage->drop_group, PS_IMAGE_GROUP_MAX_VERSIONS, &nd) != 0 ||
+		stage->nselected + ns > PS_BOUNDED_PRUNE_MAX_SELECTED ||
+		stage->ndropped + nd > PS_BOUNDED_PRUNE_MAX_DROPPED)
+		return -1;
+	memcpy(stage->selected + stage->nselected, stage->sel_group, (size_t) ns * sizeof(*stage->selected));
+	memcpy(stage->dropped + stage->ndropped, stage->drop_group, (size_t) nd * sizeof(*stage->dropped));
+	stage->nselected += ns;
+	stage->ndropped += nd;
+	return 0;
+}
+
+static int
+bounded_prune_check_drops(const PsImageGroupEntry *entries, uint32_t count, void *arg)
+{
+	BoundedPruneStage *stage = arg;
+
+	if (count > stage->ndropped - stage->checked)
+		return -1;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		const PsImageGroupEntry *a = &entries[i], *b = &stage->dropped[stage->checked++];
+		if (a->layer_id != b->layer_id || !key_eq(&a->entry.key, &b->entry.key) ||
+			a->entry.block != b->entry.block || a->entry.lsn != b->entry.lsn ||
+			a->entry.admission_seq != b->entry.admission_seq || a->entry.data_off != b->entry.data_off ||
+			a->entry.growth_lsn != b->entry.growth_lsn || a->entry.order_id != b->entry.order_id ||
+			a->entry.seg_off != b->entry.seg_off || a->entry.seg_id != b->entry.seg_id ||
+			a->entry.flags != b->entry.flags)
+			return -1;
+	}
+	return 0;
+}
+
+/* Returns 1 after replacing a long chain, 0 when the ordinary bounded
+ * index update should handle it, or -1 when the snapshot became stale.
+ * Entry and exit hold all shard locks, page_prune_lock and map-wr. */
+static int page_prune_long_chain(uint32_t timeline, const PsImgRec *recs,
+	uint32_t nrec, const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	const PsCompactionPruneFence *captured);
+static uint32_t page_prune_fast_batch_count(uint32_t timeline,
+	const PsImgRec *recs, uint32_t nrec);
+
+/* Until output lifetime is coordinated with the asynchronous tier scheduler,
+ * only the local provider with its object tier explicitly disabled can retire
+ * a newly published replacement here. Unknown providers fail closed. */
+static int
+prune_abandon_local_only(void)
+{
+	return ps_layer_store == &PsLayerStoreLocal &&
+		ps_layer_store_local_object_enabled() == 0;
+}
+
+int
+ps_test_prune_abandon_local_only(void)
+{
+	return prune_abandon_local_only();
+}
+
+/* One verified published output can be discarded only while the complete original
+ * source set remains live and pinned. The exact publication check also rules
+ * out new layers, tier changes and a changed replacement. Entry holds map-wr. */
+static int
+prune_one_published_output_abandonable(uint32_t timeline, const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *output)
+{
+	uint32_t pinned = 0;
+	int output_idle = 0;
+
+	if (!prune_abandon_local_only() || ps_manifest_poisoned() ||
+		!ps_timeline_live(timeline) ||
+		__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) != 0 ||
+		!ps_image_compaction_publication_valid(&ps_layer_map, inputs, ninputs,
+			output, 1, 1))
+		return 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->layer_id == output->layer_id)
+			output_idle = __atomic_load_n(&d->cache_readers, __ATOMIC_ACQUIRE) == 0;
+		for (uint32_t j = 0; j < ninputs; j++)
+			if (d->layer_id == inputs[j].layer_id &&
+				__atomic_load_n(&d->cache_readers, __ATOMIC_ACQUIRE) != 0)
+				pinned++;
+	}
+	return output_idle && pinned == ninputs;
+}
+
+/* Caller holds the same locks as compact_timeline. Input layers are pinned
+ * while planning, writing and verifying outside those locks. */
+static int
+compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
+								int *prune_deferred)
+{
+	PsLayerDesc inputs[PS_IMAGE_MERGE_MAX_INPUTS], outputs[PS_BOUNDED_PRUNE_MAX_OUTPUTS] = {0};
+	uint32_t ninputs = 0, retired = 0, noutputs = 0;
+	uint64_t max_id = 0, output_ids[PS_BOUNDED_PRUNE_MAX_OUTPUTS], uncertain = 0, kept = 0, dropped = 0;
+	PsHistoryFence *fences = NULL, *storage_fences = NULL;
+	PsViewFence *views = NULL;
+	uint32_t nfences = 0, nstorage = 0;
+	bool has_inherited = false;
+	uint64_t inherited = 0;
+	PsCompactionPruneFence captured = {0}, current = {0};
+	PsTimelineState state;
+	PsCompactionRelationPlan *plan = NULL;
+	BoundedPruneStage stage = {0};
+	PsImgRec *dropped_recs = NULL;
+	int plan_rc = -1, staged = 0, published = 0, ambiguous = 0, publish_ambiguous = 0, result = -1;
+	uint32_t visited;
+
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		const PsLayerLocation *loc;
+
+		if (d->kind != PS_LAYER_IMAGE || d->deleting || d->timeline != timeline ||
+			layer_shard_from_id(d->layer_id) != shard)
+			continue;
+		if (ninputs == PS_IMAGE_MERGE_MAX_INPUTS || d->remote_durable ||
+			d->legacy_shard_zero || (loc = tier_local_location(d)) == NULL ||
+			!loc->available || __atomic_load_n(&d->cache_readers, __ATOMIC_ACQUIRE) != 0)
+			return 0;
+		inputs[ninputs++] = *d;
+		if (d->layer_id > max_id)
+			max_id = d->layer_id;
+	}
+	if (ninputs == 0 || floor == 0 || ps_manifest_poisoned())
+		return 0;
+	if (page_prune_fences(timeline, &fences, &nfences) != 0 ||
+		page_storage_fences(timeline, fences, nfences, &storage_fences, &nstorage) != 0)
+		goto before_unlock;
+	if (nstorage != 0)
+	{
+		views = malloc((size_t) nstorage * sizeof(*views));
+		if (views == NULL)
+			goto before_unlock;
+		for (uint32_t i = 0; i < nstorage; i++)
+			views[i] = history_fence_view(storage_fences[i]);
+	}
+	inherited = timeline_inherited_below(timeline, &has_inherited);
+	if (ps_retention_epoch(&captured.retention_epoch) != 0 ||
+		!ps_timeline_state(timeline, &state, &captured.timeline_incarnation) ||
+		state != PS_TIMELINE_LIVE)
+		goto before_unlock;
+	captured.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	captured.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	captured.page_floor = floor;
+	stage.selected = calloc(PS_BOUNDED_PRUNE_MAX_SELECTED, sizeof(*stage.selected));
+	stage.dropped = calloc(PS_BOUNDED_PRUNE_MAX_DROPPED, sizeof(*stage.dropped));
+	stage.sel_group = calloc(PS_IMAGE_GROUP_MAX_VERSIONS, sizeof(*stage.sel_group));
+	stage.drop_group = calloc(PS_IMAGE_GROUP_MAX_VERSIONS, sizeof(*stage.drop_group));
+	dropped_recs = calloc(PS_BOUNDED_PRUNE_MAX_DROPPED, sizeof(*dropped_recs));
+	if (!stage.selected || !stage.dropped || !stage.sel_group || !stage.drop_group || !dropped_recs)
+		goto before_unlock;
+	for (uint32_t i = 0; i < PS_BOUNDED_PRUNE_MAX_OUTPUTS; i++)
+	{
+		output_ids[i] = alloc_layer_id(&g_shards[shard]);
+		if (output_ids[i] <= max_id || (i != 0 && output_ids[i] <= output_ids[i - 1]))
+			goto before_unlock;
+	}
+	for (uint32_t k = 0; k < ninputs; k++)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == inputs[k].layer_id)
+				__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+	ps_unlock_map();
+	pthread_rwlock_unlock(&page_prune_lock);
+	for (uint32_t s = core_shards(); s > 0; s--)
+		ps_unlock_shard(s - 1);
+	plan_rc = ps_compaction_relation_plan_open(inputs, ninputs, PS_IMAGE_GROUP_MAX_VERSIONS,
+		(PsPruneFence) {floor, UINT64_MAX}, views, nstorage, inherited, has_inherited, &plan);
+	if (plan_rc == 0)
+		do {
+			plan_rc = ps_compaction_relation_plan_step(plan, 32, bounded_prune_collect, &stage, &visited);
+		} while (plan_rc == 1);
+	ps_compaction_relation_plan_close(plan);
+	plan = NULL;
+	if (plan_rc == 0 && stage.ndropped != 0 && stage.nselected != 0)
+	{
+		noutputs = (stage.nselected + PS_IMAGE_BATCH_MAX_RECORDS - 1) / PS_IMAGE_BATCH_MAX_RECORDS;
+		for (uint32_t i = 0; i < noutputs; i++)
+		{
+			uint32_t offset = i * PS_IMAGE_BATCH_MAX_RECORDS;
+			uint32_t count = stage.nselected - offset;
+			int write_rc;
+
+			if (count > PS_IMAGE_BATCH_MAX_RECORDS)
+				count = PS_IMAGE_BATCH_MAX_RECORDS;
+			write_rc = ps_image_compaction_stage_selected_batch(inputs, ninputs,
+				stage.selected + offset, count, output_ids[i], page_size, &outputs[i], &uncertain);
+			if (write_rc != 0)
+			{
+				plan_rc = -1;
+				ambiguous = write_rc == -2;
+				break;
+			}
+			staged++;
+		}
+		if (plan_rc == 0)
+		{
+			plan_rc = ps_compaction_verify_relation_plan(inputs, ninputs, outputs, noutputs,
+				page_size, PS_IMAGE_GROUP_MAX_VERSIONS, (PsPruneFence) {floor, UINT64_MAX},
+				views, nstorage, inherited, has_inherited, bounded_prune_check_drops,
+				&stage, &kept, &dropped);
+			if (plan_rc == 0 && (kept != stage.nselected || dropped != stage.ndropped ||
+				stage.checked != stage.ndropped))
+				plan_rc = -1;
+		}
+	}
+	else
+		plan_rc = 1; /* ineligible, no output exists */
+	if (staged && plan_rc == 0)
+		for (uint32_t i = 0; i < stage.ndropped; i++)
+		{
+			dropped_recs[i].key = stage.dropped[i].entry.key;
+			dropped_recs[i].block = stage.dropped[i].entry.block;
+			dropped_recs[i].lsn = stage.dropped[i].entry.lsn;
+			dropped_recs[i].admission_seq = stage.dropped[i].entry.admission_seq;
+		}
+	free(views);
+	views = NULL;
+	if (staged && plan_rc == 0 && compaction_unlocked_test_hook != NULL)
+		compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
+	for (uint32_t s = 0; s < core_shards(); s++)
+		ps_lock_shard_wr(s);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	if (ps_retention_epoch(&current.retention_epoch) != 0 ||
+		!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
+		state != PS_TIMELINE_LIVE ||
+		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+			&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+		goto done;
+	current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	if (current.retention_epoch != captured.retention_epoch ||
+		current.timeline_epoch != captured.timeline_epoch ||
+		current.admission_epoch != captured.admission_epoch ||
+		current.timeline_incarnation != captured.timeline_incarnation || current.page_floor != captured.page_floor ||
+		count_image_layers(timeline, shard) != ninputs || ps_manifest_poisoned())
+	{
+		g_shards[shard].staged_compaction_retries = 1;
+		goto done;
+	}
+	if (plan_rc == 1 && !ambiguous)
+	{
+		/* No file was created. Verify the exact original source descriptors
+		 * and that the reserved output ID is still absent before fallback. */
+		PsLayerDesc unused_output = inputs[0];
+
+		unused_output.layer_id = output_ids[0];
+		if (!ps_image_compaction_publication_valid(&ps_layer_map, inputs, ninputs,
+				&unused_output, 1, 0))
+		{
+			g_shards[shard].staged_compaction_retries = 1;
+			goto done;
+		}
+		result = 0;
+		goto done;
+	}
+	if (plan_rc != 0 || !staged ||
+		!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
+			&captured, &current, 1, 0, 0, 0, 0, 0))
+		goto done;
+	if (page_frontier_advance(timeline, floor,
+			captured.admission_epoch ? captured.admission_epoch - 1 : 0) != 0 ||
+		ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) != 0)
+		goto done;
+	for (uint32_t k = 0; k < noutputs; k++)
+	{
+		if (!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
+				&captured, &current, 1, 0, k, 0, 1, 0))
+			goto done;
+		if (ps_manifest_publish_image_batch(inputs, ninputs, outputs, noutputs, k) != 0)
+		{
+			ambiguous = 1;
+			publish_ambiguous = 1;
+			goto done;
+		}
+		published++;
+		inspection_metrics_changed();
+		if (k + 1 < noutputs)
+		{
+			ps_unlock_map();
+			pthread_rwlock_unlock(&page_prune_lock);
+			for (uint32_t sh = core_shards(); sh > 0; sh--)
+				ps_unlock_shard(sh - 1);
+			if (prune_batch_test_hook != NULL)
+				prune_batch_test_hook(prune_batch_test_hook_arg);
+			for (uint32_t sh = 0; sh < core_shards(); sh++)
+				ps_lock_shard_wr(sh);
+			pthread_rwlock_rdlock(&page_prune_lock);
+			ps_lock_map_wr();
+			if (ps_manifest_poisoned() ||
+				ps_retention_epoch(&current.retention_epoch) != 0 ||
+				!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
+				state != PS_TIMELINE_LIVE ||
+				retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+					&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+				goto done;
+			current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+			current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+		}
+	}
+	__atomic_fetch_add(&test_bounded_prune_published_count, 1, __ATOMIC_RELAXED);
+	if (ps_fault_probe(PS_FAULT_POINT_PAGE_COMPACTION_AFTER_PUBLISH) != 0 ||
+		!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
+			&captured, &current, 1, 0, noutputs, 0, 1, 0))
+		goto done;
+	/* All sources stay live until the entire index update is complete. A
+	 * stale snapshot stops the remaining work and leaves pruning due. */
+	for (uint32_t offset = 0; offset < stage.ndropped;)
+	{
+		uint32_t count = stage.ndropped - offset;
+
+		uint32_t group = 1;
+		int long_chain;
+
+		while (offset + group < stage.ndropped &&
+			   dropped_recs[offset + group].block == dropped_recs[offset].block &&
+			   key_eq(&dropped_recs[offset + group].key, &dropped_recs[offset].key))
+			group++;
+		long_chain = page_prune_long_chain(timeline, dropped_recs + offset, group,
+			inputs, ninputs, outputs, noutputs, &captured);
+		if (long_chain < 0)
+			goto done;
+		if (long_chain > 0)
+			count = group;
+		else
+		{
+			count = page_prune_fast_batch_count(timeline, dropped_recs + offset, count);
+			if (count == 0)
+				goto done;
+			page_remove_compacted_versions(timeline, dropped_recs + offset, count);
+		}
+		offset += count;
+		if (offset < stage.ndropped)
+		{
+			ps_unlock_map();
+			pthread_rwlock_unlock(&page_prune_lock);
+			for (uint32_t sh = core_shards(); sh > 0; sh--)
+				ps_unlock_shard(sh - 1);
+			if (prune_index_test_hook != NULL)
+				prune_index_test_hook(prune_index_test_hook_arg);
+			for (uint32_t sh = 0; sh < core_shards(); sh++)
+				ps_lock_shard_wr(sh);
+			pthread_rwlock_rdlock(&page_prune_lock);
+			ps_lock_map_wr();
+			if (ps_manifest_poisoned() ||
+				ps_retention_epoch(&current.retention_epoch) != 0 ||
+				!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
+				state != PS_TIMELINE_LIVE ||
+				retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+					&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+				goto done;
+			current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+			current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+			if (!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs,
+					outputs, noutputs, &captured, &current, 1, 0, noutputs, 0, 1, 0))
+				goto done;
+		}
+	}
+	if (metrics_header != NULL)
+	{
+		ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+		ps_fetch_add_u64(&metrics_header->page_prune_compactions, 1);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_scanned, stage.scanned);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_kept, stage.nselected);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted, stage.scanned - stage.nselected);
+		ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+	}
+	for (uint32_t k = 0; k < ninputs; k++)
+	{
+		if (!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
+				&captured, &current, 1, 0, noutputs, k, 1, 1) ||
+			ps_manifest_retire_image_source(inputs, ninputs, outputs, noutputs, k) != 0)
+			goto done;
+		retired++;
+		inspection_metrics_changed();
+		if (ps_fault_probe(PS_FAULT_POINT_PAGE_GC_AFTER_MARK_DELETE) != 0)
+			goto done;
+		if (k + 1 < ninputs)
+		{
+			/* Release the locks between durable source tombstones and fence
+			 * every subsequent one against the original pruning snapshot. */
+			ps_unlock_map();
+			pthread_rwlock_unlock(&page_prune_lock);
+			for (uint32_t s = core_shards(); s > 0; s--)
+				ps_unlock_shard(s - 1);
+			if (prune_retired_test_hook != NULL)
+				prune_retired_test_hook(prune_retired_test_hook_arg);
+			for (uint32_t s = 0; s < core_shards(); s++)
+				ps_lock_shard_wr(s);
+			pthread_rwlock_rdlock(&page_prune_lock);
+			ps_lock_map_wr();
+			if (ps_manifest_poisoned() ||
+				ps_retention_epoch(&current.retention_epoch) != 0 ||
+				!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
+				state != PS_TIMELINE_LIVE ||
+				retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+					&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+				goto done;
+			current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+			current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+		}
+	}
+	result = 1;
+	g_shards[shard].staged_compaction_retries = 0;
+
+done:
+	/* Before any source is retired, a complete pinned source set still covers
+	 * one verified published output. Retire it on an aborted attempt so repeated
+	 * snapshot conflicts do not accumulate redundant live layers. Never guess
+	 * after an ambiguous manifest append or changed layer set. */
+	if (result < 0 && published == 1 && retired == 0 && !ambiguous &&
+		prune_one_published_output_abandonable(timeline, inputs, ninputs, &outputs[0]))
+	{
+		if (ps_manifest_mark_delete(outputs[0].layer_id) == 0)
+		{
+			inspection_metrics_changed();
+			if (prune_abandon_test_hook != NULL)
+				prune_abandon_test_hook(prune_abandon_test_hook_arg);
+		}
+		else
+			g_shards[shard].staged_compaction_retries = 1;
+	}
+	for (uint32_t k = 0; k < ninputs; k++)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == inputs[k].layer_id)
+			{
+				__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+				break;
+			}
+	/* Keep a possibly submitted batch for replay; later batches were never
+	 * submitted and can be removed even after a partial publication. */
+	for (uint32_t k = published + (publish_ambiguous ? 1 : 0); k < (uint32_t) staged; k++)
+		if (ps_layer_store->delete_local_layer(&outputs[k]) != 0)
+			g_shards[shard].staged_compaction_retries = 1;
+	if (ambiguous && !published)
+		g_shards[shard].staged_compaction_retries = 1;
+	if (retired != 0)
+		result = 1;
+	if (published)
+		*prune_deferred = 1;
+before_unlock:
+	free(fences);
+	free(storage_fences);
+	free(views);
+	free(stage.selected);
+	free(stage.dropped);
+	free(stage.sel_group);
+	free(stage.drop_group);
+	free(dropped_recs);
+	return result;
+}
+
+/* A bounded merge may conservatively keep more history than the ordinary
+ * planner (notably versions hidden by fork invalidation). Re-request pruning
+ * after a successful merge so that history remains eligible for reclamation. */
+static int
+bounded_all_versions_kept(const PsImageGroupEntry *entries, uint32_t count,
+		const unsigned char *keep, const unsigned char *closure, void *arg)
+{
+	int *all_kept = arg;
+
+	(void) entries;
+	(void) closure;
+	for (uint32_t i = 0; i < count; i++)
+		if (!keep[i])
+			*all_kept = 0;
+	return 0;
+}
+
 /* Merge without pruning when a bounded replacement can reduce layer count.
  * Entry and exit both hold all shard locks, page_prune_lock and map-wr.
  * Return 0 when ineligible, 1 on work, and -1 on an attempted failure. */
 static int
-compact_timeline_bounded(uint32_t timeline, uint32_t shard,
+compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 						 uint64_t *scanned_out, uint64_t *kept_out)
 {
 	PsLayerDesc inputs[PS_IMAGE_MERGE_MAX_INPUTS];
@@ -3913,7 +4507,12 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard,
 	uint32_t capacity;
 	uint64_t bytes = 0, retention_epoch, current_retention_epoch;
 	uint64_t timeline_epoch, admission_epoch;
-	int result = -1, prepare_rc, ambiguous = 0;
+	int result = -1, prepare_rc = 0, ambiguous = 0, eligible = 1;
+	PsHistoryFence *fences = NULL, *storage_fences = NULL;
+	PsViewFence *views = NULL;
+	uint32_t nfences = 0, nstorage = 0;
+	uint64_t inherited = 0;
+	bool has_inherited = false;
 
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 	{
@@ -3938,8 +4537,36 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard,
 	 * Duplicates may make this conservative, which only chooses the old path. */
 	if (bytes > (uint64_t) capacity * PS_IMAGE_BATCH_MAX_RECORDS * page_size)
 		return 0;
+	if (page_floor != 0)
+	{
+		if (page_prune_fences(timeline, &fences, &nfences) != 0 ||
+			page_storage_fences(timeline, fences, nfences, &storage_fences, &nstorage) != 0)
+		{
+			free(fences);
+			free(storage_fences);
+			return -1;
+		}
+		if (nstorage != 0)
+		{
+			views = malloc((size_t) nstorage * sizeof(*views));
+			if (views == NULL)
+			{
+				free(fences);
+				free(storage_fences);
+				return -1;
+			}
+			for (uint32_t i = 0; i < nstorage; i++)
+				views[i] = history_fence_view(storage_fences[i]);
+		}
+		inherited = timeline_inherited_below(timeline, &has_inherited);
+		free(fences);
+		free(storage_fences);
+	}
 	if (ps_retention_epoch(&retention_epoch) != 0)
+	{
+		free(views);
 		return -1;
+	}
 	timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 	admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	__atomic_fetch_add(&test_bounded_compaction_count, 1, __ATOMIC_RELAXED);
@@ -3954,12 +4581,37 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard,
 	pthread_rwlock_unlock(&page_prune_lock);
 	for (uint32_t s = core_shards(); s > 0; s--)
 		ps_unlock_shard(s - 1);
-	if (compaction_unlocked_test_hook != NULL)
+	if (page_floor == 0 && compaction_unlocked_test_hook != NULL)
 		compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
-	prepare_rc = ps_image_compaction_prepare_counted(inputs, ninputs, ids, capacity,
-										 page_size, outputs, &noutputs, &uncertain,
-										 scanned_out, kept_out);
-	if (prepare_rc == 0 &&
+	if (page_floor != 0)
+	{
+		PsCompactionRelationPlan *plan = NULL;
+		uint32_t visited;
+		int plan_rc = ps_compaction_relation_plan_open(inputs, ninputs,
+			PS_IMAGE_GROUP_MAX_VERSIONS, (PsPruneFence) {page_floor, UINT64_MAX},
+			views, nstorage, inherited, has_inherited, &plan);
+
+		if (plan_rc == 0)
+			do {
+				plan_rc = ps_compaction_relation_plan_step(plan, 32,
+					bounded_all_versions_kept, &eligible, &visited);
+			} while (plan_rc == 1 && eligible);
+		ps_compaction_relation_plan_close(plan);
+		if (plan_rc != 0 || !eligible)
+			eligible = 0;
+		if (eligible)
+		{
+			__atomic_fetch_add(&test_bounded_nonzero_plan_count, 1, __ATOMIC_RELAXED);
+			if (compaction_unlocked_test_hook != NULL)
+				compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
+		}
+	}
+	free(views);
+	if (eligible)
+		prepare_rc = ps_image_compaction_prepare_counted(inputs, ninputs, ids, capacity,
+											 page_size, outputs, &noutputs, &uncertain,
+											 scanned_out, kept_out);
+	if (eligible && prepare_rc == 0 &&
 		ps_image_compaction_verify_coverage(inputs, ninputs, outputs, noutputs, page_size) != 0)
 		prepare_rc = -1;
 	for (uint32_t s = 0; s < core_shards(); s++)
@@ -3976,6 +4628,36 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard,
 		ambiguous = prepare_rc == -2;
 		if (prepare_rc == 0 || prepare_rc == -3)
 			g_shards[shard].staged_compaction_retries = 1;
+		goto done;
+	}
+	/* A failed conservative plan may fall back to the ordinary path.  Its
+	 * pre-unlock source snapshot must still name the entire live set. */
+	if (count_image_layers(timeline, shard) != ninputs)
+	{
+		g_shards[shard].staged_compaction_retries = 1;
+		goto done;
+	}
+	for (uint32_t k = 0; k < ninputs; k++)
+	{
+		int found = 0;
+
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == inputs[k].layer_id)
+			{
+				found = !ps_layer_map.layers[i].deleting &&
+					ps_layer_map.layers[i].remote_durable == inputs[k].remote_durable &&
+					tier_local_location(&ps_layer_map.layers[i]) != NULL;
+				break;
+			}
+		if (!found)
+		{
+			g_shards[shard].staged_compaction_retries = 1;
+			goto done;
+		}
+	}
+	if (!eligible)
+	{
+		result = 0;
 		goto done;
 	}
 	for (uint32_t k = 0; k < noutputs; k++)
@@ -4041,11 +4723,13 @@ done:
 }
 
 static int
-compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
+compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
+				 int *prune_deferred)
 {
 	PsLayerDesc *old;
 	uint32_t	nold = count_image_layers(timeline, shard);
 	PsImgRec   *recs = NULL;
+	CompactOrder *order = NULL;
 	CompactPageSource **pages = NULL;
 	uint32_t	nrec = 0,
 				cap = 0,
@@ -4060,6 +4744,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	uint64_t	frontier_seq;
 	uint64_t	retention_epoch = 0, timeline_epoch = 0, admission_epoch = 0;
 	int			stage_unlocked = g_shards[shard].staged_compaction_retries < 1;
+	int			gather_unlocked = 0, gather_ok = 1;
 	int			rc = -1;
 
 	if (!ps_timeline_live(timeline))
@@ -4127,12 +4812,25 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 				return 0;
 			}
 
+	/* Try the bounded relation-only pruning path before the legacy gather. */
+	if (page_floor != 0 && stage_unlocked)
+	{
+		int bounded_prune = compact_timeline_pruned_bounded(timeline, shard,
+												 page_floor, prune_deferred);
+
+		if (bounded_prune != 0)
+		{
+			rc = bounded_prune;
+			goto cleanup;
+		}
+	}
+
 	/* At floor zero the prune planner retains every identity, for all key
 	 * classes. Skip its unbounded locked index gather in this case. */
 	if (page_floor == 0 && stage_unlocked && nold > 1)
 	{
 		uint64_t bounded_scanned = 0, bounded_kept = 0;
-		int bounded = compact_timeline_bounded(timeline, shard,
+		int bounded = compact_timeline_bounded(timeline, shard, 0,
 										 &bounded_scanned, &bounded_kept);
 
 		if (bounded != 0)
@@ -4153,6 +4851,60 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		}
 	}
 
+	/* Conservatively merge relation-only histories when bounded planning proves
+	 * every version is kept. A later pruning turn handles fork invalidation. */
+	if (page_floor != 0 && stage_unlocked && nold > 1)
+	{
+		uint64_t bounded_scanned = 0, bounded_kept = 0;
+		int bounded = compact_timeline_bounded(timeline, shard, page_floor,
+										 &bounded_scanned, &bounded_kept);
+
+		if (bounded != 0)
+		{
+			if (bounded > 0)
+			{
+				*prune_deferred = 1;
+				if (metrics_header != NULL)
+				{
+					ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+					ps_fetch_add_u64(&metrics_header->page_prune_compactions, 1);
+					ps_fetch_add_u64(&metrics_header->page_prune_versions_scanned, bounded_scanned);
+					ps_fetch_add_u64(&metrics_header->page_prune_versions_kept, bounded_kept);
+					ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted,
+								 bounded_scanned - bounded_kept);
+					ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+				}
+			}
+			rc = bounded;
+			goto cleanup;
+		}
+	}
+
+	/* Snapshot and pin verified local inputs so index I/O and record allocation
+	 * do not block writers. The pruning decision still runs under the locks. */
+	if (stage_unlocked && nold > 0)
+	{
+		gather_unlocked = 1;
+		for (uint32_t k = 0; k < nold; k++)
+			if (old[k].remote_durable || old[k].legacy_shard_zero ||
+				!old[k].data_verified || tier_local_location(&old[k]) == NULL)
+				gather_unlocked = 0;
+		if (gather_unlocked && ps_retention_epoch(&retention_epoch) != 0)
+			goto cleanup;
+		if (gather_unlocked)
+		{
+			timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+			admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+			for (uint32_t k = 0; k < nold; k++)
+				for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+					if (ps_layer_map.layers[i].layer_id == old[k].layer_id)
+						__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+			ps_unlock_map();
+			pthread_rwlock_unlock(&page_prune_lock);
+			for (uint32_t sh = core_shards(); sh > 0; sh--)
+				ps_unlock_shard(sh - 1);
+		}
+	}
 	/* Gather metadata only; read retained pages on demand after pruning. */
 	for (uint32_t k = 0; k < nold; k++)
 	{
@@ -4160,15 +4912,13 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		uint32_t	n;
 
 		if (read_image_index_refreshing(&old[k], &idx, &n) != 0)
-			goto cleanup;
-		/* materialize_compaction_inputs() checksummed this local copy just
-		 * before the locks were taken, and only an eviction -- excluded by
-		 * the map write lock held here -- clears the flag.  Checksumming every
-		 * input again would double the time all writers of this shard wait. */
+			goto gather_done;
+		/* materialize_compaction_inputs() verified this copy before the pass.
+		 * The map lock or the gather pin prevents eviction while it is read. */
 		if (!old[k].data_verified && verify_image_layer_refreshing(&old[k]) != 0)
 		{
 			free(idx);
-			goto cleanup;
+			goto gather_done;
 		}
 		for (uint32_t j = 0; j < n; j++)
 		{
@@ -4183,14 +4933,14 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 				if (!nr)
 				{
 					free(idx);
-					goto cleanup;
+					goto gather_done;
 				}
 				recs = nr;
 				np = realloc(pages, (size_t) nc * sizeof(*pages));
 				if (!np)
 				{
 					free(idx);
-					goto cleanup;
+					goto gather_done;
 				}
 				pages = np;
 				cap = nc;
@@ -4199,7 +4949,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 			if (!pg)
 			{
 				free(idx);
-				goto cleanup;
+				goto gather_done;
 			}
 			pg->layer = &old[k];
 			pg->offset = idx[j].data_off;
@@ -4219,10 +4969,62 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		}
 		free(idx);
 	}
+	if (nrec != 0)
+	{
+		order = compact_build_order(recs, nrec);
+		if (order == NULL)
+			goto gather_done;
+	}
+	/* Exercise snapshot validation after the unlocked sort has completed. */
+	if (gather_unlocked && compaction_gather_test_hook != NULL)
+		compaction_gather_test_hook(compaction_gather_test_hook_arg);
+	goto gather_complete;
+gather_done:
+	gather_ok = 0;
+gather_complete:
+	if (gather_unlocked)
+	{
+		uint64_t current_retention_epoch;
+		int valid = 1;
+
+		for (uint32_t sh = 0; sh < core_shards(); sh++)
+			ps_lock_shard_wr(sh);
+		pthread_rwlock_rdlock(&page_prune_lock);
+		ps_lock_map_wr();
+		if (!ps_timeline_live(timeline) || ps_manifest_poisoned() ||
+			ps_retention_epoch(&current_retention_epoch) != 0 ||
+			current_retention_epoch != retention_epoch ||
+			__atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE) != timeline_epoch ||
+			__atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE) != admission_epoch ||
+			count_image_layers(timeline, shard) != nold)
+			valid = 0;
+		for (uint32_t k = 0; k < nold; k++)
+		{
+			int found = 0;
+			for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+				if (ps_layer_map.layers[i].layer_id == old[k].layer_id)
+				{
+					found = !ps_layer_map.layers[i].deleting &&
+						ps_layer_map.layers[i].remote_durable == old[k].remote_durable &&
+						tier_local_location(&ps_layer_map.layers[i]) != NULL;
+					__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+					break;
+				}
+			if (!found)
+				valid = 0;
+		}
+		if (!valid)
+		{
+			g_shards[shard].staged_compaction_retries = 1;
+			gather_ok = 0;
+		}
+	}
+	if (!gather_ok)
+		goto cleanup;
 	if (nrec == 0)
 		goto cleanup;
 	scanned = nrec;
-	if (prune_compaction_records(timeline, recs, &nrec, page_floor,
+	if (prune_compaction_records(timeline, recs, &nrec, page_floor, order,
 								 &dropped, &ndropped) != 0)
 		goto cleanup;
 	/* Every source version can be invalidated (a dropped relation whose
@@ -4250,7 +5052,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	 * Use the bounded merge only after it proves no versions were dropped. */
 	if (ndropped == 0 && stage_unlocked)
 	{
-		int bounded = compact_timeline_bounded(timeline, shard, NULL, NULL);
+		int bounded = compact_timeline_bounded(timeline, shard, 0, NULL, NULL);
 
 		if (bounded != 0)
 		{
@@ -4484,6 +5286,7 @@ cleanup:
 		free(pages[j]);
 	free(recs);
 	free(pages);
+	free(order);
 	free(dropped);
 	free(old);
 	return rc;
@@ -6086,6 +6889,7 @@ page_cleanup_purge_timeline_locked(uint32_t timeline)
 					continue;
 				}
 				*link = e->next;
+				page_index_changed(&g_shards[sh]);
 				free(e->vers);
 				free(e);
 			}
@@ -6275,6 +7079,7 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 			}
 		}
 		e->nver = out;
+		page_index_changed(shard_for(&e->key));
 		r = end;
 	}
 	/*
@@ -6325,6 +7130,216 @@ page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
 	}
 }
 
+/* Test fixture helper: change only an empty memtable's flush threshold. */
+int
+ps_test_resize_empty_memtable(uint32_t shard, uint32_t threshold)
+{
+	PsMemtable *replacement, *old;
+
+	if (shard >= core_shards() || threshold == 0)
+		return -1;
+	replacement = ps_memtable_create(page_size, threshold);
+	if (replacement == NULL)
+		return -1;
+	ps_lock_shard_wr(shard);
+	old = g_shards[shard].memtable;
+	if (old == NULL || ps_memtable_count(old) != 0)
+	{
+		ps_unlock_shard(shard);
+		ps_memtable_destroy(replacement);
+		return -1;
+	}
+	g_shards[shard].memtable = replacement;
+	ps_unlock_shard(shard);
+	ps_memtable_destroy(old);
+	return 0;
+}
+
+/* Long relation chains are copied under a sequence of short lock holds.
+ * The shard epoch makes any append, pruning update or GC retarget invalidate
+ * the snapshot, including changes that do not allocate an admission ID. */
+#define PS_LONG_CHAIN_MIN_VERSIONS 1024
+#define PS_LONG_CHAIN_MAX_VERSIONS 65536
+#define PS_LONG_CHAIN_COPY_BATCH 128
+
+/* Never let a regular batch pull a later eligible long chain into the
+ * locked array scan. Preserve the 128-identity cap for ordinary pages. */
+static uint32_t
+page_prune_fast_batch_count(uint32_t timeline, const PsImgRec *recs, uint32_t nrec)
+{
+	uint32_t count = 0;
+
+	while (count < nrec && count < PS_BOUNDED_PRUNE_INDEX_BATCH)
+	{
+		uint32_t group = 1;
+		PageEnt *e = page_find(timeline, &recs[count].key, recs[count].block);
+
+		if (e != NULL && e->nver > PS_LONG_CHAIN_MIN_VERSIONS &&
+			e->nver <= PS_LONG_CHAIN_MAX_VERSIONS &&
+			recs[count].key.klass == PS_KLASS_RELATION && recs[count].lsn != 0)
+			break;
+		while (count + group < nrec &&
+			   recs[count + group].block == recs[count].block &&
+			   key_eq(&recs[count + group].key, &recs[count].key))
+			group++;
+		if (group > PS_BOUNDED_PRUNE_INDEX_BATCH - count)
+			group = PS_BOUNDED_PRUNE_INDEX_BATCH - count;
+		count += group;
+	}
+	return count;
+}
+
+static int
+page_snapshot_dropped(const PsImgRec *recs, uint32_t count, const PageVer *v)
+{
+	uint32_t lo = 0, hi = count;
+
+	while (lo < hi)
+	{
+		uint32_t mid = lo + (hi - lo) / 2;
+
+		if (recs[mid].lsn < v->lsn ||
+			(recs[mid].lsn == v->lsn && recs[mid].admission_seq < v->admission_seq))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo < count && recs[lo].lsn == v->lsn &&
+		recs[lo].admission_seq == v->admission_seq;
+}
+
+static void
+page_snapshot_unlock(void)
+{
+	ps_unlock_map();
+	pthread_rwlock_unlock(&page_prune_lock);
+	for (uint32_t sh = core_shards(); sh > 0; sh--)
+		ps_unlock_shard(sh - 1);
+}
+
+/* Always returns holding the original locks, even on a failed validation. */
+static int
+page_snapshot_lock_valid(uint32_t timeline, const PsKey *key, uint32_t block,
+	uint32_t shard, uint64_t epoch, int nver,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	const PsCompactionPruneFence *captured)
+{
+	PsCompactionPruneFence current = {0};
+	PsTimelineState state;
+	PageEnt *e;
+
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		ps_lock_shard_wr(sh);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	if (ps_manifest_poisoned() ||
+		ps_retention_epoch(&current.retention_epoch) != 0 ||
+		!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
+		state != PS_TIMELINE_LIVE ||
+		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+			&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+		return 0;
+	current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	if (!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
+			captured, &current, 1, 0, noutputs, 0, 1, 0) ||
+		g_shards[shard].page_index_epoch != epoch)
+		return 0;
+	e = page_find(timeline, key, block);
+	return e != NULL && e->nver == nver;
+}
+
+static int
+page_prune_long_chain(uint32_t timeline, const PsImgRec *recs, uint32_t nrec,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	const PsCompactionPruneFence *captured)
+{
+	PsKey key = recs[0].key;
+	uint32_t block = recs[0].block, shard = ps_shard_of(&key);
+	PageEnt *e = page_find(timeline, &key, block);
+	PageVer *snapshot = NULL, *old = NULL;
+	uint64_t epoch;
+	int nver, kept = 0, valid;
+
+	if (e == NULL || e->nver <= PS_LONG_CHAIN_MIN_VERSIONS ||
+		e->nver > PS_LONG_CHAIN_MAX_VERSIONS || key.klass != PS_KLASS_RELATION)
+		return 0;
+	/* Removing an LSN-zero record also changes fork-level WAL-less state.
+	 * Keep that case on the existing path until it can be snapshotted too. */
+	for (uint32_t i = 0; i < nrec; i++)
+		if (recs[i].lsn == 0)
+			return 0;
+	nver = e->nver;
+	epoch = g_shards[shard].page_index_epoch;
+	if (epoch >= UINT64_MAX - 1 || (size_t) nver > SIZE_MAX / sizeof(*snapshot))
+		return -1;
+	page_snapshot_unlock();
+	snapshot = malloc((size_t) nver * sizeof(*snapshot));
+	valid = page_snapshot_lock_valid(timeline, &key, block, shard, epoch, nver,
+		inputs, ninputs, outputs, noutputs, captured);
+	if (!valid || snapshot == NULL)
+		goto fail;
+	for (int offset = 0; offset < nver;)
+	{
+		int count = nver - offset;
+
+		if (count > PS_LONG_CHAIN_COPY_BATCH)
+			count = PS_LONG_CHAIN_COPY_BATCH;
+		e = page_find(timeline, &key, block);
+		memcpy(snapshot + offset, e->vers + offset, (size_t) count * sizeof(*snapshot));
+#ifdef PAGESTORE_ASSERT_CHECKING
+		for (int i = offset; i < offset + count; i++)
+		{
+			const PageVer *v = &snapshot[i];
+			int remove = page_snapshot_dropped(recs, nrec, v);
+
+			PS_ASSERT(!remove || v->seg < 0 ||
+				(g_shards[v->shard].flush_watermark_valid &&
+				 ((uint32_t) v->seg < g_shards[v->shard].flush_watermark.seg_id ||
+				  ((uint32_t) v->seg == g_shards[v->shard].flush_watermark.seg_id &&
+				   v->off + page_size <= g_shards[v->shard].flush_watermark.seg_off))));
+		}
+#endif
+		page_snapshot_unlock();
+		for (int i = offset; i < offset + count; i++)
+			if (!page_snapshot_dropped(recs, nrec, &snapshot[i]))
+				snapshot[kept++] = snapshot[i];
+		offset += count;
+		if (prune_snapshot_test_hook != NULL)
+			prune_snapshot_test_hook(prune_snapshot_test_hook_arg);
+		valid = page_snapshot_lock_valid(timeline, &key, block, shard, epoch, nver,
+			inputs, ninputs, outputs, noutputs, captured);
+		if (!valid)
+			goto fail;
+	}
+	e = page_find(timeline, &key, block);
+	old = e->vers;
+	e->vers = snapshot;
+	e->nver = kept;
+	e->cap = nver;
+	snapshot = NULL;
+	page_index_changed(&g_shards[shard]);
+	epoch++;
+	page_snapshot_unlock();
+	free(old);
+	if (prune_snapshot_swap_test_hook != NULL)
+		prune_snapshot_swap_test_hook(prune_snapshot_swap_test_hook_arg);
+	valid = page_snapshot_lock_valid(timeline, &key, block, shard, epoch, kept,
+		inputs, ninputs, outputs, noutputs, captured);
+	return valid ? 1 : -1;
+
+fail:
+	page_snapshot_unlock();
+	free(snapshot);
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		ps_lock_shard_wr(sh);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	return -1;
+}
+
 /*
  * Record a new version of (timeline, key, block).  Only ever appends to the
  * version chain -- existing versions are never dropped -- which is what makes
@@ -6360,6 +7375,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 		e->cap = e->cap ? e->cap * 2 : 2;
 		e->vers = realloc(e->vers, (size_t) e->cap * sizeof(PageVer));
 	}
+	page_index_changed(s);
 	e->vers[e->nver].shard = shard;
 	e->vers[e->nver].lsn = lsn;
 	e->vers[e->nver].admission_seq = admission_seq;
@@ -25989,6 +27005,7 @@ reclaim_one_segment(Shard *s, int layers_prepared, const GcVerifiedSet *verified
 					{
 						e->vers[i].seg = -1;
 						e->vers[i].off = 0;
+						page_index_changed(&g_shards[sh]);
 					}
 	/* Once a positive-size covered victim is known to be counted, remember it
 	 * before remove().  POSIX may unlink it and then fail the directory fsync;
@@ -26817,6 +27834,7 @@ ps_core_maintenance_impl(void)
 					PS_RETENTION_RESOURCE_PAGE_HISTORY, &page_floor, 1,
 					NULL, NULL, NULL, NULL) == 0)
 			{
+				int		prune_deferred = 0;
 				int		was_due = __atomic_exchange_n(&page_prune_due[ftl][fsh],
 													  0, __ATOMIC_ACQ_REL);
 
@@ -26825,8 +27843,8 @@ ps_core_maintenance_impl(void)
 				 * durable) is a fresh mark for the next pass, not one this
 				 * pass clears on its way out.  Zero disables pruning but
 				 * still permits a safe layer merge. */
-				did = compact_timeline(ftl, fsh, page_floor) > 0;
-				if (!did && was_due)
+				did = compact_timeline(ftl, fsh, page_floor, &prune_deferred) > 0;
+				if ((!did && was_due) || prune_deferred)
 					__atomic_store_n(&page_prune_due[ftl][fsh], 1,
 									 __ATOMIC_RELEASE);
 			}

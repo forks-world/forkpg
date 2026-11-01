@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -24,6 +25,68 @@
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
 #include "pagestore_retention.h"
+
+#define TEST_TEMP_PATH_MAX 192
+
+/* Failure must stop the test: callers may otherwise use or remove a partial
+ * path. Resolve the root because fault injection requires an absolute path. */
+static void
+test_tmp_template(char *path, size_t capacity)
+{
+	const char *root = getenv("TMPDIR");
+	char name[256];
+	char *absolute;
+	int n;
+
+	if (root == NULL || *root == '\0')
+		root = "/tmp";
+	if (strlen(path) >= sizeof(name))
+	{
+		fprintf(stderr, "temporary fixture name is too long\n");
+		exit(2);
+	}
+	strcpy(name, path);
+	absolute = realpath(root, NULL);
+	if (absolute == NULL)
+	{
+		perror("resolve TMPDIR");
+		exit(2);
+	}
+	n = snprintf(path, capacity, "%s/%s", absolute, name);
+	free(absolute);
+	if (n < 0 || (size_t) n >= capacity)
+	{
+		fprintf(stderr, "temporary fixture path is too long\n");
+		exit(2);
+	}
+}
+
+static char *
+test_mkdtemp(char *path, size_t capacity)
+{
+	test_tmp_template(path, capacity);
+	if (mkdtemp(path) == NULL)
+	{
+		perror("create temporary fixture directory");
+		exit(2);
+	}
+	return path;
+}
+
+static int
+test_mkstemp(char *path, size_t capacity)
+{
+	int fd;
+
+	test_tmp_template(path, capacity);
+	fd = mkstemp(path);
+	if (fd < 0)
+	{
+		perror("create temporary fixture file");
+		exit(2);
+	}
+	return fd;
+}
 
 #define TEST_TIMELINE_MAGIC 0x324d4c54U
 #define TEST_FORK_META_V2_MAGIC 0x324d4b46U
@@ -425,8 +488,8 @@ count_occurrences(const char *haystack, const char *needle)
 static int
 capture_stderr_maintenance(int turns, char *out, size_t out_cap)
 {
-	char		logpath[] = "/tmp/pstimelinemaintlogXXXXXX";
-	int			logfd = mkstemp(logpath);
+	char		logpath[TEST_TEMP_PATH_MAX] = "pstimelinemaintlogXXXXXX";
+	int			logfd = test_mkstemp(logpath, sizeof(logpath));
 	int			saved_stderr;
 	ssize_t		n;
 
@@ -926,13 +989,13 @@ test_deleting_timeline_cleanup(const char *store, uint32_t timeline)
 static void
 test_deletion_requires_durable_forkmeta(void)
 {
-	char store[] = "/tmp/pagestore-timeline-forkmeta-gate-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-forkmeta-gate-XXXXXX";
 	TestForkMetaRecV2 residue;
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	PsTimelineState state;
 
 	configure_timeline_core();
-	check(mkdtemp(store) != NULL, "create durable forkmeta gate store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create durable forkmeta gate store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			begin_delete(1, 1, NULL),
 			"create empty-runtime deleting timeline for forkmeta gate");
@@ -976,14 +1039,14 @@ test_deletion_requires_durable_forkmeta(void)
 static void
 test_deletion_state_append_failure(void)
 {
-	char store[] = "/tmp/pagestore-timeline-deleted-append-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-deleted-append-XXXXXX";
 	PsTimelineState state;
 	char timelines_path[512];
 	struct stat before;
 	struct stat after;
 
 	configure_timeline_core();
-	check(mkdtemp(store) != NULL, "create DELETED append-failure store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create DELETED append-failure store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			begin_delete(1, 1, NULL),
 			"create deleting timeline for DELETED append failure");
@@ -1821,7 +1884,7 @@ expect_open_failure(const char *store)
 static void
 test_timeline_incarnation_reuse(void)
 {
-	char store[] = "/tmp/pagestore-timeline-incarnation-reuse-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-incarnation-reuse-XXXXXX";
 	unsigned char wal[] = {0x41, 0x42, 0x43};
 	unsigned char page[8192];
 	PsTimelineState state;
@@ -1832,7 +1895,7 @@ test_timeline_incarnation_reuse(void)
 
 	configure_timeline_core();
 	cache_pages = 8;
-	check(mkdtemp(store) != NULL, "create incarnation-reuse store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create incarnation-reuse store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			state_of(1, &state, &incarnation) && state == PS_TIMELINE_LIVE &&
 			incarnation == 1,
@@ -1961,7 +2024,7 @@ test_timeline_incarnation_reuse(void)
 static void
 test_timeline_incarnation_frontiers(void)
 {
-	char store[] = "/tmp/pagestore-timeline-incarnation-frontiers-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-incarnation-frontiers-XXXXXX";
 	unsigned char wal[800];
 	unsigned char page[8192];
 	PsRetentionPin pin;
@@ -1974,7 +2037,7 @@ test_timeline_incarnation_frontiers(void)
 	flush_pages = 1;
 	compact_layers = 0;
 	memset(wal, 0xA5, sizeof(wal));
-	check(mkdtemp(store) != NULL, "create incarnation-frontier store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create incarnation-frontier store");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  ps_core_open(store) == 0 && create_branch(1, 0, 500),
 		"open the old incarnation below its future frontier");
@@ -2099,15 +2162,36 @@ test_timeline_incarnation_frontiers(void)
 static void
 remove_tree(const char *path)
 {
-	char command[512];
+	DIR *dir = opendir(path);
+	struct dirent *entry;
 
-	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) > 0)
-		(void) system(command);
+	if (dir == NULL)
+	{
+		(void) unlink(path);
+		return;
+	}
+	while ((entry = readdir(dir)) != NULL)
+	{
+		char child[1024];
+		struct stat st;
+		int n;
+
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		n = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+		if (n < 0 || (size_t) n >= sizeof(child) || lstat(child, &st) != 0)
+			continue;
+		if (S_ISDIR(st.st_mode))
+			remove_tree(child);
+		else
+			(void) unlink(child);
+	}
+	closedir(dir);
+	if (rmdir(path) != 0)
+		fprintf(stderr, "note: could not remove %s\n", path);
 }
 
-/* Remove one target's ordered segment markers while preserving the rest of the
- * fixed forkmeta log.  This models a crash/loss of the marker after the page
- * body reached the segment, without changing the physical segment bytes. */
+
 static int
 strip_ordered_markers(const char *store, uint32_t timeline)
 {
@@ -2174,13 +2258,13 @@ configure_timeline_core(void)
 static void
 test_relation_inspection_forkmeta_poison(void)
 {
-	char store[] = "/tmp/pagestore-relation-inspection-poison-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-relation-inspection-poison-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	PsInspectionRelationResult result;
 	int rc;
 
 	configure_timeline_core();
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open relation inspection poison fixture");
 		remove_tree(store);
@@ -2207,7 +2291,7 @@ test_relation_inspection_forkmeta_poison(void)
 static void
 test_relation_inspection_rejects_non_live_timeline(void)
 {
-	char store[] = "/tmp/pagestore-relation-inspection-state-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-relation-inspection-state-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	PsInspectionRelationResult result;
 	PsTimelineState state;
@@ -2216,7 +2300,7 @@ test_relation_inspection_rejects_non_live_timeline(void)
 	int rc;
 
 	configure_timeline_core();
-	if (mkdtemp(store) == NULL)
+	if (test_mkdtemp(store, sizeof(store)) == NULL)
 	{
 		check(0, "create non-live relation-inspection fixture");
 		return;
@@ -2259,7 +2343,7 @@ test_relation_inspection_rejects_non_live_timeline(void)
 static void
 test_relation_inspection_rejects_reused_timeline_incarnation(void)
 {
-	char store[] = "/tmp/pagestore-relation-inspection-incarnation-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-relation-inspection-incarnation-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	PsInspectionRelationResult result;
 	PsTimelineState state;
@@ -2270,7 +2354,7 @@ test_relation_inspection_rejects_reused_timeline_incarnation(void)
 	int rc;
 
 	configure_timeline_core();
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open reused-incarnation relation-inspection fixture");
 		remove_tree(store);
@@ -2340,13 +2424,13 @@ test_relation_inspection_rejects_reused_timeline_incarnation(void)
 static void
 test_inspection_timeline_cache_deep_ancestry(void)
 {
-	char store[] = "/tmp/pagestore-timeline-inspection-depth-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-inspection-depth-XXXXXX";
 	PsShmHeader metrics;
 	int created = 1;
 
 	configure_timeline_core();
 	ps_core_set_metrics_header(NULL);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
 		  "open maximally deep inspection timeline store");
 	for (uint32_t timeline = 1;
 		 timeline < PS_INSPECTION_MAX_TIMELINES && created; timeline++)
@@ -2375,7 +2459,7 @@ test_inspection_timeline_cache_deep_ancestry(void)
 static void
 test_inspection_structural_horizon_lifecycle_states(void)
 {
-	char store[] = "/tmp/pagestore-timeline-inspection-state-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-inspection-state-XXXXXX";
 	char blocker[1024];
 	PsShmHeader metrics;
 	PsTimelineState deleting_state = PS_TIMELINE_LIVE;
@@ -2383,7 +2467,7 @@ test_inspection_structural_horizon_lifecycle_states(void)
 
 	configure_timeline_core();
 	ps_core_set_metrics_header(NULL);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  create_branch(1, 0, 500) && create_branch(2, 0, 300) &&
 		  create_branch(3, 0, 100),
 		  "create LIVE, DELETING, and DELETED inspection branches");
@@ -2432,13 +2516,13 @@ test_inspection_structural_horizon_lifecycle_states(void)
 static void
 test_inspection_retention_snapshot_alloc_failure(void)
 {
-	char store[] = "/tmp/pagestore-timeline-inspection-retention-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-inspection-retention-XXXXXX";
 	PsShmHeader metrics;
 	PsRetentionPin pin;
 
 	configure_timeline_core();
 	ps_core_set_metrics_header(NULL);
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 			create_branch(1, 0, 500),
 		  "open retention allocation-failure inspection store");
 	memset(&pin, 0, sizeof(pin));
@@ -2488,7 +2572,7 @@ test_inspection_retention_snapshot_alloc_failure(void)
 static void
 test_old_event_replay_derives_reused_parent_incarnation(void)
 {
-	char store[] = "/tmp/pagestore-timeline-old-parent-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-old-parent-XXXXXX";
 	char path[512];
 	TestTimelineEventV1 events[7];
 	PsTimelineState state;
@@ -2498,7 +2582,7 @@ test_old_event_replay_derives_reused_parent_incarnation(void)
 	uint64_t parent_incarnation;
 
 	configure_timeline_core();
-	check(mkdtemp(store) != NULL, "create old-event reused-parent store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create old-event reused-parent store");
 	check(snprintf(path, sizeof(path), "%s/timelines", store) > 0,
 		  "build old-event reused-parent timeline path");
 	init_timeline_event_v1(&events[0], 1, 1, 0, PS_TIMELINE_LIVE, 100, 1);
@@ -2529,7 +2613,7 @@ test_old_event_replay_derives_reused_parent_incarnation(void)
 static void
 test_legacy_migration_and_parser_fail_closed(void)
 {
-	char store[] = "/tmp/pagestore-timeline-parser-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-parser-XXXXXX";
 	char path[512];
 	TestTimelineLegacy legacy;
 	TestTimelineV2 v2;
@@ -2537,7 +2621,7 @@ test_legacy_migration_and_parser_fail_closed(void)
 	int fd;
 
 	configure_timeline_core();
-	check(mkdtemp(store) != NULL, "create parser test store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create parser test store");
 	check(snprintf(path, sizeof(path), "%s/timelines", store) > 0,
 		  "build parser test path");
 	memset(&legacy, 0, sizeof(legacy));
@@ -2557,8 +2641,8 @@ test_legacy_migration_and_parser_fail_closed(void)
 		(void) close(fd);
 	remove_tree(store);
 
-	strcpy(store, "/tmp/pagestore-timeline-parser-XXXXXX");
-	check(mkdtemp(store) != NULL, "create magic corruption store");
+	strcpy(store, "pagestore-timeline-parser-XXXXXX");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create magic corruption store");
 	check(snprintf(path, sizeof(path), "%s/timelines", store) > 0,
 		  "build magic corruption path");
 	memset(&v2, 0, sizeof(v2));
@@ -2577,8 +2661,8 @@ test_legacy_migration_and_parser_fail_closed(void)
 		  "corrupt modern magic fails closed");
 	remove_tree(store);
 
-	strcpy(store, "/tmp/pagestore-timeline-parser-XXXXXX");
-	check(mkdtemp(store) != NULL, "create unknown length store");
+	strcpy(store, "pagestore-timeline-parser-XXXXXX");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create unknown length store");
 	check(snprintf(path, sizeof(path), "%s/timelines", store) > 0,
 		  "build unknown length path");
 	memset(&v2, 0, sizeof(v2));
@@ -2600,11 +2684,11 @@ test_legacy_migration_and_parser_fail_closed(void)
 static void
 test_delete_discards_unflushed_memtable(void)
 {
-	char store[] = "/tmp/pagestore-timeline-memtable-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-memtable-XXXXXX";
 	uint64_t ids;
 	int remote;
 
-	check(mkdtemp(store) != NULL, "create unflushed-delete test store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create unflushed-delete test store");
 	page_size = 8192;
 	segment_size = 1024 * 1024;
 	flush_pages = 100;
@@ -2631,14 +2715,14 @@ test_delete_discards_unflushed_memtable(void)
 static void
 test_deleting_timeline_wal_cleanup(void)
 {
-	char store[] = "/tmp/pagestore-timeline-wal-cleanup-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-wal-cleanup-XXXXXX";
 	char path[1024];
 	PsShmHeader metrics;
 	unsigned char wal_data[] = {0x11, 0x22, 0x33, 0x44};
 	PsTimelineState state;
 	int did;
 
-	check(mkdtemp(store) != NULL, "create timeline WAL-cleanup store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create timeline WAL-cleanup store");
 	configure_timeline_core();
 	memset(&metrics, 0, sizeof(metrics));
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
@@ -2976,12 +3060,12 @@ test_deleting_timeline_wal_cleanup(void)
 static void
 test_walidx_publish_no_race_publishes_once(void)
 {
-	char		store[] = "/tmp/pagestore-walidx-plan-epoch-norace-XXXXXX";
+	char		store[TEST_TEMP_PATH_MAX] = "pagestore-walidx-plan-epoch-norace-XXXXXX";
 	PsChannel	channel;
 	uint32_t	timeline = 503;
 	uint64_t	aborts_before;
 
-	check(mkdtemp(store) != NULL, "create walidx plan-epoch no-race store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create walidx plan-epoch no-race store");
 	configure_timeline_core();
 	check(ps_core_open(store) == 0 && create_branch(timeline, 0, 100),
 		  "open store for the walidx no-race control case");
@@ -3027,7 +3111,7 @@ test_walidx_publish_no_race_publishes_once(void)
 static void
 test_v2_and_mixed_lifecycle(void)
 {
-	char store[] = "/tmp/pagestore-timeline-test-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-test-XXXXXX";
 	char timelines_path[512];
 	TestTimelineV2 old;
 	PsChannel result;
@@ -3036,7 +3120,7 @@ test_v2_and_mixed_lifecycle(void)
 	PsRetentionPin pin;
 	unsigned char bad;
 
-	check(mkdtemp(store) != NULL, "create timeline test store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create timeline test store");
 	page_size = 8192;
 	segment_size = 1024 * 1024;
 	flush_pages = 1;
@@ -3208,7 +3292,7 @@ test_v2_and_mixed_lifecycle(void)
 static void
 test_deleting_timeline_page_cleanup(void)
 {
-	char store[] = "/tmp/pagestore-timeline-page-cleanup-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-page-cleanup-XXXXXX";
 	unsigned char page[8192];
 	PsTimelineState state;
 	int64_t before, after;
@@ -3217,7 +3301,7 @@ test_deleting_timeline_page_cleanup(void)
 	segment_size = 1024 * 1024;
 	flush_pages = 1; /* force a watermark in the mixed source segment */
 	cache_pages = 8;
-	check(mkdtemp(store) != NULL, "create shared page-cleanup store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create shared page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100),
 		  "open shared page-cleanup store with 1/10 siblings");
@@ -3269,8 +3353,8 @@ test_deleting_timeline_page_cleanup(void)
 	/* A segment containing only the target keeps its bytes -- it becomes one
 	 * hole record, not an empty file; segment GC (not cleanup) reclaims it
 	 * once the watermark moves past it. */
-	strcpy(store, "/tmp/pagestore-timeline-page-cleanup-XXXXXX");
-	check(mkdtemp(store) != NULL, "create pure-target page-cleanup store");
+	strcpy(store, "pagestore-timeline-page-cleanup-XXXXXX");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create pure-target page-cleanup store");
 	configure_timeline_core();
 	segment_size = 16384;
 	flush_pages = 100;
@@ -3306,7 +3390,7 @@ test_deleting_timeline_page_cleanup(void)
 static void
 test_deleting_timeline_page_cleanup_fail_closed(void)
 {
-	char store[] = "/tmp/pagestore-timeline-page-malformed-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-page-malformed-XXXXXX";
 	unsigned char page[8192];
 	uint32_t bad_magic = 0xdeadbeefU;
 	uint32_t magic_check = 0;
@@ -3318,7 +3402,7 @@ test_deleting_timeline_page_cleanup_fail_closed(void)
 	configure_timeline_core();
 	segment_size = 1024 * 1024;
 	flush_pages = 100;
-	check(mkdtemp(store) != NULL, "create malformed page-cleanup store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create malformed page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100) &&
 			write_timeline_layer(1, 0, 100) == 0,
@@ -3370,8 +3454,8 @@ test_deleting_timeline_page_cleanup_fail_closed(void)
 static void
 test_deleting_timeline_page_cleanup_stale_failure_not_reattributed(void)
 {
-	char storeA[] = "/tmp/pagestore-timeline-stale-failA-XXXXXX";
-	char storeB[] = "/tmp/pagestore-timeline-stale-failB-XXXXXX";
+	char storeA[TEST_TEMP_PATH_MAX] = "pagestore-timeline-stale-failA-XXXXXX";
+	char storeB[TEST_TEMP_PATH_MAX] = "pagestore-timeline-stale-failB-XXXXXX";
 	uint32_t bad_magic = 0xdeadbeefU;
 	unsigned char sparse_tail = 0;
 	char captured[4096];
@@ -3388,7 +3472,7 @@ test_deleting_timeline_page_cleanup_stale_failure_not_reattributed(void)
 	configure_timeline_core();
 	segment_size = 1024 * 1024;
 	flush_pages = 100;
-	check(mkdtemp(storeA) != NULL, "create store A");
+	check(test_mkdtemp(storeA, sizeof(storeA)) != NULL, "create store A");
 	check(ps_core_open(storeA) == 0 && create_branch(901, 0, 100) &&
 			create_branch(910, 0, 100) &&
 			write_timeline_layer(901, 0, 100) == 0,
@@ -3415,7 +3499,7 @@ test_deleting_timeline_page_cleanup_stale_failure_not_reattributed(void)
 	configure_timeline_core();
 	segment_size = 32768;
 	flush_pages = 100;
-	check(mkdtemp(storeB) != NULL, "create store B");
+	check(test_mkdtemp(storeB, sizeof(storeB)) != NULL, "create store B");
 	check(ps_core_open(storeB) == 0 && create_branch(902, 0, 100) &&
 			write_timeline_layer(902, 0, 100) == 0,
 		  "B: write the target record");
@@ -3444,7 +3528,7 @@ test_deleting_timeline_page_cleanup_stale_failure_not_reattributed(void)
 static void
 test_deleting_timeline_page_cleanup_blocked_diagnostic_resets_on_reuse(void)
 {
-	char store[] = "/tmp/pagestore-timeline-blocked-reset-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-blocked-reset-XXXXXX";
 	uint32_t bad_magic = 0xdeadbeefU;
 	uint32_t good_magic = 0;
 	char captured[8192];
@@ -3457,7 +3541,7 @@ test_deleting_timeline_page_cleanup_blocked_diagnostic_resets_on_reuse(void)
 	configure_timeline_core();
 	segment_size = 1024 * 1024;
 	flush_pages = 100;
-	check(mkdtemp(store) != NULL, "create blocked-diagnostic-reset store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create blocked-diagnostic-reset store");
 	check(ps_core_open(store) == 0 && create_branch(903, 0, 100) &&
 			create_branch(913, 0, 100) &&
 			write_timeline_layer(903, 0, 100) == 0,
@@ -3521,7 +3605,7 @@ test_deleting_timeline_page_cleanup_blocked_diagnostic_resets_on_reuse(void)
 static void
 test_deleting_timeline_page_cleanup_garbage_beyond_cursor_is_ignored(void)
 {
-	char store[] = "/tmp/pagestore-timeline-page-beyond-cursor-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-page-beyond-cursor-XXXXXX";
 	unsigned char page[8192];
 	uint32_t bad = 0xdeadbeefU;
 	int64_t valid_size;
@@ -3531,7 +3615,7 @@ test_deleting_timeline_page_cleanup_garbage_beyond_cursor_is_ignored(void)
 	configure_timeline_core();
 	segment_size = 1024 * 1024;
 	flush_pages = 100;
-	check(mkdtemp(store) != NULL, "create beyond-cursor page-cleanup store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create beyond-cursor page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100) &&
 			write_timeline_layer(1, 0, 100) == 0 &&
@@ -3566,7 +3650,7 @@ test_deleting_timeline_page_cleanup_garbage_beyond_cursor_is_ignored(void)
 static void
 test_deleting_timeline_page_cleanup_backpressure_debt(void)
 {
-	char store[] = "/tmp/pagestore-timeline-page-debt-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-page-debt-XXXXXX";
 	PsShmHeader metrics;
 	int64_t first_size;
 	int deleted_seen = 0;
@@ -3584,7 +3668,7 @@ test_deleting_timeline_page_cleanup_backpressure_debt(void)
 	segment_gc_enabled = 1;
 	check(ps_backpressure_configure(segment_size, 1, 0, 0) == 0,
 		  "configure PAGE debt for timeline deletion tombstoning");
-	check(mkdtemp(store) != NULL, "create PAGE debt timeline-deletion store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create PAGE debt timeline-deletion store");
 	memset(&metrics, 0, sizeof(metrics));
 	ps_core_set_metrics_header(&metrics);
 	check(ps_core_open(store) == 0 && create_branch(2, 0, 100) &&
@@ -3657,7 +3741,7 @@ test_deleting_timeline_page_cleanup_backpressure_debt(void)
 static void
 test_deleting_timeline_page_cleanup_pending_remove(void)
 {
-	char store[] = "/tmp/pagestore-timeline-page-pending-remove-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-page-pending-remove-XXXXXX";
 	PsShmHeader metrics;
 	int64_t size0;
 	int64_t size1;
@@ -3672,7 +3756,7 @@ test_deleting_timeline_page_cleanup_pending_remove(void)
 	segment_gc_enabled = 1;
 	check(ps_backpressure_configure(segment_size, 1, 0, 0) == 0,
 		  "configure PAGE debt for pending-remove rewrite test");
-	check(mkdtemp(store) != NULL,
+	check(test_mkdtemp(store, sizeof(store)) != NULL,
 		  "create pending-remove timeline-deletion store");
 	memset(&metrics, 0, sizeof(metrics));
 	ps_core_set_metrics_header(&metrics);
@@ -3760,7 +3844,7 @@ test_deleting_timeline_page_cleanup_pending_remove(void)
 static void
 test_deleting_timeline_page_cleanup_oversized(void)
 {
-	char store[] = "/tmp/pagestore-timeline-page-oversized-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-page-oversized-XXXXXX";
 	unsigned char page[8192];
 	unsigned char sparse_tail = 0;
 	PsTimelineState state;
@@ -3771,7 +3855,7 @@ test_deleting_timeline_page_cleanup_oversized(void)
 	segment_size = 32768;
 	flush_pages = 100;
 	cache_pages = 0;
-	check(mkdtemp(store) != NULL, "create oversized page-cleanup store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create oversized page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100) &&
 			write_timeline_layer(1, 0, 100) == 0 &&
@@ -3809,7 +3893,7 @@ test_deleting_timeline_page_cleanup_oversized(void)
 static void
 test_deleting_timeline_page_cleanup_prefix_hole(void)
 {
-	char store[] = "/tmp/pagestore-timeline-page-hole-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-page-hole-XXXXXX";
 	unsigned char page[8192];
 	int64_t before;
 
@@ -3820,7 +3904,7 @@ test_deleting_timeline_page_cleanup_prefix_hole(void)
 	segment_size = 20000;
 	flush_pages = 100;
 	cache_pages = 0;
-	check(mkdtemp(store) != NULL, "create prefix-hole page-cleanup store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create prefix-hole page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100) &&
 			write_timeline_layer(0, 2, 50) == 0 &&
@@ -3854,7 +3938,7 @@ test_deleting_timeline_page_cleanup_prefix_hole(void)
 static void
 test_deleting_timeline_page_cleanup_retired_short_segment(void)
 {
-	char store[] = "/tmp/pagestore-timeline-retired-short-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-retired-short-XXXXXX";
 	unsigned char page[8192];
 	PsTimelineState state;
 	TestSegRecHdr sibling_hdr;
@@ -3868,7 +3952,7 @@ test_deleting_timeline_page_cleanup_retired_short_segment(void)
 	segment_size = 32768;
 	flush_pages = 100;
 	use_layers = 0; /* keep the recovery case on the physical segment path */
-	check(mkdtemp(store) != NULL, "create retired-short page-cleanup store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create retired-short page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100) &&
 			/* The below-branch-floor LSN forces the sibling into the ordered
@@ -3939,7 +4023,7 @@ test_deleting_timeline_page_cleanup_retired_short_segment(void)
 static void
 test_deleting_timeline_page_cleanup_torn_tail(void)
 {
-	char store[] = "/tmp/pagestore-timeline-page-torn-tail-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-page-torn-tail-XXXXXX";
 	unsigned char page[8192];
 	unsigned char tail_before[256];
 	unsigned char tail_after[256];
@@ -3956,7 +4040,7 @@ test_deleting_timeline_page_cleanup_torn_tail(void)
 	configure_timeline_core();
 	segment_size = 1024 * 1024;
 	flush_pages = 1;
-	check(mkdtemp(store) != NULL, "create torn-tail page-cleanup store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create torn-tail page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100) &&
 			write_timeline_layer(1, 0, 100) == 0 &&
@@ -4034,7 +4118,7 @@ test_deleting_timeline_page_cleanup_torn_tail(void)
 static void
 test_deleting_timeline_page_cleanup_sealed_torn_tail(void)
 {
-	char store[] = "/tmp/pagestore-timeline-page-sealed-torn-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-page-sealed-torn-XXXXXX";
 	unsigned char page[8192];
 	PsTimelineState state;
 	TestSegRecHdr hdr;
@@ -4050,7 +4134,7 @@ test_deleting_timeline_page_cleanup_sealed_torn_tail(void)
 	configure_timeline_core();
 	segment_size = 20000;
 	flush_pages = 1;
-	check(mkdtemp(store) != NULL, "create sealed-torn-tail page-cleanup store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create sealed-torn-tail page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100) &&
 			write_timeline_layer(1, 0, 100) == 0 &&
@@ -4132,7 +4216,7 @@ test_deleting_timeline_page_cleanup_sealed_torn_tail(void)
 static void
 test_deleting_timeline_page_cleanup_retired_torn_tail(void)
 {
-	char store[] = "/tmp/pagestore-timeline-retired-torn-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-retired-torn-XXXXXX";
 	unsigned char page[8192];
 	PsTimelineState state;
 	TestSegRecHdr hdr;
@@ -4148,7 +4232,7 @@ test_deleting_timeline_page_cleanup_retired_torn_tail(void)
 	segment_size = 32768;
 	flush_pages = 100;
 	use_layers = 0; /* keep the recovery case on the physical segment path */
-	check(mkdtemp(store) != NULL, "create retired-torn page-cleanup store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create retired-torn page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100) &&
 			write_timeline_layer(10, 1, 50) == 0 &&
@@ -4225,7 +4309,7 @@ test_deleting_timeline_page_cleanup_retired_torn_tail(void)
 static void
 test_deleting_timeline_page_cleanup_zero_tail(void)
 {
-	char store[] = "/tmp/pagestore-timeline-page-zero-tail-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-page-zero-tail-XXXXXX";
 	unsigned char page[8192];
 	unsigned char zeros[4096];
 	unsigned char tail_before[4096];
@@ -4239,7 +4323,7 @@ test_deleting_timeline_page_cleanup_zero_tail(void)
 	configure_timeline_core();
 	segment_size = 1024 * 1024;
 	flush_pages = 1;
-	check(mkdtemp(store) != NULL, "create zero-tail page-cleanup store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create zero-tail page-cleanup store");
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 			create_branch(10, 0, 100) &&
 			write_timeline_layer(1, 0, 100) == 0 &&
@@ -4309,14 +4393,14 @@ test_deleting_timeline_page_cleanup_zero_tail(void)
 static void
 test_deleting_timeline_page_cleanup_below_watermark_no_resurrection(void)
 {
-	char store[] = "/tmp/pagestore-timeline-below-wm-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-below-wm-XXXXXX";
 	unsigned char page[8192];
 	PsTimelineState state;
 	uint64_t inc;
 	pid_t pid;
 	int status;
 
-	check(mkdtemp(store) != NULL,
+	check(test_mkdtemp(store, sizeof(store)) != NULL,
 		  "create below-watermark torn-tail regression store");
 
 	pid = fork();
@@ -4395,7 +4479,7 @@ test_deleting_timeline_page_cleanup_below_watermark_no_resurrection(void)
 static void
 test_timeline_seqcap_format(void)
 {
-	char store[] = "/tmp/pagestore-timeline-seqcap-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-seqcap-XXXXXX";
 	char path[512];
 	TestTimelineEventV2 old;
 	TestTimelineEvent current, mutation, activation;
@@ -4405,7 +4489,7 @@ test_timeline_seqcap_format(void)
 	int fd;
 
 	configure_timeline_core();
-	check(mkdtemp(store) != NULL, "create seqcap format store");
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create seqcap format store");
 	(void) snprintf(path, sizeof(path), "%s/timelines", store);
 	memset(&old, 0, sizeof(old));
 	old.magic = TEST_TIMELINE_MAGIC;
@@ -4560,7 +4644,7 @@ change_gc_layer_set(void *arg)
 static void
 test_page_gc_missing_prefix_preflight(void)
 {
-	char store[] = "/tmp/pagestore-gc-missing-prefix-XXXXXX";
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-missing-prefix-XXXXXX";
 	PsLayerStore counted_layers = PsLayerStoreLocal;
 	PsStorage stale_storage = PsStoragePosix;
 	unsigned char page[8192];
@@ -4570,7 +4654,7 @@ test_page_gc_missing_prefix_preflight(void)
 	segment_size = 16384;
 	flush_pages = 1;
 	compact_layers = 1000;
-	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
 	{
 		check(0, "open sparse page-GC fixture");
 		return;

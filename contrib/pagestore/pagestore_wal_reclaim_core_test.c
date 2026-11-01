@@ -8,6 +8,7 @@
 #endif
 
 #include <dirent.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -55,16 +56,63 @@ check(int ok, const char *name)
 	}
 }
 
+/* Leave space in existing 256-byte derived path buffers for file names. */
+#define TEST_STORE_PATH_MAX 192
+
+static char *
+test_mkdtemp(char *path, size_t capacity)
+{
+	const char *root = getenv("TMPDIR");
+	char name[128];
+	int n;
+
+	if (root == NULL || *root == '\0')
+		root = "/tmp";
+	if (strlen(path) >= sizeof(name))
+	{
+		errno = ENAMETOOLONG;
+		return NULL;
+	}
+	strcpy(name, path);
+	n = snprintf(path, capacity, "%s/%s", root, name);
+	if (n < 0 || (size_t) n >= capacity)
+	{
+		path[0] = '\0';
+		errno = ENAMETOOLONG;
+		return NULL;
+	}
+	return mkdtemp(path);
+}
+
 static void
 remove_tree(const char *path)
 {
-	char command[512];
+	DIR *dir = opendir(path);
+	struct dirent *entry;
 
-	/* best effort: a store left behind in /tmp is a nuisance, not a failure
-	 * (and the compiler's warn_unused_result on system() is not silenced by
-	 * a void cast) */
-	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) > 0 &&
-		system(command) != 0)
+	if (dir == NULL)
+	{
+		(void) unlink(path);
+		return;
+	}
+	while ((entry = readdir(dir)) != NULL)
+	{
+		char child[1024];
+		struct stat st;
+		int n;
+
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		n = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+		if (n < 0 || (size_t) n >= sizeof(child) || lstat(child, &st) != 0)
+			continue;
+		if (S_ISDIR(st.st_mode))
+			remove_tree(child);
+		else
+			(void) unlink(child);
+	}
+	closedir(dir);
+	if (rmdir(path) != 0)
 		fprintf(stderr, "note: could not remove %s\n", path);
 }
 
@@ -572,10 +620,10 @@ segment_count(const char *store, uint32_t timeline)
 }
 
 static int
-prepare_store(const char *store, uint64_t control_redo, uint64_t pin_lsn,
+prepare_store(char *store, uint64_t control_redo, uint64_t pin_lsn,
 			  uint64_t index_lsn, int make_progress)
 {
-	if (mkdtemp((char *) store) == NULL || ps_core_open(store) != 0 ||
+	if (test_mkdtemp(store, TEST_STORE_PATH_MAX) == NULL || ps_core_open(store) != 0 ||
 		!append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL))
 		return 0;
 	if (control_redo != 0 && !write_control(0, WAL_TOTAL, control_redo))
@@ -642,7 +690,7 @@ static void *maintenance_thread(void *arg);
 static void
 test_no_floor_or_progress(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-no-proof-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-no-proof-XXXXXX";
 
 	configure_core();
 	check(prepare_store(store, 0, 0, 0, 0),
@@ -657,11 +705,11 @@ test_no_floor_or_progress(void)
 static void
 test_preselection_skips_empty_reclaim(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-preselection-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-preselection-XXXXXX";
 	AdmissionCallCounter counter = {0};
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, WAL_SEGMENT / 2),
 		  "construct a WAL tail without a complete immutable segment");
 	ps_test_set_admission_write_lock_hook(count_admission_call, &counter);
@@ -695,7 +743,7 @@ static void
 test_no_progress_backoff_follows_proof(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-proof-backoff-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-proof-backoff-XXXXXX";
 	AdmissionCallCounter counter = {0};
 	struct timespec t_arm, t0, t1;
 	int reclaimed;
@@ -792,7 +840,7 @@ static void
 test_epoch_retries_are_rate_limited(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-epoch-rate-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-epoch-rate-XXXXXX";
 	AdmissionCallCounter counter = {0};
 	struct timespec t0, t1;
 	double loop_ms;
@@ -855,7 +903,7 @@ static void
 test_stale_wal_index_requests_compaction(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-reclaim-due-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-reclaim-due-XXXXXX";
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
@@ -886,7 +934,7 @@ static void
 test_unreplaceable_dependency_requests_once(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-reclaim-once-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-reclaim-once-XXXXXX";
 	char directory[512];
 	uint64_t next_generation = 0;
 
@@ -960,7 +1008,7 @@ static void
 test_late_durable_base_requests_compaction(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-late-base-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-late-base-XXXXXX";
 	char directory[512];
 	uint64_t next_generation = 0;
 	uint64_t before_negative;
@@ -1043,7 +1091,7 @@ static void
 test_late_fpi_requests_compaction(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-late-fpi-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-late-fpi-XXXXXX";
 	char directory[512];
 	uint64_t next_generation = 0;
 	uint64_t before_fire;
@@ -1110,8 +1158,8 @@ test_late_fpi_requests_compaction(void)
 static void
 test_superseded_note_in_memtable_is_pruned(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-note-flush-XXXXXX";
-	char store2[] = "/tmp/pagestore-wal-policy-note-required-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-note-flush-XXXXXX";
+	char store2[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-note-required-XXXXXX";
 	PsKey control_key;
 
 	memset(&control_key, 0, sizeof(control_key));
@@ -1119,7 +1167,7 @@ test_superseded_note_in_memtable_is_pruned(void)
 
 	configure_core();
 	flush_pages = 64;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
 		  write_control(0, WAL_SEGMENT + 4096, WAL_SEGMENT + 4096) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_READER, 100, 1,
@@ -1144,7 +1192,7 @@ test_superseded_note_in_memtable_is_pruned(void)
 	 * fence) and must not be pruned or flushed on the reclaimer's behalf. */
 	configure_core();
 	flush_pages = 64;
-	check(mkdtemp(store2) != NULL && ps_core_open(store2) == 0 &&
+	check(test_mkdtemp(store2, sizeof(store2)) != NULL && ps_core_open(store2) == 0 &&
 		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
 		  write_control(0, WAL_SEGMENT + 4096, WAL_SEGMENT + 4096) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_READER, 100, 1,
@@ -1176,7 +1224,7 @@ static void
 test_base_durable_between_evaluations(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-base-between-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-base-between-XXXXXX";
 	struct timespec t0,
 				t1;
 	double		elapsed_ms;
@@ -1226,8 +1274,8 @@ static void
 test_base_durable_at_write(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-base-at-write-XXXXXX";
-	char store2[] = "/tmp/pagestore-wal-policy-base-at-write2-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-base-at-write-XXXXXX";
+	char store2[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-base-at-write2-XXXXXX";
 
 	configure_core();
 	/* flush_pages stays at configure_core()'s default of 1. */
@@ -1274,7 +1322,7 @@ static void
 test_watch_ignores_unrelated_shard_flush(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-cost-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-cost-XXXXXX";
 	char directory[512];
 	uint64_t	gen0 = 0,
 				gen1 = 0;
@@ -1348,7 +1396,7 @@ test_watch_ignores_unrelated_shard_flush(void)
 static void
 test_control_flush_not_repeated(void)
 {
-	char		store[] = "/tmp/pagestore-wal-policy-twin-churn-XXXXXX";
+	char		store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-twin-churn-XXXXXX";
 	uint64_t	compact_before;
 	uint64_t	compact_after;
 	uint64_t	stored_before;
@@ -1368,7 +1416,7 @@ test_control_flush_not_repeated(void)
 	control_shard = ps_shard_of(&control_key);
 	flush_pages = 64;
 	compact_layers = 8;
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
 		  /* A: checkpoint 1, self-redo -- this is the note the fence-based
 		   * superseded check alone will judge superseded (A2, not A, is the
@@ -1451,7 +1499,7 @@ static void
 test_late_fpi_requests_compaction_protected_horizon(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char		store[] = "/tmp/pagestore-wal-policy-late-fpi-prot-XXXXXX";
+	char		store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-late-fpi-prot-XXXXXX";
 
 	configure_core();
 	flush_pages = 4;
@@ -1508,7 +1556,7 @@ test_fpi_between_protected_and_progress_retires(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
 	const uint64_t F = limited + 8192;
-	char		store[] = "/tmp/pagestore-wal-policy-r2a-XXXXXX";
+	char		store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-r2a-XXXXXX";
 
 	configure_core();			/* flush_pages == 1: a base is durable at write */
 	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
@@ -1563,7 +1611,7 @@ test_watch_does_not_refire_on_satisfied_base_evidence(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
 	const uint64_t F = limited + 8192;
-	char		store[] = "/tmp/pagestore-wal-policy-r2b-XXXXXX";
+	char		store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-r2b-XXXXXX";
 	unsigned int evals = 0;
 	struct timespec tloop0, tloop1;
 	double		loop_ms;
@@ -1651,7 +1699,7 @@ static void
 test_walidx_only_pin_drop_requests_compaction(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-walidx-pin-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-walidx-pin-XXXXXX";
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
@@ -1708,7 +1756,7 @@ advance_progress_before_floor(uint32_t timeline, void *arg)
 static void
 test_backoff_epoch_predates_attempt_inputs(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-epoch-order-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-epoch-order-XXXXXX";
 	uint64_t end = WAL_TOTAL;
 	struct timespec t0, t1;
 	int reclaimed;
@@ -1748,7 +1796,7 @@ static void
 test_dependency_cutoffs(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-dependency-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-dependency-XXXXXX";
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, 0, 1) &&
@@ -1758,7 +1806,7 @@ test_dependency_cutoffs(void)
 	remove_tree(store);
 
 	configure_core();
-	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	strcpy(store, "pagestore-wal-policy-dependency-XXXXXX");
 	check(prepare_store(store, limited, 0, 0, 1) &&
 		  wal_floor(0) == limited && maintenance_until_count(store, 0, 2),
 		  "control floor limits reclaim to the aligned safe prefix");
@@ -1766,7 +1814,7 @@ test_dependency_cutoffs(void)
 	remove_tree(store);
 
 	configure_core();
-	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	strcpy(store, "pagestore-wal-policy-dependency-XXXXXX");
 	check(prepare_store(store, WAL_TOTAL, limited, 0, 1) &&
 		  effective_floor(0, PS_RETENTION_RESOURCE_WAL) == limited &&
 		  maintenance_until_count(store, 0, 2),
@@ -1775,8 +1823,8 @@ test_dependency_cutoffs(void)
 	remove_tree(store);
 
 	configure_core();
-	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	strcpy(store, "pagestore-wal-policy-dependency-XXXXXX");
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
 		  write_control(0, WAL_TOTAL, WAL_TOTAL) &&
 		  create_branch(1, 0, limited) &&
@@ -1787,7 +1835,7 @@ test_dependency_cutoffs(void)
 	remove_tree(store);
 
 	configure_core();
-	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	strcpy(store, "pagestore-wal-policy-dependency-XXXXXX");
 	check(prepare_store(store, WAL_TOTAL, WAL_TOTAL, limited, 1) &&
 		  wal_floor(0) == WAL_TOTAL && maintenance_until_count(store, 0, 2),
 		  "WAL-index raw dependency limits reclaim");
@@ -1795,8 +1843,8 @@ test_dependency_cutoffs(void)
 	remove_tree(store);
 
 	configure_core();
-	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	strcpy(store, "pagestore-wal-policy-dependency-XXXXXX");
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
 		  write_control(0, WAL_TOTAL, WAL_TOTAL) &&
 		  create_branch(1, 0, limited) &&
@@ -1811,7 +1859,7 @@ test_dependency_cutoffs(void)
 	 * stored version at or after the record and the materializer's cutoff
 	 * lets WAL-index compaction replace the FPI chain with that base. */
 	configure_core();
-	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	strcpy(store, "pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
 		  write_relation_page(0, 0, limited + 100) &&
@@ -1826,7 +1874,7 @@ test_dependency_cutoffs(void)
 
 	/* Finite durable progress is a storage fence even without a PAGE owner. */
 	configure_core();
-	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	strcpy(store, "pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
 		  write_relation_page(0, 0, limited + 100) &&
@@ -1839,7 +1887,7 @@ test_dependency_cutoffs(void)
 
 	/* A finite index-only owner independently keeps its replacement base. */
 	configure_core();
-	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	strcpy(store, "pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
 		  write_relation_page(0, 0, limited + 100) &&
@@ -1856,7 +1904,7 @@ test_dependency_cutoffs(void)
 
 	/* The materializer and finite progress can share one stored base. */
 	configure_core();
-	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	strcpy(store, "pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
 		  write_relation_page(0, 0, limited + 100) &&
@@ -1873,7 +1921,7 @@ test_dependency_cutoffs(void)
 	/* PAGE and finite index owners at the same LSN each retain their own
 	 * selected base; either owner can release independently. */
 	configure_core();
-	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	strcpy(store, "pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
 		  write_relation_page(0, 0, limited + 100) &&
@@ -1891,7 +1939,7 @@ test_dependency_cutoffs(void)
 	/* A block outside the relation after a durable unlink has nothing left
 	 * to reconstruct; the unlink itself releases its raw dependency. */
 	configure_core();
-	strcpy(store, "/tmp/pagestore-wal-policy-dependency-XXXXXX");
+	strcpy(store, "pagestore-wal-policy-dependency-XXXXXX");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  prepare_store(store, WAL_TOTAL, 0, limited, 1) &&
 		  unlink_relation(0, limited + 100) &&
@@ -1974,7 +2022,7 @@ test_death_base_survives_prefix_prune(void)
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
 	const uint64_t first_death = limited + 100;
 	const uint64_t second_death = limited + 300;
-	char store[] = "/tmp/pagestore-wal-policy-death-base-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-death-base-XXXXXX";
 	PsKey rel = {1, 1, 1, 0, PS_KLASS_RELATION};
 	int count = -1;
 
@@ -2057,10 +2105,10 @@ test_natural_nonzero_start(void)
 {
 	const uint64_t start = WAL_SEGMENT;
 	const uint64_t end = start + WAL_TOTAL;
-	char store[] = "/tmp/pagestore-wal-policy-nonzero-start-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-nonzero-start-XXXXXX";
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, start, (uint32_t) WAL_TOTAL) &&
 		  write_control(0, end, end) &&
 		  wal_index_progress(0, start, end),
@@ -2080,10 +2128,10 @@ static void
 test_progress_beyond_immutable_end(void)
 {
 	const uint64_t tail = WAL_TOTAL + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-progress-tail-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-progress-tail-XXXXXX";
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, (uint32_t) tail) &&
 		  write_control(0, tail, tail) &&
 		  wal_index_progress(0, 0, tail) &&
@@ -2100,11 +2148,11 @@ test_child_branch_cap(void)
 	const uint64_t branch_lsn = WAL_SEGMENT + WAL_SEGMENT / 2;
 	const uint64_t child_start = branch_lsn - branch_lsn % WAL_SEGMENT;
 	const uint64_t child_end = child_start + 2 * WAL_SEGMENT;
-	char store[] = "/tmp/pagestore-wal-policy-branch-cap-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-branch-cap-XXXXXX";
 	uint64_t retained_base = 0;
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
 		  write_control(0, WAL_TOTAL, WAL_TOTAL) &&
 		  create_branch(1, 0, branch_lsn) &&
@@ -2131,7 +2179,7 @@ test_child_branch_cap(void)
 static void
 test_residual_prefix_retry_after_reopen(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-residual-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-residual-XXXXXX";
 	PsShmHeader metrics;
 
 	configure_core();
@@ -2185,12 +2233,12 @@ test_residual_prefix_and_suffix_debt(void)
 	const uint64_t total = (uint64_t) WAL_SEGMENT * nsegments;
 	const uint64_t residual = WAL_SEGMENT;
 	const uint64_t suffix = 3 * (uint64_t) WAL_SEGMENT;
-	char store[] = "/tmp/pagestore-wal-policy-residual-suffix-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-residual-suffix-XXXXXX";
 	PsShmHeader metrics;
 	int opened = 0;
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  (opened = 1) && append_wal_bytes(0, 0, (uint32_t) total) &&
 		  write_control(0, total, total) &&
 		  wal_index_progress(0, 0, total) &&
@@ -2275,10 +2323,10 @@ test_restart_with_crossing_flat_tail(void)
 {
 	const uint64_t crossing_start = WAL_SEGMENT - 32 * 1024;
 	const uint64_t tail_end = WAL_SEGMENT + 32 * 1024;
-	char store[] = "/tmp/pagestore-wal-policy-crossing-tail-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-crossing-tail-XXXXXX";
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, (uint32_t) crossing_start) &&
 		  append_wal_bytes(0, crossing_start, 64 * 1024) &&
 		  write_control(0, tail_end, tail_end) &&
@@ -2306,11 +2354,11 @@ static void
 test_deleted_descendant_floor(void)
 {
 	const uint64_t branch_lsn = WAL_SEGMENT + WAL_SEGMENT / 2;
-	char store[] = "/tmp/pagestore-wal-policy-deleted-floor-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-deleted-floor-XXXXXX";
 	PsTimelineState state = PS_TIMELINE_LIVE;
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
 		  write_control(0, WAL_TOTAL, WAL_TOTAL) &&
 		  create_branch(1, 0, branch_lsn) &&
@@ -2336,7 +2384,7 @@ test_deleted_descendant_floor(void)
 static void
 test_fenced_residual_query_stops_retries(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-fenced-residual-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-fenced-residual-XXXXXX";
 	ReclaimAttemptCounter counter = {0};
 	AdmissionCallCounter admission = {0};
 	PsShmHeader metrics;
@@ -2380,10 +2428,10 @@ test_fenced_residual_query_stops_retries(void)
 static void
 test_undefined_timeline_read(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-undefined-read-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-undefined-read-XXXXXX";
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(2, 0, WAL_SEGMENT / 2) &&
 		  !ps_timeline_defined(2) && wal_read_status(2, 0) == PS_STATUS_OK,
 		  "undefined shipped timeline keeps its local pre-metadata WAL readable");
@@ -2394,10 +2442,10 @@ test_undefined_timeline_read(void)
 static void
 test_missing_proof_does_not_starve_later_timeline(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-fairness-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-fairness-XXXXXX";
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
 		  create_branch(1, 0, WAL_TOTAL) &&
 		  append_wal_bytes(1, 0, (uint32_t) WAL_TOTAL) &&
@@ -2414,7 +2462,7 @@ test_missing_proof_does_not_starve_later_timeline(void)
 static void
 test_pending_durable_proof(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-pending-proof-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-pending-proof-XXXXXX";
 	ReclaimAttemptCounter counter = {0};
 
 	configure_core();
@@ -2445,12 +2493,12 @@ test_pending_durable_proof(void)
 static void
 test_safe_delete_admission_restart_and_isolation(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-safe-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-safe-XXXXXX";
 	unsigned int child_before;
 	ReclaimAttemptCounter counter = {0};
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
 		  write_control(0, WAL_TOTAL, WAL_TOTAL) &&
 		  create_branch(1, 0, WAL_TOTAL) &&
@@ -2594,7 +2642,7 @@ map_first_wal_readers_thread(void *arg)
 static void
 test_floor_scan_does_not_hold_reader_gates(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-floor-locks-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-floor-locks-XXXXXX";
 	ReclaimFloorGate gate;
 	pthread_t maintenance;
 	pthread_t reader;
@@ -2635,7 +2683,7 @@ test_floor_scan_does_not_hold_reader_gates(void)
 static void
 test_read_rechecks_frontier_under_wal_lock(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-read-race-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-read-race-XXXXXX";
 	ReadFrontierGate gate;
 	pthread_t reader;
 	pthread_t maintenance;
@@ -2677,7 +2725,7 @@ test_read_rechecks_frontier_under_wal_lock(void)
 static void
 test_failure_backoff(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-failure-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-failure-XXXXXX";
 	ReclaimAttemptCounter counter = {0};
 	PsShmHeader metrics;
 
@@ -2782,7 +2830,7 @@ admission_pin_thread(void *arg)
 static void
 test_concurrent_admission(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-admission-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-admission-XXXXXX";
 	AdmissionGate gate;
 	pthread_t maintenance;
 	pthread_t pin;
@@ -2854,7 +2902,7 @@ admission_traffic_refresh(void *arg)
 static void
 test_wal_observation_beats_reader_traffic(void)
 {
-	char store[] = "/tmp/pagestore-wal-policy-reader-traffic-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-reader-traffic-XXXXXX";
 	PsShmHeader metrics;
 	AdmissionTraffic traffic;
 	pthread_t readers[4];
@@ -2919,7 +2967,7 @@ horizon_test_crc(unsigned char *data, size_t len)
 static void
 test_horizon_formats(void)
 {
-	char store[] = "/tmp/pagestore-horizon-format-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-horizon-format-XXXXXX";
 	char path[256];
 	unsigned char record[1088];
 	uint32_t bytes;
@@ -2928,7 +2976,7 @@ test_horizon_formats(void)
 	int loaded;
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		  append_wal_bytes(0, 0, 16384) && wal_index_progress(0, 0, 8192),
 		  "write progress with activated horizon");
 	close_store();
@@ -2987,7 +3035,7 @@ test_horizon_formats(void)
 static void
 test_checkpoint_owner_is_daemon_owned(void)
 {
-	char store[] = "/tmp/pagestore-checkpoint-owner-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-checkpoint-owner-XXXXXX";
 	PsRetentionPin pin = {0, PS_RETENTION_OWNER_CHECKPOINT_FENCE,
 		PS_RETENTION_RESOURCE_ALL, 1, 9001, 100, 1};
 	PsRetentionPin got;
@@ -2996,7 +3044,7 @@ test_checkpoint_owner_is_daemon_owned(void)
 	uint64_t before, after;
 
 	configure_core();
-	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
 		ps_retention_reserve_and_set(&pin) == PS_RETENTION_OK,
 		"seed a daemon-owned checkpoint fence");
 	check(ps_retention_admission_highwater(&before) == 0,
@@ -3070,7 +3118,7 @@ read_index_state(uint32_t timeline, uint32_t block, uint64_t lsn, uint64_t seq,
 static void
 test_index_state_preserves_lifecycle(void)
 {
-	char store[] = "/tmp/pagestore-index-lifecycle-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-index-lifecycle-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	unsigned char page[8192];
 	PsWalBaseState state;
@@ -3130,7 +3178,7 @@ test_finite_index_base_reclaims_raw_wal(void)
 {
 	const uint64_t record = WAL_SEGMENT + WAL_SEGMENT / 2;
 	const uint64_t view_lsn = record + 200;
-	char store[] = "/tmp/pagestore-index-base-reclaim-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-index-base-reclaim-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	PsRetentionPin pin;
 	PsWalBaseState state;
@@ -3209,7 +3257,7 @@ test_index_base_reclaim_conservative_fallback(void)
 {
 	for (int legacy = 0; legacy < 2; legacy++)
 	{
-		char store[] = "/tmp/pagestore-index-base-fallback-XXXXXX";
+		char store[TEST_STORE_PATH_MAX] = "pagestore-index-base-fallback-XXXXXX";
 		PsWalBaseState state;
 		unsigned char page[8192];
 
@@ -3243,7 +3291,7 @@ test_index_base_reclaim_conservative_fallback(void)
 static void
 test_index_state_caps_ancestry(void)
 {
-	char store[] = "/tmp/pagestore-index-ancestry-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-index-ancestry-XXXXXX";
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	PsRetentionPin pin;
 	PsWalBaseState state;
@@ -3272,7 +3320,7 @@ test_index_state_caps_ancestry(void)
 static void
 test_index_state_refuses_wal_less_zero_fallback(void)
 {
-	char store[] = "/tmp/pagestore-index-wal-less-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-index-wal-less-XXXXXX";
 	unsigned char page[8192];
 	PsWalBaseState state;
 	PsRetentionPin pin;
@@ -3310,7 +3358,7 @@ fail_base_segment_read(uint32_t shard, int seg, uint64_t off, void *buf,
 static void
 test_index_base_skips_transient_and_reports_io(void)
 {
-	char store[] = "/tmp/pagestore-wal-base-buffered-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-base-buffered-XXXXXX";
 	unsigned char page[8192];
 	PsWalBaseState state;
 	PsRetentionPin pin;
@@ -3357,7 +3405,7 @@ test_index_base_skips_transient_and_reports_io(void)
 static void
 test_index_view_keeps_its_storage_base(void)
 {
-	char store[] = "/tmp/pagestore-wal-index-base-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-index-base-XXXXXX";
 	unsigned char page[8192];
 	PsRetentionPin pin;
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
@@ -3429,7 +3477,7 @@ test_index_view_keeps_its_storage_base(void)
 static void
 test_raw_materializer_requires_page_base(void)
 {
-	char store[] = "/tmp/pagestore-wal-materializer-page-base-XXXXXX";
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-materializer-page-base-XXXXXX";
 	uint64_t frontier = 0;
 	uint64_t seq = 0;
 

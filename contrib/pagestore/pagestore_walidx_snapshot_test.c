@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_walidx_snapshot.h"
 
 static int run;
@@ -64,7 +65,7 @@ pwrite_byte(const char *path, off_t offset, unsigned char value)
 int
 main(void)
 {
-	char root[] = "/tmp/pswalidxsnapXXXXXX";
+	char root[PS_TEST_TEMP_PATH_MAX] = "pswalidxsnapXXXXXX";
 	char directory[1024];
 	char recovery_directory[1024];
 	char reshard_directory[1024];
@@ -82,7 +83,7 @@ main(void)
 	PsWalIdxSnapshotPrepared prepared;
 	uint64_t prepared_obsolete = 0;
 
-	check(mkdtemp(root) != NULL, "create snapshot test root");
+	check(ps_test_mkdtemp(root, sizeof(root)) != NULL, "create snapshot test root");
 	for (size_t i = 0; i < sizeof(shard0); i++)
 		shard0[i] = (unsigned char) (i * 3u + 1u);
 	for (size_t i = 0; i < sizeof(shard1); i++)
@@ -605,7 +606,7 @@ main(void)
 	rmdir(reshard_directory);
 	rmdir(unselected_directory);
 	rmdir(directory);
-	rmdir(root);
+	ps_test_remove_tree(root);
 
 	printf("pagestore_walidx_snapshot_test: %d checks, %d failed\n",
 		   run, failed);

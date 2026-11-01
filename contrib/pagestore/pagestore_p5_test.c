@@ -2,6 +2,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <errno.h>
 #include <stdint.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -10,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "pagestore_test_temp.h"
 #include "pagestore_core.h"
 #include "pagestore_retention.h"
 #include "pagestore_fault.h"
@@ -78,16 +80,16 @@ set_pin(uint64_t owner, uint64_t lsn, uint64_t seq, uint32_t resources)
 static void
 remove_store(const char *path)
 {
-	char		command[256];
+	struct stat st;
 
-	snprintf(command, sizeof(command), "rm -rf -- '%s'", path);
-	check(system(command) == 0, "remove private test store");
+	ps_test_remove_tree(path);
+	check(lstat(path, &st) != 0 && errno == ENOENT, "remove private test store");
 }
 
 static void
 test_legacy_upgrade(void)
 {
-	char		store[] = "/tmp/pagestore-p5-upgrade-XXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-p5-upgrade-XXXXXX";
 	char		path[256];
 	struct stat before,
 				after;
@@ -97,7 +99,7 @@ test_legacy_upgrade(void)
 	PsKey		relation = {.klass = PS_KLASS_RELATION, .relNumber = 66};
 	PsKey		control = {.klass = PS_KLASS_CONTROL};
 
-	check(mkdtemp(store) != NULL && ps_retention_open(store) == 0 &&
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL && ps_retention_open(store) == 0 &&
 		  ps_retention_set(&pin) == 0, "seed a pre-activation pin with a high sequence word");
 	ps_retention_close();
 	check(ps_core_open(store) == 0, "upgrade legacy pin store");
@@ -133,13 +135,13 @@ test_wal_first_arrival(void)
 {
 	for (unsigned progress = 0; progress < 2; progress++)
 	{
-		char		store[] = "/tmp/pagestore-p5-wal-first-XXXXXX";
+		char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-p5-wal-first-XXXXXX";
 		PsKey		relation = {.klass = PS_KLASS_RELATION, .relNumber = 88};
 		PsChannel	ch = {.opcode = PS_OP_CREATE, .key = relation, .req_lsn = 50};
 		PsRetentionPin pin;
 		uint64_t	seq;
 
-		check(mkdtemp(store) && ps_core_open(store) == 0, "open first-arrival regression store");
+		check(ps_test_mkdtemp(store, sizeof(store)) && ps_core_open(store) == 0, "open first-arrival regression store");
 		ps_lock_shard_wr(ps_shard_of(&relation));
 		ps_handle_meta(&ch);
 		ps_unlock_shard(ps_shard_of(&relation));
@@ -206,11 +208,11 @@ test_wal_first_arrival(void)
 static void
 test_checkpoint_retry(void)
 {
-	char store[] = "/tmp/pagestore-p5-checkpoint-retry-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-p5-checkpoint-retry-XXXXXX";
 	uint64_t prior, current, retry;
 	PsRetentionPin slots[2];
 
-	check(mkdtemp(store) && ps_core_open(store) == 0, "open checkpoint retry store");
+	check(ps_test_mkdtemp(store, sizeof(store)) && ps_core_open(store) == 0, "open checkpoint retry store");
 	prior = ps_admission_barrier_register(0, 200);
 	current = ps_admission_barrier_register(0, 300);
 	retry = ps_admission_barrier_register(0, 300);
@@ -231,12 +233,12 @@ test_checkpoint_retry(void)
 static void
 test_late_wal_reserve(void)
 {
-	char store[] = "/tmp/pagestore-p5-late-wal-XXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-p5-late-wal-XXXXXX";
 	PsKey relation = {.klass = PS_KLASS_RELATION, .relNumber = 89};
 	PsChannel ch = {.opcode = PS_OP_CREATE, .key = relation, .req_lsn = 50};
 	PsRetentionPin pin;
 
-	check(mkdtemp(store) && ps_core_open(store) == 0, "open late WAL-index reserve store");
+	check(ps_test_mkdtemp(store, sizeof(store)) && ps_core_open(store) == 0, "open late WAL-index reserve store");
 	ps_lock_shard_wr(ps_shard_of(&relation));
 	ps_handle_meta(&ch);
 	ps_unlock_shard(ps_shard_of(&relation));
@@ -296,14 +298,14 @@ begin_delete(uint32_t timeline, uint64_t incarnation, uint32_t *reason)
 static void
 test_checkpoint_delete(void)
 {
-	char		store[] = "/tmp/pagestore-p5-delete-XXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-p5-delete-XXXXXX";
 	PsChannel	ch = {.opcode = PS_OP_CREATE_BRANCH, .timeline = 1,
 	.parent_timeline = 0, .req_lsn = 100, .req_seq = 1};
 	PsRetentionPin pin;
 	uint64_t	seq;
 	uint32_t	reason;
 
-	check(mkdtemp(store) && ps_core_open(store) == 0, "open checkpoint deletion store");
+	check(ps_test_mkdtemp(store, sizeof(store)) && ps_core_open(store) == 0, "open checkpoint deletion store");
 	ps_lock_map_wr();
 	ps_handle_meta(&ch);
 	ps_unlock_map();
@@ -341,13 +343,13 @@ test_checkpoint_delete(void)
 		  "reused timeline advances checkpoint generations beyond old tombstones");
 	ps_core_close();
 	{
-		char		fault_dir[] = "/tmp/pagestore-p5-delete-fault-XXXXXX";
+		char		fault_dir[PS_TEST_TEMP_PATH_MAX] = "pagestore-p5-delete-fault-XXXXXX";
 		char		arm[256];
 		FILE	   *file;
 		int			status = 0;
 		pid_t		child;
 
-		check(mkdtemp(fault_dir) != NULL, "create crash-control directory");
+		check(ps_test_mkdtemp(fault_dir, sizeof(fault_dir)) != NULL, "create crash-control directory");
 		snprintf(arm, sizeof(arm), "%s/arm", fault_dir);
 		file = fopen(arm, "w");
 		check(file != NULL && fclose(file) == 0, "arm deletion crash");
@@ -424,7 +426,7 @@ test_handoff_race(void)
 int
 main(int argc, char **argv)
 {
-	char		store[] = "/tmp/pagestore-p5-XXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-p5-XXXXXX";
 	PsKey		relation = {.klass = PS_KLASS_RELATION, .relNumber = 55};
 	PsKey		control = {.klass = PS_KLASS_CONTROL};
 	PsKey		artifact = {.klass = PS_KLASS_SLRU, .relNumber = 77};
@@ -460,7 +462,7 @@ main(int argc, char **argv)
 	test_checkpoint_delete();
 	test_checkpoint_retry();
 	test_late_wal_reserve();
-	check(mkdtemp(store) && ps_core_open(store) == 0, "open P5 store");
+	check(ps_test_mkdtemp(store, sizeof(store)) && ps_core_open(store) == 0, "open P5 store");
 	{
 		PsChannel	ch = {.opcode = PS_OP_CREATE, .key = relation, .req_lsn = 50};
 

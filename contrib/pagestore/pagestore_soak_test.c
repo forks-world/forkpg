@@ -53,6 +53,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_ipc.h"
 #include "pagestore_shm.h"
 
@@ -353,11 +354,7 @@ sleep_ms(long ms)
 static void
 remove_tree(const char *path)
 {
-	char		cmd[1024];
-
-	if (snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", path) > 0 &&
-		system(cmd) != 0)
-		fprintf(stderr, "warning: could not remove %s\n", path);
+	ps_test_remove_tree(path);
 }
 
 static void
@@ -2088,7 +2085,7 @@ write_report(FILE *out, int rounds, uint64_t seed, const Physical *max,
 int
 main(int argc, char **argv)
 {
-	const char *base = argc >= 3 ? argv[2] : "/tmp";
+	const char *base = argc >= 3 ? argv[2] : getenv("TMPDIR");
 	const char *env;
 	int			rounds = 2400;
 	uint64_t	seed = 20260909ull;
@@ -2104,6 +2101,8 @@ main(int argc, char **argv)
 	uint64_t	t0;
 	uint64_t	floor = 0;
 
+	if (base == NULL || (argc < 3 && *base == '\0'))
+		base = "/tmp";
 	memset(&quiescent_metrics, 0, sizeof(quiescent_metrics));
 	if (argc < 2)
 	{
@@ -2120,8 +2119,15 @@ main(int argc, char **argv)
 	trace = getenv("PAGESTORE_SOAK_TRACE") != NULL;
 	rng_state = seed ? seed : 1;
 	snprintf(shm_name, sizeof(shm_name), "/pssoak_%d", (int) getpid());
-	snprintf(store_dir, sizeof(store_dir), "%s/pagestore-soak-%d", base,
-			 (int) getpid());
+	{
+		int n = snprintf(store_dir, sizeof(store_dir), "%s/pagestore-soak-%d", base,
+					 (int) getpid());
+		if (n < 0 || (size_t) n >= sizeof(store_dir))
+		{
+			fprintf(stderr, "soak: store path too long\n");
+			return 2;
+		}
+	}
 	ps_shm_unlink(shm_name);
 	remove_tree(store_dir);
 	if (mkdir(store_dir, 0700) != 0)

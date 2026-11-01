@@ -43,6 +43,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_core.h"
 #include "pagestore_forkmeta_snapshot.h"
 #include "pagestore_prune.h"
@@ -55,37 +56,6 @@ now_s(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
-}
-
-static void
-remove_tree(const char *path)
-{
-	DIR *dir = opendir(path);
-	struct dirent *entry;
-
-	if (dir == NULL)
-	{
-		(void) unlink(path);
-		return;
-	}
-	while ((entry = readdir(dir)) != NULL)
-	{
-		char child[1200];
-		struct stat st;
-
-		if (strcmp(entry->d_name, ".") == 0 ||
-			strcmp(entry->d_name, "..") == 0)
-			continue;
-		if (snprintf(child, sizeof(child), "%s/%s", path, entry->d_name) < 0 ||
-			lstat(child, &st) != 0)
-			continue;
-		if (S_ISDIR(st.st_mode))
-			remove_tree(child);
-		else
-			(void) unlink(child);
-	}
-	closedir(dir);
-	(void) rmdir(path);
 }
 
 static int
@@ -183,7 +153,7 @@ set_pin(uint64_t lsn, uint64_t seq, uint64_t generation)
 static int
 run_periodic(unsigned long K)
 {
-	char store[] = "/tmp/fevbenchperiodicXXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "fevbenchperiodicXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -196,7 +166,7 @@ run_periodic(unsigned long K)
 	const uint64_t floor = 100000;
 	uint32_t max_nevents = 0, first_nevents = 0;
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 1;
 	snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -272,7 +242,7 @@ run_periodic(unsigned long K)
 		   K, rounds, max_nevents, first_nevents);
 	close_runtime();
 	if (getenv("FEV_KEEP") == NULL)
-		remove_tree(store);
+		ps_test_remove_tree(store);
 	else
 		printf("periodic store kept at %s\n", store);
 	return 0;
@@ -281,7 +251,7 @@ run_periodic(unsigned long K)
 int
 main(int argc, char **argv)
 {
-	char store[] = "/tmp/fevbenchXXXXXX";
+	char store[PS_TEST_TEMP_PATH_MAX] = "fevbenchXXXXXX";
 	char snapshots[1024];
 	char manifest[1200];
 	char frontier[1200];
@@ -297,7 +267,7 @@ main(int argc, char **argv)
 	if (argc > 2 && strcmp(argv[2], "periodic") == 0)
 		return run_periodic(K);
 
-	if (mkdtemp(store) == NULL)
+	if (ps_test_mkdtemp(store, sizeof(store)) == NULL)
 		return 1;
 	snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
 	snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
@@ -479,7 +449,7 @@ main(int argc, char **argv)
 	}
 	close_runtime();
 	if (getenv("FEV_KEEP") == NULL)
-		remove_tree(store);
+		ps_test_remove_tree(store);
 	else
 		printf("store kept at %s\n", store);
 	return 0;

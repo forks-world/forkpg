@@ -4,6 +4,7 @@ int pagestore_fuzz_main(int argc, char **argv);
 #include "pagestore_fuzz_test.c"
 #undef main
 #include <poll.h>
+#include "pagestore_test_temp.h"
 
 #define REQUIRE(c) do { if (!(c)) { \
 	fprintf(stderr, "failed at line %d: %s\n", __LINE__, #c); \
@@ -12,11 +13,12 @@ int pagestore_fuzz_main(int argc, char **argv);
 int
 main(int argc, char **argv)
 {
-	char path[] = "/tmp/pagestore-fuzz-helpers-XXXXXX";
-	char invalid[128];
+	char root[PS_TEST_TEMP_PATH_MAX] = "pagestore-fuzz-helpers-XXXXXX";
+	char path[512];
+	char invalid[1024];
 	char contents[128] = {0};
 	int actions[2];
-	int fd = mkstemp(path);
+	int fd;
 	FILE *f;
 
 	if (argc == 5 && strcmp(argv[1], "--signal-candidate") == 0)
@@ -28,8 +30,6 @@ main(int argc, char **argv)
 		int pipefd = atoi(argv[4]);
 
 		/* A fake replay leaves the same resources as a crashed real one. */
-		close(fd);
-		unlink(path);
 		snprintf(store, sizeof(store), "%s/pagestore-fuzz-%d", argv[2], (int) self);
 		snprintf(shm, sizeof(shm), "/psfuzz_%d", (int) self);
 		REQUIRE(mkdir(store, 0700) == 0);
@@ -53,6 +53,9 @@ main(int argc, char **argv)
 		_exit(1);
 	}
 
+	ps_test_mkdtemp(root, sizeof(root));
+	REQUIRE(snprintf(path, sizeof(path), "%s/sequence-XXXXXX", root) > 0);
+	fd = mkstemp(path);
 	REQUIRE(fd >= 0);
 	close(fd);
 	actions[0] = find_action_index("env_sleep");
@@ -73,6 +76,7 @@ main(int argc, char **argv)
 	REQUIRE(!write_seq_file(invalid));
 	REQUIRE(errno == ENOTDIR);
 	unlink(path);
+	ps_test_remove_tree(root);
 
 	/* Linux /dev/full accepts open but fails buffered writes/close. */
 	if (access("/dev/full", W_OK) == 0)
@@ -150,7 +154,7 @@ main(int argc, char **argv)
 		REQUIRE(child->visible.nblocks == (uint32_t) prior);
 	}
 	{
-		char base[] = "/tmp/pagestore-shrink-helper-XXXXXX";
+		char base[PS_TEST_TEMP_PATH_MAX] = "pagestore-shrink-helper-XXXXXX";
 		char pidpath[600], store[600], shm[64], pipearg[32];
 		char *candidate_argv[] = {argv[0], "--signal-candidate", base,
 			pidpath, pipearg, NULL};
@@ -159,7 +163,7 @@ main(int argc, char **argv)
 		char byte;
 		FzShrinkCandidateResult result;
 
-		REQUIRE(mkdtemp(base) != NULL);
+		REQUIRE(ps_test_mkdtemp(base, sizeof(base)) != NULL);
 		snprintf(pidpath, sizeof(pidpath), "%s/candidate.pid", base);
 		REQUIRE(pipe(pipes) == 0);
 		snprintf(pipearg, sizeof(pipearg), "%d", pipes[1]);

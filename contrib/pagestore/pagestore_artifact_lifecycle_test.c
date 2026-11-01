@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include "pagestore_test_temp.h"
 #include "pagestore_core.h"
 #include "pagestore_artifact_format.h"
 static int	failures,
@@ -718,9 +719,9 @@ main(int argc, char **argv)
 			return 12;
 		_exit(failures ? 13 : 0);
 	}
-	char		store[] = "/tmp/pagestore-artifact-XXXXXX";
+	char		store[PS_TEST_TEMP_PATH_MAX] = "pagestore-artifact-XXXXXX";
 
-	check(mkdtemp(store) != NULL, "create test directory");
+	check(ps_test_mkdtemp(store, sizeof(store)) != NULL, "create test directory");
 	page_size = 8;
 	check(ps_core_open(store) != 0 && errno == EINVAL, "reject eight-byte logical pages before recovery");
 	page_size = sizeof(PsArtifactLifecycle) - 1;
@@ -878,11 +879,8 @@ main(int argc, char **argv)
 
 	check(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, "persist corrupt lifecycle record");
 	check(ps_core_open(store) != 0, "recovery rejects corrupt completion metadata");
-	char		cmd[512];
-
-	snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", store);
-	if (system(cmd) != 0)
-		failures++;
+	ps_test_remove_tree(store);
+	check(access(store, F_OK) != 0 && errno == ENOENT, "remove test directory");
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

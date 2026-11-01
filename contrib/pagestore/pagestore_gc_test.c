@@ -15,6 +15,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -28,6 +29,87 @@
 #include "pagestore_manifest.h"
 #include "pagestore_layer.h"
 #include "pagestore_layer_store.h"
+
+#define TEST_TEMP_PATH_MAX 192
+
+/* Stop before callers can use or remove a partial path. Resolve the root so
+ * fixture paths remain valid even if the test changes its working directory. */
+static void
+test_tmp_template(char *path, size_t capacity)
+{
+	const char *root = getenv("TMPDIR");
+	char name[256];
+	char *absolute;
+	int n;
+
+	if (root == NULL || *root == '\0')
+		root = "/tmp";
+	if (strlen(path) >= sizeof(name))
+	{
+		fprintf(stderr, "temporary fixture name is too long\n");
+		exit(2);
+	}
+	strcpy(name, path);
+	absolute = realpath(root, NULL);
+	if (absolute == NULL)
+	{
+		perror("resolve TMPDIR");
+		exit(2);
+	}
+	n = snprintf(path, capacity, "%s/%s", absolute, name);
+	free(absolute);
+	if (n < 0 || (size_t) n >= capacity)
+	{
+		fprintf(stderr, "temporary fixture path is too long\n");
+		exit(2);
+	}
+}
+
+static char *
+test_mkdtemp(char *path, size_t capacity)
+{
+	test_tmp_template(path, capacity);
+	if (mkdtemp(path) == NULL)
+	{
+		perror("create temporary fixture directory");
+		exit(2);
+	}
+	return path;
+}
+
+
+static void
+remove_tree(const char *path)
+{
+	DIR *dir = opendir(path);
+	struct dirent *entry;
+
+	if (dir == NULL)
+	{
+		(void) unlink(path);
+		return;
+	}
+	while ((entry = readdir(dir)) != NULL)
+	{
+		char child[1024];
+		struct stat st;
+		int n;
+
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		n = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+		if (n < 0 || (size_t) n >= sizeof(child) || lstat(child, &st) != 0)
+			continue;
+		if (S_ISDIR(st.st_mode))
+			remove_tree(child);
+		else
+			(void) unlink(child);
+	}
+	closedir(dir);
+	if (rmdir(path) != 0)
+		fprintf(stderr, "note: could not remove %s\n", path);
+}
+
 
 #define PSZ 8192
 
@@ -141,8 +223,7 @@ read_live_latest(const PsKey *key, uint32_t block, unsigned char *page)
 static void
 test_partial_batch_publication_restart(void)
 {
-	char dir[] = "/tmp/ps-batch-replay-XXXXXX";
-	char command[4096];
+	char dir[TEST_TEMP_PATH_MAX] = "ps-batch-replay-XXXXXX";
 	PsKey key = {1, 1, 955, 0, PS_KLASS_RELATION};
 	PsImgRec *records = calloc(PS_IMAGE_BATCH_MAX_RECORDS, sizeof(*records));
 	unsigned char older[PSZ] = {1}, newer[PSZ] = {2}, concurrent[PSZ] = {3}, page[PSZ];
@@ -153,7 +234,7 @@ test_partial_batch_publication_restart(void)
 	pid_t child;
 	int status = 0, ok;
 
-	if (records == NULL || mkdtemp(dir) == NULL ||
+	if (records == NULL || test_mkdtemp(dir, sizeof(dir)) == NULL ||
 		ps_layer_store->open(dir) != 0 || ps_manifest_open(dir) != 0)
 	{
 		check(0, "open partial-publication fixture");
@@ -431,8 +512,7 @@ test_partial_batch_publication_restart(void)
 	ps_layer_store->close();
 done:
 	free(records);
-	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", dir) > 0 && system(command) != 0)
-		fprintf(stderr, "warning: failed to remove batch fixture\n");
+	remove_tree(dir);
 }
 
 /*
@@ -509,7 +589,7 @@ synth_layer(uint64_t id, const char *dir)
 static void
 test_torn_tail_poison(void)
 {
-	char		dir[] = "/tmp/pspoisontestXXXXXX";
+	char		dir[TEST_TEMP_PATH_MAX] = "pspoisontestXXXXXX";
 	char		mpath[4096];
 	PsLayerDesc d1,
 				d2;
@@ -517,7 +597,7 @@ test_torn_tail_poison(void)
 				lim;
 	struct stat st;
 
-	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	if (!test_mkdtemp(dir, sizeof(dir)) || ps_manifest_open(dir) != 0)
 	{
 		check(0, "poison test setup");
 		return;
@@ -563,7 +643,7 @@ test_torn_tail_poison(void)
 	ps_manifest_close();
 
 	unlink(mpath);
-	rmdir(dir);
+	remove_tree(dir);
 }
 
 /*
@@ -575,7 +655,7 @@ test_torn_tail_poison(void)
 static void
 test_manifest_compaction(void)
 {
-	char		dir[] = "/tmp/psmcomptestXXXXXX";
+	char		dir[TEST_TEMP_PATH_MAX] = "psmcomptestXXXXXX";
 	char		mpath[4096],
 				tmppath[4096];
 	struct stat before,
@@ -584,7 +664,7 @@ test_manifest_compaction(void)
 			   *l40;
 	int			fd;
 
-	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	if (!test_mkdtemp(dir, sizeof(dir)) || ps_manifest_open(dir) != 0)
 	{
 		check(0, "manifest-compaction setup");
 		return;
@@ -652,7 +732,7 @@ test_manifest_compaction(void)
 
 	unlink(mpath);
 	unlink(tmppath);
-	rmdir(dir);
+	remove_tree(dir);
 }
 
 /* Flip every bit of one byte at 'off' in a file. */
@@ -703,7 +783,7 @@ build_two_adds(char *dir, char *mpath, size_t mpath_cap)
 	struct stat st;
 	off_t		add1;
 
-	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	if (!test_mkdtemp(dir, TEST_TEMP_PATH_MAX) || ps_manifest_open(dir) != 0)
 		return -1;
 	snprintf(mpath, mpath_cap, "%s/layers.manifest", dir);
 	d1 = synth_layer(1, dir);
@@ -732,7 +812,7 @@ build_two_adds(char *dir, char *mpath, size_t mpath_cap)
 static void
 test_manifest_replay_robustness(void)
 {
-	char		dir[] = "/tmp/psrobXXXXXX";
+	char		dir[TEST_TEMP_PATH_MAX] = "psrobXXXXXX";
 	char		mpath[4096];
 	off_t		add1;
 
@@ -747,10 +827,10 @@ test_manifest_replay_robustness(void)
 		  "  ... the corrupt last record is dropped, the earlier ADD survives");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir);
+	remove_tree(dir);
 
 	/* (b) last record's VERSION flipped 3->2 must NOT bypass the CRC */
-	memcpy(dir, "/tmp/psrobXXXXXX", sizeof(dir));
+	strcpy(dir, "psrobXXXXXX");
 	add1 = build_two_adds(dir, mpath, sizeof(mpath));
 	check(add1 > 0, "robust: build (version-downgrade)");
 	poke_byte(mpath, add1 + MR_VERSION_OFF, 2);	/* ADD2.version 3 -> 2 */
@@ -761,10 +841,10 @@ test_manifest_replay_robustness(void)
 		  "  ... the downgraded record is not installed (CRC not bypassed)");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir);
+	remove_tree(dir);
 
 	/* (c) last record's MAGIC corrupted -> torn tail, earlier ADD survives */
-	memcpy(dir, "/tmp/psrobXXXXXX", sizeof(dir));
+	strcpy(dir, "psrobXXXXXX");
 	add1 = build_two_adds(dir, mpath, sizeof(mpath));
 	check(add1 > 0, "robust: build (magic)");
 	poke_byte(mpath, add1 + MR_MAGIC_OFF, 0x00);	/* ADD2.magic low byte */
@@ -774,12 +854,12 @@ test_manifest_replay_robustness(void)
 		  "last-record magic corruption recovers as a torn tail");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir);
+	remove_tree(dir);
 
 	/* (d) interior record's TYPE corrupted to ADD must FAIL, not truncate the
 	 * following REMOVE (which would resurrect the removed layer) */
-	memcpy(dir, "/tmp/psrobXXXXXX", sizeof(dir));
-	if (mkdtemp(dir) && ps_manifest_open(dir) == 0)
+	strcpy(dir, "psrobXXXXXX");
+	if (test_mkdtemp(dir, sizeof(dir)) && ps_manifest_open(dir) == 0)
 	{
 		PsLayerDesc d1 = synth_layer(1, dir);
 		struct stat st;
@@ -797,7 +877,7 @@ test_manifest_replay_robustness(void)
 			  "interior type corruption fails replay (REMOVE not truncated away)");
 		ps_manifest_close();
 		unlink(mpath);
-		rmdir(dir);
+		remove_tree(dir);
 	}
 	else
 		check(0, "robust: build (interior ADD)");
@@ -812,7 +892,7 @@ test_manifest_replay_robustness(void)
 static void
 test_manifest_v2_migration(void)
 {
-	char		dir[] = "/tmp/psv2XXXXXX";
+	char		dir[TEST_TEMP_PATH_MAX] = "psv2XXXXXX";
 	char		mpath[4096];
 	PsLayerDesc d1;
 	struct stat st;
@@ -823,7 +903,7 @@ test_manifest_v2_migration(void)
 	uint32_t	ver;
 
 	/* 1. write a normal v3 manifest with one ADD(7) */
-	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	if (!test_mkdtemp(dir, sizeof(dir)) || ps_manifest_open(dir) != 0)
 	{
 		check(0, "v2: setup");
 		return;
@@ -881,7 +961,7 @@ test_manifest_v2_migration(void)
 		  "the migrated v3 manifest re-replays");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir);
+	remove_tree(dir);
 }
 
 /*
@@ -893,14 +973,14 @@ test_manifest_v2_migration(void)
 static void
 test_manifest_v3_first_downgrade(void)
 {
-	char		dir[] = "/tmp/psv3dgXXXXXX";
+	char		dir[TEST_TEMP_PATH_MAX] = "psv3dgXXXXXX";
 	char		mpath[4096];
 	PsLayerDesc d1;
 	struct stat after;
 	int			fd;
 	uint32_t	two = 2;
 
-	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	if (!test_mkdtemp(dir, sizeof(dir)) || ps_manifest_open(dir) != 0)
 	{
 		check(0, "v3-downgrade: setup");
 		return;
@@ -923,7 +1003,7 @@ test_manifest_v3_first_downgrade(void)
 		  "  ... no bogus layer installed (truncated to empty, not read as v2)");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir);
+	remove_tree(dir);
 }
 
 /*
@@ -935,7 +1015,7 @@ test_manifest_v3_first_downgrade(void)
 static void
 test_manifest_v2_corrupt_first(void)
 {
-	char		dir[] = "/tmp/psv2cfXXXXXX";
+	char		dir[TEST_TEMP_PATH_MAX] = "psv2cfXXXXXX";
 	char		mpath[4096];
 	PsLayerDesc d1;
 	struct stat after;
@@ -945,7 +1025,7 @@ test_manifest_v2_corrupt_first(void)
 	ssize_t		sz;
 	uint32_t	two = 2;
 
-	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	if (!test_mkdtemp(dir, sizeof(dir)) || ps_manifest_open(dir) != 0)
 	{
 		check(0, "v2-corrupt: setup");
 		return;
@@ -977,7 +1057,7 @@ test_manifest_v2_corrupt_first(void)
 		  "  ... dropped to empty, no unchecked bytes installed as a layer");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir);
+	remove_tree(dir);
 }
 
 /*
@@ -988,13 +1068,13 @@ test_manifest_v2_corrupt_first(void)
 static void
 test_manifest_torn_first_record(void)
 {
-	char		dir[] = "/tmp/pstornfXXXXXX";
+	char		dir[TEST_TEMP_PATH_MAX] = "pstornfXXXXXX";
 	char		mpath[4096];
 	PsLayerDesc d1;
 	struct stat st;
 	int			fd;
 
-	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	if (!test_mkdtemp(dir, sizeof(dir)) || ps_manifest_open(dir) != 0)
 	{
 		check(0, "torn-first: setup");
 		return;
@@ -1017,7 +1097,7 @@ test_manifest_torn_first_record(void)
 		  "  ... and is truncated to an empty manifest");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir);
+	remove_tree(dir);
 }
 
 /*
@@ -1028,13 +1108,13 @@ test_manifest_torn_first_record(void)
 static void
 test_manifest_spanning_corruption(void)
 {
-	char		dir[] = "/tmp/psspanXXXXXX";
+	char		dir[TEST_TEMP_PATH_MAX] = "psspanXXXXXX";
 	char		mpath[4096];
 	PsLayerDesc d;
 	struct stat st;
 	off_t		add1;
 
-	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	if (!test_mkdtemp(dir, sizeof(dir)) || ps_manifest_open(dir) != 0)
 	{
 		check(0, "spanning: setup");
 		return;
@@ -1057,7 +1137,7 @@ test_manifest_spanning_corruption(void)
 		  "two corrupt records before an intact one = interior corruption (fail)");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir);
+	remove_tree(dir);
 }
 
 /*
@@ -1068,15 +1148,15 @@ test_manifest_spanning_corruption(void)
 static void
 test_manifest_crc(void)
 {
-	char		dir[] = "/tmp/pscrcintXXXXXX";
-	char		dir2[] = "/tmp/pscrctailXXXXXX";
+	char		dir[TEST_TEMP_PATH_MAX] = "pscrcintXXXXXX";
+	char		dir2[TEST_TEMP_PATH_MAX] = "pscrctailXXXXXX";
 	char		mpath[4096];
 	PsLayerDesc d1,
 				d2;
 	struct stat st;
 
 	/* --- interior corruption must fail replay --- */
-	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	if (!test_mkdtemp(dir, sizeof(dir)) || ps_manifest_open(dir) != 0)
 	{
 		check(0, "crc test setup");
 		return;
@@ -1093,10 +1173,10 @@ test_manifest_crc(void)
 		  "interior CRC corruption fails replay (not loaded as a wrong layer)");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir);
+	remove_tree(dir);
 
 	/* --- corruption of the last record is a recoverable torn tail --- */
-	if (!mkdtemp(dir2) || ps_manifest_open(dir2) != 0)
+	if (!test_mkdtemp(dir2, sizeof(dir2)) || ps_manifest_open(dir2) != 0)
 	{
 		check(0, "crc tail setup");
 		return;
@@ -1116,7 +1196,7 @@ test_manifest_crc(void)
 		  "record 1 survives, the corrupt last record is dropped");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir2);
+	remove_tree(dir2);
 }
 
 /*
@@ -1128,8 +1208,8 @@ test_manifest_crc(void)
 static void
 test_manifest_len_corruption(void)
 {
-	char		dir[] = "/tmp/pslenintXXXXXX";
-	char		dir2[] = "/tmp/pslentailXXXXXX";
+	char		dir[TEST_TEMP_PATH_MAX] = "pslenintXXXXXX";
+	char		dir2[TEST_TEMP_PATH_MAX] = "pslentailXXXXXX";
 	char		mpath[4096];
 	PsLayerDesc d1;
 	struct stat st;
@@ -1144,7 +1224,7 @@ test_manifest_len_corruption(void)
 	 * Build [ADD, MARK_DELETE, REMOVE]; measure the ADD's size to locate the
 	 * MARK_DELETE header that follows it.
 	 */
-	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	if (!test_mkdtemp(dir, sizeof(dir)) || ps_manifest_open(dir) != 0)
 	{
 		check(0, "len test setup");
 		return;
@@ -1163,10 +1243,10 @@ test_manifest_len_corruption(void)
 		  "interior len corruption fails replay (not a misread torn tail)");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir);
+	remove_tree(dir);
 
 	/* --- last record's len corrupted -> recoverable torn tail --- */
-	if (!mkdtemp(dir2) || ps_manifest_open(dir2) != 0)
+	if (!test_mkdtemp(dir2, sizeof(dir2)) || ps_manifest_open(dir2) != 0)
 	{
 		check(0, "len tail setup");
 		return;
@@ -1188,14 +1268,14 @@ test_manifest_len_corruption(void)
 		  "the ADD survives and the truncated MARK_DELETE did not apply");
 	ps_manifest_close();
 	unlink(mpath);
-	rmdir(dir2);
+	remove_tree(dir2);
 }
 
 int
 main(void)
 {
-	char		dir[] = "/tmp/psgctestXXXXXX";
-	char		objects[] = "/tmp/psgcobjectsXXXXXX";
+	char		dir[TEST_TEMP_PATH_MAX] = "psgctestXXXXXX";
+	char		objects[TEST_TEMP_PATH_MAX] = "psgcobjectsXXXXXX";
 	PsLayerDesc a,
 				b;
 	char		a_uri[PS_LAYER_URI_MAX],
@@ -1207,7 +1287,7 @@ main(void)
 			   *pb;
 
 	test_partial_batch_publication_restart();
-	if (!mkdtemp(dir) || !mkdtemp(objects) ||
+	if (!test_mkdtemp(dir, sizeof(dir)) || !test_mkdtemp(objects, sizeof(objects)) ||
 		setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0 ||
 		ps_layer_store->open(dir) != 0 ||
 		ps_manifest_open(dir) != 0)
@@ -1286,14 +1366,14 @@ main(void)
 		snprintf(idpath, sizeof(idpath), "%s/.pagestore-store-id", dir);
 		unlink(idpath);
 	}
-	rmdir(dir);
+	remove_tree(dir);
 	unsetenv("PAGESTORE_OBJECT_DIR");
 	{
 		char owner[4096];
 
 		snprintf(owner, sizeof(owner), "%s/.pagestore-owner", objects);
 		unlink(owner);
-		rmdir(objects);
+		remove_tree(objects);
 	}
 
 	test_torn_tail_poison();

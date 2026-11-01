@@ -34,6 +34,7 @@ CORE_SOURCES=(
   pagestore_memtable.c
   pagestore_pgcache.c
   pagestore_prune.c
+  pagestore_compaction_prune.c
   pagestore_retention.c
   pagestore_wal_store.c
   pagestore_wal_segment.c

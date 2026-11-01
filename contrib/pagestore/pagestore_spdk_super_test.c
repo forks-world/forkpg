@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_spdk_super.h"
 
 static int checks;
@@ -96,7 +97,7 @@ main(void)
 	uint32_t	out[PS_SPDK_SUPER_MAX_SHARDS];
 	uint32_t	version = 0;
 	size_t		len;
-	char		dir[] = "/tmp/pagestore-spdk-super-XXXXXX";
+	char		dir[PS_TEST_TEMP_PATH_MAX] = "pagestore-spdk-super-XXXXXX";
 	char		path[4200];
 	char		tmp[4200];
 
@@ -202,7 +203,7 @@ main(void)
 		  "a single-shard image for another sector size is refused");
 
 	/* --- read and durable publication ----------------------------------- */
-	check(mkdtemp(dir) != NULL, "temporary store directory");
+	check(ps_test_mkdtemp(dir, sizeof(dir)) != NULL, "temporary store directory");
 	snprintf(path, sizeof(path), "%s/%s", dir, PS_SPDK_SUPER_FILE);
 	snprintf(tmp, sizeof(tmp), "%s/%s.tmp", dir, PS_SPDK_SUPER_FILE);
 
@@ -302,7 +303,8 @@ main(void)
 
 	unlink(path);
 	unlink(tmp);
-	rmdir(dir);
+	ps_test_remove_tree(dir);
+	check(access(dir, F_OK) != 0 && errno == ENOENT, "remove temporary store directory");
 	printf("pagestore_spdk_super: %d checks, 0 failures\n", checks);
 	return 0;
 }

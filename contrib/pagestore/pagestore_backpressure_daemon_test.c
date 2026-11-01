@@ -18,10 +18,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pagestore_test_temp.h"
 #include "pagestore_ipc.h"
 #include "pagestore_shm.h"
 
 #define SHUTDOWN_CANCEL_READY_BYTE 0x5a
+
+static char test_root[PS_TEST_TEMP_PATH_MAX] = "pagestore-backpressure-daemon-XXXXXX";
 
 static int checks;
 static int failed;
@@ -196,7 +199,7 @@ test_unsupported_backend_cli_case(const char *daemon_path,
 								const char *case_name)
 {
 	char shm_name[64];
-	char store_dir[128];
+	char store_dir[256];
 	char output[1024];
 	int pipefd[2];
 	pid_t pid;
@@ -205,8 +208,7 @@ test_unsupported_backend_cli_case(const char *daemon_path,
 	size_t used = 0;
 
 	snprintf(shm_name, sizeof(shm_name), "/psbp_cli_%d", (int) getpid());
-	snprintf(store_dir, sizeof(store_dir), "/tmp/psbp_cli_store_%d",
-			 (int) getpid());
+	snprintf(store_dir, sizeof(store_dir), "%s/cli-store", test_root);
 	ps_shm_unlink(shm_name);
 	if (pipe(pipefd) != 0)
 	{
@@ -332,10 +334,10 @@ static int
 run_test(const char *daemon_path)
 {
 	char shm_name[64];
-	char store_dir[128];
-	char pause_file[128];
-	char shutdown_pause_file[128];
-	char empty_segment[256];
+	char store_dir[256];
+	char pause_file[256];
+	char shutdown_pause_file[256];
+	char empty_segment[512];
 	const uint32_t page_size = 8192;
 	const uint32_t rel = 4242;
 	pid_t pid = -1;
@@ -352,10 +354,9 @@ run_test(const char *daemon_path)
 	int ready_pipe[2] = {-1, -1};
 
 	snprintf(shm_name, sizeof(shm_name), "/psbp_%d", (int) getpid());
-	snprintf(store_dir, sizeof(store_dir), "/tmp/psbp_store_%d", (int) getpid());
-	snprintf(pause_file, sizeof(pause_file), "/tmp/psbp_pause_%d", (int) getpid());
-	snprintf(shutdown_pause_file, sizeof(shutdown_pause_file),
-			 "/tmp/psbp_shutdown_pause_%d", (int) getpid());
+	snprintf(store_dir, sizeof(store_dir), "%s/store", test_root);
+	snprintf(pause_file, sizeof(pause_file), "%s/pause", test_root);
+	snprintf(shutdown_pause_file, sizeof(shutdown_pause_file), "%s/shutdown-pause", test_root);
 	snprintf(empty_segment, sizeof(empty_segment), "%s/seg_%08d", store_dir, 0);
 	ps_shm_unlink(shm_name);
 	unlink(pause_file);
@@ -367,12 +368,7 @@ run_test(const char *daemon_path)
 	check(pause_fd >= 0, "integration creates maintenance pause file");
 	if (pause_fd >= 0)
 		close(pause_fd);
-	{
-		char command[256];
-
-		snprintf(command, sizeof(command), "rm -rf '%s'", store_dir);
-		(void) system(command);
-	}
+	ps_test_remove_tree(store_dir);
 
 	/* Phase 1: seed complete reclaimable segments while the controller is
 	 * disabled, so no prefill request can ever be deferred. */
@@ -809,12 +805,7 @@ cleanup:
 		close(fd);
 	ps_shm_unlink(shm_name);
 	unlink(pause_file);
-	{
-		char command[256];
-
-		snprintf(command, sizeof(command), "rm -rf '%s'", store_dir);
-		(void) system(command);
-	}
+	ps_test_remove_tree(store_dir);
 	free(readback);
 	return failed == 0;
 }
@@ -826,9 +817,9 @@ static void
 test_forkmeta_request_classification(const char *daemon_path)
 {
 	char shm_name[64];
-	char store_dir[128];
-	char pause_file[128];
-	char frontier_file[256];
+	char store_dir[256];
+	char pause_file[256];
+	char frontier_file[512];
 	PsShmHeader *hdr = NULL;
 	PsChannel *writer = NULL;
 	PsChannel *pending = NULL;
@@ -839,18 +830,13 @@ test_forkmeta_request_classification(const char *daemon_path)
 	int ready;
 
 	snprintf(shm_name, sizeof(shm_name), "/psforkmeta_%d", (int) getpid());
-	snprintf(store_dir, sizeof(store_dir), "/tmp/psforkmeta_store_%d", (int) getpid());
-	snprintf(pause_file, sizeof(pause_file), "/tmp/psforkmeta_pause_%d", (int) getpid());
+	snprintf(store_dir, sizeof(store_dir), "%s/forkmeta-store", test_root);
+	snprintf(pause_file, sizeof(pause_file), "%s/forkmeta-pause", test_root);
 	snprintf(frontier_file, sizeof(frontier_file), "%s/page-prune.frontiers",
 			 store_dir);
 	ps_shm_unlink(shm_name);
 	unlink(pause_file);
-	{
-		char command[256];
-
-		snprintf(command, sizeof(command), "rm -rf '%s'", store_dir);
-		(void) system(command);
-	}
+	ps_test_remove_tree(store_dir);
 	pause_fd = open(pause_file, O_CREAT | O_EXCL | O_WRONLY, 0600);
 	check(pause_fd >= 0, "forkmeta classification pauses maintenance");
 	if (pause_fd >= 0)
@@ -976,12 +962,7 @@ cleanup:
 		close(fd);
 	ps_shm_unlink(shm_name);
 	unlink(pause_file);
-	{
-		char command[256];
-
-		snprintf(command, sizeof(command), "rm -rf '%s'", store_dir);
-		(void) system(command);
-	}
+	ps_test_remove_tree(store_dir);
 }
 
 int
@@ -993,10 +974,12 @@ main(int argc, char **argv)
 				"[path-to-pagestore_daemon_spdk]\n", argv[0]);
 		return 2;
 	}
+	ps_test_mkdtemp(test_root, sizeof(test_root));
 	(void) run_test(argv[1]);
 	test_forkmeta_request_classification(argv[1]);
 	if (argc == 3)
 		test_unsupported_backend_cli(argv[2]);
+	ps_test_remove_tree(test_root);
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }
