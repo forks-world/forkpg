@@ -335,6 +335,34 @@ streaming_layer_test(void)
 			map.nlayers = 3;
 			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 0,
 				  "new source layer invalidates the preparation snapshot");
+			check(ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4) == 1,
+				  "all-versions merge permits a newer layer after reserved outputs");
+			present[2].layer_id = 1005;
+			check(ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4) == 0,
+				  "layer older than a reserved output is not admitted");
+			present[2].layer_id = 1021;
+			present[2].legacy_shard_zero = true;
+			check(ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4) == 0,
+				  "new mixed-shard legacy layer remains invalid");
+			present[2].legacy_shard_zero = false;
+			check(ps_image_compaction_publication_valid_newer(&map, &layer, 1, outputs, 4, 1),
+				  "a newer layer preserves the exact published output prefix");
+			check(!ps_image_compaction_publication_valid_newer(&map, &layer, 1, outputs, 4, 0),
+				  "newer-layer publication still rejects a wrong output prefix");
+			{
+				PsLayerDesc entries[6];
+				PsLayerMap retire_map = {.layers = entries, .nlayers = 6, .capacity = 6};
+
+				entries[0] = layer;
+				entries[0].cache_readers = 1;
+				memcpy(&entries[1], outputs, sizeof(outputs));
+				entries[5] = present[2];
+				check(ps_image_compaction_retirement_valid_newer(&retire_map, &layer, 1,
+						outputs, 4, 0), "pinned input can retire with a newer layer");
+				entries[0].cache_readers = 0;
+				check(!ps_image_compaction_retirement_valid_newer(&retire_map, &layer, 1,
+						outputs, 4, 0), "newer layers do not waive input pinning");
+			}
 			present[2].deleting = true;
 			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 1,
 				  "unrelated already-deleting layer does not invalidate snapshot");
