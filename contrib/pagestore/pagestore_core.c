@@ -334,6 +334,7 @@ static int timeline_delete_publish_one(void);
 static void inspection_metrics_changed(void);
 static void inspection_timeline_cache_changed(void);
 static void publish_inspection_metrics(int force);
+static uint64_t inspection_now_ns(void);
 static int branch_frontiers_allow(int parent, uint64_t branch_lsn);
 static uint64_t fork_meta_snapshot_cutoff_lsn;
 static uint64_t fork_meta_snapshot_cutoff_seq;
@@ -702,6 +703,15 @@ static uint64_t ps_test_compaction_pass_count;
 static unsigned segment_gc_compaction_turn;
 static void (*compaction_unlocked_test_hook)(void *);
 static void *compaction_unlocked_test_hook_arg;
+static void (*compaction_fallback_test_hook)(void *);
+static void *compaction_fallback_test_hook_arg;
+
+void
+ps_test_set_compaction_fallback_hook(void (*hook)(void *), void *arg)
+{
+	compaction_fallback_test_hook = hook;
+	compaction_fallback_test_hook_arg = arg;
+}
 static void (*prune_snapshot_swap_test_hook)(void *);
 static void *prune_snapshot_swap_test_hook_arg;
 
@@ -4252,17 +4262,46 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 		state != PS_TIMELINE_LIVE ||
 		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
 			&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+	{
+		if (metrics_header != NULL)
+			ps_fetch_add_u64(&metrics_header->compaction.prune_state_unavailable, 1);
 		goto done;
+	}
 	current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 	current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
-	if (current.retention_epoch != captured.retention_epoch ||
-		current.timeline_epoch != captured.timeline_epoch ||
-		current.admission_epoch != captured.admission_epoch ||
-		current.timeline_incarnation != captured.timeline_incarnation || current.page_floor != captured.page_floor ||
-		count_image_layers(timeline, shard) != ninputs || ps_manifest_poisoned())
 	{
-		g_shards[shard].staged_compaction_retries = 1;
-		goto done;
+		int retention_changed = current.retention_epoch != captured.retention_epoch;
+		int timeline_changed = current.timeline_epoch != captured.timeline_epoch ||
+			current.timeline_incarnation != captured.timeline_incarnation;
+		int admission_changed = current.admission_epoch != captured.admission_epoch;
+		int floor_changed = current.page_floor != captured.page_floor;
+		int layer_count_changed = count_image_layers(timeline, shard) != ninputs;
+		int manifest_poisoned = ps_manifest_poisoned();
+
+		if (retention_changed || timeline_changed || admission_changed || floor_changed ||
+			layer_count_changed || manifest_poisoned)
+		{
+			if (metrics_header != NULL)
+			{
+				PsCompactionMetrics *m = &metrics_header->compaction;
+
+				ps_fetch_add_u64(&m->prune_snapshot_conflicts, 1);
+				if (admission_changed)
+					ps_fetch_add_u64(&m->prune_admission_changed, 1);
+				if (retention_changed)
+					ps_fetch_add_u64(&m->prune_retention_changed, 1);
+				if (timeline_changed)
+					ps_fetch_add_u64(&m->prune_timeline_changed, 1);
+				if (floor_changed)
+					ps_fetch_add_u64(&m->prune_floor_changed, 1);
+				if (layer_count_changed)
+					ps_fetch_add_u64(&m->prune_layer_count_changed, 1);
+				if (manifest_poisoned)
+					ps_fetch_add_u64(&m->prune_manifest_poisoned, 1);
+			}
+			g_shards[shard].staged_compaction_retries = 1;
+			goto done;
+		}
 	}
 	if (plan_rc == 1 && !ambiguous)
 	{
@@ -4280,10 +4319,15 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 		result = 0;
 		goto done;
 	}
-	if (plan_rc != 0 || !staged ||
-		!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
-			&captured, &current, 1, 0, 0, 0, 0, 0))
+	if (plan_rc != 0 || !staged)
 		goto done;
+	if (!ps_compaction_prune_fence_valid(&ps_layer_map, inputs, ninputs, outputs, noutputs,
+			&captured, &current, 1, 0, 0, 0, 0, 0))
+	{
+		if (metrics_header != NULL)
+			ps_fetch_add_u64(&metrics_header->compaction.prune_descriptor_rejected, 1);
+		goto done;
+	}
 	if (page_frontier_advance(timeline, floor,
 			captured.admission_epoch ? captured.admission_epoch - 1 : 0) != 0 ||
 		ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) != 0)
@@ -4629,13 +4673,19 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 		/* On -2, the helper explicitly reports an uncertain or failed cleanup. */
 		ambiguous = prepare_rc == -2;
 		if (prepare_rc == 0 || prepare_rc == -3)
+		{
+			if (prepare_rc == 0 && metrics_header != NULL)
+				ps_fetch_add_u64(&metrics_header->compaction.bounded_merge_conflicts, 1);
 			g_shards[shard].staged_compaction_retries = 1;
+		}
 		goto done;
 	}
 	/* A failed conservative plan may fall back to the ordinary path.  Its
 	 * pre-unlock source snapshot must still name the entire live set. */
 	if (count_image_layers(timeline, shard) != ninputs)
 	{
+		if (metrics_header != NULL)
+			ps_fetch_add_u64(&metrics_header->compaction.bounded_merge_conflicts, 1);
 		g_shards[shard].staged_compaction_retries = 1;
 		goto done;
 	}
@@ -4653,6 +4703,8 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 			}
 		if (!found)
 		{
+			if (metrics_header != NULL)
+				ps_fetch_add_u64(&metrics_header->compaction.bounded_merge_conflicts, 1);
 			g_shards[shard].staged_compaction_retries = 1;
 			goto done;
 		}
@@ -4748,6 +4800,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	int			stage_unlocked = g_shards[shard].staged_compaction_retries < 1;
 	int			gather_unlocked = 0, gather_ok = 1;
 	int			rc = -1;
+	uint64_t	locked_start = 0;
+	int			locked_fallback = 0;
 
 	if (!ps_timeline_live(timeline))
 		return 0;
@@ -4813,6 +4867,19 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 				free(old);
 				return 0;
 			}
+
+	/* The retry fallback keeps the caller's shard and map locks throughout
+	 * this pass. Start after the input pin check and record until cleanup. */
+	if (!stage_unlocked && metrics_header != NULL)
+	{
+		locked_fallback = 1;
+		locked_start = inspection_now_ns();
+		ps_store_release_u64(&metrics_header->compaction.locked_fallback_active_timeline, timeline);
+		ps_store_release_u64(&metrics_header->compaction.locked_fallback_active_shard, shard);
+		ps_store_release_u64(&metrics_header->compaction.locked_fallback_active_since_ns, locked_start);
+		if (compaction_fallback_test_hook != NULL)
+			compaction_fallback_test_hook(compaction_fallback_test_hook_arg);
+	}
 
 	/* Try the bounded relation-only pruning path before the legacy gather. */
 	if (page_floor != 0 && stage_unlocked)
@@ -5017,6 +5084,8 @@ gather_complete:
 		}
 		if (!valid)
 		{
+			if (metrics_header != NULL)
+				ps_fetch_add_u64(&metrics_header->compaction.legacy_gather_conflicts, 1);
 			g_shards[shard].staged_compaction_retries = 1;
 			gather_ok = 0;
 		}
@@ -5087,6 +5156,17 @@ gather_complete:
 			stage_unlocked = 0;
 	if (stage_unlocked && ps_retention_epoch(&retention_epoch) != 0)
 		goto cleanup;
+	/* Remote inputs can force the locked output path after an unlocked gather. */
+	if (!stage_unlocked && !locked_fallback && metrics_header != NULL)
+	{
+		locked_fallback = 1;
+		locked_start = inspection_now_ns();
+		ps_store_release_u64(&metrics_header->compaction.locked_fallback_active_timeline, timeline);
+		ps_store_release_u64(&metrics_header->compaction.locked_fallback_active_shard, shard);
+		ps_store_release_u64(&metrics_header->compaction.locked_fallback_active_since_ns, locked_start);
+		if (compaction_fallback_test_hook != NULL)
+			compaction_fallback_test_hook(compaction_fallback_test_hook_arg);
+	}
 	if (stage_unlocked)
 	{
 		int write_rc, valid = 1;
@@ -5133,6 +5213,8 @@ gather_complete:
 		}
 		if (write_rc != 0 || !valid)
 		{
+			if (!valid && metrics_header != NULL)
+				ps_fetch_add_u64(&metrics_header->compaction.legacy_output_conflicts, 1);
 			if (!valid && g_shards[shard].staged_compaction_retries < 1)
 				g_shards[shard].staged_compaction_retries++;
 			if (write_rc == 0)
@@ -5282,6 +5364,26 @@ gather_complete:
 	g_shards[shard].staged_compaction_retries = 0;
 
 cleanup:
+	if (locked_fallback && metrics_header != NULL)
+	{
+		PsCompactionMetrics *m = &metrics_header->compaction;
+		uint64_t end = inspection_now_ns();
+
+		ps_fetch_add_u64(&m->locked_fallback_attempts, 1);
+		if (locked_start != 0 && end >= locked_start)
+		{
+			uint64_t elapsed = end - locked_start;
+			uint64_t maximum = ps_load_acquire_u64(&m->locked_fallback_max_ns);
+
+			ps_fetch_add_u64(&m->locked_fallback_ns, elapsed);
+			while (elapsed > maximum &&
+				   !ps_cas_u64(&m->locked_fallback_max_ns, maximum, elapsed))
+				maximum = ps_load_acquire_u64(&m->locked_fallback_max_ns);
+		}
+		else
+			ps_fetch_add_u64(&m->locked_fallback_clock_errors, 1);
+		ps_store_release_u64(&m->locked_fallback_active_since_ns, 0);
+	}
 	for (int i = 0; i < COMPACT_READ_SLOTS; i++)
 		free(read_cache.slots[i].bytes);
 	for (uint32_t j = 0; j < npages; j++)

@@ -412,6 +412,22 @@ primary's buffer and replayed WAL.
 each postmaster, store size by top-level directory) and `diagnostics/`
 (`pagestore_inspect` dumps and `pg_stat_activity` at a timeout or failure).
 
+Each metrics sample may include `compaction`, from the read-only
+`pagestore_inspect --shm NAME compaction` operation. Counters are cumulative
+for one daemon instance and reset on restart; use `daemon_instance` to detect
+that boundary. The `prune_*_changed` values describe observed snapshot fields,
+not exclusive causes: for example, an admission sequence change does not by
+itself identify a page write, and one conflict can change several fields.
+`locked_fallback_ns` and `locked_fallback_max_ns` measure the locked portion
+of completed fallback attempts (not time waiting to acquire the locks); source
+snapshotting before the fallback timer and earlier unlocked work are excluded.
+`locked_fallback_active_since_ns` is a monotonic-clock timestamp while a
+fallback is running (zero otherwise), with its timeline and shard. It lets a
+monitor detect a currently long-held lock before the attempt completes.
+`compaction_sample_monotonic_ns` in the same sample uses the same host clock;
+subtract the active timestamp to estimate the elapsed hold at sampling.
+The counters are individually atomic but not a coherent multi-field snapshot.
+
 - Pass: `PASS.json`, `events.jsonl` and `metrics.jsonl` move to
   `<root>/passed/<seed>/`; the bulk is deleted.
 - Failure: the root stays as it was -- computes stopped immediate, the daemon

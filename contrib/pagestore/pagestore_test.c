@@ -363,6 +363,12 @@ check_inspector(const char *shm, uint32_t page_size,
 		  strstr(output, "\"forkmeta_high_water_bytes\":0") != NULL &&
 		  strstr(output, "\"forkmeta_throttled\":0") != NULL,
 		  "read-only inspector reports idle mailbox backpressure state");
+	check(run_inspector(shm, "compaction", output, sizeof(output)) &&
+		  strstr(output, "\"daemon_instance\":") != NULL &&
+		  strstr(output, "\"prune_snapshot_conflicts\":0") != NULL &&
+		  strstr(output, "\"locked_fallback_attempts\":0") != NULL &&
+		  strstr(output, "\"locked_fallback_ns\":0") != NULL,
+		  "read-only inspector reports initial compaction diagnostics");
 	check(run_inspector(shm, "pruning", output, sizeof(output)),
 		  "read-only inspector pruning exits cleanly");
 	check(strstr(output, "\"compactions\":") != NULL &&
