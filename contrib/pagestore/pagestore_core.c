@@ -4506,7 +4506,7 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	uint32_t ninputs = 0, noutputs = 0, published = 0, retired = 0;
 	uint32_t capacity;
 	uint64_t bytes = 0, retention_epoch, current_retention_epoch;
-	uint64_t timeline_epoch, admission_epoch;
+	uint64_t timeline_epoch;
 	int result = -1, prepare_rc = 0, ambiguous = 0, eligible = 1;
 	PsHistoryFence *fences = NULL, *storage_fences = NULL;
 	PsViewFence *views = NULL;
@@ -4568,7 +4568,6 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 		return -1;
 	}
 	timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
-	admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	__atomic_fetch_add(&test_bounded_compaction_count, 1, __ATOMIC_RELAXED);
 	for (uint32_t i = 0; i < capacity; i++)
 		ids[i] = alloc_layer_id(&g_shards[shard]);
@@ -4618,11 +4617,14 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 		ps_lock_shard_wr(s);
 	pthread_rwlock_rdlock(&page_prune_lock);
 	ps_lock_map_wr();
+	/* This merge verifies that every input identity and its winning bytes
+	 * survive. Concurrent admissions into the memtable do not invalidate
+	 * that proof; source-set changes are checked separately below. Pruning
+	 * compactions must still fence admissions because they discard history. */
 	if (prepare_rc != 0 || !ps_timeline_live(timeline) || ps_manifest_poisoned() ||
 		ps_retention_epoch(&current_retention_epoch) != 0 ||
 		current_retention_epoch != retention_epoch ||
-		__atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE) != timeline_epoch ||
-		__atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE) != admission_epoch)
+		__atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE) != timeline_epoch)
 	{
 		/* On -2, the helper explicitly reports an uncertain or failed cleanup. */
 		ambiguous = prepare_rc == -2;
