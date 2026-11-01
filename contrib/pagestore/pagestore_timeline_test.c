@@ -4652,6 +4652,116 @@ change_gc_layer_set(void *arg)
 	ps_unlock_map();
 }
 
+typedef struct GcConcurrentAdds
+{
+	int calls;
+	int failed;
+} GcConcurrentAdds;
+
+static void
+gc_add_layer_during_verify(void *arg)
+{
+	GcConcurrentAdds *probe = arg;
+
+	probe->calls++;
+	if (write_timeline_layer(0, 30 + probe->calls, 1000 + probe->calls) != 0)
+		probe->failed = 1;
+}
+
+static void
+gc_add_other_shard_during_verify(void *arg)
+{
+	GcConcurrentAdds *probe = arg;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	uint32_t original = ps_shard_of(&key);
+	unsigned char page[8192];
+
+	ps_test_set_gc_cancel_hook(NULL, NULL);
+	while (ps_shard_of(&key) == original)
+		key.relNumber++;
+	memset(page, 0x5A, sizeof(page));
+	memset(page, 0, 8);
+	probe->calls++;
+	ps_lock_shard_wr(ps_shard_of(&key));
+	if (append_page(0, &key, 30, page, 0, NULL) != 0)
+		probe->failed = 1;
+	ps_unlock_shard(ps_shard_of(&key));
+}
+
+static void
+test_gc_other_shard_does_not_cancel(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-other-shard-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	GcConcurrentAdds probe = {0};
+	uint32_t shard;
+
+	configure_timeline_core();
+	ps_nshards = 2;
+	segment_size = 16384;
+	flush_pages = 1;
+	compact_layers = 1000;
+	shard = ps_shard_of(&key);
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open other-shard GC fixture");
+		return;
+	}
+	check(write_timeline_layer(0, 0, 100) == 0 &&
+		  write_timeline_layer(0, 1, 200) == 0 &&
+		  write_timeline_layer(0, 2, 300) == 0,
+		  "prepare other-shard GC fixture");
+	ps_test_set_gc_cancel_hook(gc_add_other_shard_during_verify, &probe);
+	check(ps_test_gc_verified_local(shard, 1, NULL, NULL) == 0 &&
+		  probe.calls == 1 && !probe.failed,
+		  "another shard's new layer does not cancel GC preflight");
+	ps_test_set_gc_cancel_hook(NULL, NULL);
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_gc_cancel_retries_without_deleting(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-cancel-XXXXXX";
+	unsigned char page[8192];
+	GcConcurrentAdds probe = {0};
+	int removed = 0;
+
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 1;
+	compact_layers = 1000;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open cancelled GC fixture");
+		return;
+	}
+	check(write_timeline_layer(0, 0, 100) == 0 &&
+		  write_timeline_layer(0, 1, 200) == 0 &&
+		  write_timeline_layer(0, 2, 300) == 0 &&
+		  ps_storage->seg_size(0, 0) > 0,
+		  "prepare covered segment for cancellation");
+	segment_gc_enabled = 1;
+	ps_test_set_gc_cancel_hook(gc_add_layer_during_verify, &probe);
+	for (int i = 0; i < 64 && probe.calls == 0; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_gc_cancel_hook(NULL, NULL);
+	check(probe.calls == 1 && !probe.failed && ps_storage->seg_size(0, 0) > 0,
+		  "cancelled preflight leaves the source segment intact");
+	for (int i = 0; i < 128 && !removed; i++)
+	{
+		(void) ps_core_maintenance();
+		errno = 0;
+		removed = ps_storage->seg_size(0, 0) < 0 && errno == ENOENT;
+	}
+	check(removed && read_test_page(0, 0, page) == 1 && page[100] == 0x5A &&
+		  read_test_page(0, 31, page) == 1 && page[100] == 0x5A,
+		  "later maintenance reclaims the segment and preserves both pages");
+	close_store();
+	remove_tree(store);
+}
+
 static void
 test_page_gc_parallel_corruption(void)
 {
@@ -4740,6 +4850,18 @@ test_page_gc_missing_prefix_preflight(void)
 	check(ps_test_gc_verified_local(0, 1, NULL, NULL) == 0,
 		  "local GC preflight validates unchanged covered layers");
 	{
+		GcConcurrentAdds probe = {0};
+
+		ps_test_set_gc_cancel_hook(gc_add_layer_during_verify, &probe);
+		for (int i = 0; i < 3; i++)
+			check(ps_test_gc_verified_local(0, 1, NULL, NULL) != 0,
+				  "new covering set cancels the stale checksum");
+		check(!probe.failed && probe.calls == 3 &&
+			  ps_test_gc_verified_local(0, 1, NULL, NULL) == 0 && probe.calls == 3,
+			  "bounded cancellations eventually perform a full GC verification");
+		ps_test_set_gc_cancel_hook(NULL, NULL);
+	}
+	{
 		char path[4096] = "";
 		uint32_t covered_layer = UINT32_MAX;
 		for (uint32_t i = 0; i < ps_layer_map.nlayers && !path[0]; i++)
@@ -4814,6 +4936,8 @@ main(void)
 {
 	test_page_gc_missing_prefix_preflight();
 	test_page_gc_parallel_corruption();
+	test_gc_cancel_retries_without_deleting();
+	test_gc_other_shard_does_not_cancel();
 	test_timeline_seqcap_format();
 	test_old_event_replay_derives_reused_parent_incarnation();
 	test_legacy_migration_and_parser_fail_closed();

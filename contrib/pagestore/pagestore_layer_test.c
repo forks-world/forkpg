@@ -37,6 +37,21 @@ check(int cond, const char *msg)
 
 #define PSZ 8192
 
+static int
+cancel_image_verify(void *arg)
+{
+	int *calls = arg;
+	(*calls)++;
+	return 1;
+}
+
+static int
+cancel_after_first_image_chunk(void *arg)
+{
+	int *calls = arg;
+	return ++(*calls) >= 2;
+}
+
 typedef struct LegacyIndexV2
 {
 	PsKey key;
@@ -1390,6 +1405,17 @@ bounded_shared_payload_test(void)
 		  index[32].data_off == index[33].data_off &&
 		  index[34].data_off != index[33].data_off,
 		  "identical adjacent payloads share one offset across a write-buffer boundary");
+	if (ok)
+	{
+		int fd = open(layer.locations[0].uri, O_RDONLY);
+		int calls = 0;
+
+		check(fd >= 0 && ps_image_layer_verify_fd_cancellable(fd, layer.locations[0].size,
+				 PSZ, cancel_after_first_image_chunk, &calls) == -2 && calls == 2,
+			  "image checksum can be cancelled after a completed data chunk");
+		if (fd >= 0)
+			close(fd);
+	}
 	check(ok && ps_image_layer_verify_data(&layer, PSZ) == 0 &&
 		  ps_image_layer_lookup_exact(&layer, &key, 0, 100, 33, actual, PSZ, NULL, NULL) == 1 &&
 		  memcmp(actual, pages + (size_t) 31 * PSZ, PSZ) == 0 &&
@@ -1839,6 +1865,16 @@ main(void)
 		fd = open(d.locations[0].uri, O_RDONLY);
 		check(fd >= 0 && ps_image_layer_verify_fd(fd, d.locations[0].size, psz) == 0,
 			  "single-file verification accepts restored data");
+		if (fd >= 0)
+		{
+			int calls = 0;
+
+			check(ps_image_layer_verify_fd_cancellable(fd, d.locations[0].size,
+					psz, cancel_image_verify, &calls) == -2 && calls == 1,
+				  "cancelled image verification reports a distinct outcome");
+			check(ps_image_layer_verify_fd(fd, d.locations[0].size, psz) == 0,
+				  "a later full verification still validates restored data");
+		}
 		if (fd >= 0)
 			close(fd);
 	}

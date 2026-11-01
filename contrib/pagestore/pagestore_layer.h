@@ -359,6 +359,9 @@ extern void ps_image_layer_cache_reset(void);
 extern int ps_image_layer_read_index_fd(const PsLayerDesc *layer, int fd,
 									  PsImgIndexEnt **out, uint32_t *n);
 extern int	ps_image_layer_verify_fd(int fd, uint64_t size, uint32_t page_size);
+/* Returns -2 on cancellation; errors and checksum mismatches remain -1. */
+extern int ps_image_layer_verify_fd_cancellable(int fd, uint64_t size,
+	uint32_t page_size, int (*cancel)(void *), void *arg);
 extern int	ps_image_layer_verify_data(const PsLayerDesc *layer,
 								 uint32_t page_size);
 extern int	ps_delta_layer_verify_data(const PsLayerDesc *layer);
