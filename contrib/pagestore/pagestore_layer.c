@@ -2003,7 +2003,8 @@ out:
 /* Verify data through one already-open immutable file, without reopening its
  * pathname between chunks.  Its caller must check that the file did not change. */
 int
-ps_image_layer_verify_fd(int fd, uint64_t size, uint32_t page_size)
+ps_image_layer_verify_fd_cancellable(int fd, uint64_t size, uint32_t page_size,
+									 int (*cancel)(void *), void *arg)
 {
 	PsImgFooter foot;
 	unsigned char *buffer;
@@ -2023,6 +2024,11 @@ ps_image_layer_verify_fd(int fd, uint64_t size, uint32_t page_size)
 	{
 		uint32_t len = foot.index_off - offset > IMAGE_STREAM_BYTES ?
 			IMAGE_STREAM_BYTES : (uint32_t) (foot.index_off - offset);
+		if (cancel != NULL && cancel(arg))
+		{
+			free(buffer);
+			return -2;
+		}
 		if (image_fd_read(fd, offset, buffer, len) != 0)
 		{
 			free(buffer);
@@ -2033,6 +2039,12 @@ ps_image_layer_verify_fd(int fd, uint64_t size, uint32_t page_size)
 	}
 	free(buffer);
 	return crc == foot.data_crc ? 0 : -1;
+}
+
+int
+ps_image_layer_verify_fd(int fd, uint64_t size, uint32_t page_size)
+{
+	return ps_image_layer_verify_fd_cancellable(fd, size, page_size, NULL, NULL);
 }
 
 int

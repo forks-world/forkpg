@@ -2186,6 +2186,9 @@ typedef struct Shard
 	PsFlushWatermark flush_watermark;
 	uint32_t	gc_next_seg;		/* oldest segment not yet reclaimed */
 	uint64_t	gc_debt_segments;	/* existing, nonempty covered segments */
+	uint64_t	gc_layer_add_epoch;	/* atomic: new image during preflight */
+	uint32_t	gc_preflight_active;	/* atomic: cancellable preflights */
+	uint32_t	gc_stale_retries;	/* atomic: bound consecutive cancellations */
 	uint32_t	gc_pending_remove_seg;	/* victim whose remove result is ambiguous */
 	int			gc_pending_remove;
 	int			gc_storage_error;	/* sticky fail-closed storage observation */
@@ -2875,7 +2878,23 @@ record_layer(void *ctx, const PsLayerDesc *desc)
 	 * map (idempotently); do not add to the map a second time. */
 	rc = ps_manifest_add_layer(desc);
 	if (rc == 0)
+	{
+		uint32_t shard = layer_shard_from_id(desc->layer_id);
+
+		/* Readers register while holding map-rd, so an ADD published under
+		 * map-wr cannot slip between snapshot and registration. */
+		if (desc->kind == PS_LAYER_IMAGE && shard < core_shards() &&
+			__atomic_load_n(&g_shards[shard].gc_preflight_active, __ATOMIC_ACQUIRE) != 0)
+		{
+			uint64_t epoch = __atomic_load_n(&g_shards[shard].gc_layer_add_epoch, __ATOMIC_RELAXED);
+
+			while (epoch != UINT64_MAX &&
+				   !__atomic_compare_exchange_n(&g_shards[shard].gc_layer_add_epoch,
+						&epoch, epoch + 1, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+				;
+		}
 		inspection_metrics_changed();
+	}
 	return rc;
 }
 
@@ -26895,6 +26914,36 @@ typedef struct GcVerifiedSet
 	bool ready;
 } GcVerifiedSet;
 
+typedef struct GcCancelSnapshot
+{
+	uint32_t shard;
+	uint64_t epoch;
+} GcCancelSnapshot;
+
+static void (*gc_cancel_test_hook)(void *);
+static void *gc_cancel_test_hook_arg;
+
+void
+ps_test_set_gc_cancel_hook(void (*hook)(void *), void *arg)
+{
+	gc_cancel_test_hook = hook;
+	gc_cancel_test_hook_arg = arg;
+}
+
+static int
+gc_preflight_cancelled(void *arg)
+{
+	GcCancelSnapshot *snapshot = arg;
+
+	if (gc_cancel_test_hook != NULL)
+		gc_cancel_test_hook(gc_cancel_test_hook_arg);
+	return __atomic_load_n(&g_shards[snapshot->shard].gc_layer_add_epoch,
+							 __ATOMIC_ACQUIRE) != snapshot->epoch;
+}
+
+enum { GC_PREPARE_FAILED = 0, GC_PREPARE_OK = 1, GC_PREPARE_STALE = 2 };
+#define GC_PREFLIGHT_MAX_STALE_RETRIES 3
+
 static bool
 gc_same_file(const struct stat *a, const struct stat *b)
 {
@@ -26915,8 +26964,7 @@ gc_same_file(const struct stat *a, const struct stat *b)
 #endif
 }
 
-/* Each immutable layer is checked through its own fd. Limit concurrency so a
- * maintenance pass cannot create unbounded threads or simultaneous reads. */
+/* Bound parallel reads while allowing a newer layer to cancel all workers. */
 #define PS_GC_VERIFY_WORKERS 4
 static int gc_verify_test_thread_limit = -1;
 
@@ -26932,6 +26980,9 @@ typedef struct GcPrepareWork
 	uint32_t victim;
 	uint32_t next;
 	int failed;
+	int stale;
+	int cancellable;
+	GcCancelSnapshot *snapshot;
 } GcPrepareWork;
 
 static void *
@@ -26940,14 +26991,15 @@ gc_prepare_worker(void *arg)
 	GcPrepareWork *work = arg;
 	uint32_t i;
 
-	while ((i = __atomic_fetch_add(&work->next, 1, __ATOMIC_RELAXED)) < work->set->count)
+	while (!__atomic_load_n(&work->stale, __ATOMIC_RELAXED) &&
+		   (i = __atomic_fetch_add(&work->next, 1, __ATOMIC_RELAXED)) < work->set->count)
 	{
 		GcVerifiedLayer *v = &work->set->layers[i];
 		const PsLayerLocation *loc = tier_local_location(&v->desc);
 		PsImgIndexEnt *idx = NULL;
 		uint32_t n = 0;
 		struct stat after, path;
-		int fd = -1;
+		int fd = -1, verify_rc = 0;
 		bool ok = false;
 
 		if (!loc || !loc->uri[0] || (fd = open(loc->uri, O_RDONLY)) < 0)
@@ -26959,8 +27011,15 @@ gc_prepare_worker(void *arg)
 		for (uint32_t j = 0; j < n; j++)
 			if ((idx[j].flags & PS_IMG_REC_SEG_VALID) && idx[j].seg_id == work->victim)
 			{ v->covers = true; break; }
-		if ((v->covers && ps_image_layer_verify_fd(fd, loc->size, page_size) != 0) ||
-			fstat(fd, &after) != 0 || stat(loc->uri, &path) != 0 ||
+		if (v->covers)
+			verify_rc = ps_image_layer_verify_fd_cancellable(fd, loc->size, page_size,
+				work->cancellable ? gc_preflight_cancelled : NULL, work->snapshot);
+		if (verify_rc == -2)
+		{
+			__atomic_store_n(&work->stale, 1, __ATOMIC_RELAXED);
+			goto done;
+		}
+		if (verify_rc != 0 || fstat(fd, &after) != 0 || stat(loc->uri, &path) != 0 ||
 			!gc_same_file(&v->identity, &after) || !gc_same_file(&after, &path))
 			goto done;
 		ok = true;
@@ -26968,22 +27027,23 @@ done:
 		free(idx);
 		if (fd >= 0)
 			close(fd);
-		if (!ok)
+		if (!ok && verify_rc != -2)
 			__atomic_store_n(&work->failed, 1, __ATOMIC_RELAXED);
 	}
 	return NULL;
 }
 
-/* Return false for unsupported stores or any stale/corrupt observation.
- * In that case the caller retains the original locked verification path. */
-static bool
+/* Stale snapshots defer instead of repeating verification under the locks. */
+static int
 gc_prepare_local(uint32_t shard, uint32_t victim, GcVerifiedSet *set)
 {
 	uint32_t count = 0;
-	bool ok = false;
+	int result = GC_PREPARE_FAILED;
+	int cancellable = 0;
+	GcCancelSnapshot snapshot = {.shard = shard};
 	pthread_t threads[PS_GC_VERIFY_WORKERS - 1];
 	uint32_t nthreads = 0;
-	GcPrepareWork work = {.set = set, .victim = victim};
+	GcPrepareWork work = {.set = set, .victim = victim, .snapshot = &snapshot};
 
 	if (ps_layer_store != &PsLayerStoreLocal)
 		return false;
@@ -27008,32 +27068,58 @@ gc_prepare_local(uint32_t shard, uint32_t victim, GcVerifiedSet *set)
 			!d->deleting && layer_shard_from_id(d->layer_id) == shard)
 			set->layers[set->count++].desc = *d;
 	}
+	if (__atomic_load_n(&g_shards[shard].gc_stale_retries, __ATOMIC_RELAXED) <
+		GC_PREFLIGHT_MAX_STALE_RETRIES &&
+		__atomic_load_n(&g_shards[shard].gc_layer_add_epoch, __ATOMIC_RELAXED) != UINT64_MAX)
+	{
+		__atomic_add_fetch(&g_shards[shard].gc_preflight_active, 1, __ATOMIC_ACQ_REL);
+		snapshot.epoch = __atomic_load_n(&g_shards[shard].gc_layer_add_epoch, __ATOMIC_ACQUIRE);
+		cancellable = 1;
+	}
 	ps_unlock_map();
+	work.cancellable = cancellable;
 	while (nthreads < PS_GC_VERIFY_WORKERS - 1 && nthreads + 1 < set->count)
 	{
 		int test_limit = __atomic_load_n(&gc_verify_test_thread_limit, __ATOMIC_RELAXED);
 
-		if (test_limit >= 0 && nthreads >= (uint32_t) test_limit)
+		/* Interposition hooks modify test state and must run serially. */
+		if (gc_cancel_test_hook != NULL ||
+			(test_limit >= 0 && nthreads >= (uint32_t) test_limit))
 			break;
 		if (pthread_create(&threads[nthreads], NULL, gc_prepare_worker, &work) != 0)
-			break; /* The caller safely completes unclaimed layers. */
+			break;
 		nthreads++;
 	}
 	(void) gc_prepare_worker(&work);
 	for (uint32_t i = 0; i < nthreads; i++)
 		if (pthread_join(threads[i], NULL) != 0)
-			abort(); /* Never free a snapshot while a worker may still use it. */
+			abort();
+	/* Preserve an I/O or corruption failure even if a different worker also
+	 * observed cancellation; it must take the conservative fallback. */
 	if (__atomic_load_n(&work.failed, __ATOMIC_RELAXED))
 		goto out;
-	set->ready = ok = true;
+	if (__atomic_load_n(&work.stale, __ATOMIC_RELAXED))
+	{
+		result = GC_PREPARE_STALE;
+		goto out;
+	}
+	set->ready = true;
+	result = GC_PREPARE_OK;
+
 out:
-	if (!ok)
+	if (cancellable)
+		__atomic_sub_fetch(&g_shards[shard].gc_preflight_active, 1, __ATOMIC_ACQ_REL);
+	if (result == GC_PREPARE_STALE)
+		__atomic_add_fetch(&g_shards[shard].gc_stale_retries, 1, __ATOMIC_RELAXED);
+	else
+		__atomic_store_n(&g_shards[shard].gc_stale_retries, 0, __ATOMIC_RELAXED);
+	if (result != GC_PREPARE_OK)
 	{
 		free(set->layers);
 		set->layers = NULL;
 		set->count = 0;
 	}
-	return ok;
+	return result;
 }
 
 static int
@@ -27087,7 +27173,7 @@ ps_test_gc_verified_local(uint32_t shard, uint32_t victim,
 {
 	GcVerifiedSet set = {0};
 	int rc;
-	if (!gc_prepare_local(shard, victim, &set))
+	if (gc_prepare_local(shard, victim, &set) != GC_PREPARE_OK)
 		return -1;
 	if (interpose)
 		interpose(arg);
@@ -27971,7 +28057,11 @@ ps_core_maintenance_impl(void)
 				}
 				if (!missing)
 				{
-					if (!gc_prepare_local(sh, victim, &verified[sh]))
+					int prepare_rc = gc_prepare_local(sh, victim, &verified[sh]);
+
+					if (prepare_rc == GC_PREPARE_STALE)
+						continue;
+					if (prepare_rc == GC_PREPARE_FAILED)
 						(void) prepare_segment_layers(sh, victim);
 					prepared_victim[sh] = victim;
 					layers_prepared[sh] = true;
@@ -28566,6 +28656,9 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		g_shards[i].cur_off = 0;
 		g_shards[i].gc_next_seg = 0;
 		g_shards[i].gc_debt_segments = 0;
+		__atomic_store_n(&g_shards[i].gc_layer_add_epoch, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&g_shards[i].gc_preflight_active, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&g_shards[i].gc_stale_retries, 0, __ATOMIC_RELAXED);
 		g_shards[i].gc_pending_remove_seg = 0;
 		g_shards[i].gc_pending_remove = 0;
 		g_shards[i].gc_storage_error = 0;
