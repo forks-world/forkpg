@@ -418,6 +418,9 @@ for one daemon instance and reset on restart; use `daemon_instance` to detect
 that boundary. The `prune_*_changed` values describe observed snapshot fields,
 not exclusive causes: for example, an admission sequence change does not by
 itself identify a page write, and one conflict can change several fields.
+`prune_relation_page_admission_observed` counts conflicts whose unlocked window
+included at least one successfully allocated relation-page admission anywhere in
+the process; the write may still fail, and it need not be on the same shard.
 `locked_fallback_ns` and `locked_fallback_max_ns` measure the locked portion
 of completed fallback attempts (not time waiting to acquire the locks); source
 snapshotting before the fallback timer and earlier unlocked work are excluded.

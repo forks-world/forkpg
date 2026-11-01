@@ -1975,11 +1975,13 @@ test_bounded_prune_conflict(int mode)
 	if (mode == 0)
 		check(metrics->compaction.prune_snapshot_conflicts == 1 &&
 			  metrics->compaction.prune_admission_changed == 1 &&
+			  metrics->compaction.prune_relation_page_admission_observed == 1 &&
 			  metrics->compaction.prune_layer_count_changed == 1,
 			  "pruning metrics report admission and added-layer conflict");
 	else if (mode == 1)
 		check(metrics->compaction.prune_snapshot_conflicts == 1 &&
-			  metrics->compaction.prune_retention_changed == 1,
+			  metrics->compaction.prune_retention_changed == 1 &&
+			  metrics->compaction.prune_relation_page_admission_observed == 0,
 			  "pruning metrics report retention conflict");
 	else
 		check(metrics->compaction.prune_descriptor_rejected == 1,
