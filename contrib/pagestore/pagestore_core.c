@@ -2180,6 +2180,7 @@ typedef struct Shard
 	int			note_flush_pending;	/* a checkpoint note awaits durability */
 	int			coverage_broken;	/* a record was not staged; do not advance */
 	uint64_t	next_layer_id;		/* next layer-local id for this shard */
+	/* 0: initial stage; 1: admission retry; 2: locked fallback. */
 	unsigned	staged_compaction_retries;
 	uint64_t	prune_relation_page_admissions; /* diagnostics, per shard */
 	uint64_t	rr_mem,			/* read-source counters */
@@ -4333,7 +4334,15 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 				if (manifest_poisoned)
 					ps_fetch_add_u64(&m->prune_manifest_poisoned, 1);
 			}
-			g_shards[shard].staged_compaction_retries = 1;
+			/* A transient admission alone need not force the very next pass
+			 * through the locked gather. Retry staging once, but retain the
+			 * locked fallback after a second conflict to ensure progress. */
+			if (admission_changed && !retention_changed && !timeline_changed &&
+				!floor_changed && !layer_count_changed && !manifest_poisoned &&
+				g_shards[shard].staged_compaction_retries == 0)
+				g_shards[shard].staged_compaction_retries = 1;
+			else
+				g_shards[shard].staged_compaction_retries = 2;
 			goto done;
 		}
 	}
@@ -4347,7 +4356,7 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 		if (!ps_image_compaction_publication_valid(&ps_layer_map, inputs, ninputs,
 				&unused_output, 1, 0))
 		{
-			g_shards[shard].staged_compaction_retries = 1;
+			g_shards[shard].staged_compaction_retries = 2;
 			goto done;
 		}
 		result = 0;
@@ -4522,7 +4531,7 @@ done:
 				prune_abandon_test_hook(prune_abandon_test_hook_arg);
 		}
 		else
-			g_shards[shard].staged_compaction_retries = 1;
+			g_shards[shard].staged_compaction_retries = 2;
 	}
 	for (uint32_t k = 0; k < ninputs; k++)
 		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
@@ -4535,9 +4544,9 @@ done:
 	 * submitted and can be removed even after a partial publication. */
 	for (uint32_t k = published + (publish_ambiguous ? 1 : 0); k < (uint32_t) staged; k++)
 		if (ps_layer_store->delete_local_layer(&outputs[k]) != 0)
-			g_shards[shard].staged_compaction_retries = 1;
+			g_shards[shard].staged_compaction_retries = 2;
 	if (ambiguous && !published)
-		g_shards[shard].staged_compaction_retries = 1;
+		g_shards[shard].staged_compaction_retries = 2;
 	if (retired != 0)
 		result = 1;
 	if (published)
@@ -4710,7 +4719,7 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 		{
 			if (prepare_rc == 0 && metrics_header != NULL)
 				ps_fetch_add_u64(&metrics_header->compaction.bounded_merge_conflicts, 1);
-			g_shards[shard].staged_compaction_retries = 1;
+			g_shards[shard].staged_compaction_retries = 2;
 		}
 		goto done;
 	}
@@ -4720,7 +4729,7 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	{
 		if (metrics_header != NULL)
 			ps_fetch_add_u64(&metrics_header->compaction.bounded_merge_conflicts, 1);
-		g_shards[shard].staged_compaction_retries = 1;
+		g_shards[shard].staged_compaction_retries = 2;
 		goto done;
 	}
 	for (uint32_t k = 0; k < ninputs; k++)
@@ -4739,7 +4748,7 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 		{
 			if (metrics_header != NULL)
 				ps_fetch_add_u64(&metrics_header->compaction.bounded_merge_conflicts, 1);
-			g_shards[shard].staged_compaction_retries = 1;
+			g_shards[shard].staged_compaction_retries = 2;
 			goto done;
 		}
 	}
@@ -4831,7 +4840,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	CompactReadCache read_cache = {0};
 	uint64_t	frontier_seq;
 	uint64_t	retention_epoch = 0, timeline_epoch = 0, admission_epoch = 0;
-	int			stage_unlocked = g_shards[shard].staged_compaction_retries < 1;
+	int			stage_unlocked = g_shards[shard].staged_compaction_retries < 2;
 	int			gather_unlocked = 0, gather_ok = 1;
 	int			rc = -1;
 	uint64_t	locked_start = 0;
@@ -5120,7 +5129,7 @@ gather_complete:
 		{
 			if (metrics_header != NULL)
 				ps_fetch_add_u64(&metrics_header->compaction.legacy_gather_conflicts, 1);
-			g_shards[shard].staged_compaction_retries = 1;
+			g_shards[shard].staged_compaction_retries = 2;
 			gather_ok = 0;
 		}
 	}
@@ -5249,8 +5258,8 @@ gather_complete:
 		{
 			if (!valid && metrics_header != NULL)
 				ps_fetch_add_u64(&metrics_header->compaction.legacy_output_conflicts, 1);
-			if (!valid && g_shards[shard].staged_compaction_retries < 1)
-				g_shards[shard].staged_compaction_retries++;
+			if (!valid)
+				g_shards[shard].staged_compaction_retries = 2;
 			if (write_rc == 0)
 				(void) ps_layer_store->delete_local_layer(&newdesc);
 			goto cleanup;
