@@ -210,6 +210,7 @@ def replay(run, args):
     if module is None:
         raise Failure("build_incomplete", "pagestore module is absent from the PostgreSQL installation")
     return {"target_lsn": target, "replay_seconds": round(elapsed, 3), "checksums": got,
+            "daemon_args": args.daemon_arg, "sample_interval": args.sample_interval,
             "fixture_manifest_sha256": file_hash(meta_path),
             "daemon_sha256": file_hash(run.daemon_bin), "postgres_sha256": file_hash(run.bin / "postgres"),
             "module_sha256": file_hash(module), "walrestore_sha256": file_hash(run.walrestore)}

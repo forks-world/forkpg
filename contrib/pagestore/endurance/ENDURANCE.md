@@ -57,7 +57,7 @@ python3 contrib/pagestore/endurance/pagestore_fixed_replay.py replay \
 ```
 
 Use the same fixture, machine, daemon options and PostgreSQL build for each
-comparison. `result.json` records the input manifest and binary hashes,
+comparison. `result.json` records the input manifest and binary hashes, daemon arguments,
 verified checksums and replay time from materializer start to target LSN;
 it excludes fixture copying and checksum verification. Record several runs to
 account for cache and system noise. For example, pass daemon options with
