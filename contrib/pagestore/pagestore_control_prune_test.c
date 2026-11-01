@@ -422,6 +422,21 @@ read_relation_at(uint32_t block, uint64_t lsn)
 	return read_relation_asof(block, lsn, lsn);
 }
 
+static int
+read_relation_byte(uint32_t block, uint64_t lsn, unsigned char expected)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	int rc;
+
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&key));
+	rc = read_resolve(0, &key, block, lsn, 0, page, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	return rc == 1 && page[8] == expected;
+}
+
 static void
 test_segment_gc_does_not_starve_compaction(void)
 {
@@ -1570,6 +1585,7 @@ typedef struct BoundedConflictProbe
 {
 	int called;
 	int wrote;
+	int same_lsn;
 } BoundedConflictProbe;
 
 static void *
@@ -1577,7 +1593,20 @@ bounded_conflict_writer(void *arg)
 {
 	BoundedConflictProbe *probe = arg;
 
-	probe->wrote = write_relation(0, 3, 4000);
+	if (probe->same_lsn)
+	{
+		PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+		unsigned char page[8192] = {0};
+		uint32_t lo = 2000;
+
+		memcpy(page + sizeof(uint32_t), &lo, sizeof(lo));
+		page[8] = 0xA7;
+		ps_lock_shard_wr(ps_shard_of(&key));
+		probe->wrote = append_page(0, &key, 1, page, 2000, NULL) == 0;
+		ps_unlock_shard(ps_shard_of(&key));
+	}
+	else
+		probe->wrote = write_relation(0, 3, 4000);
 	return NULL;
 }
 
@@ -1628,6 +1657,62 @@ test_bounded_compaction_concurrent_write(void)
 	run_maintenance(64);
 	check(read_relation_at(1, 2000) && read_relation_at(2, 3000) &&
 		  read_relation_at(3, 4000), "bounded retry preserves concurrent write");
+	close_store();
+	remove_tree(store);
+}
+
+/* A foreground write that remains in the memtable changes the admission
+ * sequence but not the immutable inputs. An all-versions merge can publish
+ * safely without falling back to a locked full rewrite. */
+static void
+test_bounded_compaction_concurrent_memtable_write(int same_lsn)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-memtable-XXXXXX";
+	BoundedConflictProbe probe = {.same_lsn = same_lsn};
+	uint32_t before = 0, after = 0;
+
+	configure_core(1);
+	compact_layers = 100;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  write_control(0, 1000, 800), "open bounded memtable conflict store");
+	run_maintenance(32);
+	check(write_relation(0, 1, 2000) && write_relation(0, 2, 3000),
+		  "prepare bounded memtable conflict inputs");
+	close_store();
+	flush_pages = 100;
+	check(ps_core_open(store) == 0, "reopen with a larger memtable");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting)
+			before++;
+	ps_unlock_map();
+	ps_test_set_compaction_unlocked_hook(bounded_conflict_hook, &probe);
+	compact_layers = 1;
+	for (int i = 0; i < 64 && !probe.called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+			!ps_layer_map.layers[i].deleting)
+			after++;
+	ps_unlock_map();
+	check(probe.called && probe.wrote && after < before,
+		  "bounded merge publishes despite an unrelated memtable write");
+	check(read_relation_at(1, 2000) && read_relation_at(2, 3000) &&
+		  (same_lsn || read_relation_at(3, 4000)),
+		  "merge preserves inputs and concurrent write");
+	if (same_lsn)
+		check(read_relation_byte(1, 2000, 0xA7),
+			  "same-LSN concurrent write remains newest");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(1, 2000) &&
+		  read_relation_at(2, 3000) && (same_lsn || read_relation_at(3, 4000)),
+		  "bounded merge and concurrent write survive restart");
+	if (same_lsn)
+		check(read_relation_byte(1, 2000, 0xA7),
+			  "same-LSN write remains newest after restart");
 	close_store();
 	remove_tree(store);
 }
@@ -2181,12 +2266,17 @@ test_staged_compaction_rejects_concurrent_write(uint32_t nshards)
 	check(probe.called == 1 && probe.read_ok && probe.write_ok,
 		  "foreground reads and writes proceed during staged output");
 	ps_lock_map_rd();
-	check(ps_layer_map_count(&ps_layer_map) == probe.layers_after_write,
-		  "concurrent write invalidates staged replacement");
+	if (nshards == 1)
+		check(ps_layer_map_count(&ps_layer_map) == probe.layers_after_write,
+			  "new input layer invalidates staged replacement");
+	else
+		check(ps_layer_map_count(&ps_layer_map) > probe.layers_after_write,
+			  "write to another shard does not invalidate the bounded merge");
 	ps_unlock_map();
 	run_maintenance(64);
 	check(read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 2000, &version) && version == 2000,
 		  "retry preserves control image after concurrent write");
+	check(read_relation_at(1, 3000), "concurrent relation write remains visible");
 	close_store();
 	remove_tree(store);
 }
@@ -3182,6 +3272,8 @@ main(void)
 	test_partial_output_conflict_churn();
 	test_partial_output_abandon_crash();
 	test_bounded_compaction_concurrent_write();
+	test_bounded_compaction_concurrent_memtable_write(0);
+	test_bounded_compaction_concurrent_memtable_write(1);
 	test_compaction_gather_rejects_concurrent_change(0);
 	test_compaction_gather_rejects_concurrent_change(1);
 	test_staged_compaction_rejects_concurrent_write(1);
