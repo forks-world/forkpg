@@ -4653,6 +4653,59 @@ change_gc_layer_set(void *arg)
 }
 
 static void
+test_page_gc_parallel_corruption(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-multi-layer-XXXXXX";
+	char path[4096] = "";
+	uint32_t covering = 0;
+
+	configure_timeline_core();
+	segment_size = 32768;
+	flush_pages = 1;
+	compact_layers = 1000;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open multi-layer GC fixture");
+		return;
+	}
+	for (uint32_t block = 0; block < 9; block++)
+		check(write_timeline_layer(0, block, 100 + block) == 0,
+			  "write multi-layer GC input");
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsImgIndexEnt *index = NULL;
+		uint32_t n = 0;
+
+		if (ps_image_layer_read_index(&ps_layer_map.layers[i], &index, &n) == 0)
+			for (uint32_t j = 0; j < n; j++)
+				if ((index[j].flags & PS_IMG_REC_SEG_VALID) && index[j].seg_id == 1)
+				{
+					covering++;
+					snprintf(path, sizeof(path), "%s", ps_layer_map.layers[i].locations[0].uri);
+					break;
+				}
+		free(index);
+	}
+	check(covering > 1 && ps_test_gc_verified_local(0, 1, NULL, NULL) == 0,
+		  "GC validates multiple layers covering one segment");
+	if (path[0] != '\0')
+	{
+		change_gc_layer(path);
+		check(ps_test_gc_verified_local(0, 1, NULL, NULL) != 0,
+			  "GC rejects corruption in a later covering layer");
+		ps_test_gc_verify_thread_limit(0);
+		check(ps_test_gc_verified_local(0, 1, NULL, NULL) != 0,
+			  "GC rejects corruption when no helper threads can start");
+		change_gc_layer(path);
+		check(ps_test_gc_verified_local(0, 1, NULL, NULL) == 0,
+			  "GC validates restored layers without helper threads");
+		ps_test_gc_verify_thread_limit(-1);
+	}
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_page_gc_missing_prefix_preflight(void)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-missing-prefix-XXXXXX";
@@ -4760,6 +4813,7 @@ int
 main(void)
 {
 	test_page_gc_missing_prefix_preflight();
+	test_page_gc_parallel_corruption();
 	test_timeline_seqcap_format();
 	test_old_event_replay_derives_reused_parent_incarnation();
 	test_legacy_migration_and_parser_fail_closed();
