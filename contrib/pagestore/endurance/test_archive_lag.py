@@ -106,6 +106,21 @@ class ArchiveLagTests(unittest.TestCase):
         self.run.event.assert_called_once_with('archive_restartpoint', replay='0/200',
                                                marker='0/100', segment='segment')
 
+    def test_failure_diagnostics_capture_wal_status_before_halt(self):
+        self.run.root = self.root
+        self.run.writer.name, self.run.mat.name = 'writer', 'materializer'
+        self.run.writer.sql.side_effect = ['writer activity', 'writer status']
+        self.run.mat.sql.side_effect = ['materializer activity', 'materializer status']
+        self.run.computes = lambda: [self.run.writer, self.run.mat]
+        self.run.branches = []
+        self.run.inspect = Mock(return_value='inspection')
+        self.run.dump_diagnostics()
+        d = self.root / 'diagnostics'
+        self.assertEqual(next(d.glob('*-writer-wal-status.txt')).read_text(), 'writer status')
+        self.assertEqual(next(d.glob('*-materializer-wal-status.txt')).read_text(), 'materializer status')
+        self.run.writer.halt.assert_called_once()
+        self.run.mat.halt.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()
