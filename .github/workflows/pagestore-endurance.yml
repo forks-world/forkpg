@@ -71,6 +71,7 @@ jobs:
         run: |
           python3 contrib/pagestore/endurance/test_space_budget.py
           python3 contrib/pagestore/endurance/test_archive_lag.py
+          python3 contrib/pagestore/endurance/test_success_evidence.py
           python3 contrib/pagestore/endurance/test_branch_reclaim.py
           python3 contrib/pagestore/endurance/test_endurance_watch.py
           python3 contrib/pagestore/endurance/test_resources.py
