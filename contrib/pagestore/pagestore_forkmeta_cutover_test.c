@@ -6154,6 +6154,14 @@ test_wal_proven_historical_growth(void)
 	ps_lifecycle_read_unlock();
 	check(ch.status == PS_STATUS_OK, "ship WAL covering historical page record");
 	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch.req_seq = 200;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	check(ch.status == PS_STATUS_OK, "commit an index prefix behind the historical page");
+	memset(&ch, 0, sizeof(ch));
 	memset(&entry, 0, sizeof(entry));
 	entry.key = key;
 	entry.block = 3;
@@ -6176,6 +6184,7 @@ test_wal_proven_historical_growth(void)
 		  "uncommitted WAL index is not proof");
 	memset(&ch, 0, sizeof(ch));
 	ch.opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch.req_lsn = 200;
 	ch.req_seq = 1024;
 	ch.status = PS_STATUS_OK;
 	ps_lifecycle_read_lock();
