@@ -38,6 +38,38 @@ cap, and pinned readers/hot-standby query caps are unchanged.
 Put `--root` on a real filesystem.  On tmpfs every fsync is free and the run
 says nothing about the store's durability ordering.
 
+## Fixed-input replay comparisons
+
+`pagestore_fixed_replay.py` captures a stopped store and materializer plus a
+fixed amount of archived WAL. It records the writer's table checksums and a
+SHA-256 manifest of the input files, directories and permissions. Each replay
+copies and verifies that input, waits for the recorded LSN and checks the table
+checksums and invariants. Both the fixture and run directories are preserved;
+each work directory and a captured fixture must be new paths.
+The original store is retained as `captured-store` in the capture directory;
+its old path must remain absent so the layer manifest can be relocated safely.
+
+```sh
+python3 contrib/pagestore/endurance/pagestore_fixed_replay.py capture \
+    --build build --work-dir /data/capture-1 --fixture /data/fixture-1
+python3 contrib/pagestore/endurance/pagestore_fixed_replay.py replay \
+    --build build --work-dir /data/replay-1 --fixture /data/fixture-1
+```
+
+Use the same fixture, machine, daemon options and PostgreSQL build for each
+comparison. `result.json` records the input manifest and binary hashes, daemon arguments,
+verified checksums and replay time from materializer start to target LSN;
+it excludes fixture copying and checksum verification. Record several runs to
+account for cache and system noise. For example, pass daemon options with
+`--daemon-arg=--page-high-water-bytes --daemon-arg=16777216`.
+The replay workload is bounded and does not replace a 72-hour endurance run.
+
+The defaults allow 20 GiB per run, 15 GiB per store and require 50 GiB free;
+set `--max-run-gb`, `--max-store-gb` and `--min-free-gb` for the host. During
+copying the run limit conservatively counts logical file sizes and headroom is
+checked before each file; active processes use the endurance driver's periodic
+resource sampling. The fixture uses additional space on its own filesystem.
+
 `.github/workflows/pagestore-endurance.yml` runs a bounded run on demand (any
 ref, seed, duration and scale), a 15-minute one weekly, and a five-minute
 one on a pull request that changes the driver, uploading the
@@ -102,6 +134,11 @@ segment alignment and a latched checkpoint crossing; WAL-index limits reserve
 maximum-record/padding headroom, so neither setting is an exact byte ceiling.
 Warnings that archiving is paused are expected while the worker catches up;
 failure to catch up within `--sync-timeout` remains a finding.
+While waiting for bounded archiving, the driver also applies the materializer
+supervisor's progress policy: if replay is ahead of the durable marker but has
+stopped advancing, it performs a fast restart to publish a restartpoint. The
+driver records each attempt as `archive_restartpoint`; it never bypasses either
+lag limiter or treats an unavailable marker as progress.
 
 ## Exit notifications and persistent status
 

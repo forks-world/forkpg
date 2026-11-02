@@ -6,7 +6,7 @@ import tempfile
 import subprocess
 import sys
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pagestore_endurance as endurance
 
@@ -58,6 +58,53 @@ class ArchiveLagTests(unittest.TestCase):
             self.run.configure_archive_lag_limits()
         self.assertEqual(caught.exception.kind, 'archive_lag_config')
         self.run.event.assert_not_called()
+
+    def test_restartpoint_requires_durable_lag_and_idle_replay(self):
+        policy = endurance.ArchiveRestartpointPolicy(idle_seconds=30)
+        self.assertFalse(policy.should_restart(0, '0/100', '0/100'))
+        self.assertFalse(policy.should_restart(31, '0/200', '0/100'))
+        self.assertFalse(policy.should_restart(45, '0/300', '0/100'))
+        self.assertFalse(policy.should_restart(74, '0/300', '0/100'))
+        self.assertTrue(policy.should_restart(75, '0/300', '0/100'))
+        self.assertFalse(policy.should_restart(80, '0/300', '0/100'))
+        self.assertFalse(policy.should_restart(110, '0/300', '0/300'))
+
+    def test_checkpointer_write_error_is_not_mistaken_for_idle_archive(self):
+        self.assertIsNotNone(endurance.BAD_LOG.search(
+            'ERROR:  pagestore localsvc: daemon reported error for op 8'))
+        self.assertIsNone(endurance.BAD_LOG.search(
+            'ERROR:  pagestore localsvc: daemon reported error for op 80'))
+
+    def test_restartpoint_does_not_repeat_without_progress(self):
+        policy = endurance.ArchiveRestartpointPolicy(idle_seconds=30)
+        self.assertFalse(policy.should_restart(0, '0/200', '0/100'))
+        self.assertTrue(policy.should_restart(30, '0/200', '0/100'))
+        self.assertFalse(policy.should_restart(60, '0/200', '0/100'))
+        self.assertFalse(policy.should_restart(61, '0/300', '0/100'))
+        self.assertTrue(policy.should_restart(91, '0/300', '0/100'))
+
+    def test_archive_wait_restarts_stalled_worker_without_skipping_archive(self):
+        wal = self.root / 'pg_wal'
+        (wal / 'archive_status').mkdir(parents=True)
+        (wal / 'segment').touch()
+        self.run.writer.sql.side_effect = ['0/200', 'segment']
+        self.run.mat.expected_up = True
+        self.run.mat.sql.return_value = '0/200|0/100'
+        self.run.probe_timeout = Mock(return_value=1)
+
+        def wait(what, poll, timeout):
+            self.assertFalse(poll())
+            self.assertFalse(poll())
+            (wal / 'archive_status' / 'segment.done').touch()
+            self.assertTrue(poll())
+
+        self.run.wait_for.side_effect = wait
+        with patch.object(endurance.time, 'monotonic', side_effect=[0, 31]):
+            self.assertEqual(self.run.archive_current_wal(), '0/200')
+        self.run.mat.stop.assert_called_once_with('fast')
+        self.run.mat.start.assert_called_once()
+        self.run.event.assert_called_once_with('archive_restartpoint', replay='0/200',
+                                               marker='0/100', segment='segment')
 
 
 if __name__ == '__main__':

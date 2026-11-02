@@ -529,6 +529,10 @@ handle_request(PsChannel *ch)
 										 &reason)) != 0)
 					{
 						ch->status = PS_STATUS_ERROR;
+						if (!artifact_klass)
+							fprintf(stderr, "pagestore: relation write refused timeline=%u rel=%u fork=%u block=%u reason=%d recovery=%d\n",
+									tl, ch->key.relNumber, ch->key.forkNum,
+									ch->blocknum + i, reason, recovery);
 						if (artifact_klass)
 						{
 							ch->result = (uint32_t) reason;
