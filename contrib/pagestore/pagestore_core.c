@@ -20729,6 +20729,26 @@ walidx_proves_page_lsn(uint32_t timeline, const PsKey *key, uint32_t block,
 				break;
 		}
 	}
+	if (!found)
+	{
+		int allowed = walidx_frontier_ancestry_allows(timeline, page_lsn);
+		WalIdxEnt *probe = walidx_find(timeline, key, block);
+		fprintf(stderr, "pagestore: WAL proof debug timeline=%u rel=%u block=%u lsn=%llu frontier_allowed=%d entries=%d",
+				timeline, key->relNumber, block, (unsigned long long) page_lsn,
+				allowed, probe ? probe->n : 0);
+		if (probe)
+		{
+			int pos = walidx_upper_bound(probe, page_lsn);
+			if (pos > 0)
+			{
+				WalIdxItem *item = &probe->items[pos - 1];
+				fprintf(stderr, " previous=%llu/%llu flags=%u",
+						(unsigned long long) item->lsn,
+						(unsigned long long) item->end_lsn, item->flags);
+			}
+		}
+		fprintf(stderr, "\n");
+	}
 	walidx_publish_rdunlock();
 	ps_unlock_map();
 	return found;
