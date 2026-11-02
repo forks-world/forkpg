@@ -116,11 +116,23 @@ def preserve_success_logs(root: Path, keep: Path) -> None:
 
 def directory_kb(path: Path) -> int:
     """Allocated bytes, including hidden files; never follow external symlinks."""
-    result = subprocess.run(["du", "-sk", "--", str(path)],
-                            capture_output=True, text=True, timeout=120)
-    if result.returncode != 0:
-        raise ValueError(f"du {path.name}: {result.stderr.strip()[:200]}")
-    return int(result.stdout.split("\t", 1)[0])
+    # Compaction can remove a layer between du's directory read and stat.
+    # Retry the whole scan instead of accepting du's incomplete total.  Any
+    # other error, or repeated races, still fails closed.
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    for attempt in range(3):
+        result = subprocess.run(["du", "-sk", "--", str(path)],
+                                capture_output=True, text=True, timeout=120, env=env)
+        if result.returncode == 0:
+            return int(result.stdout.split("\t", 1)[0])
+        lines = result.stderr.strip().splitlines()
+        vanished = lines and all(line.startswith("du: cannot access ") and
+                                 line.endswith(": No such file or directory")
+                                 for line in lines)
+        if not vanished or attempt == 2:
+            raise ValueError(f"du {path.name}: {result.stderr.strip()[:200]}")
+    raise AssertionError("unreachable")
 
 
 def space_snapshot(root: Path, store: Path, args: argparse.Namespace) -> dict[str, Any]:

@@ -60,6 +60,31 @@ class SpaceBudgetTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 endurance.directory_kb(self.root)
 
+    def test_disappearing_layer_retries_full_scan(self):
+        missing = SimpleNamespace(returncode=1, stdout="2\tstore\n", stderr=
+                                  "du: cannot access 'store/layer': No such file or directory\n")
+        success = SimpleNamespace(returncode=0, stdout="42\tstore\n", stderr="")
+        with patch.object(endurance.subprocess, "run", side_effect=[missing, success]) as scan:
+            self.assertEqual(endurance.directory_kb(self.store), 42)
+            self.assertEqual(scan.call_count, 2)
+
+    def test_repeated_disappearing_layer_fails_closed(self):
+        missing = SimpleNamespace(returncode=1, stdout="2\tstore\n", stderr=
+                                  "du: cannot access 'store/layer': No such file or directory\n")
+        with patch.object(endurance.subprocess, "run", return_value=missing) as scan:
+            with self.assertRaises(ValueError):
+                endurance.directory_kb(self.store)
+            self.assertEqual(scan.call_count, 3)
+
+    def test_mixed_du_errors_are_not_retried(self):
+        result = SimpleNamespace(returncode=1, stdout="", stderr=
+                                 "du: cannot access 'gone': No such file or directory\n"
+                                 "du: cannot read directory 'private': Permission denied\n")
+        with patch.object(endurance.subprocess, "run", return_value=result) as scan:
+            with self.assertRaises(ValueError):
+                endurance.directory_kb(self.store)
+            self.assertEqual(scan.call_count, 1)
+
     def test_sampler_fails_closed_after_three_bad_measurements(self):
         run = object.__new__(endurance.Run)
         run.root, run.store, run.args = self.root, self.store, self.args
