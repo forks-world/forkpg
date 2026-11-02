@@ -4652,6 +4652,130 @@ change_gc_layer_set(void *arg)
 	ps_unlock_map();
 }
 
+typedef struct GcBatchProbe
+{
+	int calls;
+	int corrupt;
+	char path[4096];
+} GcBatchProbe;
+
+static void
+gc_batch_interpose(void *arg)
+{
+	GcBatchProbe *probe = arg;
+
+	probe->calls++;
+	ps_test_set_gc_batch_hook(NULL, NULL);
+	if (probe->corrupt == 1)
+		change_gc_layer(probe->path);
+	else if (probe->corrupt == 2 && write_timeline_layer(0, 50, 1000) != 0)
+		probe->calls = -100;
+}
+
+static void
+test_page_gc_batch(int corrupt)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-batch-XXXXXX";
+	unsigned char page[8192];
+	GcBatchProbe probe = {.corrupt = corrupt};
+
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 1;
+	compact_layers = 1000;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open bounded GC batch fixture");
+		return;
+	}
+	for (uint32_t block = 0; block < 8; block++)
+		check(write_timeline_layer(0, block, 100 + block) == 0,
+			  "write GC batch source");
+	check(ps_layer_map.nlayers > 0 && ps_storage->seg_size(0, 4) > 0,
+		  "prepare at least five GC segments");
+	if (ps_layer_map.nlayers > 0)
+		snprintf(probe.path, sizeof(probe.path), "%s", ps_layer_map.layers[0].locations[0].uri);
+	segment_gc_enabled = 1;
+	ps_test_set_gc_batch_hook(gc_batch_interpose, &probe);
+	for (int i = 0; i < 64 && probe.calls == 0; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_gc_batch_hook(NULL, NULL);
+	check(probe.calls == 1 && ps_storage->seg_size(0, 0) < 0,
+		  "first GC segment is removed before yielding the batch");
+	if (corrupt)
+	{
+		check(ps_storage->seg_size(0, 1) > 0,
+			  "changed layer or layer set stops the batch before the next segment");
+		if (corrupt == 1)
+			change_gc_layer(probe.path);
+	}
+	else
+		check(ps_storage->seg_size(0, 3) < 0 && ps_storage->seg_size(0, 4) > 0,
+			  "unchanged batch removes at most four covered segments");
+	close_store();
+	check(ps_core_open(store) == 0, "reopen after a partial or complete GC batch");
+	for (int i = 0; i < 64 && ps_storage->seg_size(0, 3) > 0; i++)
+		(void) ps_core_maintenance();
+	for (uint32_t block = 0; block < 8; block++)
+		check(read_test_page(0, block, page) == 1 && page[100] == 0x5A,
+			  "GC batch preserves readable pages after restart");
+	if (corrupt == 2)
+		check(read_test_page(0, 50, page) == 1 && page[100] == 0x5A,
+			  "concurrent image is readable after batch restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+gc_batch_crash(void *arg)
+{
+	(void) arg;
+	_exit(73);
+}
+
+static void
+test_page_gc_batch_crash(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-batch-crash-XXXXXX";
+	unsigned char page[8192];
+	pid_t child;
+	int status = 0;
+
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 1;
+	compact_layers = 1000;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open GC batch crash fixture");
+		return;
+	}
+	for (uint32_t block = 0; block < 8; block++)
+		check(write_timeline_layer(0, block, 100 + block) == 0,
+			  "write GC batch crash source");
+	close_store();
+	child = fork();
+	if (child == 0)
+	{
+		if (ps_core_open(store) != 0)
+			_exit(74);
+		segment_gc_enabled = 1;
+		ps_test_set_gc_batch_hook(gc_batch_crash, NULL);
+		for (int i = 0; i < 64; i++)
+			(void) ps_core_maintenance();
+		_exit(75);
+	}
+	check(child > 0 && waitpid(child, &status, 0) == child &&
+		  WIFEXITED(status) && WEXITSTATUS(status) == 73,
+		  "crash after first segment in bounded GC batch");
+	check(ps_core_open(store) == 0, "reopen after GC batch crash");
+	for (uint32_t block = 0; block < 8; block++)
+		check(read_test_page(0, block, page) == 1 && page[100] == 0x5A,
+			  "GC batch crash preserves readable pages");
+	close_store();
+	remove_tree(store);
+}
+
 static void
 test_page_gc_missing_prefix_preflight(void)
 {
@@ -4760,6 +4884,10 @@ int
 main(void)
 {
 	test_page_gc_missing_prefix_preflight();
+	test_page_gc_batch(0);
+	test_page_gc_batch(1);
+	test_page_gc_batch(2);
+	test_page_gc_batch_crash();
 	test_timeline_seqcap_format();
 	test_old_event_replay_derives_reused_parent_incarnation();
 	test_legacy_migration_and_parser_fail_closed();

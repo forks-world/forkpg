@@ -26966,15 +26966,28 @@ typedef struct GcVerifiedLayer
 {
 	PsLayerDesc desc;
 	struct stat identity;
-	bool covers;
+	uint32_t covers_mask;
 } GcVerifiedLayer;
 
+#define PS_GC_BATCH_SEGMENTS 4
 typedef struct GcVerifiedSet
 {
 	GcVerifiedLayer *layers;
 	uint32_t count;
+	uint32_t first_victim;
+	uint32_t nvictims;
 	bool ready;
 } GcVerifiedSet;
+
+static void (*gc_batch_test_hook)(void *);
+static void *gc_batch_test_hook_arg;
+
+void
+ps_test_set_gc_batch_hook(void (*hook)(void *), void *arg)
+{
+	gc_batch_test_hook = hook;
+	gc_batch_test_hook_arg = arg;
+}
 
 static bool
 gc_same_file(const struct stat *a, const struct stat *b)
@@ -26999,13 +27012,18 @@ gc_same_file(const struct stat *a, const struct stat *b)
 /* Return false for unsupported stores or any stale/corrupt observation.
  * In that case the caller retains the original locked verification path. */
 static bool
-gc_prepare_local(uint32_t shard, uint32_t victim, GcVerifiedSet *set)
+gc_prepare_local(uint32_t shard, uint32_t victim, uint32_t nvictims,
+				 GcVerifiedSet *set)
 {
 	uint32_t count = 0;
 	bool ok = false;
 
-	if (ps_layer_store != &PsLayerStoreLocal)
+	if (ps_layer_store != &PsLayerStoreLocal || nvictims == 0 ||
+		nvictims > PS_GC_BATCH_SEGMENTS ||
+		(uint64_t) victim + nvictims > (uint64_t) UINT32_MAX + 1)
 		return false;
+	set->first_victim = victim;
+	set->nvictims = nvictims;
 	ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 	{
@@ -27048,10 +27066,11 @@ gc_prepare_local(uint32_t shard, uint32_t victim, GcVerifiedSet *set)
 			goto out;
 		}
 		for (uint32_t j = 0; j < n; j++)
-			if ((idx[j].flags & PS_IMG_REC_SEG_VALID) && idx[j].seg_id == victim)
-			{ v->covers = true; break; }
+			if ((idx[j].flags & PS_IMG_REC_SEG_VALID) && idx[j].seg_id >= victim &&
+				(uint64_t) idx[j].seg_id - victim < nvictims)
+				v->covers_mask |= 1u << (idx[j].seg_id - victim);
 		free(idx);
-		if ((v->covers && ps_image_layer_verify_fd(fd, loc->size, page_size) != 0) ||
+		if ((v->covers_mask && ps_image_layer_verify_fd(fd, loc->size, page_size) != 0) ||
 			fstat(fd, &after) != 0 || stat(loc->uri, &path) != 0 ||
 			!gc_same_file(&v->identity, &after) || !gc_same_file(&after, &path))
 		{
@@ -27072,10 +27091,16 @@ out:
 }
 
 static int
-gc_confirm_local(uint32_t shard, const GcVerifiedSet *set, int need_layer)
+gc_confirm_local(uint32_t shard, uint32_t victim, const GcVerifiedSet *set, int need_layer)
 {
 	uint32_t count = 0;
 	bool found = false;
+	uint32_t mask;
+
+	if (victim < set->first_victim ||
+		(uint64_t) victim - set->first_victim >= set->nvictims)
+		return -1;
+	mask = 1u << (victim - set->first_victim);
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 	{
 		PsLayerDesc *d = &ps_layer_map.layers[i];
@@ -27103,7 +27128,7 @@ gc_confirm_local(uint32_t shard, const GcVerifiedSet *set, int need_layer)
 				return -1;
 			}
 		}
-		if (v->covers)
+		if (v->covers_mask & mask)
 		{
 			found = true;
 			layer_verified_forget(d->layer_id);
@@ -27122,12 +27147,12 @@ ps_test_gc_verified_local(uint32_t shard, uint32_t victim,
 {
 	GcVerifiedSet set = {0};
 	int rc;
-	if (!gc_prepare_local(shard, victim, &set))
+	if (!gc_prepare_local(shard, victim, 1, &set))
 		return -1;
 	if (interpose)
 		interpose(arg);
 	ps_lock_map_rd();
-	rc = gc_confirm_local(shard, &set, 1);
+	rc = gc_confirm_local(shard, victim, &set, 1);
 	ps_unlock_map();
 	free(set.layers);
 	return rc;
@@ -27287,7 +27312,7 @@ reclaim_one_segment(Shard *s, int layers_prepared, const GcVerifiedSet *verified
 	if (!layers_prepared)
 		return 0;
 	refs = segment_has_references(s->id, victim);
-	if ((verified && verified->ready ? gc_confirm_local(s->id, verified, refs) :
+	if ((verified && verified->ready ? gc_confirm_local(s->id, victim, verified, refs) :
 		 verify_segment_layers_locked(s->id, victim, refs)) != 0)
 		return 0;
 	for (uint32_t sh = 0; sh < ns; sh++)
@@ -27963,7 +27988,7 @@ ps_core_maintenance_impl(void)
 	if (!defer_layer_gc && tier_one_layer())
 		return 1;
 
-	/* Reclaim at most one complete segment.  The boundary segment containing
+	/* Reclaim a bounded batch of complete segments. The boundary segment containing
 	 * the watermark stays present because its suffix may not be in a layer.
 	 * Shared segments can contain records from several timelines, so retain all
 	 * of them while any deletion awaits its filtered-rewrite phase. */
@@ -27974,10 +27999,13 @@ ps_core_maintenance_impl(void)
 		uint32_t prepared_victim[MAX_SHARDS];
 		bool layers_prepared[MAX_SHARDS] = {false};
 		GcVerifiedSet verified[MAX_SHARDS] = {{0}};
+		uint32_t reclaimed_shard = UINT32_MAX;
+		bool batch_allowed = false;
 
 		for (uint32_t sh = 0; sh < ns; sh++)
 		{
 			uint32_t	victim = 0;
+			uint32_t	nvictims = 0;
 			int			due;
 
 			/* flush_memtable() publishes the coverage watermark while its
@@ -27989,7 +28017,12 @@ ps_core_maintenance_impl(void)
 				g_shards[sh].gc_next_seg <
 				g_shards[sh].flush_watermark.seg_id;
 			if (due)
+			{
 				victim = g_shards[sh].gc_next_seg;
+				nvictims = g_shards[sh].flush_watermark.seg_id - victim;
+				if (nvictims > PS_GC_BATCH_SEGMENTS)
+					nvictims = PS_GC_BATCH_SEGMENTS;
+			}
 			ps_unlock_shard(sh);
 			if (due)
 			{
@@ -28006,7 +28039,7 @@ ps_core_maintenance_impl(void)
 				}
 				if (!missing)
 				{
-					if (!gc_prepare_local(sh, victim, &verified[sh]))
+					if (!gc_prepare_local(sh, victim, nvictims, &verified[sh]))
 						(void) prepare_segment_layers(sh, victim);
 					prepared_victim[sh] = victim;
 					layers_prepared[sh] = true;
@@ -28017,12 +28050,53 @@ ps_core_maintenance_impl(void)
 			ps_lock_shard_wr(sh);
 		ps_lock_map_rd();
 		for (uint32_t sh = 0; sh < ns && !found; sh++)
+		{
+			bool stable_debt = !defer_layer_gc && !g_shards[sh].gc_pending_remove &&
+				!g_shards[sh].gc_storage_error &&
+				(!g_shards[sh].gc_debt_unavailable || page_reclaim_high_water_bytes == 0);
+
 			found = reclaim_one_segment(&g_shards[sh],
 				layers_prepared[sh] && prepared_victim[sh] ==
 				g_shards[sh].gc_next_seg, &verified[sh]);
+			if (found)
+			{
+				reclaimed_shard = sh;
+				batch_allowed = stable_debt;
+			}
+		}
 		ps_unlock_map();
 		for (uint32_t sh = ns; sh > 0; sh--)
 			ps_unlock_shard(sh - 1);
+		/* Revalidate the entire layer set and file identities under the locks
+		 * before each additional unlink. Yield to foreground work in between;
+		 * any change or failed removal stops the batch. */
+		if (found && batch_allowed && reclaimed_shard != UINT32_MAX && verified[reclaimed_shard].ready)
+		{
+			GcVerifiedSet *set = &verified[reclaimed_shard];
+
+			for (uint32_t offset = 1; offset < set->nvictims; offset++)
+			{
+				int next_done = 0;
+				bool stable;
+
+				if (gc_batch_test_hook != NULL)
+					gc_batch_test_hook(gc_batch_test_hook_arg);
+				for (uint32_t sh = 0; sh < ns; sh++)
+					ps_lock_shard_wr(sh);
+				ps_lock_map_rd();
+				stable = !g_shards[reclaimed_shard].gc_storage_error &&
+					(!g_shards[reclaimed_shard].gc_debt_unavailable || page_reclaim_high_water_bytes == 0);
+				for (uint32_t sh = 0; sh < ns; sh++)
+					stable &= !g_shards[sh].gc_pending_remove;
+				if (stable && g_shards[reclaimed_shard].gc_next_seg == set->first_victim + offset)
+					next_done = reclaim_one_segment(&g_shards[reclaimed_shard], 1, set);
+				ps_unlock_map();
+				for (uint32_t sh = ns; sh > 0; sh--)
+					ps_unlock_shard(sh - 1);
+				if (!next_done)
+					break;
+			}
+		}
 		for (uint32_t sh = 0; sh < ns; sh++)
 			free(verified[sh].layers);
 		/* Give compaction a turn before another ordinary segment GC. */
