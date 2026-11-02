@@ -160,6 +160,30 @@ ps_walidx_prune_plan_bases(const PsWalIdxPruneItem *items, uint32_t n,
 }
 
 int
+ps_walidx_prune_plan_proof_range(const PsWalIdxPruneItem *items, uint32_t n,
+								  const uint64_t *bases, uint32_t nbases,
+								  const uint64_t *deaths, uint32_t ndeaths,
+								  uint64_t cutoff, int cutoff_bases_ok,
+								  const uint64_t *horizons, uint32_t nhorizons,
+								  const unsigned char *horizon_bases_ok,
+								  uint64_t proof_floor, unsigned char *keep)
+{
+	int kept = ps_walidx_prune_plan_bases(items, n, bases, nbases, deaths,
+										 ndeaths, cutoff, cutoff_bases_ok, horizons,
+										 nhorizons, horizon_bases_ok, keep);
+
+	if (kept < 0 || proof_floor == 0)
+		return kept;
+	for (uint32_t i = 0; i < n; i++)
+		if (items[i].known && items[i].end_lsn >= proof_floor && !keep[i])
+		{
+			keep[i] = 1;
+			kept++;
+		}
+	return kept;
+}
+
+int
 ps_walidx_prune_plan(const PsWalIdxPruneItem *items, uint32_t n,
 					uint64_t cutoff, const uint64_t *horizons,
 					uint32_t nhorizons, unsigned char *keep)

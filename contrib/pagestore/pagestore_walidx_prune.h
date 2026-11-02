@@ -54,4 +54,14 @@ extern int ps_walidx_prune_plan_bases(const PsWalIdxPruneItem *items,
 									  uint32_t nhorizons,
 									  const unsigned char *horizon_bases_ok,
 									  unsigned char *keep);
+
+/* Like the base planner, but also keep every exact record ending at or above
+ * proof_floor. Zero disables this additional protection. This plans a future
+ * replay-proof interval; it does not register a pin or change read frontiers. */
+extern int ps_walidx_prune_plan_proof_range(const PsWalIdxPruneItem *items,
+			uint32_t n, const uint64_t *bases, uint32_t nbases,
+			const uint64_t *deaths, uint32_t ndeaths, uint64_t cutoff,
+			int cutoff_bases_ok, const uint64_t *horizons, uint32_t nhorizons,
+			const unsigned char *horizon_bases_ok, uint64_t proof_floor,
+			unsigned char *keep);
 #endif
