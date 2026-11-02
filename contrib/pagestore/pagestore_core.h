@@ -393,6 +393,8 @@ extern void ps_test_wal_reclaim_proof_changed(void);
 extern int ps_test_wal_retained_base(uint32_t timeline, uint64_t *base_out);
 extern int ps_test_walidx_frontier_exception_active(uint32_t timeline,
 	uint64_t lsn);
+/* Test only: change the in-memory frontier without publishing a snapshot. */
+extern int ps_test_walidx_override_frontier(uint32_t timeline, uint64_t lsn);
 /* Test-only scheduling seam for pending forkmeta GC/snapshot retries. */
 extern void ps_test_forkmeta_snapshot_gc_retry_now(void);
 extern int ps_test_forkmeta_canonical_gc_ambiguous(void);

@@ -6190,11 +6190,17 @@ test_wal_proven_historical_growth(void)
 	ps_lifecycle_read_lock();
 	(void) ps_handle_meta(&ch);
 	ps_lifecycle_read_unlock();
-	check(ch.status == PS_STATUS_OK &&
+	check(ch.status == PS_STATUS_OK && ps_test_walidx_override_frontier(0, 500) == 0,
+		  "simulate an advanced frontier with an exact record retained");
+	check(append_relation_recovery_timeline_tag(0, &key, 4, 410, page, 0x42, NULL) != 0,
+		  "an advanced frontier does not turn an absent record into proof");
+	check(
 		  append_relation_recovery_timeline_tag(0, &key, 3, 410, page, 0x42, NULL) == 0 &&
 		  read_resolve(0, &key, 3, 410, 0, page, NULL) == 1 && page[128] == 0x42 &&
 		  read_resolve(0, &key, 3, UINT64_MAX, 0, page, NULL) == 0,
-		  "committed exact WAL proof admits growth without resurrecting the page");
+		  "retained exact WAL proof admits growth below frontier without resurrection");
+	check(ps_test_walidx_override_frontier(0, 0) == 0,
+		  "restore simulated frontier before reopening the store");
 	close_runtime();
 	check(ps_core_open(store) == 0 &&
 		  read_resolve(0, &key, 3, 410, 0, page, NULL) == 1 && page[128] == 0x42 &&
