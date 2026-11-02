@@ -73,7 +73,7 @@ resource sampling. The fixture uses additional space on its own filesystem.
 `.github/workflows/pagestore-endurance.yml` runs a bounded run on demand (any
 ref, seed, duration and scale), a 15-minute one weekly, and a five-minute
 one on a pull request that changes the driver, uploading the
-history, the passed runs' events and metrics, and a failed run's logs,
+history, the passed runs' events, metrics and bounded log evidence, and a failed run's logs,
 diagnostics and controller journals as the `pagestore-endurance-<seed>`
 artifact.  It keeps the driver exercised on the current tree; multi-hour
 runs stay on a developer box, and neither is release evidence
@@ -470,8 +470,11 @@ monitor detect a currently long-held lock before the attempt completes.
 subtract the active timestamp to estimate the elapsed hold at sampling.
 The counters are individually atomic but not a coherent multi-field snapshot.
 
-- Pass: `PASS.json`, `events.jsonl` and `metrics.jsonl` move to
-  `<root>/passed/<seed>/`; the bulk is deleted.
+- Pass: `PASS.json`, `events.jsonl`, `metrics.jsonl`, and bounded log tails and
+  recent warnings move to `<root>/passed/<seed>/`; the bulk is deleted. Log
+  evidence covers the daemon, writer, materializer, and four recent branches:
+  up to 512 KiB of tail and 1024 warning/error lines per log, with each warning
+  line capped at 1024 bytes.
 - Failure: the root stays as it was -- computes stopped immediate, the daemon
   `SIGKILL`ed so the store is not flushed past the failure -- with
   `FAILURE.json` naming the kind, detail, seed, round and commit.

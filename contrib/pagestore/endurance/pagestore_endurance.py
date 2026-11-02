@@ -9,6 +9,7 @@ tmp_install) as --build.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import contextlib
 import json
 import math
@@ -83,6 +84,34 @@ class ArchiveRestartpointPolicy:
         self.changed_at = now
         self.last_restart = (replay_value, marker_value)
         return True
+
+
+def preserve_success_logs(root: Path, keep: Path) -> None:
+    """Keep bounded context and recent warnings before removing a passed run."""
+    # Reusing a seed replaces its prior successful evidence; do not leave
+    # warnings or branch logs from an earlier run under the same seed.
+    for old in keep.glob("*.log.tail"):
+        old.unlink()
+    for old in keep.glob("*.log.warnings"):
+        old.unlink()
+    # A long run may create many branch logs. Bound both their count and the
+    # evidence kept per log so a passing 72-hour run does not retain bulk data.
+    branches = sorted(root.glob("branch*.log"), key=lambda p: p.stat().st_mtime,
+                      reverse=True)[:4]
+    for src in [root / "daemon.log", root / "writer.log", root / "materializer.log", *branches]:
+        if not src.is_file():
+            continue
+        warnings = deque(maxlen=1024)
+        with src.open("rb") as stream:
+            for line in stream:
+                if any(word in line for word in (b"WARNING:", b"ERROR:", b"FATAL:",
+                                                  b"PANIC:", b"refused historical recovery")):
+                    warnings.append(line[:1024].rstrip(b"\r\n") + b"\n")
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 512 * 1024))
+            (keep / (src.name + ".tail")).write_bytes(stream.read())
+        if warnings:
+            (keep / (src.name + ".warnings")).write_bytes(b"".join(warnings))
 
 
 def directory_kb(path: Path) -> int:
@@ -1717,6 +1746,7 @@ def main() -> int:
             for name in ("PASS.json", "events.jsonl", "metrics.jsonl"):
                 if (root / name).exists():
                     shutil.copy(root / name, keep / name)
+            preserve_success_logs(root, keep)
             shutil.rmtree(root, ignore_errors=True)
         else:
             failures += 1
