@@ -1498,6 +1498,26 @@ recovery_target_action = 'promote'
                 (d / f"{stamp}-{pg.name}-activity.txt").write_text(text)
             except OSError:
                 pass
+        # Capture the archive limiter's durable inputs before stopping any
+        # process. The replay pointer is not durable, so record it separately
+        # from the store-observed marker and release checkpoint.
+        for pg, name, query in (
+            (self.writer, "writer-wal-status",
+             "SELECT pg_current_wal_lsn(), checkpoint_lsn, shipped_wal_lsn, "
+             "materialized_wal_lsn, lag_bytes, release_checkpoint_lsn "
+             "FROM pg_control_checkpoint(), pagestore_ext.pagestore_materializer_status();"),
+            (self.mat, "materializer-wal-status",
+             "SELECT pg_last_wal_replay_lsn(), checkpoint_lsn, "
+             "pagestore_ext.pagestore_materialized_wal_lsn() FROM pg_control_checkpoint();"),
+        ):
+            try:
+                text = pg.sql(query, timeout=20)
+            except (SqlError, subprocess.TimeoutExpired) as e:
+                text = f"[status unavailable] {e}"
+            try:
+                (d / f"{stamp}-{name}.txt").write_text(text)
+            except OSError:
+                pass
         for pg in self.computes():
             pg.halt()
         timelines = [("timeline", str(tl)) for tl in [0] + [b[0] for b in self.branches]]
