@@ -484,6 +484,36 @@ $P -c "CREATE FUNCTION pagestore_index_wal(pg_lsn,pg_lsn) RETURNS void
         AS 'pagestore','pagestore_index_wal' LANGUAGE C STRICT;" >/dev/null
 $P -c "CREATE FUNCTION pagestore_walidx_count(regclass,int,int) RETURNS int
         AS 'pagestore','pagestore_walidx_count' LANGUAGE C STRICT;" >/dev/null
+$P -c "CREATE FUNCTION pagestore_test_index_wal_bounded(pg_lsn,pg_lsn) RETURNS pg_lsn
+        AS 'pagestore','pagestore_test_index_wal_bounded' LANGUAGE C STRICT;" >/dev/null
+
+# Use real WAL records to test both the over-budget-record case and resumption
+# at the previous batch end.  Logical messages contain no page references, so
+# their large payloads do not create an equally large index.
+batch_start=$($P -c "SELECT pg_current_wal_insert_lsn();")
+batch_large=$($P -c "SELECT pg_logical_emit_message(false, 'pagestore-batch', repeat('a', 17 * 1024 * 1024));")
+batch_1=$($P -c "SELECT pg_logical_emit_message(false, 'pagestore-batch', repeat('b', 9 * 1024 * 1024));")
+batch_2=$($P -c "SELECT pg_logical_emit_message(false, 'pagestore-batch', repeat('c', 9 * 1024 * 1024));")
+batch_3=$($P -c "SELECT pg_logical_emit_message(false, 'pagestore-batch', repeat('d', 9 * 1024 * 1024));")
+batch_4=$($P -c "SELECT pg_logical_emit_message(false, 'pagestore-batch', repeat('e', 9 * 1024 * 1024));")
+$P -c "SELECT pg_switch_wal();" >/dev/null
+batch_archived=f
+for ((i = 1; i <= 600; i++)); do
+	batch_archived=$($P -c "SELECT coalesce(last_archived_wal >= pg_walfile_name('$batch_4'), false) FROM pg_stat_archiver;")
+	[ "$batch_archived" = t ] && break
+	sleep 0.1
+done
+if [ "$batch_archived" = t ]; then
+	batch_end1=$($P -c "SELECT pagestore_test_index_wal_bounded('$batch_start', '$batch_4');")
+	batch_end2=$($P -c "SELECT pagestore_test_index_wal_bounded('$batch_end1', '$batch_4');")
+	batch_end3=$($P -c "SELECT pagestore_test_index_wal_bounded('$batch_end2', '$batch_4');")
+	assert "$batch_end1" "$batch_large" "bounded WAL scan finishes an over-budget record"
+	assert "$batch_end2" "$batch_2" "bounded WAL scan resumes and finishes the next batch"
+	assert "$batch_end3" "$batch_4" "bounded WAL scan resumes through the last batch"
+else
+	echo "FAIL - WAL for bounded index scan was not archived"
+	fail=1
+fi
 wait_walidx_visible() {
 	local rel=$1
 	local count=0

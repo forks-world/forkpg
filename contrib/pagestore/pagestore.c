@@ -1585,6 +1585,8 @@ pagestore_index_wal_page_read(XLogReaderState *state,
 }
 
 #define PAGESTORE_WAL_INDEX_BATCH_MAX 4096
+/* Publish progress during a backlog instead of waiting for the entire tail. */
+#define PAGESTORE_WAL_INDEX_SCAN_BYTES (16 * 1024 * 1024)
 
 /*
  * Decode WAL in [start, end) and record, for each block a record modifies, an
@@ -1592,7 +1594,8 @@ pagestore_index_wal_page_read(XLogReaderState *state,
  * the test-only SQL wrapper can still inspect the current local WAL tail.
  */
 static XLogRecPtr
-pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
+pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store,
+						  bool bounded)
 {
 	XLogReaderState *volatile reader = NULL;
 	ReadLocalXLogPageNoWaitPrivate *volatile pd = NULL;
@@ -1668,6 +1671,13 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 					}
 				}
 				indexed_end = reader->EndRecPtr;
+				/*
+				 * Stop only after a whole record, including all its block
+				 * references.  A record may itself exceed the byte budget.
+				 * The SQL helper retains its historical full-range behavior.
+				 */
+				if (bounded && indexed_end - start >= PAGESTORE_WAL_INDEX_SCAN_BYTES)
+					break;
 			}
 			if (nbatch > 0)
 				pagestore_localsvc_walidx_add_batch(
@@ -1731,7 +1741,7 @@ pagestore_wal_index_worker_main(Datum main_arg)
 					indexed_end = shipped_end;
 				else
 					indexed_end = pagestore_index_wal_range(scan_start,
-														 shipped_end, true);
+													 shipped_end, true, true);
 
 				if (indexed_end > start)
 				{
@@ -1786,12 +1796,24 @@ pagestore_index_wal(PG_FUNCTION_ARGS)
 {
 	XLogRecPtr	start = PG_GETARG_LSN(0);
 	XLogRecPtr	end = PG_GETARG_LSN(1);
-	XLogRecPtr	indexed_end = pagestore_index_wal_range(start, end, false);
+	XLogRecPtr	indexed_end = pagestore_index_wal_range(start, end, false, false);
 
 	/* Only a contiguous scan may advance the durable resume boundary. */
 	if (pagestore_localsvc_walidx_progress() == start && indexed_end > start)
 		pagestore_localsvc_walidx_commit(start, indexed_end);
 	PG_RETURN_VOID();
+}
+
+/* Test helper: exercise the worker's batch boundary with local WAL. */
+PG_FUNCTION_INFO_V1(pagestore_test_index_wal_bounded);
+
+Datum
+pagestore_test_index_wal_bounded(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr start = PG_GETARG_LSN(0);
+	XLogRecPtr end = PG_GETARG_LSN(1);
+
+	PG_RETURN_LSN(pagestore_index_wal_range(start, end, false, true));
 }
 
 /*
