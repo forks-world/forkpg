@@ -542,6 +542,22 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 						ch->key.klass, ch->key.dbOid, ch->key.relNumber, ch->blocknum,
 						LSN_FORMAT_ARGS(ch->req_lsn),
 						pagestore_artifact_refuse_reason_name((PsArtifactRefuseReason) ch->result))));
+	if (status == PS_STATUS_ERROR && ch->key.klass == PS_KLASS_RELATION &&
+		(ch->opcode == PS_OP_EXTEND || ch->opcode == PS_OP_WRITEV) &&
+		ch->is_redo == PS_WRITE_REPLAY_FLOOR &&
+		ch->result == PS_ARTIFACT_REFUSE_RECOVERY_WAL_PROOF &&
+		ch->old_nblocks < (ch->opcode == PS_OP_EXTEND ? 1 : ch->nblocks))
+	{
+		uint32		failed = ch->old_nblocks;
+		XLogRecPtr	page_lsn = PageGetLSN((Page) (ch->data + (size_t) failed * BLCKSZ));
+
+		ereport(ERROR,
+				(errmsg("pagestore localsvc: daemon reported error for op %u", ch->opcode),
+				 errdetail("Recovery WAL proof unavailable for timeline %u, key %u/%u/%u fork %u, block %u, page LSN %X/%08X; %u earlier pages in this request were accepted.",
+						   ch->timeline, ch->key.spcOid, ch->key.dbOid,
+						   ch->key.relNumber, ch->key.forkNum, ch->blocknum + failed,
+						   LSN_FORMAT_ARGS(page_lsn), failed)));
+	}
 	ereport(ERROR,
 			(errmsg("pagestore localsvc: daemon reported error for op %u",
 					ch->opcode),

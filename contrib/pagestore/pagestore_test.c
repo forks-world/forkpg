@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include "pagestore_test_temp.h"
+#include "pagestore_artifact_format.h"
 #include "pagestore_ipc.h"
 #include "pagestore_shm.h"
 
@@ -3970,6 +3971,58 @@ run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
 #define SLRU_ZERO_OBJ	4243
 
 static void
+check_recovery_proof_reason(uint32_t page_size, unsigned char *pa, unsigned char *pb)
+{
+	/* The daemon may accept a prefix before refusing a later page. */
+	PsChannel *ch = ps_channel(cl_shm, cl_chan);
+	uint32_t rel = 987654;
+
+	op_create_at(rel, FORK0, 50);
+	fill_page(pa, page_size, 100, 0x41);
+	op_write_one(rel, FORK0, 0, pa);
+	op_truncate_at(rel, FORK0, 0, 425);
+	fill_page(pb, page_size, 410, 0x42);
+	cl_setkey(ch, rel, FORK0);
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = 0;
+	ch->nblocks = 2;
+	ch->is_redo = PS_WRITE_REPLAY_FLOOR;
+	ch->req_lsn = 450;
+	memcpy(ch->data, pa, page_size);
+	memcpy(ch->data + page_size, pb, page_size);
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR &&
+		  ch->result == PS_ARTIFACT_REFUSE_RECOVERY_WAL_PROOF &&
+		  ch->old_nblocks == 1,
+		  "vectored recovery reports missing proof and failed page index");
+	cl_setkey(ch, rel, FORK0);
+	ch->opcode = PS_OP_EXTEND;
+	ch->blocknum = 1;
+	ch->nblocks = 1;
+	ch->is_redo = PS_WRITE_REPLAY_FLOOR;
+	ch->req_lsn = 450;
+	memcpy(ch->data, pb, page_size);
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR &&
+		  ch->result == PS_ARTIFACT_REFUSE_RECOVERY_WAL_PROOF &&
+		  ch->old_nblocks == 0,
+		  "recovery extend reports missing proof and its page index");
+	fill_page(pb, page_size, 100, 0x55);
+	cl_setkey(ch, rel, FORK0);
+	ch->opcode = PS_OP_EXTEND;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	ch->is_redo = PS_WRITE_REPLAY_FLOOR;
+	ch->req_lsn = 450;
+	memcpy(ch->data, pb, page_size);
+	cl_exec();
+	check(ch->status == PS_STATUS_ERROR && ch->result == 0,
+		  "conflicting same-LSN bytes do not report missing WAL proof");
+	ch->is_redo = 0;
+	ch->old_nblocks = 0;
+}
+
+static void
 run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 {
 	char		shm[64];
@@ -3996,6 +4049,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	frontend_capabilities = wait_ready(shm, page_size);
 	check_inspector(shm, page_size, frontend_capabilities);
 	client_attach(shm, page_size);
+	check_recovery_proof_reason(page_size, pa, pb);
 	{
 		PsShmHeader *hdr = (PsShmHeader *) cl_shm;
 		uint64_t before = ps_load_acquire_u64(&hdr->inspection_metrics_seq);
@@ -6947,6 +7001,33 @@ main(int argc, char **argv)
 	{
 		perror("mkdtemp");
 		return 2;
+	}
+	if (getenv("PAGESTORE_TEST_RECOVERY_PROOF_REASON_ONLY"))
+	{
+		for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
+		{
+			char shm[64], store[256];
+			unsigned char *pa = malloc(sizes[i]), *pb = malloc(sizes[i]);
+			pid_t pid;
+
+			if (!pa || !pb)
+				return 2;
+			snprintf(shm, sizeof(shm), "/pstest_reason_%d_%u", (int) getpid(), sizes[i]);
+			snprintf(store, sizeof(store), "%s/reason_%u", tmpbase, sizes[i]);
+			ps_shm_unlink(shm);
+			pid = spawn_daemon(daemon_path, shm, store, sizes[i], test_nshards);
+			(void) wait_ready(shm, sizes[i]);
+			client_attach(shm, sizes[i]);
+			check_recovery_proof_reason(sizes[i], pa, pb);
+			client_detach();
+			stop_daemon(pid);
+			ps_shm_unlink(shm);
+			free(pa);
+			free(pb);
+		}
+		rm_rf(tmpbase);
+		fprintf(stderr, "%d checks, %d failed\n", tests_run, tests_failed);
+		return tests_failed ? 1 : 0;
 	}
 	if (getenv("PAGESTORE_TEST_BUGB_ONLY"))
 	{

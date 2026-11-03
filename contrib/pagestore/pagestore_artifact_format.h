@@ -108,6 +108,7 @@ typedef enum PsArtifactRefuseReason
 	 * request, so durable state cannot differ from in-memory state.
 	 */
 	PS_ARTIFACT_REFUSE_RECORD_UNREADABLE,	/* an existing lifecycle record failed validation on read; not poisoning */
+	PS_ARTIFACT_REFUSE_RECOVERY_WAL_PROOF, /* historical relation growth lacks exact committed WAL proof */
 } PsArtifactRefuseReason;
 
 static inline const char *
@@ -153,6 +154,8 @@ pagestore_artifact_refuse_reason_name(PsArtifactRefuseReason reason)
 			return "immutable generation bytes differ";
 		case PS_ARTIFACT_REFUSE_RECORD_UNREADABLE:
 			return "an existing lifecycle record failed validation on read (not a storage failure; not poisoning)";
+		case PS_ARTIFACT_REFUSE_RECOVERY_WAL_PROOF:
+			return "historical recovery growth lacks exact committed WAL proof";
 	}
 	return "unknown";
 }

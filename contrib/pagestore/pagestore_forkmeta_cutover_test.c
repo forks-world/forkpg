@@ -413,10 +413,10 @@ append_relation_timeline(uint32_t timeline, const PsKey *key, uint32_t block,
 /* A materializer recovery flush (no explicit floor; the core uses the durable
  * forkmeta cutoff). */
 static int
-append_relation_recovery_timeline_tag(uint32_t timeline, const PsKey *key,
+append_relation_recovery_timeline_tag_reason(uint32_t timeline, const PsKey *key,
 									  uint32_t block, uint64_t lsn,
 									  unsigned char *page, unsigned char tag,
-									  uint64_t *seq)
+									  uint64_t *seq, PsArtifactRefuseReason *reason)
 {
 	uint32_t hi = (uint32_t) (lsn >> 32);
 	uint32_t lo = (uint32_t) lsn;
@@ -428,10 +428,20 @@ append_relation_recovery_timeline_tag(uint32_t timeline, const PsKey *key,
 	page[128] = tag;
 	ps_admission_read_lock();
 	ps_lock_shard_wr(ps_shard_of(key));
-	rc = ps_artifact_write_recovery(timeline, key, block, page, lsn, 0, seq, NULL);
+	rc = ps_artifact_write_recovery(timeline, key, block, page, lsn, 0, seq, reason);
 	ps_unlock_shard(ps_shard_of(key));
 	ps_admission_read_unlock();
 	return rc;
+}
+
+static int
+append_relation_recovery_timeline_tag(uint32_t timeline, const PsKey *key,
+									  uint32_t block, uint64_t lsn,
+									  unsigned char *page, unsigned char tag,
+									  uint64_t *seq)
+{
+	return append_relation_recovery_timeline_tag_reason(timeline, key, block,
+															 lsn, page, tag, seq, NULL);
 }
 
 static int
@@ -2422,6 +2432,7 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 			  "E6 recovery flush is ordered after the durable forkmeta cutoff");
 		if (timeline == 0)
 		{
+			PsArtifactRefuseReason conflict_reason;
 			check(meta_request_timeline(timeline, PS_OP_CREATE, &rec_fsm_key, 300, 0, 0, 0, NULL) &&
 				  append_relation_timeline_tag(timeline, &rec_fsm_key, 2, 400, page, 0x4a, NULL) == 0 &&
 				  meta_request_timeline(timeline, PS_OP_TRUNCATE, &rec_fsm_key, 425, 0, 1, 0, NULL) &&
@@ -2432,7 +2443,9 @@ test_ordered_write_after_cutoff(uint32_t timeline, int walless)
 				  meta_request_timeline(timeline, PS_OP_TRUNCATE, &rec_order_key, 425, 0, 1, 0, NULL) &&
 				  append_relation_timeline_tag(timeline, &rec_order_key, 0, 500, page, 0x7f, NULL) == 0,
 				  "create stale page and truncate before later fork activity");
-			check(append_relation_recovery_timeline_tag(timeline, &rec_order_key, 2, 400, page, 0x70, NULL) != 0,
+			check(append_relation_recovery_timeline_tag_reason(timeline, &rec_order_key, 2, 400, page, 0x70,
+																				 NULL, &conflict_reason) != 0 &&
+				  conflict_reason == PS_ARTIFACT_REFUSE_INVALID,
 				  "stale pre-truncate recovery page fails closed when bytes differ");
 			check(append_relation_recovery_timeline_tag(timeline, &rec_order_key, 2, 400, page, 0x7d, NULL) == 0 &&
 				  append_relation_timeline_tag(timeline, &rec_order_key, 2, 450, page, 0x7e, NULL) == 0 &&
@@ -6135,6 +6148,7 @@ test_wal_proven_historical_growth(void)
 	PsKey key = {8, 8, 8, 0, PS_KLASS_RELATION};
 	PsChannel ch;
 	PsWalIndexEntry entry;
+	PsArtifactRefuseReason reason;
 	unsigned char page[8192];
 
 	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
@@ -6143,8 +6157,10 @@ test_wal_proven_historical_growth(void)
 		  append_relation_tag(&key, 0, 100, page, 0x41, NULL) == 0 &&
 		  meta_request(PS_OP_TRUNCATE, &key, 425, 0, 0, 0, NULL),
 		  "prepare later truncate after one historical block");
-	check(append_relation_recovery_timeline_tag(0, &key, 3, 410, page, 0x42, NULL) != 0,
-		  "unproven historical growth is refused");
+	check(append_relation_recovery_timeline_tag_reason(0, &key, 3, 410, page, 0x42,
+															   NULL, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_RECOVERY_WAL_PROOF,
+		  "unproven historical growth reports missing exact WAL proof");
 	memset(&ch, 0, sizeof(ch));
 	ch.opcode = PS_OP_WAL_APPEND;
 	ch.datalen = 1024;
@@ -6180,7 +6196,9 @@ test_wal_proven_historical_growth(void)
 	ps_unlock_shard(ps_shard_of(&key));
 	ps_lifecycle_read_unlock();
 	check(ch.status == PS_STATUS_OK &&
-		  append_relation_recovery_timeline_tag(0, &key, 3, 410, page, 0x42, NULL) != 0,
+		  append_relation_recovery_timeline_tag_reason(0, &key, 3, 410, page, 0x42,
+															   NULL, &reason) != 0 &&
+		  reason == PS_ARTIFACT_REFUSE_RECOVERY_WAL_PROOF,
 		  "uncommitted WAL index is not proof");
 	memset(&ch, 0, sizeof(ch));
 	ch.opcode = PS_OP_WAL_INDEX_PROGRESS;
