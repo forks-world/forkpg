@@ -367,6 +367,25 @@ main(void)
 		check(ps_walidx_prune_plan_bases(items, 6, NULL, 0, NULL, 0, 80, 1,
 										 NULL, 0, NULL, keep) == 4,
 			  "no bases behaves exactly like the FPI-only planner");
+		check(ps_walidx_prune_plan_proof_range(items, 6, base60, 1, NULL, 0,
+										 100, 1, NULL, 0, NULL, 60, keep) == 4 &&
+			  !keep[0] && !keep[1] && keep[2] && keep[3] && keep[4] && keep[5],
+			  "proof interval retains the record ending at its inclusive floor");
+		check(ps_walidx_prune_plan_proof_range(items, 6, base60, 1, NULL, 0,
+										 100, 1, NULL, 0, NULL, 75, keep) == 3 &&
+			  !keep[2] && keep[3] && keep[4] && keep[5],
+			  "a record crossing the proof floor is retained");
+		check(ps_walidx_prune_plan_proof_range(items, 6, base60, 1, NULL, 0,
+										 100, 1, (uint64_t[]) {40}, 1, ok1, 75, keep) == 5 &&
+			  keep[0] && keep[1] && !keep[2] && keep[3] && keep[4] && keep[5],
+			  "proof interval and discrete view chains are retained together");
+		check(ps_walidx_prune_plan_proof_range(items, 6, base60, 1, NULL, 0,
+										 100, 1, NULL, 0, NULL, 0, keep) == 2 &&
+			  !keep[2] && !keep[3] && keep[4] && keep[5],
+			  "disabled proof interval retains existing planner behavior");
+		check(ps_walidx_prune_plan_proof_range(legacy, 2, NULL, 0, NULL, 0,
+										 40, 0, NULL, 0, NULL, 20, keep) == -1,
+			  "proof retention does not bypass invalid legacy metadata");
 	}
 
 	/*
