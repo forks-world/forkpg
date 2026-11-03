@@ -499,6 +499,11 @@ handle_request(PsChannel *ch)
 									 &reason)) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
+					if (!artifact_klass && reason == PS_ARTIFACT_REFUSE_RECOVERY_WAL_PROOF)
+					{
+						ch->result = (uint32_t) reason;
+						ch->old_nblocks = 0;
+					}
 					if (artifact_klass)
 					{
 						ch->result = (uint32_t) reason;
@@ -529,6 +534,11 @@ handle_request(PsChannel *ch)
 										 &reason)) != 0)
 					{
 						ch->status = PS_STATUS_ERROR;
+						if (!artifact_klass && reason == PS_ARTIFACT_REFUSE_RECOVERY_WAL_PROOF)
+						{
+							ch->result = (uint32_t) reason;
+							ch->old_nblocks = i;
+						}
 						if (!artifact_klass)
 							fprintf(stderr, "pagestore: relation write refused timeline=%u rel=%u fork=%u block=%u reason=%d recovery=%d\n",
 									tl, ch->key.relNumber, ch->key.forkNum,

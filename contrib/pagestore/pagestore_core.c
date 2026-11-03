@@ -964,6 +964,7 @@ typedef enum PsAppendOutcome
 	PS_APPEND_REFUSED_INVALID,			/* forked child / admission allocator exhausted; nothing written */
 	PS_APPEND_REFUSED_UNFENCED,		/* artifact klass: lsn below the page frontier with no owner/branch fence; nothing written */
 	PS_APPEND_REFUSED_FORKMETA_CUTOFF, /* growth not future of the forkmeta snapshot cutoff; nothing written */
+	PS_APPEND_REFUSED_RECOVERY_WAL_PROOF, /* relation growth requires exact WAL proof; nothing written */
 	PS_APPEND_IO_FAILED,				/* seg_write / ordered marker append failed; bytes may be on disk */
 } PsAppendOutcome;
 
@@ -21077,7 +21078,11 @@ append_page_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 						(unsigned long long) (old ? old->lsn : 0), found,
 						fork_size_asof_hop(fe, hdr.lsn, 0),
 						(unsigned long long) walidx_progress_read(timeline));
-				*outcome = PS_APPEND_REFUSED_INVALID;
+				*outcome = ((!old || old->lsn < hdr.lsn) &&
+							hdr.lsn > fork_meta_snapshot_cutoff_lsn &&
+							(branch_floor == 0 || hdr.lsn >= branch_floor) &&
+							fork_size_asof_hop(fe, hdr.lsn, 0) <= block) ?
+					PS_APPEND_REFUSED_RECOVERY_WAL_PROOF : PS_APPEND_REFUSED_INVALID;
 				return -1;
 			}
 		}

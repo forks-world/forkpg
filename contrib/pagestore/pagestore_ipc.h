@@ -486,7 +486,8 @@ typedef struct PsChannel
 	uint32_t	skip_fsync;
 	uint32_t	blocknum;
 	uint32_t	nblocks;		/* WAL_INDEX_GET: optional result-page limit */
-	uint32_t	old_nblocks;		/* RETENTION_PIN_{SET,DROP}: generation */
+	uint32_t	old_nblocks;		/* RETENTION_PIN_{SET,DROP}: generation;
+								 * recovery proof refusal: failed WRITEV index */
 	uint32_t	timeline;		/* timeline this op targets (0 = main) */
 	uint32_t	parent_timeline;	/* CREATE_BRANCH parent; WAL_INDEX_GET cursor
 								 * timeline; artifact BEGIN/COMMIT/DROP/WRITE:
@@ -507,7 +508,8 @@ typedef struct PsChannel
 								 * refusal reason (PsArtifactRefuseReason,
 								 * pagestore_artifact_format.h; append-only);
 								 * EXTEND/WRITEV error on an SLRU/reader-
-								 * artifact klass -> the same refusal reason */
+								 * artifact klass -> the same refusal reason;
+								 * relation recovery proof refusal -> its reason */
 	uint32_t	shard;			/* key-owner shard for this request */
 
 	/* payload: up to PS_IO_UNIT bytes (io_unit / page_size pages) */
