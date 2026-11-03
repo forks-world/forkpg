@@ -28621,7 +28621,19 @@ ps_core_maintenance(void)
 			walidx_reclaim_fence_changed();
 		}
 		if (published || proof_pending)
+		{
+			/* The prioritized path still owes the maintenance turn's
+			 * inspection and enabled backpressure refreshes. */
+			ps_lifecycle_read_lock();
+			publish_inspection_metrics(0);
+			ps_lifecycle_read_unlock();
+			if (page_reclaim_high_water_bytes != 0 ||
+				wal_reclaim_high_water_bytes != 0 ||
+				walidx_reclaim_high_water_bytes != 0 ||
+				forkmeta_reclaim_high_water_bytes != 0)
+				ps_backpressure_refresh_automatic();
 			return 1;
+		}
 	}
 	/* Keep lifecycle-rd across the complete synchronous call.  Any asynchronous
 	 * worker started within it reserves an additional reader before create and
