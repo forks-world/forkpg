@@ -215,6 +215,31 @@ wal_index_count(uint32_t timeline, uint32_t block, uint64_t lsn_max)
 }
 
 static int
+wal_index_only_record(uint32_t timeline, uint32_t block, uint64_t lsn_max,
+					  uint64_t expected)
+{
+	PsChannel ch;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsWalRec record;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_INDEX_GET;
+	ch.timeline = timeline;
+	ch.key = key;
+	ch.blocknum = block;
+	ch.req_lsn = lsn_max;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	if (ch.status != PS_STATUS_OK || ch.result != 1)
+		return 0;
+	memcpy(&record, ch.data, sizeof(record));
+	return record.lsn == expected && record.end_lsn == expected + 50 &&
+		(record.flags & PS_WAL_INDEX_FLAG_KNOWN) != 0;
+}
+
+static int
 wal_index_progress(uint32_t timeline, uint64_t start, uint64_t end)
 {
 	PsChannel ch;
@@ -2046,11 +2071,11 @@ test_death_base_survives_prefix_prune(void)
 		  churn_fork_bytes(0, limited + 400) &&
 		  wal_index_progress(0, 0, 2 * WAL_SEGMENT + 650),
 		  "build a regrown block whose old chain is retired against a truncate");
-	/* A WAL-index-only owner between the two truncates, and a page-history
+	/* A WAL-and-index reader between the two truncates, and a page-history
 	 * owner at the end so page compaction drops the versions the truncates
 	 * invalidated and nothing else keeps the first truncate required.  The
 	 * shipper's progress is the only other WAL-index horizon. */
-	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+	check(reserve_pin(0, PS_RETENTION_OWNER_READER, 300, 1,
 					  PS_RETENTION_RESOURCE_WAL |
 					  PS_RETENTION_RESOURCE_WAL_INDEX, limited + 250) &&
 		  reserve_pin(0, PS_RETENTION_OWNER_READER, 301, 1,
@@ -3508,9 +3533,80 @@ test_raw_materializer_requires_page_base(void)
 	remove_tree(store);
 }
 
+static void
+test_materializer_retains_replay_proof_interval(void)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-proof-interval-XXXXXX";
+	char directory[512];
+	uint64_t generation = 0;
+	uint64_t before = WAL_SEGMENT / 2;
+	uint64_t after = WAL_SEGMENT + WAL_SEGMENT / 2;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint32_t lsn_hi = (uint32_t) ((after + 50) >> 32);
+	uint32_t lsn_lo = (uint32_t) (after + 50);
+	int recovery_result;
+
+	configure_core();
+	walidx_snapshot_trigger_option_bytes = 1;
+	check(prepare_store(store, WAL_TOTAL, 0, 0, 0) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_WAL, WAL_SEGMENT) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 301, 1,
+					  PS_RETENTION_RESOURCE_WAL, WAL_TOTAL) &&
+		  wal_index_add_record(0, before, 0, 1) &&
+		  wal_index_add_record(0, after, 0, 1) &&
+		  write_relation_page(0, 0, after + 100) &&
+		  truncate_relation(0, after + 200, 0) &&
+		  wal_index_progress(0, 0, WAL_TOTAL),
+		  "prepare two replay intervals with a durable replacement page");
+	check(snprintf(directory, sizeof(directory), "%s/walidx_snapshots_0", store) > 0,
+		  "build index snapshot path");
+	for (int i = 0; i < 100; i++)
+		(void) ps_core_maintenance();
+	check(ps_walidx_snapshot_next_generation(directory, 0, &generation) == 0 &&
+		  generation > 1, "publish an actual WAL-index snapshot");
+	check(wal_index_only_record(0, 0, WAL_TOTAL, after),
+		  "compact the older record but retain the replay proof");
+	memset(page, 0x4a, sizeof(page));
+	memcpy(page, &lsn_hi, sizeof(lsn_hi));
+	memcpy(page + sizeof(lsn_hi), &lsn_lo, sizeof(lsn_lo));
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	recovery_result = ps_artifact_write_recovery(0, &key, 0, page,
+												WAL_TOTAL, 0, NULL, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_admission_read_unlock();
+	check(recovery_result == 0,
+		  "historical growth uses the proof retained by actual compaction");
+	close_store();
+	check(ps_core_open(store) == 0 && wal_index_only_record(0, 0, WAL_TOTAL, after),
+		  "the replay proof survives store reopen");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
+					  PS_RETENTION_RESOURCE_WAL, WAL_TOTAL) &&
+		  append_wal_bytes(0, WAL_TOTAL, 8192) &&
+		  wal_index_add_record(0, WAL_TOTAL + 100, 1, 1) &&
+		  wal_index_progress(0, WAL_TOTAL, WAL_TOTAL + 8192),
+		  "advance the materializer and publish another indexed record");
+	for (int i = 0; i < 100; i++)
+		(void) ps_core_maintenance();
+	check(wal_index_count(0, 0, WAL_TOTAL + 8192) == 0 &&
+		  wal_index_only_record(0, 1, WAL_TOTAL + 8192, WAL_TOTAL + 100),
+		  "later compaction releases the old proof while retaining the new one");
+	close_store();
+	walidx_snapshot_trigger_option_bytes = 0;
+	remove_tree(store);
+}
+
 int
 main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "--replay-proof-interval") == 0)
+	{
+		test_materializer_retains_replay_proof_interval();
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--finite-index-base") == 0)
 	{
 		test_finite_index_base_reclaims_raw_wal();
@@ -3518,6 +3614,7 @@ main(int argc, char **argv)
 		return failed != 0;
 	}
 	check(ps_test_walidx_raw_first() == 0, "sorted WAL dependency summary matches full scan");
+	test_materializer_retains_replay_proof_interval();
 	test_finite_index_base_reclaims_raw_wal();
 	test_index_base_reclaim_conservative_fallback();
 	test_index_state_caps_ancestry();
