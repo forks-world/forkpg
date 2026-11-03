@@ -3534,6 +3534,77 @@ test_raw_materializer_requires_page_base(void)
 }
 
 static void
+test_reindex_compacted_recovery_proof(void)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-reindex-proof-XXXXXX";
+	uint64_t record = WAL_SEGMENT + WAL_SEGMENT / 2;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint32_t hi = (uint32_t) ((record + 50) >> 32);
+	uint32_t lo = (uint32_t) (record + 50);
+	int rc;
+
+	configure_core();
+	walidx_snapshot_trigger_option_bytes = 1;
+	check(prepare_store(store, WAL_TOTAL, WAL_SEGMENT, 0, 0) &&
+		  wal_index_add_record(0, record, 0, 1) &&
+		  write_relation_page(0, 0, record + 100) &&
+		  truncate_relation(0, record + 200, 0) &&
+		  wal_index_progress(0, 0, WAL_TOTAL),
+		  "prepare old indexed proof protected by raw WAL but not a materializer");
+	for (int i = 0; i < 100; i++)
+		(void) ps_core_maintenance();
+	check(wal_index_count(0, 0, WAL_TOTAL) == 0,
+		  "real compaction removed the proof below the frontier");
+	memset(page, 0x4a, sizeof(page));
+	memcpy(page, &hi, sizeof(hi));
+	memcpy(page + sizeof(hi), &lo, sizeof(lo));
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = ps_artifact_write_recovery(0, &key, 0, page, WAL_TOTAL, 0, NULL, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_admission_read_unlock();
+	check(rc != 0, "missing exact proof refuses historical recovery growth");
+	check(wal_index_add_record(0, record, 1, 1),
+		  "insert an unrelated block at the same WAL record position");
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = ps_artifact_write_recovery(0, &key, 0, page, WAL_TOTAL, 0, NULL, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_admission_read_unlock();
+	check(rc != 0, "a different block at the same LSN is not recovery proof");
+	check(wal_index_add_record(0, record, 0, 1),
+		  "reinsert the exact proof while its raw WAL remains retained");
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = ps_artifact_write_recovery(0, &key, 0, page, WAL_TOTAL, 0, NULL, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_admission_read_unlock();
+	check(rc == 0, "reinserted exact proof admits the historical recovery write");
+	close_store();
+	check(ps_core_open(store) == 0 && wal_index_only_record(0, 0, WAL_TOTAL, record),
+		  "reinserted proof survives reopening");
+	close_store();
+	walidx_snapshot_trigger_option_bytes = 0;
+	remove_tree(store);
+}
+
+static void
+test_reindex_rejects_reclaimed_wal(void)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-reindex-reclaimed-XXXXXX";
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, 0, 1) &&
+		  maintenance_until_count(store, 0, 0),
+		  "advance the raw WAL frontier beyond the old record");
+	check(!wal_index_add_record(0, WAL_SEGMENT + 100, 0, 1),
+		  "cannot recreate an index proof after its raw WAL was reclaimed");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_materializer_retains_replay_proof_interval(void)
 {
 	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-proof-interval-XXXXXX";
@@ -3583,8 +3654,24 @@ test_materializer_retains_replay_proof_interval(void)
 	check(ps_core_open(store) == 0 && wal_index_only_record(0, 0, WAL_TOTAL, after),
 		  "the replay proof survives store reopen");
 	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 300, 1,
-					  PS_RETENTION_RESOURCE_WAL, WAL_TOTAL) &&
-		  append_wal_bytes(0, WAL_TOTAL, 8192) &&
+					  PS_RETENTION_RESOURCE_WAL, WAL_TOTAL),
+		  "advance the materializer without further indexed traffic");
+	for (int i = 0; i < 100; i++)
+		(void) ps_core_maintenance();
+	check(wal_index_count(0, 0, WAL_TOTAL) == 0,
+		  "release the old replay proof without requiring new WAL index writes");
+	check(ps_walidx_snapshot_next_generation(directory, 0, &generation) == 0,
+		  "read the generation after the proof is released");
+	{
+		uint64_t idle_generation = 0;
+
+		for (int i = 0; i < 100; i++)
+			(void) ps_core_maintenance();
+		check(ps_walidx_snapshot_next_generation(directory, 0, &idle_generation) == 0 &&
+			  idle_generation == generation,
+			  "idle maintenance does not repeatedly publish index snapshots");
+	}
+	check(append_wal_bytes(0, WAL_TOTAL, 8192) &&
 		  wal_index_add_record(0, WAL_TOTAL + 100, 1, 1) &&
 		  wal_index_progress(0, WAL_TOTAL, WAL_TOTAL + 8192),
 		  "advance the materializer and publish another indexed record");
@@ -3604,6 +3691,8 @@ main(int argc, char **argv)
 	if (argc == 2 && strcmp(argv[1], "--replay-proof-interval") == 0)
 	{
 		test_materializer_retains_replay_proof_interval();
+		test_reindex_compacted_recovery_proof();
+		test_reindex_rejects_reclaimed_wal();
 		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 		return failed != 0;
 	}
@@ -3615,6 +3704,8 @@ main(int argc, char **argv)
 	}
 	check(ps_test_walidx_raw_first() == 0, "sorted WAL dependency summary matches full scan");
 	test_materializer_retains_replay_proof_interval();
+	test_reindex_compacted_recovery_proof();
+	test_reindex_rejects_reclaimed_wal();
 	test_finite_index_base_reclaims_raw_wal();
 	test_index_base_reclaim_conservative_fallback();
 	test_index_state_caps_ancestry();
