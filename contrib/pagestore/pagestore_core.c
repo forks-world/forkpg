@@ -18545,7 +18545,7 @@ walidx_debt_snapshot_unchanged(uint32_t tl,
 static int
 walidx_entry_prune_plan(const WalIdxEnt *e, uint64_t cutoff,
 						const uint64_t *horizons, uint32_t nhorizons,
-						unsigned char *keep)
+						uint64_t proof_floor, unsigned char *keep)
 {
 	PsWalIdxPruneItem *items;
 	int rc;
@@ -18579,14 +18579,14 @@ walidx_entry_prune_plan(const WalIdxEnt *e, uint64_t cutoff,
 			for (uint32_t i = 0; i < nhorizons; i++)
 				ok[i] = walidx_plan_horizon_protected(horizons[i]);
 		}
-		rc = ps_walidx_prune_plan_bases(items, (uint32_t) e->n,
+		rc = ps_walidx_prune_plan_proof_range(items, (uint32_t) e->n,
 										bases != NULL ? bases->bases : NULL,
 										bases != NULL ? bases->nbases : 0,
 										bases != NULL ? bases->deaths : NULL,
 										bases != NULL ? bases->ndeaths : 0,
 										cutoff,
 										walidx_plan_horizon_protected(cutoff),
-										horizons, nhorizons, ok, keep);
+										horizons, nhorizons, ok, proof_floor, keep);
 		free(ok);
 	}
 	free(items);
@@ -19259,13 +19259,37 @@ out:
 	return rc;
 }
 
+/* Caller holds map-rd and walidx_prune_lock, which fences owner changes.
+ * A materializer's WAL pin protects the records it may replay from its last
+ * durable restartpoint; retain exact index records over the same interval. */
+static int
+walidx_materializer_proof_floor(uint32_t timeline, uint64_t *floor_out)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	uint64_t floor = 0;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return -1;
+	for (uint32_t i = 0; i < npins; i++)
+		if (pins[i].timeline == timeline &&
+			pins[i].owner_kind == PS_RETENTION_OWNER_MATERIALIZER &&
+			(pins[i].resources & PS_RETENTION_RESOURCE_WAL) != 0 &&
+			pins[i].lsn != 0 && (floor == 0 || pins[i].lsn < floor))
+			floor = pins[i].lsn;
+	free(pins);
+	*floor_out = floor;
+	return 0;
+}
+
 /* Prove every page before writing any compacted shard.  One unprovable page
  * keeps the whole timeline on its full snapshot generation, so the single
  * timeline frontier can never mask a lagging shard. */
 static int
 walidx_snapshot_compaction_plan(uint32_t tl, uint64_t cutoff,
 								const uint64_t *horizons,
-								uint32_t nhorizons, uint64_t *dropped_out)
+								uint32_t nhorizons, uint64_t proof_floor,
+								uint64_t *dropped_out)
 {
 	uint64_t dropped = 0;
 
@@ -19283,7 +19307,7 @@ walidx_snapshot_compaction_plan(uint32_t tl, uint64_t cutoff,
 					if (keep == NULL)
 						return 0;
 					kept = walidx_entry_prune_plan(e, cutoff, horizons,
-											  nhorizons, keep);
+											  nhorizons, proof_floor, keep);
 					free(keep);
 					if (kept < 0)
 						return 0;
@@ -19308,6 +19332,7 @@ typedef struct WalIdxSnapshotProduceCtx
 	int compact;
 	const uint64_t *horizons;
 	uint32_t nhorizons;
+	uint64_t proof_floor;
 } WalIdxSnapshotProduceCtx;
 
 static int
@@ -19398,7 +19423,7 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 			if (keep == NULL)
 				goto fail;
 			kept = walidx_entry_prune_plan(e, ctx->end_lsn,
-										  ctx->horizons, ctx->nhorizons, keep);
+										  ctx->horizons, ctx->nhorizons, ctx->proof_floor, keep);
 			if (kept < 0)
 			{
 				free(keep);
@@ -19455,6 +19480,7 @@ walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 								 uint64_t log_epoch,
 								 int compact, const uint64_t *horizons,
 								 uint32_t nhorizons,
+								 uint64_t proof_floor,
 								 WalIdxSnapshotProduceCtx *ctx,
 							 PsWalIdxSnapshotInput *input)
 {
@@ -19475,7 +19501,7 @@ walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 					if (keep == NULL)
 						return -1;
 					n = walidx_entry_prune_plan(e, end_lsn, horizons,
-													  nhorizons, keep);
+													  nhorizons, proof_floor, keep);
 					free(keep);
 					if (n < 0)
 						return -1;
@@ -19491,7 +19517,7 @@ walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 		return -1;
 	*ctx = (WalIdxSnapshotProduceCtx) {
 		tl, shard, generation, start_lsn, end_lsn, source_offset, log_epoch,
-		nrecords, walidx_horizon_seq[tl] ? walidx_horizon_seq[tl] : PS_SEQ_UNBOUNDED, compact, horizons, nhorizons
+		nrecords, walidx_horizon_seq[tl] ? walidx_horizon_seq[tl] : PS_SEQ_UNBOUNDED, compact, horizons, nhorizons, proof_floor
 	};
 	*input = (PsWalIdxSnapshotInput) {
 		NULL,
@@ -19504,7 +19530,7 @@ walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 
 static void
 walidx_prune_memory(uint32_t tl, uint64_t cutoff, const uint64_t *horizons,
-					uint32_t nhorizons)
+					uint32_t nhorizons, uint64_t proof_floor)
 {
 	for (uint32_t shard = 0; shard < core_shards(); shard++)
 	{
@@ -19519,7 +19545,7 @@ walidx_prune_memory(uint32_t tl, uint64_t cutoff, const uint64_t *horizons,
 
 					if (keep == NULL ||
 						walidx_entry_prune_plan(e, cutoff, horizons,
-											 nhorizons, keep) < 0)
+											 nhorizons, proof_floor, keep) < 0)
 					{
 						free(keep);
 						continue;
@@ -19974,6 +20000,7 @@ walidx_snapshot_publish_one(void)
 		uint64_t previous_end;
 		uint64_t snapshot_bytes = 0;
 		uint64_t dropped = 0;
+		uint64_t proof_floor = 0;
 		char directory[4096];
 		PsWalIdxSnapshotPrepared staged;
 		int compact = 0;
@@ -20054,13 +20081,15 @@ walidx_snapshot_publish_one(void)
 			goto publish_done;
 		if (walidx_prune_fences(tl, &fences, &nfences) != 0)
 			goto publish_done;
+		if (walidx_materializer_proof_floor(tl, &proof_floor) != 0)
+			goto publish_done;
 		compact = walidx_snapshot_compaction_plan(tl, end_lsn, fences,
-											nfences, &dropped) && dropped != 0;
+											nfences, proof_floor, &dropped) && dropped != 0;
 		for (uint32_t shard = 0; shard < ns; shard++)
 		{
 			if (walidx_snapshot_prepare_shard(tl, shard, generation,
 											start_lsn, end_lsn, 0, generation,
-											compact, fences, nfences,
+											compact, fences, nfences, proof_floor,
 											&producers[shard], &inputs[shard]) != 0)
 			{
 				retry = 1;
@@ -20110,7 +20139,7 @@ walidx_snapshot_publish_one(void)
 				retry = 1;
 				goto publish_done;
 			}
-			walidx_prune_memory(tl, end_lsn, fences, nfences);
+			walidx_prune_memory(tl, end_lsn, fences, nfences, proof_floor);
 			goto do_generation_switch;
 		}
 		/*
