@@ -6110,6 +6110,13 @@ ps_test_timeline_page_proof_segment(uint32_t timeline)
 		timeline_page_proofs[timeline]->segment : -1;
 }
 
+int
+ps_test_timeline_page_proof_shard(uint32_t timeline)
+{
+	return timeline < MAX_TIMELINES && timeline_page_proofs[timeline] ?
+		(int) timeline_page_proofs[timeline]->shard : -1;
+}
+
 static void
 timeline_page_proof_reset(uint32_t timeline)
 {
@@ -7326,6 +7333,52 @@ fail:
 	return -1;
 }
 
+/* Observe one segment while the caller holds the publication fences. */
+static int
+timeline_page_proof_observe(TimelinePageProofShard *part, uint32_t shard,
+							int segment, uint32_t timeline)
+{
+	uint64_t before, after;
+	int rc;
+
+	if ((size_t) segment >= part->capacity)
+	{
+		size_t capacity = part->capacity ? part->capacity : 64;
+		uint64_t *grown;
+
+		while (capacity <= (size_t) segment && capacity <= SIZE_MAX / 2)
+			capacity *= 2;
+		if (capacity <= (size_t) segment || capacity > SIZE_MAX / sizeof(*grown) ||
+			(grown = realloc(part->tokens, capacity * sizeof(*grown))) == NULL)
+			return -1;
+		part->tokens = grown;
+		part->capacity = capacity;
+	}
+	if (ps_storage->seg_change_token(shard, segment, &before) != 0)
+		return -1;
+	errno = 0;
+	if (ps_storage->seg_size(shard, segment) < 0)
+	{
+		if (errno != ENOENT)
+			return -1;
+		rc = 0;
+	}
+	else
+		rc = page_cleanup_tombstone_segment(&g_shards[shard], segment, timeline);
+	if (rc < 0)
+		return -1;
+	if (rc > 0)
+		return 2;
+	if (ps_storage->seg_change_token(shard, segment, &after) != 0)
+		return -1;
+	if (before != after)
+		return 3;
+	part->tokens[segment] = after;
+	if ((size_t) segment >= part->count)
+		part->count = (size_t) segment + 1;
+	return 1;
+}
+
 /* Return 1 for a complete stable proof, 0 for more bounded work, 2 when a
  * target record was found, and -1 if the provider cannot supply a proof. */
 static int
@@ -7353,7 +7406,6 @@ timeline_page_proof_step(uint32_t timeline)
 		uint32_t sh = proof->shard;
 		Shard *s = &g_shards[sh];
 		TimelinePageProofShard *part = &proof->shards[sh];
-		uint64_t before, after;
 		int rc;
 
 		if (proof->segment > s->cur_seg)
@@ -7362,43 +7414,17 @@ timeline_page_proof_step(uint32_t timeline)
 			proof->segment = 0;
 			continue;
 		}
-		if ((size_t) proof->segment >= part->capacity)
-		{
-			size_t capacity = part->capacity ? part->capacity * 2 : 64;
-			uint64_t *grown;
-
-			if (capacity < part->capacity || capacity <= (size_t) proof->segment ||
-				capacity > SIZE_MAX / sizeof(*grown) ||
-				(grown = realloc(part->tokens, capacity * sizeof(*grown))) == NULL)
-				goto unavailable;
-			part->tokens = grown;
-			part->capacity = capacity;
-		}
-		if (ps_storage->seg_change_token(sh, proof->segment, &before) != 0)
-			goto unavailable;
-		errno = 0;
-		if (ps_storage->seg_size(sh, proof->segment) < 0)
-		{
-			if (errno != ENOENT)
-				goto unavailable;
-			rc = 0;
-		}
-		else
-			rc = page_cleanup_tombstone_segment(s, proof->segment, timeline);
+		rc = timeline_page_proof_observe(part, sh, proof->segment, timeline);
 		if (rc < 0)
 			goto unavailable;
-		if (rc > 0)
+		if (rc == 2)
 		{
 			timeline_page_proof_reset(timeline);
 			return 2;
 		}
-		if (ps_storage->seg_change_token(sh, proof->segment, &after) != 0)
-			goto unavailable;
-		if (before != after)
+		if (rc == 3)
 			return 0;
-		part->tokens[proof->segment++] = after;
-		if ((size_t) proof->segment > part->count)
-			part->count = (size_t) proof->segment;
+		proof->segment++;
 		if (++visited == TIMELINE_PAGE_SCAN_SEGMENTS_PER_TURN)
 			return 0;
 	}
@@ -7408,24 +7434,25 @@ timeline_page_proof_step(uint32_t timeline)
 		size_t needed = g_shards[sh].cur_seg < 0 ? 0 :
 			(size_t) g_shards[sh].cur_seg + 1;
 
-		if (part->count < needed)
-		{
-			proof->shard = sh;
-			proof->segment = (int) part->count;
-			return 0;
-		}
 		for (size_t seg = 0; seg < needed; seg++)
 		{
 			uint64_t token;
+			int rc;
 
 			if (ps_storage->seg_change_token(sh, (int) seg, &token) != 0)
 				goto unavailable;
-			if (part->tokens[seg] != token)
+			if (seg < part->count && part->tokens[seg] == token)
+				continue;
+			rc = timeline_page_proof_observe(part, sh, (int) seg, timeline);
+			if (rc < 0)
+				goto unavailable;
+			if (rc == 2)
 			{
-				proof->shard = sh;
-				proof->segment = (int) seg;
-				return 0;
+				timeline_page_proof_reset(timeline);
+				return 2;
 			}
+			if (rc == 3 || ++visited == TIMELINE_PAGE_SCAN_SEGMENTS_PER_TURN)
+				return 0;
 		}
 	}
 	return 1;
