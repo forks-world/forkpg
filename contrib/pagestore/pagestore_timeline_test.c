@@ -3301,6 +3301,71 @@ test_v2_and_mixed_lifecycle(void)
 }
 
 static void
+test_timeline_page_proof_detects_late_write(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-proof-XXXXXX";
+	unsigned char original[16384];
+	unsigned char page[8192];
+	PsTimelineState state;
+	int64_t len;
+	int progress = -1;
+	int written = 1;
+
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 1000;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  create_branch(1, 0, 100) && write_timeline_layer(1, 0, 100) == 0,
+		  "open segment-proof fixture with a target record");
+	len = ps_storage->seg_size(0, 0);
+	check(len > 0 && len <= (int64_t) sizeof(original) &&
+		  ps_storage->seg_read(0, 0, 0, original, (uint32_t) len) == 0,
+		  "capture target record before cleanup");
+	for (uint32_t i = 0; i < 40; i++)
+		if (write_timeline_layer(0, i + 1, i + 200) != 0)
+			written = 0;
+	check(written && begin_delete(1, 1, NULL), "prepare multi-batch final proof");
+	for (int i = 0; i < 200; i++)
+	{
+		(void) ps_core_maintenance();
+		progress = ps_test_timeline_page_proof_segment(1);
+		if (progress > 0)
+			break;
+	}
+	check(progress > 0 && state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "final proof yields before all segments are checked");
+	close_store();
+	check(ps_core_open(store) == 0 && ps_test_timeline_page_proof_segment(1) == -1,
+		  "restart discards the partially accumulated final proof");
+	progress = -1;
+	for (int i = 0; i < 200; i++)
+	{
+		(void) ps_core_maintenance();
+		progress = ps_test_timeline_page_proof_segment(1);
+		if (progress > 0)
+			break;
+	}
+	check(progress > 0 && state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "restart rebuilds the proof before publishing deletion");
+	check(ps_storage->seg_write(0, 0, 0, original, (uint32_t) len) == 0 &&
+		  ps_storage->sync() == 0,
+		  "reintroduce target bytes in an already checked segment");
+	for (int i = 0; i < 200; i++)
+	{
+		(void) ps_core_maintenance();
+		if (state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED)
+			break;
+	}
+	memset(page, 0, sizeof(page));
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED &&
+		  count_segment_holes(0, 0, len) == 1 &&
+		  read_test_page(0, 1, page) == 1 && page[100] == 0x5A,
+		  "changed segment is rescanned and target removed before publication");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_deleting_timeline_page_cleanup_batched_restart(void)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-batch-XXXXXX";
@@ -4942,6 +5007,7 @@ main(void)
 	test_deletion_state_append_failure();
 	test_timeline_incarnation_reuse();
 	test_timeline_incarnation_frontiers();
+	test_timeline_page_proof_detects_late_write();
 	test_deleting_timeline_page_cleanup_batched_restart();
 	test_deleting_timeline_page_cleanup();
 	test_deleting_timeline_page_cleanup_backpressure_debt();

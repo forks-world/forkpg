@@ -329,8 +329,8 @@ static int timeline_delete_recovery_skip(void);
 static int timeline_recovery_allowed(uint32_t timeline);
 static int timeline_delete_wal_cleanup_one(void);
 static int timeline_delete_page_cleanup_one(void);
-static int timeline_delete_publish_ready(uint32_t timeline);
-static int timeline_delete_publish_one(void);
+static int timeline_delete_publish_ready(uint32_t timeline, int *proof_pending);
+static int timeline_delete_publish_one(int *proof_pending);
 static void inspection_metrics_changed(void);
 static void inspection_timeline_cache_changed(void);
 static void publish_inspection_metrics(int force);
@@ -6086,6 +6086,44 @@ static uint32_t timeline_page_scan_shard[MAX_TIMELINES];
 static int timeline_page_scan_segment[MAX_TIMELINES];
 #define TIMELINE_PAGE_SCAN_SEGMENTS_PER_TURN 16
 
+typedef struct TimelinePageProofShard
+{
+	uint64_t *tokens;
+	size_t count;
+	size_t capacity;
+} TimelinePageProofShard;
+
+typedef struct TimelinePageProof
+{
+	TimelinePageProofShard shards[PS_MAX_CHANNELS];
+	uint32_t shard;
+	int segment;
+} TimelinePageProof;
+
+static TimelinePageProof *timeline_page_proofs[MAX_TIMELINES];
+static uint32_t timeline_page_proof_count;
+
+int
+ps_test_timeline_page_proof_segment(uint32_t timeline)
+{
+	return timeline < MAX_TIMELINES && timeline_page_proofs[timeline] ?
+		timeline_page_proofs[timeline]->segment : -1;
+}
+
+static void
+timeline_page_proof_reset(uint32_t timeline)
+{
+	TimelinePageProof *proof = timeline_page_proofs[timeline];
+
+	if (!proof)
+		return;
+	for (uint32_t sh = 0; sh < PS_MAX_CHANNELS; sh++)
+		free(proof->shards[sh].tokens);
+	free(proof);
+	timeline_page_proofs[timeline] = NULL;
+	__atomic_fetch_sub(&timeline_page_proof_count, 1, __ATOMIC_RELEASE);
+}
+
 int
 ps_test_timeline_page_scan_segment(uint32_t timeline)
 {
@@ -7285,6 +7323,114 @@ page_cleanup_scan_bounded_locked(uint32_t timeline)
 fail:
 	timeline_page_scan_shard[timeline] = 0;
 	timeline_page_scan_segment[timeline] = 0;
+	return -1;
+}
+
+/* Return 1 for a complete stable proof, 0 for more bounded work, 2 when a
+ * target record was found, and -1 if the provider cannot supply a proof. */
+static int
+timeline_page_proof_step(uint32_t timeline)
+{
+	TimelinePageProof *proof = timeline_page_proofs[timeline];
+	int visited = 0;
+
+	/* Wrappers may replace seg_write without participating in POSIX tokens. */
+	if (ps_storage != &PsStoragePosix || !ps_storage->seg_change_token)
+	{
+		timeline_page_proof_reset(timeline);
+		return -1;
+	}
+	if (!proof)
+	{
+		proof = calloc(1, sizeof(*proof));
+		if (!proof)
+			return -1;
+		timeline_page_proofs[timeline] = proof;
+		__atomic_fetch_add(&timeline_page_proof_count, 1, __ATOMIC_RELEASE);
+	}
+	while (proof->shard < core_shards())
+	{
+		uint32_t sh = proof->shard;
+		Shard *s = &g_shards[sh];
+		TimelinePageProofShard *part = &proof->shards[sh];
+		uint64_t before, after;
+		int rc;
+
+		if (proof->segment > s->cur_seg)
+		{
+			proof->shard++;
+			proof->segment = 0;
+			continue;
+		}
+		if ((size_t) proof->segment >= part->capacity)
+		{
+			size_t capacity = part->capacity ? part->capacity * 2 : 64;
+			uint64_t *grown;
+
+			if (capacity < part->capacity || capacity <= (size_t) proof->segment ||
+				capacity > SIZE_MAX / sizeof(*grown) ||
+				(grown = realloc(part->tokens, capacity * sizeof(*grown))) == NULL)
+				goto unavailable;
+			part->tokens = grown;
+			part->capacity = capacity;
+		}
+		if (ps_storage->seg_change_token(sh, proof->segment, &before) != 0)
+			goto unavailable;
+		errno = 0;
+		if (ps_storage->seg_size(sh, proof->segment) < 0)
+		{
+			if (errno != ENOENT)
+				goto unavailable;
+			rc = 0;
+		}
+		else
+			rc = page_cleanup_tombstone_segment(s, proof->segment, timeline);
+		if (rc < 0)
+			goto unavailable;
+		if (rc > 0)
+		{
+			timeline_page_proof_reset(timeline);
+			return 2;
+		}
+		if (ps_storage->seg_change_token(sh, proof->segment, &after) != 0)
+			goto unavailable;
+		if (before != after)
+			return 0;
+		part->tokens[proof->segment++] = after;
+		if ((size_t) proof->segment > part->count)
+			part->count = (size_t) proof->segment;
+		if (++visited == TIMELINE_PAGE_SCAN_SEGMENTS_PER_TURN)
+			return 0;
+	}
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+	{
+		TimelinePageProofShard *part = &proof->shards[sh];
+		size_t needed = g_shards[sh].cur_seg < 0 ? 0 :
+			(size_t) g_shards[sh].cur_seg + 1;
+
+		if (part->count < needed)
+		{
+			proof->shard = sh;
+			proof->segment = (int) part->count;
+			return 0;
+		}
+		for (size_t seg = 0; seg < needed; seg++)
+		{
+			uint64_t token;
+
+			if (ps_storage->seg_change_token(sh, (int) seg, &token) != 0)
+				goto unavailable;
+			if (part->tokens[seg] != token)
+			{
+				proof->shard = sh;
+				proof->segment = (int) seg;
+				return 0;
+			}
+		}
+	}
+	return 1;
+unavailable:
+	timeline_page_proof_reset(timeline);
 	return -1;
 }
 
@@ -17739,6 +17885,7 @@ wal_runtime_purge(uint32_t tl)
 static void
 timeline_reset_reuse_runtime(uint32_t timeline)
 {
+	timeline_page_proof_reset(timeline);
 	page_cleanup_purge_timeline_locked(timeline);
 	for (uint32_t sh = 0; sh < core_shards(); sh++)
 		if (g_shards[sh].memtable != NULL)
@@ -18098,7 +18245,7 @@ walidx_runtime_has_timeline(uint32_t target)
  * pruning fences, the WAL-index publication gate, the target WAL lock, and
  * map-write. */
 static int
-timeline_delete_publish_ready(uint32_t timeline)
+timeline_delete_publish_ready(uint32_t timeline, int *proof_pending)
 {
 	PsTimelineState state;
 	int page_rc;
@@ -18159,8 +18306,15 @@ timeline_delete_publish_ready(uint32_t timeline)
 	/* The filtered rewrite is itself the durable shared-segment predicate.  If a
 	 * late/recovered target record is found, schedule another retry and do not
 	 * trust the old done bit. */
-	page_rc = page_cleanup_scan_timeline_locked(timeline);
-	if (page_rc != 0)
+	page_rc = timeline_page_proof_step(timeline);
+	if (page_rc < 0)
+		page_rc = page_cleanup_scan_timeline_locked(timeline) == 0 ? 1 : 2;
+	if (page_rc == 0)
+	{
+		*proof_pending = 1;
+		return 0;
+	}
+	if (page_rc != 1)
 	{
 		__atomic_store_n(&timeline_page_cleanup_done[timeline], 0,
 						 __ATOMIC_RELEASE);
@@ -18199,7 +18353,7 @@ timeline_delete_publish_ready(uint32_t timeline)
 }
 
 static int
-timeline_delete_publish_one(void)
+timeline_delete_publish_one(int *proof_pending)
 {
 	int did = 0;
 
@@ -18225,7 +18379,7 @@ timeline_delete_publish_one(void)
 	pthread_rwlock_wrlock(&page_prune_lock);
 	pthread_rwlock_wrlock(&walidx_prune_lock);
 	walidx_publish_wrlock();
-	for (uint32_t tl = 1; tl < MAX_TIMELINES && !did; tl++)
+	for (uint32_t tl = 1; tl < MAX_TIMELINES && !did && !*proof_pending; tl++)
 	{
 		pthread_rwlock_t *wal_lock;
 		uint64_t incarnation;
@@ -18237,13 +18391,14 @@ timeline_delete_publish_one(void)
 			continue;
 		pthread_rwlock_wrlock(wal_lock);
 		ps_lock_map_wr();
-		if (timeline_delete_publish_ready(tl) &&
+		if (timeline_delete_publish_ready(tl, proof_pending) &&
 			timeline_persist_state(tl, PS_TIMELINE_DELETED, incarnation) == 0 &&
 			ps_fault_probe(PS_FAULT_POINT_TIMELINE_DELETE_AFTER_DELETED) == 0)
 		{
 			/* The append is fsync-durable before this release publication. */
 			__atomic_store_n(&timelines[tl].state, PS_TIMELINE_DELETED,
 							 __ATOMIC_RELEASE);
+			timeline_page_proof_reset(tl);
 			inspection_timeline_cache_changed();
 			/* The deleted branch's cap no longer fences its ancestors' page
 			 * and control history; revisit their layers (map-wr is held). */
@@ -27116,6 +27271,8 @@ ps_core_close_impl(void)
 	layer_verified_reset();		/* with the files it describes */
 	if (ps_layer_store != NULL && ps_layer_store->close != NULL)
 		ps_layer_store->close();
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		timeline_page_proof_reset(tl);
 	core_close_posix_storage();
 	free_page_fork_indexes();
 	free_walidx_indexes();
@@ -28440,9 +28597,32 @@ int
 ps_core_maintenance(void)
 {
 	int did;
+	int proof_pending = 0;
 
 	if (!core_process_valid())
 		return -1;
+	/* Once a bounded publication proof is advancing, finish its next batch
+	 * before starting potentially long compaction work.  Each batch releases
+	 * all locks; a blocked prerequisite still lets other maintenance run. */
+	if (__atomic_load_n(&timeline_page_proof_count, __ATOMIC_ACQUIRE) != 0)
+	{
+		int published = 0;
+
+		/* Keep the maintenance entry lifecycle-read boundary even when the
+		 * proof gets priority over the rest of this turn. */
+		ps_lifecycle_read_lock();
+		ps_lifecycle_read_unlock();
+		if (timeline_delete_active())
+			published = timeline_delete_publish_one(&proof_pending);
+
+		if (published)
+		{
+			wal_reclaim_proof_changed();
+			walidx_reclaim_fence_changed();
+		}
+		if (published || proof_pending)
+			return 1;
+	}
 	/* Keep lifecycle-rd across the complete synchronous call.  Any asynchronous
 	 * worker started within it reserves an additional reader before create and
 	 * releases that reservation from its thread cleanup handler. */
@@ -28455,7 +28635,8 @@ ps_core_maintenance(void)
 	/* A terminal lifecycle transition cannot upgrade the read section held by
 	 * the maintenance body.  Retry readiness under the exclusive lifecycle
 	 * writer fence after all ordinary/background work has drained. */
-	if (timeline_delete_publish_one())
+	proof_pending = 0;
+	if (timeline_delete_publish_one(&proof_pending))
 	{
 		/* A DELETED timeline releases its branch cap and retention pins,
 		 * both WAL-reclaim proof inputs on its parent. */
@@ -28651,6 +28832,8 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	__atomic_store_n(&timeline_meta_poisoned, 0, __ATOMIC_RELEASE);
 	memset(timeline_used, 0, sizeof(timeline_used));
 	memset(timeline_wal_cleanup_done, 0, sizeof(timeline_wal_cleanup_done));
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		timeline_page_proof_reset(tl);
 	memset(timeline_page_cleanup_done, 0, sizeof(timeline_page_cleanup_done));
 	memset(timeline_page_scan_shard, 0, sizeof(timeline_page_scan_shard));
 	memset(timeline_page_scan_segment, 0, sizeof(timeline_page_scan_segment));

@@ -34,6 +34,7 @@
 
 #ifdef PAGESTORE_POSIX_FD_TEST
 extern void ps_test_posix_read_pinned(uint32_t shard, int seg);
+extern void ps_test_posix_write_begun(uint32_t shard, int seg);
 #endif
 
 /* bounded well under the 4096-byte path buffers so suffixes never truncate */
@@ -76,6 +77,103 @@ static int test_fail_seg_remove_before_unlink;
 static int test_fail_seg_remove_dir_fsync;
 static int test_fail_seg_size;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int posix_require_owner(void);
+
+#define SEGMENT_CHANGE_BUCKETS 4096
+
+typedef struct PosixSegmentChange
+{
+	uint32_t shard;
+	int seg;
+	uint64_t version;
+	uint32_t active;
+	struct PosixSegmentChange *next;
+} PosixSegmentChange;
+
+static PosixSegmentChange *segment_changes[SEGMENT_CHANGE_BUCKETS];
+static pthread_mutex_t segment_changes_lock = PTHREAD_MUTEX_INITIALIZER;
+static int segment_changes_poisoned;
+
+/* Caller holds segment_changes_lock. */
+static PosixSegmentChange *
+segment_change_find(uint32_t shard, int seg)
+{
+	uint32_t bucket = (shard * 2654435761u + (uint32_t) seg) % SEGMENT_CHANGE_BUCKETS;
+	PosixSegmentChange *item;
+
+	for (item = segment_changes[bucket]; item; item = item->next)
+		if (item->shard == shard && item->seg == seg)
+			return item;
+	return NULL;
+}
+
+/* Even an unsuccessful write can leave a partial physical change. */
+static int
+segment_change_begin(uint32_t shard, int seg)
+{
+	PosixSegmentChange *item;
+	int tracked = 0;
+
+	pthread_mutex_lock(&segment_changes_lock);
+	if (shard >= PS_MAX_CHANNELS || seg < 0 || segment_changes_poisoned)
+		goto out;
+	item = segment_change_find(shard, seg);
+	if (!item)
+	{
+		uint32_t bucket = (shard * 2654435761u + (uint32_t) seg) % SEGMENT_CHANGE_BUCKETS;
+		item = calloc(1, sizeof(*item));
+		if (!item)
+		{
+			segment_changes_poisoned = 1;
+			goto out;
+		}
+		item->shard = shard;
+		item->seg = seg;
+		item->next = segment_changes[bucket];
+		segment_changes[bucket] = item;
+	}
+	if (item->version == UINT64_MAX || item->active == UINT32_MAX)
+	{
+		segment_changes_poisoned = 1;
+		goto out;
+	}
+	item->version++;
+	item->active++;
+	tracked = 1;
+out:
+	pthread_mutex_unlock(&segment_changes_lock);
+	return tracked;
+}
+
+static void
+segment_change_end(uint32_t shard, int seg, int tracked)
+{
+	if (!tracked)
+		return;
+	pthread_mutex_lock(&segment_changes_lock);
+	segment_change_find(shard, seg)->active--;
+	pthread_mutex_unlock(&segment_changes_lock);
+}
+
+static int
+posix_seg_change_token(uint32_t shard, int seg, uint64_t *token)
+{
+	PosixSegmentChange *item;
+	int rc = -1;
+
+	if (posix_require_owner() != 0 || shard >= PS_MAX_CHANNELS || seg < 0 || token == NULL)
+		return -1;
+	pthread_mutex_lock(&segment_changes_lock);
+	item = segment_change_find(shard, seg);
+	if (!segment_changes_poisoned && (!item || item->active == 0))
+	{
+		*token = item ? item->version : 0;
+		rc = 0;
+	}
+	pthread_mutex_unlock(&segment_changes_lock);
+	return rc;
+}
 
 /* Flat WAL files are independent per timeline. */
 typedef struct PosixWalLock
@@ -371,6 +469,20 @@ posix_close(void)
 	pthread_mutex_lock(&seg_fds_lock);
 	free_shard_caches();
 	pthread_mutex_unlock(&seg_fds_lock);
+	pthread_mutex_lock(&segment_changes_lock);
+	for (uint32_t i = 0; i < SEGMENT_CHANGE_BUCKETS; i++)
+	{
+		PosixSegmentChange *item = segment_changes[i];
+		while (item)
+		{
+			PosixSegmentChange *next = item->next;
+			free(item);
+			item = next;
+		}
+		segment_changes[i] = NULL;
+	}
+	segment_changes_poisoned = 0;
+	pthread_mutex_unlock(&segment_changes_lock);
 	posix_wal_locks_clear();
 	posix_walidx_locks_clear();
 	posix_dir[0] = '\0';
@@ -436,9 +548,11 @@ posix_seg_remove(uint32_t shard, int seg)
 	char		path[4096];
 	int			dfd;
 	int			rc = 0;
+	int tracked;
 
 	if (posix_require_owner() != 0)
 		return -1;
+	tracked = segment_change_begin(shard, seg);
 
 	seg_path(path, sizeof(path), shard, seg);
 	pthread_mutex_lock(&seg_fds_lock);
@@ -462,6 +576,7 @@ posix_seg_remove(uint32_t shard, int seg)
 		if (seg_fd_close(entry) != 0)
 		{
 			pthread_mutex_unlock(&seg_fds_lock);
+			segment_change_end(shard, seg, tracked);
 			return -1;
 		}
 		break;
@@ -471,6 +586,7 @@ posix_seg_remove(uint32_t shard, int seg)
 	{
 		errno = EIO;
 		pthread_mutex_unlock(&seg_fds_lock);
+		segment_change_end(shard, seg, tracked);
 		return -1;
 	}
 	if (unlink(path) != 0 && errno != ENOENT)
@@ -493,6 +609,7 @@ posix_seg_remove(uint32_t shard, int seg)
 		}
 	}
 	pthread_mutex_unlock(&seg_fds_lock);
+	segment_change_end(shard, seg, tracked);
 	return rc;
 }
 
@@ -503,22 +620,32 @@ posix_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf,
 	PosixSegFd *entry;
 	ssize_t		written;
 	int			saved_errno;
+	int tracked;
 
 	if (posix_require_owner() != 0)
 		return -1;
+	tracked = segment_change_begin(shard, seg);
+#ifdef PAGESTORE_POSIX_FD_TEST
+	ps_test_posix_write_begun(shard, seg);
+#endif
 	entry = seg_fd_get(shard, seg, 1);
 	if (entry == NULL)
+	{
+		segment_change_end(shard, seg, tracked);
 		return -1;
+	}
 	if (test_fail_seg_writes > 0)
 	{
 		test_fail_seg_writes--;
 		seg_fd_put(entry, 0);
+		segment_change_end(shard, seg, tracked);
 		return -1;
 	}
 	written = pwrite(entry->fd, buf, len, (off_t) off);
 	saved_errno = errno;
 	/* Even an error can follow a partial physical write. */
 	seg_fd_put(entry, 1);
+	segment_change_end(shard, seg, tracked);
 	errno = saved_errno;
 	if (written != (ssize_t) len)
 		return -1;
@@ -2666,6 +2793,7 @@ const PsStorage PsStoragePosix = {
 	.seg_write = posix_seg_write,
 	.seg_read = posix_seg_read,
 	.seg_size = posix_seg_size,
+	.seg_change_token = posix_seg_change_token,
 	.seg_remove = posix_seg_remove,
 	.wal_append = posix_wal_append,
 	.wal_read = posix_wal_read,
