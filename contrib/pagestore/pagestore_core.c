@@ -6081,6 +6081,16 @@ static int timeline_used[MAX_TIMELINES];
 static unsigned char timeline_wal_cleanup_done[MAX_TIMELINES];
 static unsigned char timeline_page_cleanup_done[MAX_TIMELINES];
 static uint32_t timeline_page_cleanup_cursor;
+/* Volatile progress only: reopening or reusing an ID starts a fresh scan. */
+static uint32_t timeline_page_scan_shard[MAX_TIMELINES];
+static int timeline_page_scan_segment[MAX_TIMELINES];
+#define TIMELINE_PAGE_SCAN_SEGMENTS_PER_TURN 16
+
+int
+ps_test_timeline_page_scan_segment(uint32_t timeline)
+{
+	return timeline < MAX_TIMELINES ? timeline_page_scan_segment[timeline] : -1;
+}
 
 /*
  * Filled by page_cleanup_tombstone_segment() at the point it fails closed on
@@ -6863,6 +6873,54 @@ typedef struct SegmentHole
 	uint32_t	len;
 } SegmentHole;
 
+#define PAGE_CLEANUP_READ_BYTES (256 * 1024)
+
+typedef struct PageCleanupReader
+{
+	uint32_t shard;
+	int seg;
+	uint64_t limit;
+	uint64_t start;
+	size_t len;
+	unsigned char *data;
+} PageCleanupReader;
+
+/* Read complete windows so inspecting the many small record headers does not
+ * issue a separate storage operation for each page.  Never read past the same
+ * reachable bound used by the parser. */
+static int
+page_cleanup_read(PageCleanupReader *reader, uint64_t off, void *out, size_t len)
+{
+	unsigned char *dst = out;
+
+	if (off > reader->limit || len > reader->limit - off)
+		return -1;
+	while (len != 0)
+	{
+		size_t n;
+
+		if (off < reader->start || off - reader->start >= reader->len)
+		{
+			uint64_t remaining = reader->limit - off;
+
+			reader->start = off;
+			reader->len = remaining < PAGE_CLEANUP_READ_BYTES ?
+				(size_t) remaining : PAGE_CLEANUP_READ_BYTES;
+			if (ps_storage->seg_read(reader->shard, reader->seg, off,
+								 reader->data, reader->len) != 0)
+				return -1;
+		}
+		n = reader->len - (size_t) (off - reader->start);
+		if (n > len)
+			n = len;
+		memcpy(dst, reader->data + (size_t) (off - reader->start), n);
+		dst += n;
+		off += n;
+		len -= n;
+	}
+	return 0;
+}
+
 static int
 page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 {
@@ -6873,6 +6931,7 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 	uint64_t off = 0;
 	uint64_t limit;
 	uint64_t wm = 0;
+	PageCleanupReader reader = {0};
 
 	errno = 0;
 	bytes = ps_storage->seg_size(s->id, seg);
@@ -6913,6 +6972,12 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 	 */
 	if (s->flush_watermark_valid && s->flush_watermark.seg_id == (uint32_t) seg)
 		wm = s->flush_watermark.seg_off;
+	reader.shard = s->id;
+	reader.seg = seg;
+	reader.limit = limit;
+	reader.data = malloc(PAGE_CLEANUP_READ_BYTES);
+	if (reader.data == NULL)
+		return -1;
 	while (off < limit)
 	{
 		SegRecHdr hdr = {0};	/* zeroed so a seg_read() I/O failure below
@@ -6923,7 +6988,7 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 
 		if (limit - off < sizeof(hdr))
 			goto end_of_log;	/* end of log: short header (recover() short-read) */
-		if (ps_storage->seg_read(s->id, seg, off, &hdr, sizeof(hdr)) != 0)
+		if (page_cleanup_read(&reader, off, &hdr, sizeof(hdr)) != 0)
 			goto fail;			/* I/O error, not a parse decision: no malformed-record diagnostic */
 		if (hdr.magic == 0)
 			goto end_of_log;	/* end of log: zero padding / lost header (recover()'s zero-magic end-of-log check) */
@@ -6941,7 +7006,7 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 		{
 			if (bound)
 			{
-				if (ps_storage->seg_read(s->id, seg, off + sizeof(hdr), &order_id,
+				if (page_cleanup_read(&reader, off + sizeof(hdr), &order_id,
 										 sizeof(order_id)) != 0)
 					goto fail;			/* I/O error, not a parse decision */
 				if (order_id == 0)
@@ -6949,7 +7014,7 @@ page_cleanup_tombstone_segment(Shard *s, int seg, uint32_t target)
 			}
 			if (admission)
 			{
-				if (ps_storage->seg_read(s->id, seg,
+				if (page_cleanup_read(&reader,
 										 off + header_size - sizeof(admission_seq),
 										 &admission_seq, sizeof(admission_seq)) != 0)
 					goto fail;			/* I/O error, not a parse decision */
@@ -7012,12 +7077,14 @@ fail_malformed:
 	}
 	if (nholes == 0)
 	{
+		free(reader.data);
 		free(holes);
 		return 0;
 	}
 	zero_body = calloc(1, page_size ? page_size : 1);
 	if (!zero_body)
 	{
+		free(reader.data);
 		free(holes);
 		return -1;
 	}
@@ -7053,15 +7120,18 @@ fail_malformed:
 		goto write_fail;
 	free(holes);
 	free(zero_body);
+	free(reader.data);
 	return 1;
 
 write_fail:
 	free(holes);
 	free(zero_body);
+	free(reader.data);
 	return -1;
 
 fail:
 	free(holes);
+	free(reader.data);
 	return -1;
 }
 
@@ -7166,6 +7236,56 @@ page_cleanup_scan_timeline_locked(uint32_t timeline)
 		}
 	}
 	return 0;
+}
+
+/* A DELETING timeline cannot accept new records.  Advance over a bounded
+ * number of segment IDs per turn, releasing the locks between turns.  The
+ * final publication still performs the independent full durable rescan. */
+static int
+page_cleanup_scan_bounded_locked(uint32_t timeline)
+{
+	uint32_t shard = timeline_page_scan_shard[timeline];
+	int seg = timeline_page_scan_segment[timeline];
+	int visited = 0;
+
+	while (shard < core_shards())
+	{
+		Shard *s = &g_shards[shard];
+		int changed = 0;
+
+		if (seg > s->cur_seg)
+		{
+			shard++;
+			seg = 0;
+			continue;
+		}
+		errno = 0;
+		if (ps_storage->seg_size(shard, seg) < 0)
+		{
+			if (errno != ENOENT)
+				goto fail;
+		}
+		else
+		{
+			changed = page_cleanup_tombstone_segment(s, seg, timeline);
+			if (changed < 0)
+				goto fail;
+		}
+		seg++;
+		if (++visited == TIMELINE_PAGE_SCAN_SEGMENTS_PER_TURN || changed)
+		{
+			timeline_page_scan_shard[timeline] = shard;
+			timeline_page_scan_segment[timeline] = seg;
+			return 1;
+		}
+	}
+	timeline_page_scan_shard[timeline] = 0;
+	timeline_page_scan_segment[timeline] = 0;
+	return 0;
+fail:
+	timeline_page_scan_shard[timeline] = 0;
+	timeline_page_scan_segment[timeline] = 0;
+	return -1;
 }
 
 /* Forget versions omitted from a durably published compacted layer.  The
@@ -17634,6 +17754,8 @@ timeline_reset_reuse_runtime(uint32_t timeline)
 	__atomic_store_n(&timeline_used[timeline], 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_wal_cleanup_done[timeline], 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_page_cleanup_done[timeline], 0, __ATOMIC_RELEASE);
+	timeline_page_scan_shard[timeline] = 0;
+	timeline_page_scan_segment[timeline] = 0;
 	__atomic_store_n(&fork_meta_deletion_cutover_done[timeline], 0,
 						 __ATOMIC_RELEASE);
 }
@@ -17750,7 +17872,7 @@ timeline_delete_page_cleanup_one(void)
 		 * must never be attributed to this timeline below -- reset before
 		 * the call so cleanup_last_failure_valid only survives this scan. */
 		cleanup_last_failure_valid = 0;
-		rc = page_cleanup_scan_timeline_locked(tl);
+		rc = page_cleanup_scan_bounded_locked(tl);
 		if (rc == 0 && __atomic_load_n(&fork_meta_deletion_cutover_done[tl],
 											__ATOMIC_ACQUIRE))
 		{
@@ -28530,6 +28652,8 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	memset(timeline_used, 0, sizeof(timeline_used));
 	memset(timeline_wal_cleanup_done, 0, sizeof(timeline_wal_cleanup_done));
 	memset(timeline_page_cleanup_done, 0, sizeof(timeline_page_cleanup_done));
+	memset(timeline_page_scan_shard, 0, sizeof(timeline_page_scan_shard));
+	memset(timeline_page_scan_segment, 0, sizeof(timeline_page_scan_segment));
 	timeline_page_cleanup_cursor = 0;
 	fork_meta_poisoned_store(0);
 	fork_meta_bytes_store(0);

@@ -381,6 +381,7 @@ extern void ps_test_set_walidx_observation_error_hook(
 extern void ps_test_set_backpressure_slow_path_hook(
 	PsBackpressureSlowPathTestHook hook, void *arg);
 extern int ps_test_control_fence_selections(void);
+extern int ps_test_timeline_page_scan_segment(uint32_t timeline);
 struct PsLayerDesc;
 extern int ps_test_compact_read_batch(const struct PsLayerDesc *layer,
 										  uint32_t npages, unsigned char *out);
