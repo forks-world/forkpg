@@ -1585,6 +1585,8 @@ pagestore_index_wal_page_read(XLogReaderState *state,
 }
 
 #define PAGESTORE_WAL_INDEX_BATCH_MAX 4096
+/* Publish progress during a backlog instead of waiting for the entire tail. */
+#define PAGESTORE_WAL_INDEX_SCAN_BYTES (16 * 1024 * 1024)
 
 /*
  * Decode WAL in [start, end) and record, for each block a record modifies, an
@@ -1668,6 +1670,13 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 					}
 				}
 				indexed_end = reader->EndRecPtr;
+				/*
+				 * Stop only after a whole record, including all its block
+				 * references.  A record may itself exceed the byte budget.
+				 * The SQL helper retains its historical full-range behavior.
+				 */
+				if (from_store && indexed_end - start >= PAGESTORE_WAL_INDEX_SCAN_BYTES)
+					break;
 			}
 			if (nbatch > 0)
 				pagestore_localsvc_walidx_add_batch(
