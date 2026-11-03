@@ -3301,6 +3301,50 @@ test_v2_and_mixed_lifecycle(void)
 }
 
 static void
+test_deleting_timeline_page_cleanup_batched_restart(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-batch-XXXXXX";
+	unsigned char page[8192];
+	PsTimelineState state;
+	int progress = 0;
+	int written = 1;
+
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 1000;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  create_branch(1, 0, 100), "open multi-segment deletion fixture");
+	for (uint32_t i = 0; i < 40; i++)
+		if (write_timeline_layer(1, i, 100 + i) != 0)
+			written = 0;
+	check(written && write_timeline_layer(0, 100, 100) == 0 &&
+		  begin_delete(1, 1, NULL), "prepare deletion spanning many segments");
+	for (int i = 0; i < 100 && progress == 0; i++)
+	{
+		(void) ps_core_maintenance();
+		progress = ps_test_timeline_page_scan_segment(1);
+	}
+	check(progress > 0 && progress <= 16 &&
+		  state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "cleanup yields after a bounded batch before completing deletion");
+	close_store();
+	check(ps_core_open(store) == 0 && ps_test_timeline_page_scan_segment(1) == 0,
+		  "restart discards volatile cleanup progress");
+	for (int i = 0; i < 200; i++)
+	{
+		(void) ps_core_maintenance();
+		if (state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED)
+			break;
+	}
+	memset(page, 0, sizeof(page));
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED &&
+		  read_test_page(0, 100, page) == 1 && page[100] == 0x5A,
+		  "restart completes deletion while preserving the parent page");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_deleting_timeline_page_cleanup(void)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-page-cleanup-XXXXXX";
@@ -4898,6 +4942,7 @@ main(void)
 	test_deletion_state_append_failure();
 	test_timeline_incarnation_reuse();
 	test_timeline_incarnation_frontiers();
+	test_deleting_timeline_page_cleanup_batched_restart();
 	test_deleting_timeline_page_cleanup();
 	test_deleting_timeline_page_cleanup_backpressure_debt();
 	test_deleting_timeline_page_cleanup_pending_remove();
