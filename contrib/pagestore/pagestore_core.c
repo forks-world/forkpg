@@ -17483,6 +17483,23 @@ ps_test_walidx_frontier_exception_active(uint32_t timeline, uint64_t lsn)
 	return active;
 }
 
+int
+ps_test_walidx_override_frontier(uint32_t timeline, uint64_t lsn)
+{
+	PsWalIdxFrontierEntry *entry;
+	uint64_t incarnation;
+
+	if (timeline >= MAX_TIMELINES)
+		return -1;
+	ps_lock_map_wr();
+	incarnation = __atomic_load_n(&timelines[timeline].incarnation, __ATOMIC_ACQUIRE);
+	entry = incarnation ? walidx_frontier_slot(timeline, incarnation, 1) : NULL;
+	if (entry != NULL)
+		entry->frontier = lsn;
+	ps_unlock_map();
+	return entry ? 0 : -1;
+}
+
 static void
 free_walidx_indexes(void)
 {
@@ -20707,8 +20724,10 @@ walidx_proves_page_lsn(uint32_t timeline, const PsKey *key, uint32_t block,
 
 	ps_lock_map_rd();
 	walidx_publish_rdlock();
+	/* A frontier below which the index may be incomplete forbids using an
+	 * absent record as evidence.  It does not invalidate an exact retained,
+	 * committed record for this timeline, key, block and record end. */
 	if (walidx_progress_read(timeline) >= page_lsn &&
-		walidx_frontier_ancestry_allows(timeline, page_lsn) &&
 		(entry = walidx_find(timeline, key, block)) != NULL)
 	{
 		int pos = walidx_upper_bound(entry, page_lsn);
