@@ -4832,7 +4832,7 @@ gc_batch_interpose(void *arg)
 	ps_test_set_gc_batch_hook(NULL, NULL);
 	if (probe->corrupt == 1)
 		change_gc_layer(probe->path);
-	else if (probe->corrupt == 2 && write_timeline_layer(0, 50, 1000) != 0)
+	else if (probe->corrupt == 2 && write_timeline_layer(0, 100, 1000) != 0)
 		probe->calls = -100;
 }
 
@@ -4852,11 +4852,11 @@ test_page_gc_batch(int corrupt)
 		check(0, "open bounded GC batch fixture");
 		return;
 	}
-	for (uint32_t block = 0; block < 8; block++)
+	for (uint32_t block = 0; block < 70; block++)
 		check(write_timeline_layer(0, block, 100 + block) == 0,
 			  "write GC batch source");
-	check(ps_layer_map.nlayers > 0 && ps_storage->seg_size(0, 4) > 0,
-		  "prepare at least five GC segments");
+	check(ps_layer_map.nlayers > 0 && ps_storage->seg_size(0, 32) > 0,
+		  "prepare more than one full GC batch");
 	if (ps_layer_map.nlayers > 0)
 		snprintf(probe.path, sizeof(probe.path), "%s", ps_layer_map.layers[0].locations[0].uri);
 	segment_gc_enabled = 1;
@@ -4874,17 +4874,17 @@ test_page_gc_batch(int corrupt)
 			change_gc_layer(probe.path);
 	}
 	else
-		check(ps_storage->seg_size(0, 3) < 0 && ps_storage->seg_size(0, 4) > 0,
-			  "unchanged batch removes at most four covered segments");
+		check(ps_storage->seg_size(0, 31) < 0 && ps_storage->seg_size(0, 32) > 0,
+			  "unchanged batch removes at most 32 covered segments");
 	close_store();
 	check(ps_core_open(store) == 0, "reopen after a partial or complete GC batch");
 	for (int i = 0; i < 64 && ps_storage->seg_size(0, 3) > 0; i++)
 		(void) ps_core_maintenance();
-	for (uint32_t block = 0; block < 8; block++)
+	for (uint32_t block = 0; block < 70; block++)
 		check(read_test_page(0, block, page) == 1 && page[100] == 0x5A,
 			  "GC batch preserves readable pages after restart");
 	if (corrupt == 2)
-		check(read_test_page(0, 50, page) == 1 && page[100] == 0x5A,
+		check(read_test_page(0, 100, page) == 1 && page[100] == 0x5A,
 			  "concurrent image is readable after batch restart");
 	close_store();
 	remove_tree(store);

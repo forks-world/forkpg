@@ -27329,7 +27329,11 @@ typedef struct GcVerifiedLayer
 	uint32_t covers_mask;
 } GcVerifiedLayer;
 
-#define PS_GC_BATCH_SEGMENTS 4
+/* The preflight verifies each covering layer once per batch. Use the full
+ * coverage bitmap to amortize that I/O; locks and identity are still checked
+ * independently for every segment, and compaction gets a turn after this
+ * bounded batch. */
+#define PS_GC_BATCH_SEGMENTS 32
 typedef struct GcVerifiedSet
 {
 	GcVerifiedLayer *layers;
