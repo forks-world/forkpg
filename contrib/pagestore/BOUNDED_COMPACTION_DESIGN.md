@@ -7,9 +7,12 @@ complete set does not fit the existing merge limit. It preserves every selected
 version, verifies output coverage and revalidates isolation at publication and
 retirement. With a nonzero history floor it first requires the existing plan
 to prove every selected version is kept. Selection is work-limited and local
-only; an ineligible group may still fall back to the legacy compactor. This
-does not yet implement bounded pruning, oversized-source conversion or a
-store-wide disk limit.
+only; an ineligible group may still fall back to the legacy compactor.
+The local pruning path also accepts an overlap-closed subset when all excluded
+layers are provably disjoint. It retains the existing retention, admission,
+frontier and source-pin fences at publication, page-index update and retirement.
+It does not yet bound pruning when excluded layers overlap, convert oversized
+sources, or enforce a store-wide disk limit.
 If no isolated component is found, a local all-versions-preserving merge can
 also select a bounded newest-ID suffix. Overlapping omitted layers must all
 be older than every selected input; newly arriving overlapping layers must be
@@ -17,8 +20,10 @@ newer than every reserved output. Full coverage verification and publication
 revalidation preserve the winner for equal identities.
 Discovery examines at most 1024 candidate seeds and charges layer visits and
 range comparisons against a 100000-step budget while holding the map lock.
-If the budget is exhausted, the search defers without a legacy rewrite and
-resumes from a process-local per-timeline cursor on the next maintenance turn.
+If the all-versions search exhausts its budget, it defers without a legacy
+rewrite and resumes from a process-local per-timeline cursor on the next
+maintenance turn. The pruning search has an independent cursor; if it defers,
+the all-versions path can still make progress in the same maintenance turn.
 A seed that itself exceeds a whole turn's budget is skipped in that pass to
 ensure progress; layer-map changes can also make a cursor miss a candidate.
 Neither proves the skipped component is ineligible. Once a pass ends without a

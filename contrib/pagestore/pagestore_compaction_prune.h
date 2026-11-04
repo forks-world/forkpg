@@ -98,6 +98,14 @@ extern int ps_compaction_prune_fence_valid(const PsLayerMap *map,
 	const PsCompactionPruneFence *captured, const PsCompactionPruneFence *current,
 	int timeline_live, int manifest_poisoned, uint32_t published_prefix,
 	uint32_t retired_prefix, int frontier_durable, int page_index_updated);
+/* As above, allowing only excluded layers disjoint from all sources and
+ * outputs. Epochs, owned pins, frontier and index obligations are unchanged. */
+extern int ps_compaction_prune_fence_valid_disjoint(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	const PsCompactionPruneFence *captured, const PsCompactionPruneFence *current,
+	int timeline_live, int manifest_poisoned, uint32_t published_prefix,
+	uint32_t retired_prefix, int frontier_durable, int page_index_updated);
 
 extern int ps_compaction_plan_relation_groups(const PsLayerDesc *layers,
 	uint32_t count, uint32_t max_group, PsPruneFence floor,
