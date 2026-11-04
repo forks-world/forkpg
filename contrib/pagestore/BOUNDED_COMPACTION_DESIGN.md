@@ -1,5 +1,81 @@
 # Bounded image compaction: publication contract
 
+## Space-bounded key-range compaction (proposed)
+
+Initial local integration selects a bounded overlap-closed input set when the
+complete set does not fit the existing merge limit. It preserves every selected
+version, verifies output coverage and revalidates isolation at publication and
+retirement. With a nonzero history floor it first requires the existing plan
+to prove every selected version is kept. Selection is work-limited and local
+only; an ineligible group may still fall back to the legacy compactor. This
+does not yet implement bounded pruning, oversized-source conversion or a
+store-wide disk limit.
+If no isolated component is found, a local all-versions-preserving merge can
+also select a bounded newest-ID suffix. Overlapping omitted layers must all
+be older than every selected input; newly arriving overlapping layers must be
+newer than every reserved output. Full coverage verification and publication
+revalidation preserve the winner for equal identities.
+Discovery examines at most 1024 candidate seeds and charges layer visits and
+range comparisons against a 100000-step budget while holding the map lock.
+If the budget is exhausted, the search defers without a legacy rewrite and
+resumes from a process-local per-timeline cursor on the next maintenance turn.
+A seed that itself exceeds a whole turn's budget is skipped in that pass to
+ensure progress; layer-map changes can also make a cursor miss a candidate.
+Neither proves the skipped component is ineligible. Once a pass ends without a
+candidate, or if the initial legacy-layer scan cannot complete, the caller can
+still use the legacy path. A policy for avoiding unbounded fallback in those
+cases remains separate work. Restart discards the cursor and starts discovery
+again; it never publishes or retires layers as part of discovery.
+
+Neon's pageserver partitions immutable layers by key range and compacts selected
+ranges; see its [storage design](https://github.com/neondatabase/neon/blob/main/docs/pageserver-storage.md).
+Apply that idea to local pagestore without assuming that object storage exists.
+The existing 1024-record output batches alone do not bound peak disk use: all
+input layers remain live until every required replacement is durable and covered.
+In particular, a legacy single layer can already be many GiB, so writing many
+small outputs before retiring it still duplicates that layer's live bytes.
+
+The first incremental step is an all-versions-preserving compaction of complete
+layers whose key/block intervals are isolated from every excluded live layer in
+the same timeline and shard. Select inputs under both a byte budget and a fan-in
+limit; an unknown, legacy, remote or overlapping descriptor is ineligible. The
+range test must be conservative for descriptors whose boundaries do not prove
+disjointness, including equal keys and block endpoints. Reserve output IDs,
+pin the input descriptors, prepare and verify the winning records and bytes,
+then revalidate the selected inputs, excluded-layer disjointness or suffix
+precedence, timeline, and provider state at each publication and source
+retirement. Newly admitted layers are safe only where their precedence over
+the reserved outputs and their coverage are proven. Never infer safety merely
+from the number of layers: replacement IDs sort after existing layers, so an
+omitted overlapping layer between selected inputs and outputs can otherwise
+lose a tied record to an older input's replacement.
+
+This step can compact isolated ranges with bounded temporary output; it cannot
+split or retire part of an existing oversized source. Handling such sources
+requires a separately crash-safe partition conversion or a provider-specific
+copy-on-write technique, with an explicit peak-space budget. Do not claim a
+fixed store-wide bound: live data, retained branches and WAL, concurrent
+admissions, failed cleanup, and source conversion require additional headroom.
+Neon's local eviction relies on remote durability; local-only stores must not
+discard their sole durable copy to satisfy a disk target.
+
+For a distributed edition, remote-durable layers can additionally support a
+bounded local cache with upload verification, safe eviction and read-through.
+Those placement decisions must not change the range-compaction safety proof.
+Coordination between multiple pagestore nodes, including remote publication
+and GC authority, remains a separate design; the local lock is not such a
+protocol, and this design does not require a particular consensus service.
+
+Before integration, exercise overlapping and touching key/block boundaries,
+tied identities, omitted older layers, newer arrivals, changed descriptors,
+finite and ancestor views, reader pins, failed cleanup, and crashes after each
+output publication and source retirement. Check reads before and after reopen,
+measure peak allocated and filesystem-free space under a fixed workload, and
+verify that rejected or oversized plans do not silently fall back to an
+unbounded rewrite. Range partitioning is not a multi-node synchronization
+protocol; the existing local GC serialization and publication fencing remain
+required.
+
 Status: design; the implementation remains in progress. This builds on the
 staged local output work in PR #371. It does not describe behavior that is
 already implemented.

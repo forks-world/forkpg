@@ -4820,6 +4820,7 @@ typedef struct GcBatchProbe
 {
 	int calls;
 	int corrupt;
+	int at;
 	char path[4096];
 } GcBatchProbe;
 
@@ -4829,6 +4830,8 @@ gc_batch_interpose(void *arg)
 	GcBatchProbe *probe = arg;
 
 	probe->calls++;
+	if (probe->at > 0 && probe->calls < probe->at)
+		return;
 	ps_test_set_gc_batch_hook(NULL, NULL);
 	if (probe->corrupt == 1)
 		change_gc_layer(probe->path);
@@ -4837,11 +4840,50 @@ gc_batch_interpose(void *arg)
 }
 
 static void
+test_page_gc_batch_late_conflict(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-batch-late-XXXXXX";
+	unsigned char page[8192];
+	GcBatchProbe probe = {.corrupt = 1, .at = 31};
+
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 1;
+	compact_layers = 1000;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open late GC batch conflict fixture");
+		return;
+	}
+	for (uint32_t block = 0; block < 66; block++)
+		check(write_timeline_layer(0, block, 100 + block) == 0,
+			  "write late GC batch source");
+	snprintf(probe.path, sizeof(probe.path), "%s", ps_layer_map.layers[0].locations[0].uri);
+	segment_gc_enabled = 1;
+	ps_test_set_gc_batch_hook(gc_batch_interpose, &probe);
+	for (int i = 0; i < 64 && probe.calls < 31; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_gc_batch_hook(NULL, NULL);
+	check(probe.calls == 31 && ps_storage->seg_size(0, 30) < 0 &&
+		  ps_storage->seg_size(0, 31) > 0,
+		  "late layer corruption stops the last segment in a 32-segment batch");
+	change_gc_layer(probe.path);
+	close_store();
+	check(ps_core_open(store) == 0, "reopen after late GC batch conflict");
+	for (uint32_t block = 0; block < 66; block++)
+		check(read_test_page(0, block, page) == 1 && page[100] == 0x5A,
+			  "late GC batch conflict preserves pages after restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_page_gc_batch(int corrupt)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-batch-XXXXXX";
 	unsigned char page[8192];
 	GcBatchProbe probe = {.corrupt = corrupt};
+	uint32_t nblocks = corrupt ? 8 : 66;
 
 	configure_timeline_core();
 	segment_size = 16384;
@@ -4852,7 +4894,7 @@ test_page_gc_batch(int corrupt)
 		check(0, "open bounded GC batch fixture");
 		return;
 	}
-	for (uint32_t block = 0; block < 8; block++)
+	for (uint32_t block = 0; block < nblocks; block++)
 		check(write_timeline_layer(0, block, 100 + block) == 0,
 			  "write GC batch source");
 	check(ps_layer_map.nlayers > 0 && ps_storage->seg_size(0, 4) > 0,
@@ -4874,13 +4916,13 @@ test_page_gc_batch(int corrupt)
 			change_gc_layer(probe.path);
 	}
 	else
-		check(ps_storage->seg_size(0, 3) < 0 && ps_storage->seg_size(0, 4) > 0,
-			  "unchanged batch removes at most four covered segments");
+		check(ps_storage->seg_size(0, 31) < 0 && ps_storage->seg_size(0, 32) > 0,
+			  "unchanged batch removes at most 32 covered segments");
 	close_store();
 	check(ps_core_open(store) == 0, "reopen after a partial or complete GC batch");
 	for (int i = 0; i < 64 && ps_storage->seg_size(0, 3) > 0; i++)
 		(void) ps_core_maintenance();
-	for (uint32_t block = 0; block < 8; block++)
+	for (uint32_t block = 0; block < nblocks; block++)
 		check(read_test_page(0, block, page) == 1 && page[100] == 0x5A,
 			  "GC batch preserves readable pages after restart");
 	if (corrupt == 2)
@@ -5051,6 +5093,7 @@ main(void)
 	test_page_gc_batch(0);
 	test_page_gc_batch(1);
 	test_page_gc_batch(2);
+	test_page_gc_batch_late_conflict();
 	test_page_gc_batch_crash();
 	test_timeline_seqcap_format();
 	test_old_event_replay_derives_reused_parent_incarnation();

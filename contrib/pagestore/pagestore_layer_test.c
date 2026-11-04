@@ -340,6 +340,46 @@ streaming_layer_test(void)
 			present[2].layer_id = 1005;
 			check(ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4) == 0,
 				  "layer older than a reserved output is not admitted");
+			present[2].layer_id = layer.layer_id - 1;
+			check(ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4),
+				  "overlapping layer older than every source preserves tied precedence");
+			present[2].layer_id = 1005;
+			present[2].start_key = present[2].end_key = layer.end_key;
+			present[2].start_key.relNumber++;
+			present[2].end_key.relNumber++;
+			check(ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4),
+				  "older layer outside the input and output key ranges is safe");
+			check(ps_image_compaction_publication_valid_newer(&map, &layer, 1, outputs, 4, 1),
+				  "disjoint older layer preserves the published output prefix");
+			{
+				PsLayerDesc saved_output = outputs[3];
+
+				outputs[3].start_key = present[2].start_key;
+				outputs[3].end_key = present[2].end_key;
+				check(!ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4),
+					  "older layer overlapping an output cannot be omitted");
+				outputs[3] = saved_output;
+			}
+			present[2] = layer;
+			present[2].layer_id = 1005;
+			present[2].start_key.relNumber--;
+			present[2].end_key = layer.start_key;
+			check(!ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4),
+				  "touching inclusive key ranges remain overlapping");
+			present[2] = layer;
+			present[2].layer_id = 1005;
+			present[2].start_block = layer.end_block + 1;
+			present[2].end_block = layer.end_block + 10;
+			check(ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4),
+				  "older layer outside global block bounds is safe");
+			present[2].start_block = layer.end_block;
+			check(!ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4),
+				  "touching inclusive block ranges remain overlapping");
+			present[2].start_block = 2;
+			present[2].end_block = 1;
+			check(!ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4),
+				  "invalid bounds do not prove disjointness");
+			present[2] = layer;
 			present[2].layer_id = 1021;
 			present[2].legacy_shard_zero = true;
 			check(ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4) == 0,
