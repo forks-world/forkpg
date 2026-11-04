@@ -3357,6 +3357,126 @@ test_index_base_reclaim_conservative_fallback(void)
 }
 
 static void
+test_wal_less_death_reclaims_only_covered_history(void)
+{
+	for (int late_page = 0; late_page < 2; late_page++)
+	{
+		char store[TEST_STORE_PATH_MAX] = "pagestore-wal-less-death-XXXXXX";
+		uint64_t old_view = WAL_SEGMENT + 175;
+		PsWalBaseState state;
+		unsigned char page[8192];
+
+		configure_core();
+		check(prepare_store(store, WAL_TOTAL, 0, WAL_SEGMENT + 100, 0) &&
+			  write_relation_page(0, 1, 0) &&
+			  reserve_pin(0, PS_RETENTION_OWNER_READER, 982, 1,
+				PS_RETENTION_RESOURCE_WAL_INDEX, old_view) &&
+			  unlink_relation(0, WAL_SEGMENT + 300) &&
+			  (!late_page || write_relation_page(0, 2, 0)) &&
+			  wal_index_progress(0, 0, WAL_TOTAL) &&
+			  reserve_pin(0, PS_RETENTION_OWNER_READER, 983, 1,
+				PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL_INDEX,
+				WAL_TOTAL), "prepare a WAL-less fork with a pre-death view");
+		check(!maintenance_until_count(store, 0, 0) &&
+			  wal_index_count(0, 0, WAL_TOTAL) == 1,
+			  "the pre-death view retains its FPI and raw WAL");
+		close_store();
+		check(ps_core_open(store) == 0 && segment_count(store, 0) == 2 &&
+			  wal_index_count(0, 0, WAL_TOTAL) == 1,
+			  "the pre-death view and its FPI survive recovery");
+		check(drop_wal_pin(0, 982, 1), "release the pre-death view");
+		if (late_page)
+		{
+			check(read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == -1,
+				  "the later WAL-less page still prevents lifecycle reconstruction");
+			check(!maintenance_until_count(store, 0, 0) &&
+				  wal_index_count(0, 0, WAL_TOTAL) == 1,
+				  "a WAL-less page admitted after death prevents its use as proof");
+			check(unlink_relation(0, WAL_SEGMENT + 400),
+				  "a later death covers the new WAL-less page");
+		}
+		for (int i = 0; i < 3 && segment_count(store, 0) != 0; i++)
+			(void) maintenance_until_count(store, 0, 0);
+		check(segment_count(store, 0) == 0 && wal_index_count(0, 0, WAL_TOTAL) == 0,
+			  "a death covering all WAL-less pages releases the old FPI and WAL");
+		check(read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == 0 &&
+			  !state.found && state.nblocks == 0 &&
+			  state.death_lsn == WAL_SEGMENT + (late_page ? 400 : 300),
+			  "the index view can reconstruct lifecycle after the covered death");
+		close_store();
+		check(ps_core_open(store) == 0 && segment_count(store, 0) == 0 &&
+			  wal_index_count(0, 0, WAL_TOTAL) == 0,
+			  "WAL reclamation survives restart");
+		check(read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == 0 &&
+			  state.nblocks == 0 && state.death_lsn == WAL_SEGMENT + (late_page ? 400 : 300),
+			  "the index lifecycle remains readable after restart");
+		close_store();
+		remove_tree(store);
+	}
+}
+
+static void
+test_wal_less_death_preserves_child_history(void)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-less-child-XXXXXX";
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, WAL_SEGMENT + 100, 0) &&
+		  write_relation_page(0, 1, 0) &&
+		  create_branch(1, 0, WAL_SEGMENT + 175) &&
+		  unlink_relation(0, WAL_SEGMENT + 300) &&
+		  wal_index_progress(0, 0, WAL_TOTAL) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 984, 1,
+			PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL_INDEX,
+			WAL_TOTAL), "prepare a child view preceding its parent's fork death");
+	check(!maintenance_until_count(store, 0, 0) &&
+		  wal_index_count(0, 0, WAL_TOTAL) == 1,
+		  "the child retains its parent's pre-death FPI and WAL");
+	close_store();
+	check(ps_core_open(store) == 0 && segment_count(store, 0) == 2 &&
+		  wal_index_count(0, 0, WAL_TOTAL) == 1,
+		  "the child's retained history survives recovery");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_wal_less_death_redo_after_regrow(void)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-less-regrow-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsWalBaseState state;
+	unsigned char page[8192];
+	uint64_t record = 2 * WAL_SEGMENT + 100;
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, WAL_SEGMENT + 100, 0) &&
+		  write_relation_page(0, 1, 0) &&
+		  unlink_relation(0, WAL_SEGMENT + 300) &&
+		  fork_op_keyed(0, &key, PS_OP_ZEROEXTEND, WAL_SEGMENT + 400, 1, 0) &&
+		  wal_index_add_record(0, record, 0, 0) &&
+		  wal_index_progress(0, 0, WAL_TOTAL) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 985, 1,
+			PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL_INDEX,
+			WAL_TOTAL), "prepare a non-FPI record after a WAL-less fork is regrown");
+	for (int i = 0; i < 3 && wal_index_count(0, 0, WAL_TOTAL) != 1; i++)
+		(void) maintenance_until_count(store, 0, 0);
+	check(wal_index_only_record(0, 0, WAL_TOTAL, record),
+		  "retire the pre-death FPI but retain the post-death redo record");
+	check(read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == 0 &&
+		  !state.found && state.nblocks == 1 && state.death_lsn == WAL_SEGMENT + 300,
+		  "redo can select a zero-regrown base with the correct lifecycle");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  wal_index_only_record(0, 0, WAL_TOTAL, record) &&
+		  read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == 0 &&
+		  state.nblocks == 1 && state.death_lsn == WAL_SEGMENT + 300,
+		  "the redo chain and lifecycle survive restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_index_state_caps_ancestry(void)
 {
 	char store[TEST_STORE_PATH_MAX] = "pagestore-index-ancestry-XXXXXX";
@@ -3738,6 +3858,14 @@ main(int argc, char **argv)
 		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 		return failed != 0;
 	}
+	if (argc == 2 && strcmp(argv[1], "--wal-less-death") == 0)
+	{
+		test_wal_less_death_reclaims_only_covered_history();
+		test_wal_less_death_preserves_child_history();
+		test_wal_less_death_redo_after_regrow();
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--replay-proof-interval") == 0)
 	{
 		test_materializer_retains_replay_proof_interval();
@@ -3758,6 +3886,9 @@ main(int argc, char **argv)
 	test_reindex_rejects_reclaimed_wal();
 	test_finite_index_base_reclaims_raw_wal();
 	test_index_base_reclaim_conservative_fallback();
+	test_wal_less_death_reclaims_only_covered_history();
+	test_wal_less_death_preserves_child_history();
+	test_wal_less_death_redo_after_regrow();
 	check(ps_test_walidx_death_fence() == 0,
 		  "death proof respects the exact-LSN bound of an otherwise unbounded view");
 	test_index_state_caps_ancestry();
