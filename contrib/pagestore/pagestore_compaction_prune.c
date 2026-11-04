@@ -3,13 +3,14 @@
 
 #include "pagestore_compaction_prune.h"
 
-int
-ps_compaction_prune_fence_valid(const PsLayerMap *map,
+static int
+compaction_prune_fence_valid(const PsLayerMap *map,
 	const PsLayerDesc *inputs, uint32_t ninputs,
 	const PsLayerDesc *outputs, uint32_t noutputs,
 	const PsCompactionPruneFence *captured, const PsCompactionPruneFence *current,
 	int timeline_live, int manifest_poisoned, uint32_t published_prefix,
-	uint32_t retired_prefix, int frontier_durable, int page_index_updated)
+	uint32_t retired_prefix, int frontier_durable, int page_index_updated,
+	int disjoint)
 {
 	if (inputs == NULL || outputs == NULL || ninputs == 0 || noutputs == 0 ||
 		ninputs > PS_IMAGE_MERGE_MAX_INPUTS || noutputs > PS_IMAGE_PREPARE_MAX_OUTPUTS ||
@@ -29,10 +30,12 @@ ps_compaction_prune_fence_valid(const PsLayerMap *map,
 		if (inputs[i].remote_durable)
 			return 0;
 	if (page_index_updated || retired_prefix != 0)
-		return ps_image_compaction_retirement_valid(map, inputs, ninputs,
-			outputs, noutputs, retired_prefix);
-	if (!ps_image_compaction_publication_valid(map, inputs, ninputs,
-			outputs, noutputs, published_prefix))
+		return disjoint ? ps_image_compaction_retirement_valid_disjoint(map, inputs, ninputs,
+			outputs, noutputs, retired_prefix) : ps_image_compaction_retirement_valid(map,
+			inputs, ninputs, outputs, noutputs, retired_prefix);
+	if (!(disjoint ? ps_image_compaction_publication_valid_disjoint(map, inputs, ninputs,
+			outputs, noutputs, published_prefix) : ps_image_compaction_publication_valid(map,
+			inputs, ninputs, outputs, noutputs, published_prefix)))
 		return 0;
 	for (uint32_t k = 0; k < ninputs; k++)
 	{
@@ -49,6 +52,32 @@ ps_compaction_prune_fence_valid(const PsLayerMap *map,
 			return 0;
 	}
 	return 1;
+}
+
+int
+ps_compaction_prune_fence_valid(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	const PsCompactionPruneFence *captured, const PsCompactionPruneFence *current,
+	int timeline_live, int manifest_poisoned, uint32_t published_prefix,
+	uint32_t retired_prefix, int frontier_durable, int page_index_updated)
+{
+	return compaction_prune_fence_valid(map, inputs, ninputs, outputs, noutputs,
+		captured, current, timeline_live, manifest_poisoned, published_prefix,
+		retired_prefix, frontier_durable, page_index_updated, 0);
+}
+
+int
+ps_compaction_prune_fence_valid_disjoint(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs,
+	const PsCompactionPruneFence *captured, const PsCompactionPruneFence *current,
+	int timeline_live, int manifest_poisoned, uint32_t published_prefix,
+	uint32_t retired_prefix, int frontier_durable, int page_index_updated)
+{
+	return compaction_prune_fence_valid(map, inputs, ninputs, outputs, noutputs,
+		captured, current, timeline_live, manifest_poisoned, published_prefix,
+		retired_prefix, frontier_durable, page_index_updated, 1);
 }
 
 struct PsCompactionRelationPlan

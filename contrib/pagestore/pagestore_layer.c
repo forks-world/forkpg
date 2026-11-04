@@ -1689,12 +1689,12 @@ image_compaction_snapshot_valid(const PsLayerMap *map,
 
 			if (!allow_newer || current->legacy_shard_zero)
 				return 0;
-			if (current->layer_id > outputs[noutputs - 1].layer_id)
+			if (allow_newer == 1 && current->layer_id > outputs[noutputs - 1].layer_id)
 				continue;
 			/* An omitted older layer already loses every tied identity to
 			 * the selected suffix. Full-coverage verification preserves that
 			 * winner in a replacement newer than all selected sources. */
-			if (current->layer_id < min_id)
+			if (allow_newer == 1 && current->layer_id < min_id)
 				continue;
 			for (uint32_t j = 0; j < ninputs && disjoint; j++)
 				disjoint = ps_image_layer_ranges_disjoint(current, &inputs[j]);
@@ -1791,6 +1791,49 @@ ps_image_compaction_retirement_valid_newer(const PsLayerMap *map,
 {
 	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs,
 		retired_prefix, 1, 1);
+}
+
+/* Pruning may remove identities, so priority alone cannot make an excluded
+ * overlapping source safe. Every excluded layer must be range-disjoint. */
+int
+ps_image_compaction_snapshot_valid_disjoint(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs)
+{
+	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs, 0, 0, 2);
+}
+
+int
+ps_image_compaction_publication_valid_disjoint(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t published_prefix)
+{
+	if (published_prefix > noutputs ||
+		!ps_image_compaction_snapshot_valid_disjoint(map, inputs, ninputs, outputs, noutputs))
+		return 0;
+	for (uint32_t k = 0; k < noutputs; k++)
+	{
+		int present = 0;
+
+		for (uint32_t i = 0; i < map->nlayers; i++)
+			if (map->layers[i].layer_id == outputs[k].layer_id)
+			{
+				present = 1;
+				break;
+			}
+		if (present != (k < published_prefix))
+			return 0;
+	}
+	return 1;
+}
+
+int
+ps_image_compaction_retirement_valid_disjoint(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t retired_prefix)
+{
+	return image_compaction_snapshot_valid(map, inputs, ninputs, outputs, noutputs,
+		retired_prefix, 1, 2);
 }
 
 int

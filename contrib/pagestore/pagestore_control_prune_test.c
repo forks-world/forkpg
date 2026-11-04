@@ -654,7 +654,7 @@ test_bounded_isolated_compaction(int nonzero_floor)
 		{
 			live_after++;
 			if (ps_layer_map.layers[i].layer_id > max_before &&
-				ps_layer_map.layers[i].layer_id <= max_before + 2)
+				ps_layer_map.layers[i].lsn_end <= 2000)
 				replacement_bytes += ps_layer_map.layers[i].locations[0].size;
 		}
 	ps_unlock_map();
@@ -905,6 +905,239 @@ test_bounded_overlapping_suffix(int nonzero_floor)
 		  read_relation_at(0, 1069), "suffix merge survives restart");
 	close_store();
 	remove_tree(store);
+}
+
+static void
+test_isolated_bounded_pruning(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-isolated-prune-XXXXXX";
+	uint64_t before;
+	uint32_t live_before = 0, live_after = 0, old_versions = 0;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 1000;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  write_relation(0, 0, 1000), "open isolated pruning fixture");
+	run_maintenance(32);
+	check(write_relation(0, 0, 2000), "write obsolete isolated version");
+	for (uint32_t block = 1; block <= 65; block++)
+		check(write_relation(0, block, 3000 + block), "write excluded isolated range");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000), "pin pruning horizon");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_before++;
+	ps_unlock_map();
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	for (int i = 0; i < 16 && ps_test_bounded_prune_published_count() == before; i++)
+		(void) ps_core_maintenance();
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		PsImgIndexEnt *idx = NULL;
+		uint32_t count = 0;
+
+		if (d->kind != PS_LAYER_IMAGE || d->deleting)
+			continue;
+		live_after++;
+		if (ps_image_layer_read_index(d, &idx, &count) == 0)
+			for (uint32_t j = 0; j < count; j++)
+				if (idx[j].key.klass == PS_KLASS_RELATION && idx[j].block == 0 && idx[j].lsn == 1000)
+					old_versions++;
+		free(idx);
+	}
+	ps_unlock_map();
+	check(live_before > PS_IMAGE_MERGE_MAX_INPUTS && live_after >= 65 &&
+		  live_after < live_before && old_versions == 0 &&
+		  ps_test_bounded_prune_published_count() > before,
+		  "isolated pruning removes obsolete history without rewriting other ranges");
+	check(read_relation_asof(0, 5000, 2000) && read_relation_asof(65, 5000, 3065),
+		  "pruned and excluded pages remain readable at the retained horizon");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(65, 5000, 3065), "isolated pruning survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+static int
+read_isolated_branch_page(uint32_t timeline, uint64_t lsn, uint64_t expected)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint32_t hi = 0, lo = 0;
+	int rc;
+
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&key));
+	rc = read_resolve(timeline, &key, 0, lsn, 0, page, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	if (rc != 1)
+		return 0;
+	memcpy(&hi, page, sizeof(hi));
+	memcpy(&lo, page + sizeof(hi), sizeof(lo));
+	return (((uint64_t) hi << 32) | lo) == expected;
+}
+
+static void
+test_isolated_pruning_branch_view(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-isolated-prune-branch-XXXXXX";
+	uint64_t before;
+	uint32_t old_versions = 0, branch_versions = 0, live = 0;
+	int ok;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 1000;
+	ok = test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		write_relation(0, 0, 1000);
+	run_maintenance(32);
+	ok = ok && write_relation(0, 0, 1200) && create_branch(1, 0, 1500) &&
+		write_relation(0, 0, 2000) && write_relation(0, 0, 3000);
+	for (uint32_t block = 1; block <= 65 && ok; block++)
+		ok = write_relation(0, block, 3000 + block);
+	ok = ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+							 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000);
+	check(ok, "prepare isolated pruning with a branch view");
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	for (int i = 0; i < 16 && ps_test_bounded_prune_published_count() == before; i++)
+		(void) ps_core_maintenance();
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		PsImgIndexEnt *idx = NULL;
+		uint32_t count = 0;
+
+		if (d->deleting || d->kind != PS_LAYER_IMAGE)
+			continue;
+		live++;
+		if (ps_image_layer_read_index(d, &idx, &count) == 0)
+			for (uint32_t j = 0; j < count; j++)
+				if (idx[j].key.klass == PS_KLASS_RELATION && idx[j].block == 0)
+				{
+					old_versions += idx[j].lsn == 1000;
+					branch_versions += idx[j].lsn == 1200;
+				}
+		free(idx);
+	}
+	ps_unlock_map();
+	check(ps_test_bounded_prune_published_count() > before && old_versions == 0 &&
+		  branch_versions > 0 && live >= 65,
+		  "isolated pruning removes old history and retains branch and excluded ranges");
+	check(read_isolated_branch_page(1, UINT64_MAX, 1200) &&
+		  read_relation_asof(0, 5000, 3000), "branch and parent views remain readable");
+	close_store();
+	check(ps_core_open(store) == 0 && read_isolated_branch_page(1, UINT64_MAX, 1200) &&
+		  read_relation_asof(0, 5000, 3000), "branch and parent views survive restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+isolated_pruning_add_pin(void *arg)
+{
+	int *added = arg;
+
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	*added = reserve_pin(0, PS_RETENTION_OWNER_READER, 77, 1,
+						 PS_RETENTION_RESOURCE_PAGE_HISTORY, 1500);
+}
+
+static void
+test_isolated_pruning_concurrent_change(int retention_change)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-isolated-prune-conflict-XXXXXX";
+	uint64_t before;
+	int wrote = 0;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 1000;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  write_relation(0, 0, 1000), "open isolated pruning conflict fixture");
+	run_maintenance(32);
+	check(write_relation(0, 0, 2000), "write conflict fixture history");
+	for (uint32_t block = 1; block <= 65; block++)
+		check(write_relation(0, block, 3000 + block), "write conflict fixture excluded range");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000), "pin conflict fixture horizon");
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	ps_test_set_compaction_unlocked_hook(retention_change ? isolated_pruning_add_pin :
+		isolated_compaction_write, &wrote);
+	(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	check(wrote && ps_test_bounded_prune_published_count() == before &&
+		  read_relation_asof(0, 5000, retention_change ? 2000 : 3000) &&
+		  (!retention_change || read_relation_asof(0, 1500, 1000)) &&
+		  read_relation_asof(65, 5000, 3065),
+		  "concurrent write or retention change invalidates partial pruning before publication");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  read_relation_asof(0, 5000, retention_change ? 2000 : 3000) &&
+		  (!retention_change || read_relation_asof(0, 1500, 1000)) &&
+		  read_relation_asof(65, 5000, 3065), "pruning conflict survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_isolated_pruning_crash(const char *fault)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-isolated-prune-crash-XXXXXX";
+	char control[TEST_TEMP_PATH_MAX] = "pagestore-isolated-prune-fault-XXXXXX";
+	char arm[512];
+	FILE *file;
+	int status = 0, ok;
+	pid_t child;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 1000;
+	if (!test_mkdtemp(store, sizeof(store)) || !test_mkdtemp(control, sizeof(control)) ||
+		snprintf(arm, sizeof(arm), "%s/arm", control) >= (int) sizeof(arm) ||
+		(file = fopen(arm, "w")) == NULL)
+	{
+		check(0, "prepare isolated pruning crash fixture");
+		return;
+	}
+	fclose(file);
+	ok = ps_core_open(store) == 0 && write_relation(0, 0, 1000);
+	run_maintenance(32);
+	ok = ok && write_relation(0, 0, 2000);
+	for (uint32_t block = 1; block <= 65 && ok; block++)
+		ok = write_relation(0, block, 3000 + block);
+	ok = ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+							 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000);
+	close_store();
+	child = fork();
+	if (child == 0)
+	{
+		if (!ok || setenv("PAGESTORE_TEST_FAULT_NAME", fault, 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_DIR", control, 1) != 0 ||
+			ps_fault_init(store) != 0 || ps_core_open(store) != 0)
+			_exit(91);
+		compact_layers = 1;
+		run_maintenance(64);
+		_exit(92);
+	}
+	check(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+		  WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT, "isolated pruning reaches crash point");
+	check(ps_core_open(store) == 0 && read_relation_asof(0, 5000, 2000) &&
+		  read_relation_asof(65, 5000, 3065), "isolated pruning crash preserves both ranges");
+	close_store();
+	remove_tree(store);
+	remove_tree(control);
 }
 
 static int
@@ -1475,6 +1708,93 @@ test_long_chain_prune_snapshot(int mode)
 	check(ps_core_open(store) == 0 && read_relation_asof(block, 5000, 1511) &&
 		  read_relation_asof(block, 10000, (mode == 1 || mode == 5) ? 9000 : 7535),
 		  "long-chain snapshot survives a later restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+isolated_long_chain_hook(void *arg)
+{
+	int *called = arg;
+
+	(*called)++;
+	ps_test_set_prune_snapshot_hook(NULL, NULL);
+}
+
+static void
+test_isolated_pruning_long_chain(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-isolated-prune-chain-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint64_t before;
+	int ok = 1, called = 0, excluded_readable = 0;
+
+	configure_core(0);
+	segment_gc_enabled = 0;
+	compact_layers = 1000;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
+		  "open isolated long-chain pruning fixture");
+	for (uint32_t i = 0; i < 512 && ok; i++)
+		ok = write_relation(0, 0, 1000 + i);
+	ok = ok && ps_test_resize_empty_memtable(0, 100000) == 0;
+	flush_pages = 100000;
+	for (uint32_t i = 0; i < 1536 && ok; i++)
+		ok = write_relation(0, 0, 6000 + i);
+	/* Establish normal fork-growth metadata for the furthest test block. */
+	ok = ok && write_relation(0, 65, 4065);
+	/* Install independent on-disk ranges without flushing the long-chain
+	 * memtable. They exercise subset selection, not page-index admission. */
+	for (uint32_t block = 1; block <= 65 && ok; block++)
+	{
+		uint32_t lsn = 4000 + block;
+		PsImgRec rec = {.key = key, .block = block, .lsn = lsn, .page = page};
+		PsLayerDesc desc;
+
+		memset(page, 0x5A, sizeof(page));
+		memset(page, 0, sizeof(uint32_t));
+		memcpy(page + sizeof(uint32_t), &lsn, sizeof(lsn));
+		ok = ps_image_layer_write(100000 + block, 0, &rec, 1, page_size, &desc) == 0;
+		if (ok)
+		{
+			ps_lock_map_wr();
+			ok = ps_manifest_add_new_layer(&desc) == 0;
+			ps_unlock_map();
+		}
+	}
+	ok = ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+							 PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000);
+	check(ok && ps_test_page_version_count(0, &key, 0) == 2048,
+		  "prepare isolated long-chain and excluded ranges");
+	before = ps_test_bounded_prune_published_count();
+	compact_layers = 1;
+	ps_test_set_prune_snapshot_hook(isolated_long_chain_hook, &called);
+	for (int i = 0; i < 64 && !called; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_prune_snapshot_hook(NULL, NULL);
+	check(called && ps_test_bounded_prune_published_count() > before &&
+		  ps_test_page_version_count(0, &key, 0) == 1537 &&
+		  read_relation_asof(0, 5000, 1511) && read_relation_asof(0, 10000, 7535),
+		  "isolated pruning snapshots a long chain and preserves other ranges");
+	close_store();
+	check(ps_core_open(store) == 0, "reopen isolated long-chain store");
+	check(read_relation_asof(0, 5000, 1511), "isolated long-chain old view survives restart");
+	check(read_relation_asof(0, 10000, 7535), "isolated long-chain new view survives restart");
+	check(read_relation_asof(65, 5000, 4065), "excluded page view survives long-chain restart");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == 100065 && !ps_layer_map.layers[i].deleting)
+		{
+			uint32_t observed_lsn = 0;
+
+			excluded_readable = ps_image_layer_lookup_exact(&ps_layer_map.layers[i], &key,
+				65, 4065, 0, page, page_size, NULL, NULL) == 1;
+			memcpy(&observed_lsn, page + sizeof(uint32_t), sizeof(observed_lsn));
+			excluded_readable &= observed_lsn == 4065;
+			break;
+		}
+	ps_unlock_map();
+	check(excluded_readable, "excluded layer survives long-chain restart");
 	close_store();
 	remove_tree(store);
 }
@@ -3784,6 +4104,13 @@ main(void)
 	test_isolated_search_exhausted_progress();
 	test_bounded_overlapping_suffix(0);
 	test_bounded_overlapping_suffix(1);
+	test_isolated_bounded_pruning();
+	test_isolated_pruning_branch_view();
+	test_isolated_pruning_concurrent_change(0);
+	test_isolated_pruning_concurrent_change(1);
+	test_isolated_pruning_crash("page_prune.after_frontier");
+	test_isolated_pruning_crash("page_compaction.after_publish");
+	test_isolated_pruning_crash("page_gc.after_mark_delete");
 	test_bounded_shared_payload_capacity_fallback();
 	test_bounded_prune_multiple_outputs(0);
 	test_bounded_prune_multiple_outputs(1);
@@ -3800,6 +4127,7 @@ main(void)
 	test_long_chain_prune_snapshot(3);
 	test_long_chain_prune_snapshot(4);
 	test_long_chain_prune_snapshot(5);
+	test_isolated_pruning_long_chain();
 	test_prune_snapshot_conflict_churn();
 	test_prune_abandon_conflict(0);
 	test_prune_abandon_conflict(1);

@@ -58,6 +58,10 @@ extern int ps_manifest_publish_image_batch_newer(const PsLayerDesc *inputs,
 	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs, uint32_t batch_index);
 extern int ps_manifest_retire_image_source_newer(const PsLayerDesc *inputs,
 	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs, uint32_t source_index);
+extern int ps_manifest_publish_image_batch_disjoint(const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs, uint32_t batch_index);
+extern int ps_manifest_retire_image_source_disjoint(const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs, uint32_t source_index);
 extern int	ps_manifest_set_remote_location(uint64_t layer_id,
 											const PsLayerLocation *location);
 extern int	ps_manifest_set_remote_durable(uint64_t layer_id,

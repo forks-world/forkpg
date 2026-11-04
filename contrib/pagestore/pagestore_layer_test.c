@@ -343,12 +343,21 @@ streaming_layer_test(void)
 			present[2].layer_id = layer.layer_id - 1;
 			check(ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4),
 				  "overlapping layer older than every source preserves tied precedence");
+			check(!ps_image_compaction_snapshot_valid_disjoint(&map, &layer, 1, outputs, 4),
+				  "pruning refuses an overlapping older source despite its priority");
+			present[2].layer_id = 1021;
+			check(!ps_image_compaction_snapshot_valid_disjoint(&map, &layer, 1, outputs, 4),
+				  "pruning refuses an overlapping newer source despite its priority");
 			present[2].layer_id = 1005;
 			present[2].start_key = present[2].end_key = layer.end_key;
 			present[2].start_key.relNumber++;
 			present[2].end_key.relNumber++;
 			check(ps_image_compaction_snapshot_valid_newer(&map, &layer, 1, outputs, 4),
 				  "older layer outside the input and output key ranges is safe");
+			check(ps_image_compaction_snapshot_valid_disjoint(&map, &layer, 1, outputs, 4) &&
+				  ps_image_compaction_publication_valid_disjoint(&map, &layer, 1, outputs, 4, 1) &&
+				  !ps_image_compaction_publication_valid_disjoint(&map, &layer, 1, outputs, 4, 0),
+				  "pruning accepts disjoint sources only with the exact publication prefix");
 			check(ps_image_compaction_publication_valid_newer(&map, &layer, 1, outputs, 4, 1),
 				  "disjoint older layer preserves the published output prefix");
 			{
@@ -399,9 +408,18 @@ streaming_layer_test(void)
 				entries[5] = present[2];
 				check(ps_image_compaction_retirement_valid_newer(&retire_map, &layer, 1,
 						outputs, 4, 0), "pinned input can retire with a newer layer");
+				check(!ps_image_compaction_retirement_valid_disjoint(&retire_map, &layer, 1,
+						outputs, 4, 0), "pruning retirement rejects an overlapping newcomer");
+				entries[5].start_key = entries[5].end_key = layer.end_key;
+				entries[5].start_key.relNumber++;
+				entries[5].end_key.relNumber++;
+				check(ps_image_compaction_retirement_valid_disjoint(&retire_map, &layer, 1,
+						outputs, 4, 0), "pruning retirement accepts a disjoint source");
 				entries[0].cache_readers = 0;
 				check(!ps_image_compaction_retirement_valid_newer(&retire_map, &layer, 1,
 						outputs, 4, 0), "newer layers do not waive input pinning");
+				check(!ps_image_compaction_retirement_valid_disjoint(&retire_map, &layer, 1,
+						outputs, 4, 0), "disjoint pruning does not waive input pinning");
 			}
 			present[2].deleting = true;
 			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 1,
@@ -422,8 +440,8 @@ streaming_layer_test(void)
 			check(ps_image_compaction_snapshot_valid(&map, &layer, 1, outputs, 4) == 0,
 				  "output ID collision on another timeline is rejected");
 			{
-				PsLayerDesc sources[2] = {layer, layer}, entries[6];
-				PsLayerMap guarded = {.layers = entries, .nlayers = 2, .capacity = 6};
+				PsLayerDesc sources[2] = {layer, layer}, entries[7];
+				PsLayerMap guarded = {.layers = entries, .nlayers = 2, .capacity = 7};
 				PsCompactionPruneFence captured = {11, 12, 13, 1, 5000};
 				PsCompactionPruneFence current = captured;
 
@@ -434,6 +452,32 @@ streaming_layer_test(void)
 				check(ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
 						&captured, &current, 1, 0, 0, 0, 0, 0),
 					  "pinned captured set passes before frontier publication");
+				entries[2] = layer;
+				entries[2].layer_id = 900;
+				entries[2].start_key.relNumber++;
+				entries[2].end_key.relNumber++;
+				guarded.nlayers = 3;
+				check(ps_compaction_prune_fence_valid_disjoint(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0) &&
+					  !ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "disjoint pruning accepts an unrelated source that strict mode rejects");
+				current.retention_epoch++;
+				check(!ps_compaction_prune_fence_valid_disjoint(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "disjoint pruning still fences retention changes");
+				current = captured;
+				entries[0].cache_readers = 0;
+				check(!ps_compaction_prune_fence_valid_disjoint(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "disjoint pruning still requires source pins");
+				entries[0].cache_readers = 1;
+				entries[2].start_key = layer.start_key;
+				entries[2].end_key = layer.end_key;
+				check(!ps_compaction_prune_fence_valid_disjoint(&guarded, sources, 2, outputs, 4,
+						&captured, &current, 1, 0, 0, 0, 0, 0),
+					  "disjoint pruning refuses an overlapping older source");
+				guarded.nlayers = 2;
 				entries[0].cache_readers = 0;
 				check(!ps_compaction_prune_fence_valid(&guarded, sources, 2, outputs, 4,
 						&captured, &current, 1, 0, 0, 0, 0, 0),
