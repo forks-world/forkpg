@@ -357,6 +357,17 @@ extern int ps_image_compaction_publication_valid_newer(const PsLayerMap *map,
 extern int ps_image_compaction_retirement_valid_newer(const PsLayerMap *map,
 	const PsLayerDesc *inputs, uint32_t ninputs,
 	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t retired_prefix);
+/* For pruning, every excluded same-shard layer must be range-disjoint from
+ * every input and output, independent of its layer-ID priority. */
+extern int ps_image_compaction_snapshot_valid_disjoint(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs);
+extern int ps_image_compaction_publication_valid_disjoint(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t published_prefix);
+extern int ps_image_compaction_retirement_valid_disjoint(const PsLayerMap *map,
+	const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t retired_prefix);
 /* Force a fresh data-section checksum verification (ignores cached state). */
 /* Empty the process-wide image index cache; the layer store calls it on close. */
 extern void ps_image_layer_cache_reset(void);
