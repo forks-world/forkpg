@@ -631,19 +631,22 @@ static uint32_t wal_reclaim_watch_timelines_active;
  * watch across restart, flush_pages == 1, or a race between the write and
  * the arm).  overflow is a sentinel for "more than WAL_RECLAIM_WATCH_MAX
  * items share the blocking minimum": evidence is not tracked and the
- * fruitless test falls back to raw+fence only (one re-request per new raw
- * value), exactly the pre-evidence behavior, since no per-item event can be
- * named. */
+ * fruitless test falls back to raw+fence and the timeline's definitive-event
+ * epoch, since no per-item event can be named. */
 typedef struct WalReclaimEvidence
 {
 	uint64_t	base_lsn;
 	uint64_t	base_seq;
 	uint64_t	fpi_lsn;
+	uint64_t	death_epoch;
 } WalReclaimEvidence;
 
 static WalReclaimEvidence walidx_reclaim_request_evidence[MAX_TIMELINES][WAL_RECLAIM_WATCH_MAX];
 static uint32_t walidx_reclaim_request_evidence_n[MAX_TIMELINES];
 static unsigned char walidx_reclaim_request_evidence_overflow[MAX_TIMELINES];
+/* Monotonic within the process; also supplies the conservative overflow key. */
+static uint64_t wal_reclaim_death_epoch[MAX_TIMELINES];
+static uint64_t walidx_reclaim_request_death_epoch[MAX_TIMELINES];
 
 /* Dedup key for the control-shard flush request (residual 2): the identity
  * of the superseded control note (lsn, admission_seq) that was memtable-
@@ -5898,6 +5901,7 @@ typedef struct ForkEnt
 	uint64_t	last_def_lsn;	/* newest SET/DEAD lsn (growth-clamp floor) */
 	uint64_t	last_page_lsn;	/* newest durable local page tuple */
 	uint64_t	last_page_seq;
+	uint64_t	death_epoch; /* latest definitive event, under the shard lock */
 	int			has_wal_less;	/* at least one page version has lsn 0 */
 	uint64_t artifact_attempt_seq;
 	uint64_t artifact_page_count;
@@ -8978,7 +8982,12 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	 * only bump the (now purely informational) admission-observation
 	 * counter on one (Codex 4104350482). */
 	if (fork_event_add_unchecked(e, lsn, admission_seq, nblocks, kind, meta))
+	{
 		fork_event_admit_seq_bump(e->timeline, admission_seq);
+		if (FEV_KIND(kind) == FEV_SET || FEV_KIND(kind) == FEV_DEAD)
+			e->death_epoch = __atomic_add_fetch(&wal_reclaim_death_epoch[e->timeline],
+											 1, __ATOMIC_RELAXED);
+	}
 }
 
 /*
@@ -17397,6 +17406,8 @@ wal_segment_reclaim_one(void)
 				WalReclaimEvidence current_evidence[WAL_RECLAIM_WATCH_MAX];
 				WalReclaimWatchEntry armed[WAL_RECLAIM_WATCH_MAX];
 				uint32_t ncomputed = 0;
+				uint64_t death_epoch = __atomic_load_n(&wal_reclaim_death_epoch[tl],
+														 __ATOMIC_RELAXED);
 
 				if (timeline_has_parent(tl) && timelines[tl].branch_lsn < proven)
 					proven = timelines[tl].branch_lsn;
@@ -17414,8 +17425,7 @@ wal_segment_reclaim_one(void)
 				 * (more than WAL_RECLAIM_WATCH_MAX items share the blocking
 				 * minimum -- only possible with a non-PostgreSQL WAL-index
 				 * writer) skips this: no per-item event can be named, and
-				 * the fruitless test below falls back to raw+fence only,
-				 * exactly as it did before evidence existed. */
+				 * the fruitless test below uses the timeline event epoch. */
 				if (raw_floor != 0 && !watch_overflow)
 				{
 					uint64_t *idx_fences = NULL;
@@ -17442,6 +17452,12 @@ wal_segment_reclaim_one(void)
 						WalReclaimEvidence ev;
 
 						memset(&ev, 0, sizeof(ev));
+						{
+							ForkEnt *f = fork_find(tl, &watch_items[wi].key);
+
+							if (f != NULL)
+								ev.death_epoch = f->death_epoch;
+						}
 						/* Durable progress is itself a finite storage fence.
 						 * A legacy view sharing its LSN, or an unversioned
 						 * fork, still requires an FPI-led chain. */
@@ -17554,9 +17570,8 @@ wal_segment_reclaim_one(void)
 					free(idx_fences);
 					free(protected_set);
 				}
-				/* Evidence-unchanged test: overflow only tracks its own
-				 * sentinel (raw+fence alone gate a repeat, matching the
-				 * pre-evidence request); otherwise every recorded item's
+				/* Evidence-unchanged test: overflow tracks the timeline
+				 * definitive-event epoch; otherwise every recorded item's
 				 * evidence must match exactly, including the count.  A
 				 * count mismatch alone (raw_floor unchanged, but fewer or
 				 * more items now share it -- e.g. a partial retirement
@@ -17570,7 +17585,8 @@ wal_segment_reclaim_one(void)
 				 * a repeat. */
 				if (watch_overflow)
 					evidence_unchanged =
-						walidx_reclaim_request_evidence_overflow[tl] != 0;
+						walidx_reclaim_request_evidence_overflow[tl] != 0 &&
+						walidx_reclaim_request_death_epoch[tl] == death_epoch;
 				else if (walidx_reclaim_request_evidence_overflow[tl] != 0 ||
 						 walidx_reclaim_request_evidence_n[tl] != ncomputed)
 					evidence_unchanged = 0;
@@ -17584,7 +17600,8 @@ wal_segment_reclaim_one(void)
 
 						if (stored->base_lsn != current_evidence[wi].base_lsn ||
 							stored->base_seq != current_evidence[wi].base_seq ||
-							stored->fpi_lsn != current_evidence[wi].fpi_lsn)
+							stored->fpi_lsn != current_evidence[wi].fpi_lsn ||
+							stored->death_epoch != current_evidence[wi].death_epoch)
 							evidence_unchanged = 0;
 					}
 				}
@@ -17622,6 +17639,7 @@ wal_segment_reclaim_one(void)
 					walidx_reclaim_request_raw[tl] = raw_floor;
 					walidx_reclaim_request_fence_epoch[tl] = fence_epoch;
 					walidx_reclaim_request_generation[tl] = snapshot_generation;
+					walidx_reclaim_request_death_epoch[tl] = death_epoch;
 					if (watch_overflow)
 					{
 						walidx_reclaim_request_evidence_overflow[tl] = 1;
