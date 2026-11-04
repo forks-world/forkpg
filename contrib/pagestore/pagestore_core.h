@@ -219,6 +219,7 @@ extern int ps_test_layer_growth_merge(uint64_t seed);
  * 0 on success or the 1-based number of the first failed check. */
 extern int ps_test_viewcap_differential(uint64_t seed, uint32_t niter);
 extern int ps_test_walidx_fork_views(uint64_t seed, uint32_t niter);
+extern int ps_test_walidx_death_fence(void);
 /* Phase P1 differential-test extension for artifact reads (Codex finding
  * 4104937134): checks artifact_visible() against brute_page_select() at
  * PS_SEQ_UNBOUNDED and at finite caps, over a real pre-first-BEGIN
