@@ -3708,6 +3708,8 @@ main(int argc, char **argv)
 	test_reindex_rejects_reclaimed_wal();
 	test_finite_index_base_reclaims_raw_wal();
 	test_index_base_reclaim_conservative_fallback();
+	check(ps_test_walidx_death_fence() == 0,
+		  "death proof respects the exact-LSN bound of an otherwise unbounded view");
 	test_index_state_caps_ancestry();
 	test_index_state_refuses_wal_less_zero_fallback();
 	test_index_state_preserves_lifecycle();

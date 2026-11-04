@@ -19522,7 +19522,8 @@ walidx_death_visible_to_fences(const ForkEnt *f, uint32_t idx,
 	{
 		ViewCap		cap = {fences[i].lsn, fences[i].seq, fences[i].admission_seq, false};
 
-		if (f->ev[idx].lsn <= cap.lsn && cap.seq != PS_SEQ_UNBOUNDED &&
+		/* An unbounded S can still have a finite exact-LSN bound X. */
+		if (f->ev[idx].lsn <= cap.lsn &&
 			fork_event_hidden(f, idx, &cap, B, has_B))
 			return 0;
 	}
@@ -19543,13 +19544,39 @@ walidx_absent_at_fences(const ForkEnt *f, uint32_t block, uint64_t horizon,
 		uint32_t	nb = 0;
 		int			state;
 
-		if (cap.lsn != horizon || cap.seq == PS_SEQ_UNBOUNDED)
+		/* Even a legacy view can exclude a later event at this LSN. */
+		if (cap.lsn != horizon)
 			continue;
 		state = walidx_fork_view(views, f, &cap, B, has_B, &nb);
 		if (state != FORK_HOP_DEAD && (state != FORK_HOP_DEF || nb > block))
 			return 0;
 	}
 	return 1;
+}
+
+/* Exercise the exact-LSN bound independently of the global sequence cap. */
+int
+ps_test_walidx_death_fence(void)
+{
+	ForkEnt f = {0};
+	WalIdxForkViews views = {0};
+	PsHistoryFence fence = {100, 2, PS_SEQ_UNBOUNDED};
+	int rc = 0;
+
+	(void) fork_event_add_unchecked(&f, 90, 1, 1, FEV_GROW, false);
+	(void) fork_event_add_unchecked(&f, 100, 3, 0, FEV_DEAD, false);
+	if (f.nev != 2 || walidx_death_visible_to_fences(&f, 1, &fence, 1) ||
+		walidx_absent_at_fences(&f, 0, 100, &fence, 1, &views))
+		rc = 1;
+	fence.admission_seq = PS_SEQ_UNBOUNDED;
+	if (!walidx_death_visible_to_fences(&f, 1, &fence, 1) ||
+		!walidx_absent_at_fences(&f, 0, 100, &fence, 1, &views))
+		rc = 2;
+	walidx_fork_views_free(&views);
+	free(f.ev);
+	free(f.def_idx);
+	free(f.late_meta_idx);
+	return rc;
 }
 
 static int
