@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pagestore_endurance as endurance
 
@@ -84,6 +84,47 @@ class SpaceBudgetTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 endurance.directory_kb(self.store)
             self.assertEqual(scan.call_count, 1)
+
+    def test_store_categories_scale_beyond_command_line_limit(self):
+        # The old sampler passed every path to one du command.  These real
+        # names would exceed Linux's usual 2 MiB exec argument limit.
+        for i in range(15000):
+            (self.store / ("layer_" + str(i).zfill(6) + "x" * 135)).touch()
+        result = endurance.store_category_kb(self.store)
+        self.assertEqual(len(result), 15000)
+        self.assertIn("layer_000000" + "x" * 135, result)
+
+    def test_store_categories_match_allocated_du_without_following_symlinks(self):
+        (self.store / ".hidden").write_bytes(b"x" * 8192)
+        nested = self.store / "wal_segments_0"
+        nested.mkdir()
+        (nested / "segment").write_bytes(b"x" * 4096)
+        (self.store / "external").symlink_to(self.root, target_is_directory=True)
+        result = endurance.store_category_kb(self.store)
+        for name in (".hidden", "wal_segments_0", "external"):
+            expected = subprocess.check_output(["du", "-sk", "--", str(self.store / name)],
+                                               text=True)
+            self.assertEqual(result[name], int(expected.split("\t", 1)[0]))
+
+    def test_optional_category_failure_does_not_disable_budget(self):
+        run = object.__new__(endurance.Run)
+        run.root, run.store, run.args = self.root, self.store, self.args
+        run.round, run.stats = 0, {}
+        run.daemon, run.daemon_expected_up = None, False
+        run.async_failure = None
+        run.computes = lambda: []
+        run.args.sample_interval = 0.01
+        run.stop_sampler = SimpleNamespace(wait=Mock(side_effect=[False, False, False, True]))
+        space = {"run_kb": 1, "store_total_kb": 1, "filesystem_free_bytes": 1 << 30}
+        with patch.object(endurance, "space_snapshot", return_value=space) as budget, \
+             patch.object(endurance, "store_category_kb", side_effect=OSError(7, "too long")):
+            run.sample_loop()
+        self.assertEqual(budget.call_count, 3)
+        self.assertIsNone(run.async_failure)
+        records = [json.loads(line) for line in (self.root / "metrics.jsonl").read_text().splitlines()]
+        self.assertEqual(len(records), 3)
+        self.assertTrue(all(record["space"] == space and "store_kb_error" in record
+                            for record in records))
 
     def test_sampler_fails_closed_after_three_bad_measurements(self):
         run = object.__new__(endurance.Run)
