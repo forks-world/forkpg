@@ -70,6 +70,75 @@ static pthread_mutex_t pause_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pause_changed = PTHREAD_COND_INITIALIZER;
 static int	pause_read;
 static int	read_entered;
+static int pause_write;
+static int write_entered;
+
+void ps_test_posix_write_begun(uint32_t shard, int seg);
+void
+ps_test_posix_write_begun(uint32_t shard, int seg)
+{
+	if (shard != 0 || seg != 0)
+		return;
+	pthread_mutex_lock(&pause_lock);
+	if (pause_write)
+	{
+		write_entered = 1;
+		pthread_cond_broadcast(&pause_changed);
+		while (pause_write)
+			pthread_cond_wait(&pause_changed, &pause_lock);
+	}
+	pthread_mutex_unlock(&pause_lock);
+}
+
+static void *
+paused_writer(void *unused)
+{
+	uint32_t data[16];
+
+	(void) unused;
+	payload(data, 0, 10000);
+	return PsStoragePosix.seg_write(0, 0, 0, data, sizeof(data)) == 0 ? NULL : (void *) 1;
+}
+
+static void
+active_write_token_test(void)
+{
+	pthread_t thread;
+	struct timespec deadline;
+	void *result = NULL;
+	uint64_t token;
+	int entered;
+
+	pthread_mutex_lock(&pause_lock);
+	pause_write = 1;
+	write_entered = 0;
+	pthread_mutex_unlock(&pause_lock);
+	if (pthread_create(&thread, NULL, paused_writer, NULL) != 0)
+	{
+		pthread_mutex_lock(&pause_lock);
+		pause_write = 0;
+		pthread_mutex_unlock(&pause_lock);
+		check(0, "start token test writer");
+		return;
+	}
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += 5;
+	pthread_mutex_lock(&pause_lock);
+	while (!write_entered)
+		if (pthread_cond_timedwait(&pause_changed, &pause_lock, &deadline) != 0)
+			break;
+	entered = write_entered;
+	pthread_mutex_unlock(&pause_lock);
+	check(entered && PsStoragePosix.seg_change_token(0, 0, &token) != 0,
+		  "a token is unavailable during an in-flight segment write");
+	pthread_mutex_lock(&pause_lock);
+	pause_write = 0;
+	pthread_cond_broadcast(&pause_changed);
+	pthread_mutex_unlock(&pause_lock);
+	check(pthread_join(thread, &result) == 0 && result == NULL &&
+		  PsStoragePosix.seg_change_token(0, 0, &token) == 0,
+		  "the token is available again after the writer finishes");
+}
 
 void		ps_test_posix_read_pinned(uint32_t shard, int seg);
 void
@@ -158,6 +227,23 @@ main(void)
 	limited.rlim_cur = 128;
 	check(setrlimit(RLIMIT_NOFILE, &limited) == 0, "use an unchanged low descriptor ceiling");
 	check(ps_test_mkdtemp(dir, sizeof(dir)) != NULL && PsStoragePosix.open(dir, 65536) == 0, "open independent store");
+	{
+		uint64_t initial = 99, changed = 0, other = 99, removed = 0;
+
+		check(PsStoragePosix.seg_change_token(0, 0, &initial) == 0 && initial == 0 &&
+			  PsStoragePosix.seg_change_token(1, 0, &other) == 0 && other == 0,
+			  "untouched segments have independent initial change tokens");
+		memset(data, 0x34, sizeof(data));
+		check(PsStoragePosix.seg_write(0, 0, 0, data, sizeof(data)) == 0 &&
+			  PsStoragePosix.seg_change_token(0, 0, &changed) == 0 && changed != initial &&
+			  PsStoragePosix.seg_change_token(1, 0, &other) == 0 && other == 0,
+			  "segment write changes only its own token");
+		check(PsStoragePosix.seg_remove(0, 0) == 0 &&
+			  PsStoragePosix.seg_change_token(0, 0, &removed) == 0 && removed != changed &&
+			  PsStoragePosix.seg_write(0, 0, 0, data, sizeof(data)) == 0 &&
+			  PsStoragePosix.seg_change_token(0, 0, &changed) == 0 && changed != removed,
+			  "remove and recreation both invalidate the old token");
+	}
 	check(PsStoragePosix.wal_append(0, "healthy", 7, NULL, 0) == 0, "store independent healthy WAL");
 	for (int i = 0; i < SEGMENTS; i++)
 	{
@@ -200,9 +286,23 @@ main(void)
 		check(PsStoragePosix.seg_write(0, 0, 0, data, sizeof(data)) == 0 &&
 			  PsStoragePosix.seg_read(0, 0, 0, got, sizeof(got)) == 0 && !memcmp(data, got, sizeof(data)),
 			  "recreated segment cannot reuse an unlinked cached file");
+		active_write_token_test();
 		pinned_eviction_test();
 	}
 	PsStoragePosix.close();
+	{
+		uint64_t before = 0, after = 0;
+
+		check(setenv("PAGESTORE_TEST_FAIL_SEG_WRITES", "1", 1) == 0 &&
+			  PsStoragePosix.open(dir, 65536) == 0 &&
+			  PsStoragePosix.seg_change_token(0, 0, &before) == 0,
+			  "arm a failing segment write with a fresh token");
+		check(PsStoragePosix.seg_write(0, 0, 0, data, sizeof(data)) != 0 &&
+			  PsStoragePosix.seg_change_token(0, 0, &after) == 0 && after != before,
+			  "even a failed segment write invalidates its token");
+		PsStoragePosix.close();
+		unsetenv("PAGESTORE_TEST_FAIL_SEG_WRITES");
+	}
 	if (filled)
 	{
 		int			failed_at = -1,
@@ -210,6 +310,12 @@ main(void)
 
 		check(setenv("PAGESTORE_TEST_FAIL_SEG_CACHE_SYNC", "1", 1) == 0 &&
 			  PsStoragePosix.open(dir, 65536) == 0, "arm one eviction fsync failure");
+		{
+			uint64_t token = 99;
+
+			check(PsStoragePosix.seg_change_token(0, 0, &token) == 0 && token == 0,
+				  "reopen resets process-local segment change tokens");
+		}
 		for (int i = 0; i < SEGMENTS; i++)
 		{
 			payload(data, 0, i);

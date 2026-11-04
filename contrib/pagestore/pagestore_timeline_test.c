@@ -3301,6 +3301,126 @@ test_v2_and_mixed_lifecycle(void)
 }
 
 static void
+test_timeline_page_proof_continuous_other_shard_writes(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-proof-shards-XXXXXX";
+	PsKey keys[2] = {{1, 1, 1, 0, PS_KLASS_RELATION},
+					 {1, 1, 1, 0, PS_KLASS_RELATION}};
+	unsigned char page[8192];
+	PsTimelineState state;
+	int started = 0, written = 1, changed = 0;
+	uint32_t lsn_hi = 0, lsn_lo = 1000;
+
+	configure_timeline_core();
+	ps_nshards = 2;
+	segment_size = 16384;
+	flush_pages = 1000;
+	while (ps_shard_of(&keys[0]) != 0)
+		keys[0].relNumber++;
+	while (ps_shard_of(&keys[1]) != 1)
+		keys[1].relNumber++;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  create_branch(1, 0, 100), "open two-shard proof fixture");
+	memset(page, 0x5A, sizeof(page));
+	memcpy(page, &lsn_hi, sizeof(lsn_hi));
+	memcpy(page + sizeof(lsn_hi), &lsn_lo, sizeof(lsn_lo));
+	ps_lock_shard_wr(0);
+	if (append_page(0, &keys[0], 0, page, 0, NULL) != 0)
+		written = 0;
+	ps_unlock_shard(0);
+	ps_lock_shard_wr(1);
+	for (uint32_t i = 0; i < 40; i++)
+		if (append_page(0, &keys[1], i, page, 0, NULL) != 0)
+			written = 0;
+	ps_unlock_shard(1);
+	check(written && begin_delete(1, 1, NULL),
+		  "prepare many later-shard segments and one earlier-shard segment");
+	for (int i = 0; i < 200; i++)
+	{
+		unsigned char first;
+
+		(void) ps_core_maintenance();
+		if (state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED)
+			break;
+		if (ps_test_timeline_page_proof_shard(1) >= 1)
+			started = 1;
+		if (started && ps_storage->seg_read(0, 0, 0, &first, 1) == 0 &&
+			ps_storage->seg_write(0, 0, 0, &first, 1) == 0)
+			changed++;
+	}
+	check(started && changed > 1 && state_of(1, &state, NULL) &&
+		  state == PS_TIMELINE_DELETED,
+		  "later-shard proof finishes despite repeated earlier-shard mutations");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_timeline_page_proof_detects_late_write(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-proof-XXXXXX";
+	unsigned char original[16384];
+	unsigned char page[8192];
+	PsTimelineState state;
+	int64_t len;
+	int progress = -1;
+	int written = 1;
+
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 1000;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  create_branch(1, 0, 100) && write_timeline_layer(1, 0, 100) == 0,
+		  "open segment-proof fixture with a target record");
+	len = ps_storage->seg_size(0, 0);
+	check(len > 0 && len <= (int64_t) sizeof(original) &&
+		  ps_storage->seg_read(0, 0, 0, original, (uint32_t) len) == 0,
+		  "capture target record before cleanup");
+	for (uint32_t i = 0; i < 40; i++)
+		if (write_timeline_layer(0, i + 1, i + 200) != 0)
+			written = 0;
+	check(written && begin_delete(1, 1, NULL), "prepare multi-batch final proof");
+	for (int i = 0; i < 200; i++)
+	{
+		(void) ps_core_maintenance();
+		progress = ps_test_timeline_page_proof_segment(1);
+		if (progress > 0)
+			break;
+	}
+	check(progress > 0 && state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "final proof yields before all segments are checked");
+	close_store();
+	check(ps_core_open(store) == 0 && ps_test_timeline_page_proof_segment(1) == -1,
+		  "restart discards the partially accumulated final proof");
+	progress = -1;
+	for (int i = 0; i < 200; i++)
+	{
+		(void) ps_core_maintenance();
+		progress = ps_test_timeline_page_proof_segment(1);
+		if (progress > 0)
+			break;
+	}
+	check(progress > 0 && state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "restart rebuilds the proof before publishing deletion");
+	check(ps_storage->seg_write(0, 0, 0, original, (uint32_t) len) == 0 &&
+		  ps_storage->sync() == 0,
+		  "reintroduce target bytes in an already checked segment");
+	for (int i = 0; i < 200; i++)
+	{
+		(void) ps_core_maintenance();
+		if (state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED)
+			break;
+	}
+	memset(page, 0, sizeof(page));
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED &&
+		  count_segment_holes(0, 0, len) == 1 &&
+		  read_test_page(0, 1, page) == 1 && page[100] == 0x5A,
+		  "changed segment is rescanned and target removed before publication");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_deleting_timeline_page_cleanup_batched_restart(void)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-timeline-batch-XXXXXX";
@@ -4942,6 +5062,8 @@ main(void)
 	test_deletion_state_append_failure();
 	test_timeline_incarnation_reuse();
 	test_timeline_incarnation_frontiers();
+	test_timeline_page_proof_continuous_other_shard_writes();
+	test_timeline_page_proof_detects_late_write();
 	test_deleting_timeline_page_cleanup_batched_restart();
 	test_deleting_timeline_page_cleanup();
 	test_deleting_timeline_page_cleanup_backpressure_debt();
