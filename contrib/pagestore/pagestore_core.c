@@ -19195,6 +19195,23 @@ walidx_entry_prune_plan(const WalIdxEnt *e, uint64_t cutoff,
 										cutoff,
 										walidx_plan_horizon_protected(cutoff),
 										horizons, nhorizons, ok, proof_floor, keep);
+		/* Preserve every record of an unprovable, well-formed page.  A bad
+		 * chain still aborts compact publication for the whole timeline. */
+		if (rc < 0 && ps_walidx_prune_items_valid(items, (uint32_t) e->n))
+		{
+			bool all_known = true;
+
+			/* Legacy entries lack an end position.  Keep the existing
+			 * full-timeline fallback until their frontier semantics are proven. */
+			for (int i = 0; i < e->n; i++)
+				if (!items[i].known)
+					all_known = false;
+			if (all_known)
+			{
+				memset(keep, 1, (size_t) e->n);
+				rc = e->n;
+			}
+		}
 		free(ok);
 	}
 	free(items);
@@ -19973,9 +19990,9 @@ walidx_materializer_proof_floor(uint32_t timeline, uint64_t *floor_out)
 	return 0;
 }
 
-/* Prove every page before writing any compacted shard.  One unprovable page
- * keeps the whole timeline on its full snapshot generation, so the single
- * timeline frontier can never mask a lagging shard. */
+/* Plan every page before writing any compacted shard. An unprovable page with
+ * well-formed known records is retained in full across the new frontier;
+ * legacy or malformed inputs still force a full timeline snapshot. */
 static int
 walidx_snapshot_compaction_plan(uint32_t tl, uint64_t cutoff,
 								const uint64_t *horizons,
