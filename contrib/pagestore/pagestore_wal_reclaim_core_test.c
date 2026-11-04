@@ -1018,6 +1018,49 @@ test_unreplaceable_dependency_requests_once(void)
 	remove_tree(store);
 }
 
+static void
+test_death_rearms_stale_wal_reclaim(int overflow)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-death-rearm-XXXXXX";
+	char directory[512];
+	PsKey other = {1, 1, 2, 0, PS_KLASS_RELATION};
+	uint64_t generation = 0, later = 0;
+	int indexed = 1;
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, WAL_SEGMENT + 100, 0),
+		  "prepare WAL and its first indexed block");
+	if (overflow)
+		for (uint32_t block = 1; block < 35; block++)
+			indexed &= wal_index_add_record(0, WAL_SEGMENT + 100, block, 1);
+	check(indexed && wal_index_progress(0, 0, WAL_TOTAL) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 981, 1,
+			PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL_INDEX,
+			WAL_TOTAL), "prepare a blocked WAL index with no replacement base");
+	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
+		  "a fruitless publication leaves the old FPI and WAL in place");
+	check(snprintf(directory, sizeof(directory), "%s/walidx_snapshots_0", store) > 0 &&
+		  ps_walidx_snapshot_next_generation(directory, 0, &generation) == 0,
+		  "record the fruitless publication generation");
+	if (!overflow)
+	{
+		check(fork_op_keyed(0, &other, PS_OP_UNLINK, WAL_SEGMENT + 300, 0, 0),
+			  "delete an unrelated fork");
+		check(!maintenance_until_count(store, 0, 0) &&
+			  ps_walidx_snapshot_next_generation(directory, 0, &later) == 0 &&
+			  later == generation,
+			  "an unrelated death does not republish the blocked index");
+	}
+	check(unlink_relation(0, WAL_SEGMENT + 300), "delete the blocked fork");
+	/* The periodic fallback is one second; allow an additional second for IO. */
+	for (int i = 0; i < 3 && segment_count(store, 0) != 0; i++)
+		(void) maintenance_until_count(store, 0, 0);
+	check(segment_count(store, 0) == 0 && wal_index_count(0, 0, WAL_TOTAL) == 0,
+		  "the new fork death reissues the request and releases old WAL");
+	close_store();
+	remove_tree(store);
+}
+
 /*
  * Residual 1a: a replacement base that becomes durable with no fence change
  * at all.  The reclaim-due request is served once, drops nothing (the base
@@ -3688,6 +3731,13 @@ test_materializer_retains_replay_proof_interval(void)
 int
 main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "--death-rearm") == 0)
+	{
+		test_death_rearms_stale_wal_reclaim(0);
+		test_death_rearms_stale_wal_reclaim(1);
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--replay-proof-interval") == 0)
 	{
 		test_materializer_retains_replay_proof_interval();
@@ -3724,6 +3774,8 @@ main(int argc, char **argv)
 	test_backoff_epoch_predates_attempt_inputs();
 	test_stale_wal_index_requests_compaction();
 	test_unreplaceable_dependency_requests_once();
+	test_death_rearms_stale_wal_reclaim(0);
+	test_death_rearms_stale_wal_reclaim(1);
 	test_late_durable_base_requests_compaction();
 	test_late_fpi_requests_compaction();
 	test_superseded_note_in_memtable_is_pruned();
