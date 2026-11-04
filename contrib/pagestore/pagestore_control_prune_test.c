@@ -601,6 +601,312 @@ test_bounded_compaction_maintenance(void)
 	remove_tree(store);
 }
 
+static void
+isolated_compaction_write(void *arg)
+{
+	int *wrote = arg;
+
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	*wrote = write_relation(0, 0, 3000);
+}
+
+static void
+test_bounded_isolated_compaction(int nonzero_floor)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-isolated-merge-XXXXXX";
+	uint64_t before, nonzero_before, max_before = 0, replacement_bytes = 0;
+	uint32_t live_before = 0, live_after = 0;
+	int concurrent_write = 0;
+
+	configure_core(1);
+	compact_layers = 1000;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
+		  "open isolated compaction fixture");
+	if (nonzero_floor)
+		check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+						  PS_RETENTION_RESOURCE_PAGE_HISTORY, 1000),
+			  "pin the historical view for isolated compaction");
+	check(write_relation(0, 0, 1000), "seed isolated compaction fixture");
+	run_maintenance(32);
+	check(write_relation(0, 0, 1500) && write_relation(0, 0, 2000),
+		  "write overlapping range");
+	for (uint32_t block = 1; block <= 65; block++)
+		check(write_relation(0, block, 2000 + block), "write isolated range");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+		{
+			live_before++;
+			if (ps_layer_map.layers[i].layer_id > max_before)
+				max_before = ps_layer_map.layers[i].layer_id;
+		}
+	ps_unlock_map();
+	before = ps_test_bounded_compaction_count();
+	nonzero_before = ps_test_bounded_nonzero_plan_count();
+	compact_layers = 1;
+	ps_test_set_compaction_unlocked_hook(isolated_compaction_write, &concurrent_write);
+	(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+		{
+			live_after++;
+			if (ps_layer_map.layers[i].layer_id > max_before &&
+				ps_layer_map.layers[i].layer_id <= max_before + 2)
+				replacement_bytes += ps_layer_map.layers[i].locations[0].size;
+		}
+	ps_unlock_map();
+	check(concurrent_write && live_before > PS_IMAGE_MERGE_MAX_INPUTS &&
+		  live_after >= 65 && live_after < live_before &&
+		  ps_test_bounded_compaction_count() > before &&
+		  (!nonzero_floor || ps_test_bounded_nonzero_plan_count() > nonzero_before),
+		  "isolated component compacts across a concurrent write");
+	check(replacement_bytes > 0 && replacement_bytes <=
+		  (uint64_t) 2 * PS_IMAGE_BATCH_MAX_RECORDS * page_size,
+		  "isolated replacement stays within its reserved output budget");
+	check(read_relation_at(0, 3000) && read_relation_at(65, 2065),
+		  "concurrent write and excluded range remain readable");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 3000) &&
+		  read_relation_at(65, 2065), "isolated merge survives recovery");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_isolated_compaction_crash(const char *fault)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-isolated-crash-XXXXXX";
+	char control[TEST_TEMP_PATH_MAX] = "pagestore-isolated-fault-XXXXXX";
+	char arm[512];
+	FILE *file;
+	int status = 0, ok;
+	pid_t child;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 1000;
+	if (!test_mkdtemp(store, sizeof(store)) || !test_mkdtemp(control, sizeof(control)) ||
+		snprintf(arm, sizeof(arm), "%s/arm", control) >= (int) sizeof(arm) ||
+		(file = fopen(arm, "w")) == NULL)
+	{
+		check(0, "prepare isolated compaction crash fixture");
+		return;
+	}
+	fclose(file);
+	ok = ps_core_open(store) == 0 && write_relation(0, 0, 1000);
+	run_maintenance(32);
+	ok = ok && write_relation(0, 0, 2000);
+	for (uint32_t block = 1; block <= 65 && ok; block++)
+		ok = write_relation(0, block, 2000 + block);
+	close_store();
+	child = fork();
+	if (child == 0)
+	{
+		if (!ok || setenv("PAGESTORE_TEST_FAULT_NAME", fault, 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_DIR", control, 1) != 0 ||
+			ps_fault_init(store) != 0 || ps_core_open(store) != 0)
+			_exit(91);
+		compact_layers = 1;
+		run_maintenance(64);
+		_exit(92);
+	}
+	check(child > 0 && waitpid(child, &status, 0) == child &&
+		  WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT,
+		  "isolated compaction reaches requested crash point");
+	check(ps_core_open(store) == 0 && read_relation_at(0, 2000) &&
+		  read_relation_at(65, 2065), "isolated crash preserves selected and excluded pages");
+	close_store();
+	remove_tree(store);
+	remove_tree(control);
+}
+
+static void
+test_isolated_compaction_late_candidate(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-isolated-late-XXXXXX";
+	uint64_t before;
+	uint32_t live_before = 0, live_after = 0;
+
+	configure_core(1);
+	compact_layers = 1000;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
+		  "open late isolated candidate fixture");
+	check(write_relation(0, 0, 1000), "seed late candidate fixture");
+	run_maintenance(32);
+	for (uint32_t block = 1; block <= 65; block++)
+		check(write_relation(0, block, 2000 + block), "write early isolated singleton");
+	check(write_relation(0, 65, 3000), "write late overlapping candidate");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_before++;
+	ps_unlock_map();
+	before = ps_test_bounded_compaction_count();
+	compact_layers = 1;
+	(void) ps_core_maintenance();
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_after++;
+	ps_unlock_map();
+	check(live_before > PS_IMAGE_MERGE_MAX_INPUTS && live_after >= 65 &&
+		  live_after < live_before && ps_test_bounded_compaction_count() > before,
+		  "late isolated component is selected without a full rewrite");
+	check(read_relation_at(0, 1000) && read_relation_at(65, 3000),
+		  "early and late ranges stay readable");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) &&
+		  read_relation_at(65, 3000), "late component survives recovery");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_isolated_compaction_resumes_search(int nonzero_floor, int restart_before_resume)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-isolated-resume-XXXXXX";
+	uint64_t before;
+	uint32_t live_before = 0, live_after_first = 0, live_after = 0;
+
+	configure_core(1);
+	compact_layers = 1000;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
+		  "open resumable isolated search fixture");
+	if (nonzero_floor)
+		check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+						  PS_RETENTION_RESOURCE_PAGE_HISTORY, 1000),
+			  "retain a historical view across deferred search");
+	check(write_relation(0, 0, 1000), "seed resumable search fixture");
+	run_maintenance(32);
+	for (uint32_t block = 1; block <= 250; block++)
+		check(write_relation(0, block, 2000 + block), "write resumable-search singleton");
+	check(write_relation(0, 250, 4000), "write resumable-search late component");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_before++;
+	ps_unlock_map();
+	before = ps_test_bounded_compaction_count();
+	compact_layers = 1;
+	(void) ps_core_maintenance();
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_after_first++;
+	ps_unlock_map();
+	check(live_after_first == live_before && ps_test_bounded_compaction_count() == before,
+		  "search budget exhaustion defers instead of rewriting all sources");
+	if (restart_before_resume)
+	{
+		close_store();
+		check(ps_core_open(store) == 0 && read_relation_at(0, 1000) &&
+			  read_relation_at(250, 4000), "restart during deferred search preserves pages");
+	}
+	for (int i = 0; i < 8 && ps_test_bounded_compaction_count() == before; i++)
+		(void) ps_core_maintenance();
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_after++;
+	ps_unlock_map();
+	check(ps_test_bounded_compaction_count() > before && live_after >= 250 &&
+		  live_after < live_before,
+		  "a later maintenance turn selects the late component");
+	check(read_relation_at(0, 1000) && read_relation_at(250, 4000),
+		  "resumed search preserves selected and excluded pages");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) &&
+		  read_relation_at(250, 4000), "resumed search survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_isolated_search_exhausted_progress(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-isolated-exhausted-XXXXXX";
+	uint32_t live_before = 0, live_after = 0;
+
+	configure_core(1);
+	compact_layers = 1000;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 1000) &&
+		  write_relation(0, 0, 1000), "open exhausted isolated search fixture");
+	run_maintenance(32);
+	for (uint32_t block = 1; block <= 250; block++)
+		check(write_relation(0, block, 2000 + block), "write singleton without a merge partner");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_before++;
+	ps_unlock_map();
+	compact_layers = 1;
+	run_maintenance(8);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_after++;
+	ps_unlock_map();
+	check(live_after < live_before && read_relation_at(0, 1000) &&
+		  read_relation_at(250, 2250), "exhausted search does not repeat forever");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_bounded_overlapping_suffix(int nonzero_floor)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-overlap-suffix-XXXXXX";
+	uint64_t before;
+	uint32_t live_before = 0, live_after = 0;
+
+	configure_core(1);
+	compact_layers = 1000;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  write_relation(0, 0, 1000), "open overlapping suffix fixture");
+	run_maintenance(32);
+	if (nonzero_floor)
+		check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+						  PS_RETENTION_RESOURCE_PAGE_HISTORY, 1000),
+			  "pin history for overlapping suffix compaction");
+	for (uint32_t i = 1; i < 70; i++)
+		check(write_relation(0, 0, 1000 + i), "write overlapping suffix version");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_before++;
+	ps_unlock_map();
+	before = ps_test_bounded_compaction_count();
+	compact_layers = 1;
+	for (int i = 0; i < 32 && ps_test_bounded_compaction_count() == before; i++)
+		(void) ps_core_maintenance();
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_after++;
+	ps_unlock_map();
+	check(live_before > PS_IMAGE_MERGE_MAX_INPUTS && live_after > 1 &&
+		  live_after < live_before && ps_test_bounded_compaction_count() > before,
+		  "overlapping newest suffix merges without rewriting older layers");
+	check(read_relation_at(0, 1000) && read_relation_at(0, 1069),
+		  "suffix merge preserves old and latest versions");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) &&
+		  read_relation_at(0, 1069), "suffix merge survives restart");
+	close_store();
+	remove_tree(store);
+}
+
 static int
 read_fixture_page(const PsImgRec *rec, void *out, void *arg)
 {
@@ -3371,11 +3677,18 @@ test_independent_blocks_keep_their_newest(void)
 
 static uint32_t compact_test_reads;
 static bool compact_test_fail_bulk;
+static bool compact_test_admit;
+static int compact_test_admit_ok;
 
 static int
 compact_counted_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
 {
 	compact_test_reads++;
+	if (compact_test_admit)
+	{
+		compact_test_admit = false;
+		compact_test_admit_ok = write_relation(0, 2, 3000);
+	}
 	if (compact_test_fail_bulk && len > page_size)
 		return -1;
 	return PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
@@ -3418,14 +3731,23 @@ test_compaction_source_read_batch(void)
 	ps_layer_store = &counted;
 	compact_test_reads = 0;
 	compact_test_fail_bulk = false;
-	rc = ps_test_compact_read_batch(&layer, 32, out);
+	rc = ps_test_compact_read_batch(&layer, 32, out, 0);
 	check(rc == 0 && memcmp(out, pages, sizeof(pages)) == 0 && compact_test_reads == 1,
 		  "adjacent compaction pages share a verified source read");
 	compact_test_reads = 0;
 	compact_test_fail_bulk = true;
-	rc = ps_test_compact_read_batch(&layer, 32, out);
+	rc = ps_test_compact_read_batch(&layer, 32, out, 0);
 	check(rc == 0 && memcmp(out, pages, sizeof(pages)) == 0 && compact_test_reads >= 32,
 		  "failed bulk reads fall back to individual source reads");
+	compact_test_reads = 0;
+	compact_test_fail_bulk = false;
+	compact_test_admit = true;
+	compact_test_admit_ok = 0;
+	memset(out, 0xff, sizeof(pages));
+	rc = ps_test_compact_read_batch(&layer, 32, out, 1);
+	check(rc == -1 && compact_test_admit_ok && compact_test_reads == 1 &&
+		  memcmp(out, pages[0], page_size) == 0 && out[page_size] == 0xff,
+		  "stale compaction stops before reading the next cached page");
 	ps_layer_store = &PsLayerStoreLocal;
 	close_store();
 	remove_tree(store);
@@ -3451,6 +3773,17 @@ main(void)
 	test_bounded_prune_crash("page_gc.after_mark_delete");
 	test_segment_gc_does_not_starve_compaction();
 	test_bounded_compaction_maintenance();
+	test_bounded_isolated_compaction(0);
+	test_bounded_isolated_compaction(1);
+	test_isolated_compaction_crash("page_compaction.after_publish");
+	test_isolated_compaction_crash("page_gc.after_mark_delete");
+	test_isolated_compaction_late_candidate();
+	test_isolated_compaction_resumes_search(0, 0);
+	test_isolated_compaction_resumes_search(1, 0);
+	test_isolated_compaction_resumes_search(0, 1);
+	test_isolated_search_exhausted_progress();
+	test_bounded_overlapping_suffix(0);
+	test_bounded_overlapping_suffix(1);
 	test_bounded_shared_payload_capacity_fallback();
 	test_bounded_prune_multiple_outputs(0);
 	test_bounded_prune_multiple_outputs(1);

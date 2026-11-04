@@ -167,6 +167,21 @@ layer_covers(const PsLayerDesc *d, const PsKey *key, uint32_t block)
 	return 1;
 }
 
+/* The block bounds are global for the whole key range, not paired with the
+ * endpoint keys.  Disjointness in either dimension proves that the layers
+ * cannot contain the same page identity.  Invalid bounds prove nothing. */
+int
+ps_image_layer_ranges_disjoint(const PsLayerDesc *a, const PsLayerDesc *b)
+{
+	if (key_cmp(&a->start_key, &a->end_key) > 0 ||
+		key_cmp(&b->start_key, &b->end_key) > 0 ||
+		a->start_block > a->end_block || b->start_block > b->end_block)
+		return 0;
+	return key_cmp(&a->end_key, &b->start_key) < 0 ||
+		key_cmp(&b->end_key, &a->start_key) < 0 ||
+		a->end_block < b->start_block || b->end_block < a->start_block;
+}
+
 static const PsLayerLocation *
 img_local_loc(const PsLayerDesc *layer)
 {
@@ -1587,7 +1602,7 @@ image_compaction_snapshot_valid(const PsLayerMap *map,
 								   const PsLayerDesc *outputs, uint32_t noutputs,
 	uint32_t retired_prefix, int retiring, int allow_newer)
 {
-	uint64_t max_id = 0;
+	uint64_t max_id = 0, min_id = UINT64_MAX;
 	uint32_t seen_inputs = 0, seen_outputs = 0;
 	uint64_t seen_input_bits = 0, seen_output_bits = 0;
 
@@ -1611,6 +1626,8 @@ image_compaction_snapshot_valid(const PsLayerMap *map,
 				return 0;
 		if (inputs[i].layer_id > max_id)
 			max_id = inputs[i].layer_id;
+		if (inputs[i].layer_id < min_id)
+			min_id = inputs[i].layer_id;
 	}
 	for (uint32_t i = 0; i < noutputs; i++)
 		if (outputs[i].kind != PS_LAYER_IMAGE || outputs[i].deleting ||
@@ -1666,10 +1683,26 @@ image_compaction_snapshot_valid(const PsLayerMap *map,
 				matched = 1;
 				break;
 			}
-		if (!matched && !current->deleting &&
-			(!allow_newer || current->legacy_shard_zero ||
-			 current->layer_id <= outputs[noutputs - 1].layer_id))
-			return 0;
+		if (!matched && !current->deleting)
+		{
+			int disjoint = 1;
+
+			if (!allow_newer || current->legacy_shard_zero)
+				return 0;
+			if (current->layer_id > outputs[noutputs - 1].layer_id)
+				continue;
+			/* An omitted older layer already loses every tied identity to
+			 * the selected suffix. Full-coverage verification preserves that
+			 * winner in a replacement newer than all selected sources. */
+			if (current->layer_id < min_id)
+				continue;
+			for (uint32_t j = 0; j < ninputs && disjoint; j++)
+				disjoint = ps_image_layer_ranges_disjoint(current, &inputs[j]);
+			for (uint32_t j = 0; j < noutputs && disjoint; j++)
+				disjoint = ps_image_layer_ranges_disjoint(current, &outputs[j]);
+			if (!disjoint)
+				return 0;
+		}
 	}
 	return seen_inputs == ninputs && (!retiring || seen_outputs == noutputs);
 }
@@ -1717,8 +1750,9 @@ ps_image_compaction_retirement_valid(const PsLayerMap *map,
 }
 
 /* These variants are only for an all-versions-preserving merge with reserved
- * output IDs: any added layer must sort after every replacement, so it keeps
- * the same priority over a tied input version as before compaction. */
+ * output IDs. Other layers must sort before all inputs, after all outputs,
+ * or be disjoint from every input and output, so tied identities keep their
+ * winner. */
 int
 ps_image_compaction_snapshot_valid_newer(const PsLayerMap *map,
 	const PsLayerDesc *inputs, uint32_t ninputs,

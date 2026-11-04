@@ -218,6 +218,59 @@ read_live_latest(const PsKey *key, uint32_t block, unsigned char *page)
 	return found;
 }
 
+static void
+test_overlapping_suffix_tie_recovery(void)
+{
+	char dir[TEST_TEMP_PATH_MAX] = "ps-suffix-tie-XXXXXX";
+	PsKey key = {1, 1, 957, 0, PS_KLASS_RELATION};
+	unsigned char bytes[4][PSZ] = {{1}, {2}, {3}, {4}}, page[PSZ];
+	PsImgRec rec = {.key = key, .block = 0, .lsn = 100};
+	PsLayerDesc layers[4] = {0}, inputs[2], outputs[1];
+	uint64_t ids[1] = {4}, uncertain = 0;
+	uint32_t noutputs = 0;
+	int ok;
+
+	if (!test_mkdtemp(dir, sizeof(dir)) || ps_layer_store->open(dir) != 0 ||
+		ps_manifest_open(dir) != 0)
+	{
+		check(0, "open overlapping suffix tie fixture");
+		return;
+	}
+	ok = 1;
+	for (uint32_t i = 0; i < 3; i++)
+	{
+		rec.page = bytes[i];
+		ok = ok && ps_image_layer_write(i + 1, 0, &rec, 1, PSZ, &layers[i]) == 0 &&
+			ps_manifest_add_layer(&layers[i]) == 0;
+	}
+	/* The suffix selector supplies newest first; merge priority must use IDs,
+	 * not the order of this array. */
+	inputs[0] = layers[2];
+	inputs[1] = layers[1];
+	ok = ok && read_live_exact(&key, 0, page) == 1 && page[0] == 3 &&
+		ps_image_compaction_prepare(inputs, 2, ids, 1, PSZ, outputs,
+			&noutputs, &uncertain) == 0 && noutputs == 1 &&
+		ps_image_compaction_verify_coverage(inputs, 2, outputs, 1, PSZ) == 0 &&
+		pin_test_sources(inputs, 2) &&
+		ps_manifest_publish_image_batch_newer(inputs, 2, outputs, 1, 0) == 0;
+	check(ok && read_live_exact(&key, 0, page) == 1 && page[0] == 3,
+		  "suffix replacement preserves the winning tied identity over older input");
+	rec.page = bytes[3];
+	ok = ok && ps_image_layer_write(5, 0, &rec, 1, PSZ, &layers[3]) == 0 &&
+		ps_manifest_add_new_layer(&layers[3]) == 0 &&
+		ps_manifest_retire_image_source_newer(inputs, 2, outputs, 1, 0) == 0;
+	check(ok && read_live_exact(&key, 0, page) == 1 && page[0] == 4,
+		  "newer concurrent tied identity wins after first source retirement");
+	ps_manifest_close();
+	ps_layer_store->close();
+	check(ps_layer_store->open(dir) == 0 && ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0 && read_live_exact(&key, 0, page) == 1 &&
+		  page[0] == 4, "partial suffix retirement preserves concurrent winner after restart");
+	ps_manifest_close();
+	ps_layer_store->close();
+	remove_tree(dir);
+}
+
 /* A process exit after the first ADD must leave all inputs authoritative.
  * The unrecorded second output is an orphan, not permission to retire input. */
 static void
@@ -1287,6 +1340,7 @@ main(void)
 			   *pb;
 
 	test_partial_batch_publication_restart();
+	test_overlapping_suffix_tie_recovery();
 	if (!test_mkdtemp(dir, sizeof(dir)) || !test_mkdtemp(objects, sizeof(objects)) ||
 		setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0 ||
 		ps_layer_store->open(dir) != 0 ||

@@ -733,6 +733,14 @@ existing refusal behavior; data forks are not eligible for hint reset.
 
 `--max-store-gb` is a stop threshold, not a reclamation controller. Controller
 high-water/catch-up settings are supplied with repeated `--daemon-arg` options.
+For example, `--daemon-arg=--page-high-water-bytes --daemon-arg=1073741824
+--daemon-arg=--page-catch-up-bytes --daemon-arg=536870912` enables page-GC
+backpressure at 1 GiB of covered segment debt, resuming at or below 512 MiB. This
+can reduce a backlog when writes outpace GC, at the cost of foreground waits.
+It is not a quota on the store: live pages, unflushed segments, retained WAL,
+branch history and compaction outputs also occupy space, and sampling and
+in-flight work can overshoot the threshold. A long run is still needed to
+establish whether a chosen store budget is sufficient for its workload.
 After a restart without the PAGE controller, segment GC starts at the oldest
 id and checks for missing prefix files before preparing layers. The locked
 recheck still settles ambiguous removals; a segment that appears after a

@@ -97,6 +97,9 @@ extern int	ps_layer_map_reserve(PsLayerMap *map, uint32_t capacity);
 extern int	ps_layer_map_add(PsLayerMap *map, const PsLayerDesc *desc);
 extern uint32_t ps_layer_map_count(const PsLayerMap *map);
 
+/* Conservative disjointness of the inclusive image key and block bounds. */
+extern int ps_image_layer_ranges_disjoint(const PsLayerDesc *a, const PsLayerDesc *b);
+
 /* ---------------------------------------------------------------------------
  * Image layer file format (phase 2).
  *
@@ -341,9 +344,10 @@ extern int ps_image_compaction_publication_valid(const PsLayerMap *map,
 extern int ps_image_compaction_retirement_valid(const PsLayerMap *map,
 	const PsLayerDesc *inputs, uint32_t ninputs,
 	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t retired_prefix);
-/* All-versions-preserving variants permit additional same-shard layers only
- * when their IDs sort after every reserved output. The caller must prove full
- * input coverage and own the input pins, just as for the strict variants. */
+/* All-versions-preserving variants permit additional same-shard layers when
+ * their IDs sort before every input, after every reserved output, or their
+ * key/block bounds are disjoint from all inputs and outputs. The caller must
+ * prove full input coverage and own the input pins, just as for strict mode. */
 extern int ps_image_compaction_snapshot_valid_newer(const PsLayerMap *map,
 	const PsLayerDesc *inputs, uint32_t ninputs,
 	const PsLayerDesc *outputs, uint32_t noutputs);
