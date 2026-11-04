@@ -8930,7 +8930,15 @@ fork_event_add_unchecked(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	}
 	else if (admission_seq > e->max_meta_seq)
 		e->max_meta_seq = admission_seq;	/* SET/DEAD: always META */
-	if (is_meta)
+	if (is_meta && i == e->nev - 1 &&
+		(i == 0 || e->ev[i - 1].lsn != lsn))
+	{
+		/* A new final LSN starts a one-event run. Earlier META_FIRST bits
+		 * and late indexes cannot change, so avoid refolding the entire
+		 * history for each ordered event loaded from a snapshot. */
+		e->ev[i].flags |= FEV_F_META_FIRST;
+	}
+	else if (is_meta)
 		fork_event_recompute_meta_first(e);
 	else
 		fork_late_meta_shift(e, i);
