@@ -19195,6 +19195,23 @@ walidx_entry_prune_plan(const WalIdxEnt *e, uint64_t cutoff,
 										cutoff,
 										walidx_plan_horizon_protected(cutoff),
 										horizons, nhorizons, ok, proof_floor, keep);
+		/* Preserve every record of an unprovable, well-formed page.  A bad
+		 * chain still aborts compact publication for the whole timeline. */
+		if (rc < 0 && ps_walidx_prune_items_valid(items, (uint32_t) e->n))
+		{
+			bool all_known = true;
+
+			/* Legacy entries lack an end position.  Keep the existing
+			 * full-timeline fallback until their frontier semantics are proven. */
+			for (int i = 0; i < e->n; i++)
+				if (!items[i].known)
+					all_known = false;
+			if (all_known)
+			{
+				memset(keep, 1, (size_t) e->n);
+				rc = e->n;
+			}
+		}
 		free(ok);
 	}
 	free(items);
@@ -19616,6 +19633,60 @@ walidx_base_visible_to_fences(const PageEnt *page, const PageVer * version,
 	return 1;
 }
 
+/* A WAL-less page has no position order.  Only use a definitive event as
+ * replacement evidence if it kills every local WAL-less version by admission
+ * order, and no ancestor has such versions.  All shard and map locks are held. */
+static int
+walidx_death_covers_wal_less(const ForkEnt *f, const ForkEvent *death)
+{
+	TlWalk w = tl_walk_first(f->timeline, UINT64_MAX);
+
+	if (!f->has_wal_less || death->lsn == 0 || death->admission_seq == 0)
+		return 0;
+	while (tl_walk_next(&w))
+	{
+		ForkEnt *parent = fork_find(w.tl, &f->key);
+
+		if (parent != NULL && parent->has_wal_less)
+			return 0;
+	}
+	for (const PageEnt *p = f->pages; p != NULL; p = p->fork_next)
+		for (int i = 0; i < p->nver; i++)
+			if (p->vers[i].lsn == 0 &&
+				((death->kind != FEV_DEAD && p->block < death->nblocks) ||
+				 p->vers[i].admission_seq == 0 ||
+				 p->vers[i].admission_seq >= death->admission_seq))
+				return 0;
+	return 1;
+}
+
+/* A capped WAL base view can report lifecycle only when every local
+ * unversioned page is invalidated in that very view.  Remain conservative
+ * about unversioned pages on ancestors.  The caller holds shard and map locks. */
+static int
+walidx_view_covers_wal_less(uint32_t timeline, const PsKey *key, ViewCap cap)
+{
+	TlWalk w = tl_walk_first_cap(timeline, cap);
+	ForkEnt *f = fork_find(timeline, key);
+
+	if (f == NULL || !f->has_wal_less)
+		return 0;
+	for (const PageEnt *p = f->pages; p != NULL; p = p->fork_next)
+		for (int i = 0; i < p->nver; i++)
+			if (p->vers[i].lsn == 0 &&
+				!fork_page_invalidated(f, p->block, &p->vers[i], &w.cap,
+									   w.inherited_below, w.has_inherited_below))
+				return 0;
+	while (tl_walk_next(&w))
+	{
+		ForkEnt *parent = fork_find(w.tl, key);
+
+		if (parent != NULL && parent->has_wal_less)
+			return 0;
+	}
+	return 1;
+}
+
 static int
 walidx_plan_bases_build(uint32_t tl)
 {
@@ -19698,11 +19769,11 @@ walidx_plan_bases_build(uint32_t tl)
 				uint64_t   *deaths;
 				uint32_t	ndeaths = 0;
 				uint32_t	ndeaths_out = 0;
+				int			wal_less;
 
 				if (e->timeline != tl || e->n == 0)
 					continue;
-				if (fork_has_wal_less_page(tl, &e->key))
-					continue;
+				wal_less = fork_has_wal_less_page(tl, &e->key);
 				p = page_find(tl, &e->key, e->block);
 				f = fork_find(tl, &e->key);
 				/* A definitive fork event that leaves this block outside the
@@ -19716,13 +19787,14 @@ walidx_plan_bases_build(uint32_t tl)
 						uint32_t i = f->def_idx[di];
 
 						if (f->ev[i].lsn != 0 &&
+							(!wal_less || walidx_death_covers_wal_less(f, &f->ev[i])) &&
 							walidx_death_visible_to_fences(f, i, fences, nfences) &&
 							(f->ev[i].kind == FEV_DEAD ||
 							 (f->ev[i].kind == FEV_SET &&
 							  f->ev[i].nblocks <= e->block)))
 							ndeaths++;
 					}
-				if (f != NULL)
+				if (f != NULL && !wal_less)
 					for (uint32_t i = 0; i < nhorizons; i++)
 					{
 						uint32_t	nb = 0;
@@ -19744,7 +19816,7 @@ walidx_plan_bases_build(uint32_t tl)
 							walidx_absent_at_fences(f, e->block, horizons[i], fences, nfences, &views))
 							ndeaths++;
 					}
-				n = p != NULL && p->nver > 0 ? (uint32_t) p->nver : 0;
+				n = !wal_less && p != NULL && p->nver > 0 ? (uint32_t) p->nver : 0;
 				if (n == 0 && ndeaths == 0)
 					continue;
 				chain = malloc((size_t) (n != 0 ? n : 1) * sizeof(*chain));
@@ -19801,13 +19873,14 @@ walidx_plan_bases_build(uint32_t tl)
 						uint32_t i = f->def_idx[di];
 
 						if (f->ev[i].lsn != 0 &&
+							(!wal_less || walidx_death_covers_wal_less(f, &f->ev[i])) &&
 							walidx_death_visible_to_fences(f, i, fences, nfences) &&
 							(f->ev[i].kind == FEV_DEAD ||
 							 (f->ev[i].kind == FEV_SET &&
 							  f->ev[i].nblocks <= e->block)))
 							deaths[ndeaths_out++] = f->ev[i].lsn;
 					}
-					for (uint32_t i = 0; i < nhorizons; i++)
+					for (uint32_t i = 0; !wal_less && i < nhorizons; i++)
 					{
 						uint32_t	nb = 0;
 						ViewCap hc = viewcap_lsn_seq(horizons[i], 0);
@@ -19917,9 +19990,9 @@ walidx_materializer_proof_floor(uint32_t timeline, uint64_t *floor_out)
 	return 0;
 }
 
-/* Prove every page before writing any compacted shard.  One unprovable page
- * keeps the whole timeline on its full snapshot generation, so the single
- * timeline frontier can never mask a lagging shard. */
+/* Plan every page before writing any compacted shard. An unprovable page with
+ * well-formed known records is retained in full across the new frontier;
+ * legacy or malformed inputs still force a full timeline snapshot. */
 static int
 walidx_snapshot_compaction_plan(uint32_t tl, uint64_t cutoff,
 								const uint64_t *horizons,
@@ -22664,7 +22737,8 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		/* A missing durable image must not turn a WAL-less data page into
 		 * a fabricated zero page. Match capped NBLOCKS completeness rules. */
-		if (fork_has_wal_less_page(timeline, key))
+		if (fork_has_wal_less_page(timeline, key) &&
+			!walidx_view_covers_wal_less(timeline, key, *index_cap))
 		{
 			walidx_publish_rdunlock();
 			ps_unlock_map();

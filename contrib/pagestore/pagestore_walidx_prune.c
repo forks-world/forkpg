@@ -101,6 +101,28 @@ bases_valid(const uint64_t *bases, uint32_t nbases)
 }
 
 int
+ps_walidx_prune_items_valid(const PsWalIdxPruneItem *items, uint32_t n)
+{
+	uint64_t last_known_end = 0;
+
+	if (n != 0 && items == NULL)
+		return 0;
+	for (uint32_t i = 0; i < n; i++)
+	{
+		if (items[i].known > 1 || items[i].fpi > 1 ||
+			(i != 0 && items[i].lsn <= items[i - 1].lsn) ||
+			(items[i].known && items[i].end_lsn <= items[i].lsn) ||
+			(items[i].known && last_known_end != 0 && items[i].end_lsn <= last_known_end) ||
+			(!items[i].known && items[i].end_lsn != 0) ||
+			(items[i].fpi && !items[i].known))
+			return 0;
+		if (items[i].known)
+			last_known_end = items[i].end_lsn;
+	}
+	return 1;
+}
+
+int
 ps_walidx_prune_plan_bases(const PsWalIdxPruneItem *items, uint32_t n,
 						   const uint64_t *bases, uint32_t nbases,
 						   const uint64_t *deaths, uint32_t ndeaths,
@@ -110,11 +132,11 @@ ps_walidx_prune_plan_bases(const PsWalIdxPruneItem *items, uint32_t n,
 						   unsigned char *keep)
 {
 	int kept = 0;
-	uint64_t last_known_end = 0;
 
 	if ((n != 0 && (items == NULL || keep == NULL)) ||
 		(nhorizons != 0 && (horizons == NULL || horizon_bases_ok == NULL)) ||
 		!bases_valid(bases, nbases) || !bases_valid(deaths, ndeaths) ||
+		!ps_walidx_prune_items_valid(items, n) ||
 		cutoff == 0)
 		return -1;
 	if (n == 0)
@@ -122,16 +144,6 @@ ps_walidx_prune_plan_bases(const PsWalIdxPruneItem *items, uint32_t n,
 	memset(keep, 0, n);
 	for (uint32_t i = 0; i < n; i++)
 	{
-		if (items[i].known > 1 || items[i].fpi > 1 ||
-			(i != 0 && items[i].lsn <= items[i - 1].lsn) ||
-			(items[i].known && items[i].end_lsn <= items[i].lsn) ||
-			(items[i].known && last_known_end != 0 &&
-			 items[i].end_lsn <= last_known_end) ||
-			(!items[i].known && items[i].end_lsn != 0) ||
-			(items[i].fpi && !items[i].known))
-			return -1;
-		if (items[i].known)
-			last_known_end = items[i].end_lsn;
 		/* Legacy entries cannot establish visibility or a replacement base.
 		 * Once the operational cutoff reaches one, leave this page intact. */
 		if (!items[i].known && items[i].lsn <= cutoff)

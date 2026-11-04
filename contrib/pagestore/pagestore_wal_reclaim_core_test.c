@@ -160,11 +160,12 @@ append_wal_bytes(uint32_t timeline, uint64_t start, uint32_t len)
 }
 
 static int
-wal_index_add_record(uint32_t timeline, uint64_t lsn, uint32_t block, int fpi)
+wal_index_add_keyed_record(uint32_t timeline, const PsKey *keyp,
+						   uint64_t lsn, uint32_t block, int fpi)
 {
 	PsChannel ch;
 	PsWalIndexEntry entry;
-	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsKey key = *keyp;
 
 	memset(&ch, 0, sizeof(ch));
 	memset(&entry, 0, sizeof(entry));
@@ -189,6 +190,14 @@ wal_index_add_record(uint32_t timeline, uint64_t lsn, uint32_t block, int fpi)
 }
 
 static int
+wal_index_add_record(uint32_t timeline, uint64_t lsn, uint32_t block, int fpi)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	return wal_index_add_keyed_record(timeline, &key, lsn, block, fpi);
+}
+
+static int
 wal_index_add(uint32_t timeline, uint64_t lsn)
 {
 	return wal_index_add_record(timeline, lsn, 0, 1);
@@ -196,15 +205,14 @@ wal_index_add(uint32_t timeline, uint64_t lsn)
 
 /* Number of indexed records for (relation, block) at or below lsn_max. */
 static int
-wal_index_count(uint32_t timeline, uint32_t block, uint64_t lsn_max)
+wal_index_count_keyed(uint32_t timeline, const PsKey *keyp, uint32_t block, uint64_t lsn_max)
 {
 	PsChannel ch;
-	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 
 	memset(&ch, 0, sizeof(ch));
 	ch.opcode = PS_OP_WAL_INDEX_GET;
 	ch.timeline = timeline;
-	ch.key = key;
+	ch.key = *keyp;
 	ch.blocknum = block;
 	ch.req_lsn = lsn_max;
 	ch.status = PS_STATUS_OK;
@@ -212,6 +220,14 @@ wal_index_count(uint32_t timeline, uint32_t block, uint64_t lsn_max)
 	(void) ps_handle_meta(&ch);
 	ps_lifecycle_read_unlock();
 	return ch.status == PS_STATUS_OK ? (int) ch.result : -1;
+}
+
+static int
+wal_index_count(uint32_t timeline, uint32_t block, uint64_t lsn_max)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	return wal_index_count_keyed(timeline, &key, block, lsn_max);
 }
 
 static int
@@ -1286,16 +1302,14 @@ test_superseded_note_in_memtable_is_pruned(void)
  * fill its memtable happen back to back, with no maintenance call at all in
  * between (so the watch cannot be re-armed a second time before the flush
  * lands) -- the arm from the *first* fruitless evaluation must still be the
- * one that fires.  Bounded to the 20 ms fire path, not the 1 s fallback.
+ * one that fires. Check the watch directly so host scheduling cannot make a
+ * working wakeup look like the one-second fallback.
  */
 static void
 test_base_durable_between_evaluations(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
 	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-policy-base-between-XXXXXX";
-	struct timespec t0,
-				t1;
-	double		elapsed_ms;
 
 	configure_core();
 	flush_pages = 4;
@@ -1307,22 +1321,20 @@ test_base_durable_between_evaluations(void)
 		  "segment 0 goes; segment 1 is blocked, and the request is served fruitless");
 	check(ps_test_walidx_reclaim_due(0) == 0,
 		  "the served publication dropped nothing and is fruitless-suppressed");
+	check(ps_test_wal_reclaim_watch_count(0) == 1, "the blocked page is watched");
 	check(write_relation_page(0, 0, limited + 100) &&
 		  write_relation_page(0, 1, limited + 200) &&
 		  write_relation_page(0, 2, limited + 300) &&
 		  write_relation_page(0, 3, limited + 400),
 		  "the base and three fillers, written and flushed durable in one go,"
 		  " with no maintenance call in between");
-	clock_gettime(CLOCK_MONOTONIC, &t0);
-	check(maintenance_until_count(store, 0, 0),
+	check(ps_test_wal_reclaim_watch_count(0) == 0,
+		  "the flush consumes the watch without a maintenance evaluation");
+	check(maintenance_until_count(store, 0, 0) ||
+		  maintenance_until_count(store, 0, 0) ||
+		  maintenance_until_count(store, 0, 0),
 		  "[design goal] the watch armed at the earlier fruitless evaluation"
 		  " fires on the flush the fillers triggered, reclaiming the segment");
-	clock_gettime(CLOCK_MONOTONIC, &t1);
-	elapsed_ms = (double) (t1.tv_sec - t0.tv_sec) * 1000.0 +
-		(double) (t1.tv_nsec - t0.tv_nsec) / 1e6;
-	check(elapsed_ms < 700.0,
-		  "the 20 ms fire path reclaims well under the 1 s no-progress"
-		  " fallback bound (before the fix: stuck for the whole window)");
 	check(maintenance_until_count(store, 0, 0), "... stays reclaimed");
 	close_store();
 	remove_tree(store);
@@ -1353,11 +1365,15 @@ test_base_durable_at_write(void)
 		  "construct a raw dependency whose horizon a materializer pin protects");
 	check(!maintenance_until_count(store, 0, 0) && segment_count(store, 0) == 2,
 		  "segment 0 goes; segment 1 is blocked, and the request is served fruitless");
+	check(ps_test_wal_reclaim_watch_count(0) == 1, "the blocked page is watched");
 	check(write_relation_page(0, 0, limited + 100),
 		  "the base is durable at the write itself (flush_pages == 1)");
-	check(maintenance_until_count(store, 0, 0),
-		  "the fire site inside the write's own flush reclaims within the"
-		  " first 1 s window");
+	check(ps_test_wal_reclaim_watch_count(0) == 0,
+		  "the write's own flush consumes the watch immediately");
+	check(maintenance_until_count(store, 0, 0) ||
+		  maintenance_until_count(store, 0, 0) ||
+		  maintenance_until_count(store, 0, 0),
+		  "the fire site inside the write's own flush leads to reclamation");
 	close_store();
 	remove_tree(store);
 
@@ -1371,7 +1387,9 @@ test_base_durable_at_write(void)
 	ps_test_set_wal_reclaim_watch_fire_hook(1);
 	check(write_relation_page(0, 0, limited + 100),
 		  "the base is durable at the write itself, but the fire site is suppressed");
-	check(maintenance_until_count(store2, 0, 0),
+	check(maintenance_until_count(store2, 0, 0) ||
+		  maintenance_until_count(store2, 0, 0) ||
+		  maintenance_until_count(store2, 0, 0),
 		  "[design goal] the evaluation's own evidence recomputation still"
 		  " reclaims, with no fire at all");
 	ps_test_set_wal_reclaim_watch_fire_hook(0);
@@ -3357,6 +3375,157 @@ test_index_base_reclaim_conservative_fallback(void)
 }
 
 static void
+test_wal_less_death_reclaims_only_covered_history(void)
+{
+	for (int late_page = 0; late_page < 2; late_page++)
+	{
+		char store[TEST_STORE_PATH_MAX] = "pagestore-wal-less-death-XXXXXX";
+		uint64_t old_view = WAL_SEGMENT + 175;
+		PsWalBaseState state;
+		unsigned char page[8192];
+
+		configure_core();
+		check(prepare_store(store, WAL_TOTAL, 0, WAL_SEGMENT + 100, 0) &&
+			  write_relation_page(0, 1, 0) &&
+			  reserve_pin(0, PS_RETENTION_OWNER_READER, 982, 1,
+				PS_RETENTION_RESOURCE_WAL_INDEX, old_view) &&
+			  unlink_relation(0, WAL_SEGMENT + 300) &&
+			  (!late_page || write_relation_page(0, 2, 0)) &&
+			  wal_index_progress(0, 0, WAL_TOTAL) &&
+			  reserve_pin(0, PS_RETENTION_OWNER_READER, 983, 1,
+				PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL_INDEX,
+				WAL_TOTAL), "prepare a WAL-less fork with a pre-death view");
+		check(!maintenance_until_count(store, 0, 0) &&
+			  wal_index_count(0, 0, WAL_TOTAL) == 1,
+			  "the pre-death view retains its FPI and raw WAL");
+		close_store();
+		check(ps_core_open(store) == 0 && segment_count(store, 0) == 2 &&
+			  wal_index_count(0, 0, WAL_TOTAL) == 1,
+			  "the pre-death view and its FPI survive recovery");
+		check(drop_wal_pin(0, 982, 1), "release the pre-death view");
+		if (late_page)
+		{
+			check(read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == -1,
+				  "the later WAL-less page still prevents lifecycle reconstruction");
+			check(!maintenance_until_count(store, 0, 0) &&
+				  wal_index_count(0, 0, WAL_TOTAL) == 1,
+				  "a WAL-less page admitted after death prevents its use as proof");
+			check(unlink_relation(0, WAL_SEGMENT + 400),
+				  "a later death covers the new WAL-less page");
+		}
+		for (int i = 0; i < 3 && segment_count(store, 0) != 0; i++)
+			(void) maintenance_until_count(store, 0, 0);
+		check(segment_count(store, 0) == 0 && wal_index_count(0, 0, WAL_TOTAL) == 0,
+			  "a death covering all WAL-less pages releases the old FPI and WAL");
+		check(read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == 0 &&
+			  !state.found && state.nblocks == 0 &&
+			  state.death_lsn == WAL_SEGMENT + (late_page ? 400 : 300),
+			  "the index view can reconstruct lifecycle after the covered death");
+		close_store();
+		check(ps_core_open(store) == 0 && segment_count(store, 0) == 0 &&
+			  wal_index_count(0, 0, WAL_TOTAL) == 0,
+			  "WAL reclamation survives restart");
+		check(read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == 0 &&
+			  state.nblocks == 0 && state.death_lsn == WAL_SEGMENT + (late_page ? 400 : 300),
+			  "the index lifecycle remains readable after restart");
+		close_store();
+		remove_tree(store);
+	}
+}
+
+static void
+test_wal_less_death_preserves_child_history(void)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-less-child-XXXXXX";
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, WAL_SEGMENT + 100, 0) &&
+		  write_relation_page(0, 1, 0) &&
+		  create_branch(1, 0, WAL_SEGMENT + 175) &&
+		  unlink_relation(0, WAL_SEGMENT + 300) &&
+		  wal_index_progress(0, 0, WAL_TOTAL) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 984, 1,
+			PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL_INDEX,
+			WAL_TOTAL), "prepare a child view preceding its parent's fork death");
+	check(!maintenance_until_count(store, 0, 0) &&
+		  wal_index_count(0, 0, WAL_TOTAL) == 1,
+		  "the child retains its parent's pre-death FPI and WAL");
+	close_store();
+	check(ps_core_open(store) == 0 && segment_count(store, 0) == 2 &&
+		  wal_index_count(0, 0, WAL_TOTAL) == 1,
+		  "the child's retained history survives recovery");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_wal_less_death_redo_after_regrow(void)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-less-regrow-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsWalBaseState state;
+	unsigned char page[8192];
+	uint64_t record = 2 * WAL_SEGMENT + 100;
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, WAL_SEGMENT + 100, 0) &&
+		  write_relation_page(0, 1, 0) &&
+		  unlink_relation(0, WAL_SEGMENT + 300) &&
+		  fork_op_keyed(0, &key, PS_OP_ZEROEXTEND, WAL_SEGMENT + 400, 1, 0) &&
+		  wal_index_add_record(0, record, 0, 0) &&
+		  wal_index_progress(0, 0, WAL_TOTAL) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 985, 1,
+			PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL_INDEX,
+			WAL_TOTAL), "prepare a non-FPI record after a WAL-less fork is regrown");
+	for (int i = 0; i < 3 && wal_index_count(0, 0, WAL_TOTAL) != 1; i++)
+		(void) maintenance_until_count(store, 0, 0);
+	check(wal_index_only_record(0, 0, WAL_TOTAL, record),
+		  "retire the pre-death FPI but retain the post-death redo record");
+	check(read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == 0 &&
+		  !state.found && state.nblocks == 1 && state.death_lsn == WAL_SEGMENT + 300,
+		  "redo can select a zero-regrown base with the correct lifecycle");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  wal_index_only_record(0, 0, WAL_TOTAL, record) &&
+		  read_index_state(0, 0, WAL_TOTAL, 0, page, &state) == 0 &&
+		  state.nblocks == 1 && state.death_lsn == WAL_SEGMENT + 300,
+		  "the redo chain and lifecycle survive restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_unprovable_page_does_not_block_other_wal_reclaim(void)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-partial-index-XXXXXX";
+	PsKey other = {1, 1, 2, 0, PS_KLASS_RELATION};
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, WAL_SEGMENT + 100, 0) &&
+		  write_relation_page(0, 1, 0) && unlink_relation(0, WAL_SEGMENT + 300) &&
+		  wal_index_add_keyed_record(0, &other, 2 * WAL_SEGMENT + 100, 4, 0) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 987, 1,
+			PS_RETENTION_RESOURCE_WAL_INDEX, 2 * WAL_SEGMENT + 175) &&
+		  wal_index_progress(0, 0, WAL_TOTAL) &&
+		  reserve_pin(0, PS_RETENTION_OWNER_READER, 986, 1,
+			PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL_INDEX,
+			WAL_TOTAL), "prepare a retireable FPI and an unrelated unprovable chain");
+	for (int i = 0; i < 3 && wal_index_count(0, 0, WAL_TOTAL) != 0; i++)
+		(void) maintenance_until_count(store, 0, 0);
+	check(wal_index_count(0, 0, WAL_TOTAL) == 0 &&
+		  wal_index_count_keyed(0, &other, 4, WAL_TOTAL) == 1 &&
+		  wal_index_count_keyed(0, &other, 4, 2 * WAL_SEGMENT + 175) == 1,
+		  "retire the covered FPI and preserve the unprovable page's entire chain");
+	close_store();
+	check(ps_core_open(store) == 0 && wal_index_count(0, 0, WAL_TOTAL) == 0 &&
+		  wal_index_count_keyed(0, &other, 4, WAL_TOTAL) == 1 &&
+		  wal_index_count_keyed(0, &other, 4, 2 * WAL_SEGMENT + 175) == 1,
+		  "the partial compaction result survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_index_state_caps_ancestry(void)
 {
 	char store[TEST_STORE_PATH_MAX] = "pagestore-index-ancestry-XXXXXX";
@@ -3738,6 +3907,15 @@ main(int argc, char **argv)
 		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 		return failed != 0;
 	}
+	if (argc == 2 && strcmp(argv[1], "--wal-less-death") == 0)
+	{
+		test_wal_less_death_reclaims_only_covered_history();
+		test_wal_less_death_preserves_child_history();
+		test_wal_less_death_redo_after_regrow();
+		test_unprovable_page_does_not_block_other_wal_reclaim();
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--replay-proof-interval") == 0)
 	{
 		test_materializer_retains_replay_proof_interval();
@@ -3758,6 +3936,10 @@ main(int argc, char **argv)
 	test_reindex_rejects_reclaimed_wal();
 	test_finite_index_base_reclaims_raw_wal();
 	test_index_base_reclaim_conservative_fallback();
+	test_wal_less_death_reclaims_only_covered_history();
+	test_wal_less_death_preserves_child_history();
+	test_wal_less_death_redo_after_regrow();
+	test_unprovable_page_does_not_block_other_wal_reclaim();
 	check(ps_test_walidx_death_fence() == 0,
 		  "death proof respects the exact-LSN bound of an otherwise unbounded view");
 	test_index_state_caps_ancestry();

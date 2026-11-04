@@ -12,6 +12,10 @@ typedef struct PsWalIdxPruneItem
 	unsigned char fpi;
 } PsWalIdxPruneItem;
 
+/* Validate the ordering and record metadata independently of whether an
+ * FPI or replacement base can prove a reconstruction chain. */
+extern int ps_walidx_prune_items_valid(const PsWalIdxPruneItem *items, uint32_t n);
+
 /*
  * Select the union of reconstruction chains required at cutoff and at every
  * discrete retention horizon.  Items must be ordered by WAL start LSN.  A

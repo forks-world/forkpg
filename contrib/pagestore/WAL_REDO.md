@@ -213,8 +213,11 @@ progress; a pinned compute supplies its explicit sequence.
 A registered view can return no durable base while still proving that the
 block exists after zero extension. It can also prove that the block is gone.
 Unknown views, corrupt/unreadable data, and WAL-less relation contents do not
-become successful empty lifecycle answers. Unversioned relations are refused
-because their missing durable base cannot justify synthesizing a zero page.
+become successful empty lifecycle answers. Unversioned relations are normally
+refused because their missing durable base cannot justify synthesizing a zero
+page. A local fork can instead report lifecycle when every unversioned page
+is invalidated at that exact view and no ancestor contains unversioned pages.
+An unversioned page that remains visible keeps the conservative error.
 The original base-only operation retains its existing contract.
 
 Both SQL single-page redo entrypoints cache this combined response for one
