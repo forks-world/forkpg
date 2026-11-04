@@ -386,7 +386,7 @@ extern int ps_test_timeline_page_proof_segment(uint32_t timeline);
 extern int ps_test_timeline_page_proof_shard(uint32_t timeline);
 struct PsLayerDesc;
 extern int ps_test_compact_read_batch(const struct PsLayerDesc *layer,
-										  uint32_t npages, unsigned char *out);
+									  uint32_t npages, unsigned char *out, int guard_admissions);
 extern int ps_test_wal_reclaim_maintenance(void);
 extern int ps_test_walidx_raw_first(void);
 /* Test-only: bump the WAL-reclaim proof epoch directly, without going

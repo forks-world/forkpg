@@ -1079,6 +1079,27 @@ ps_manifest_retire_image_source_newer(const PsLayerDesc *inputs, uint32_t ninput
 }
 
 int
+ps_manifest_publish_image_batch_disjoint(const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t batch_index)
+{
+	if (batch_index >= noutputs ||
+		!ps_image_compaction_publication_valid_disjoint(&ps_layer_map, inputs, ninputs,
+			outputs, noutputs, batch_index))
+		return -1;
+	return ps_manifest_add_new_layer(&outputs[batch_index]);
+}
+
+int
+ps_manifest_retire_image_source_disjoint(const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs, uint32_t source_index)
+{
+	if (!ps_image_compaction_retirement_valid_disjoint(&ps_layer_map, inputs, ninputs,
+			outputs, noutputs, source_index))
+		return -1;
+	return ps_manifest_mark_delete(inputs[source_index].layer_id);
+}
+
+int
 ps_manifest_set_remote_location(uint64_t layer_id,
 								const PsLayerLocation *location)
 {
