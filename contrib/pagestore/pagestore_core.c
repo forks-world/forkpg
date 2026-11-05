@@ -4113,13 +4113,18 @@ legacy_budget_defer(uint32_t timeline, uint32_t shard)
 {
 	uint64_t now = inspection_now_ns();
 
+	/* A bounded retry must be available after a transient staged conflict;
+	 * an over-budget legacy pass cannot clear the locked-fallback latch. */
+	ps_lock_shard_wr(shard);
+	g_shards[shard].staged_compaction_retries = 0;
+	ps_unlock_shard(shard);
 	/* This is scheduling backoff, not a timeout or a storage failure. */
 	if (!__atomic_exchange_n(&legacy_budget_reported[timeline][shard], 1, __ATOMIC_RELAXED))
 		fprintf(stderr, "pagestore_core: local legacy compaction deferred for timeline %u shard %u: page payload may exceed %llu bytes\n",
 				timeline, shard, (unsigned long long) legacy_record_limit() * page_size);
 	__atomic_store_n(&legacy_budget_retry_at[timeline][shard],
 		now != 0 && now <= UINT64_MAX - PS_LEGACY_BUDGET_RETRY_NS ?
-		now + PS_LEGACY_BUDGET_RETRY_NS : 0, __ATOMIC_RELAXED);
+		now + PS_LEGACY_BUDGET_RETRY_NS : 1, __ATOMIC_RELAXED);
 	__atomic_store_n(&compaction_selection_cursor, (timeline + 1) % MAX_TIMELINES,
 					 __ATOMIC_RELAXED);
 }
@@ -6006,14 +6011,15 @@ out:
  * entire local timeline. Caller holds the shard, prune and map locks; the
  * planners release and reacquire them around their own selected-input I/O. */
 static int
-compact_large_local_first(uint32_t timeline, uint32_t shard, uint64_t floor,
-						  int *prune_deferred, int *attempted)
+compact_local_first(uint32_t timeline, uint32_t shard, uint64_t floor,
+						  int *prune_deferred, int *attempted, int allow_small)
 {
 	uint64_t scanned = 0, kept = 0;
 	int rc;
 
 	if (!prune_abandon_local_only() || g_shards[shard].staged_compaction_retries >= 2 ||
-		count_image_layers(timeline, shard) <= PS_IMAGE_MERGE_MAX_INPUTS)
+		count_image_layers(timeline, shard) == 0 ||
+		(!allow_small && count_image_layers(timeline, shard) <= PS_IMAGE_MERGE_MAX_INPUTS))
 		return 0;
 	/* Preserve compact_timeline's existing whole-timeline reader-pin rule. */
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
@@ -28704,6 +28710,45 @@ evict_one_layer(void)
 	return 1;
 }
 
+/* A legacy budget rejection is not evidence that a bounded subset is too
+ * large. Retry under the usual snapshot locks before backing this timeline off. */
+static int
+compact_budget_retry_now(uint32_t timeline, uint32_t shard, uint32_t nshards)
+{
+	uint64_t floor = 0;
+	int attempted = 0, deferred = 0, bounded = 0, was_due;
+
+	for (uint32_t sh = 0; sh < nshards; sh++)
+		ps_lock_shard_wr(sh);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	/* A rejected legacy pass cannot clear a stale staged-conflict latch. */
+	g_shards[shard].staged_compaction_retries = 0;
+	if (ps_timeline_live(timeline) && prune_abandon_local_only() &&
+		count_image_layers(timeline, shard) != 0 &&
+		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+			&floor, 1, NULL, NULL, NULL, NULL) == 0)
+	{
+		was_due = __atomic_exchange_n(&page_prune_due[timeline][shard], 0, __ATOMIC_ACQ_REL);
+		bounded = compact_local_first(timeline, shard, floor, &deferred, &attempted, 1);
+		if ((bounded <= 0 && was_due) || deferred)
+			__atomic_store_n(&page_prune_due[timeline][shard], 1, __ATOMIC_RELEASE);
+		if (bounded != 0)
+			__atomic_fetch_add(&ps_test_compaction_pass_count, 1, __ATOMIC_RELAXED);
+	}
+	ps_unlock_map();
+	pthread_rwlock_unlock(&page_prune_lock);
+	for (uint32_t sh = nshards; sh > 0; sh--)
+		ps_unlock_shard(sh - 1);
+	if (bounded > 0)
+	{
+		/* Keep the bounded path eligible on a subsequent search turn. */
+		__atomic_store_n(&legacy_budget_retry_at[timeline][shard], 1, __ATOMIC_RELAXED);
+		return 1;
+	}
+	return 0;
+}
+
 /*
  * Off-the-write-path background maintenance: compact one timeline whose image
  * layer count exceeds the (low-water) threshold.  The maintenance controller
@@ -29180,14 +29225,18 @@ ps_core_maintenance_impl(void)
 		int bounded_finished = 0;
 		int bounded_attempted = 0;
 		int large_local = 0;
+		int retry_budget = __atomic_load_n(&legacy_budget_retry_at[ftl][fsh], __ATOMIC_RELAXED) != 0;
 		int materialized;
 
-		/* Large local timelines can select and verify a bounded input set
-		 * themselves. Do that before the legacy all-layer materialization. */
+		/* Large local timelines and budget-deferred retries can select and
+		 * verify bounded inputs before legacy all-layer materialization. */
 		if (prune_abandon_local_only())
 		{
+			uint32_t count;
+
 			ps_lock_map_rd();
-			large_local = count_image_layers(ftl, fsh) > PS_IMAGE_MERGE_MAX_INPUTS;
+			count = count_image_layers(ftl, fsh);
+			large_local = count > PS_IMAGE_MERGE_MAX_INPUTS || (retry_budget && count != 0);
 			ps_unlock_map();
 		}
 		if (large_local)
@@ -29198,13 +29247,14 @@ ps_core_maintenance_impl(void)
 			ps_lock_map_wr();
 			if (ps_timeline_live(ftl) && prune_abandon_local_only() &&
 				g_shards[fsh].staged_compaction_retries < 2 &&
-				count_image_layers(ftl, fsh) > PS_IMAGE_MERGE_MAX_INPUTS &&
+				count_image_layers(ftl, fsh) != 0 &&
+				(retry_budget || count_image_layers(ftl, fsh) > PS_IMAGE_MERGE_MAX_INPUTS) &&
 				retention_effective_floor_internal(ftl, PS_RETENTION_RESOURCE_PAGE_HISTORY,
 														   &page_floor, 1, NULL, NULL, NULL, NULL) == 0)
 			{
 				int deferred = 0;
 				int was_due = __atomic_exchange_n(&page_prune_due[ftl][fsh], 0, __ATOMIC_ACQ_REL);
-				int bounded = compact_large_local_first(ftl, fsh, page_floor, &deferred, &bounded_attempted);
+				int bounded = compact_local_first(ftl, fsh, page_floor, &deferred, &bounded_attempted, retry_budget);
 
 				if ((bounded <= 0 && was_due) || deferred)
 					__atomic_store_n(&page_prune_due[ftl][fsh], 1, __ATOMIC_RELEASE);
@@ -29223,7 +29273,14 @@ ps_core_maintenance_impl(void)
 		materialized = bounded_finished ? 1 : materialize_compaction_inputs(ftl, fsh);
 
 		if (materialized == -2)
-			legacy_budget_defer(ftl, fsh);
+		{
+			/* Do not run the same bounded search twice in one turn: its
+			 * resumable cursor could cycle without reaching a candidate. */
+			if (!bounded_attempted && compact_budget_retry_now(ftl, fsh, ns))
+				did = 1;
+			else
+				legacy_budget_defer(ftl, fsh);
+		}
 		if (materialized == 0)
 		{
 			int budget_retry_needed = 0;
@@ -29248,6 +29305,8 @@ ps_core_maintenance_impl(void)
 			{
 				int		prune_deferred = 0;
 				int		compact_rc;
+				int		bounded_was_available = bounded_attempted ||
+					g_shards[fsh].staged_compaction_retries < 2;
 				int		was_due = __atomic_exchange_n(&page_prune_due[ftl][fsh],
 													  0, __ATOMIC_ACQ_REL);
 
@@ -29260,7 +29319,7 @@ ps_core_maintenance_impl(void)
 
 				did = compact_rc > 0;
 				if (compact_rc == -2)
-					budget_retry_needed = 1;
+					budget_retry_needed = bounded_was_available ? 1 : 2;
 				if ((!did && was_due) || prune_deferred)
 					__atomic_store_n(&page_prune_due[ftl][fsh], 1,
 									 __ATOMIC_RELEASE);
@@ -29270,7 +29329,12 @@ ps_core_maintenance_impl(void)
 			for (uint32_t sh = ns; sh > 0; sh--)
 				ps_unlock_shard(sh - 1);
 			if (budget_retry_needed)
-				legacy_budget_defer(ftl, fsh);
+			{
+				if (budget_retry_needed == 2 && compact_budget_retry_now(ftl, fsh, ns))
+					did = 1;
+				else
+					legacy_budget_defer(ftl, fsh);
+			}
 		}
 	}
 	/* Keep compaction inputs resident until due compaction has run.  Evicting

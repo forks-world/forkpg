@@ -35,10 +35,12 @@ under the compaction snapshot before writing; new layers between preflight and
 snapshot therefore cannot bypass it. This is a conservative upper bound on the
 page payload of a single legacy output (512 MiB at 8 KiB per page); metadata,
 retained sources, other writes, and existing oversized layers remain outside the
-bound. An over-budget timeline is deferred for five seconds and selection moves
-to another timeline. The interval is a retry backoff, not an I/O deadline or
-proof of failure; the process emits one diagnostic per timeline and shard per
-process lifetime when the budget first blocks a pass. A conservative refusal can delay useful pruning until the input set is
+bound. Before deferring an over-budget timeline, maintenance clears the staged
+conflict latch and tries bounded inputs even below the usual layer-count
+threshold. If no bounded work is possible, it defers the timeline for five
+seconds and gives another timeline a turn. The interval is a retry backoff, not
+an I/O deadline or proof of failure; the process emits one diagnostic per
+timeline and shard per process lifetime when the budget first blocks a pass. A conservative refusal can delay useful pruning until the input set is
 made smaller by bounded compaction, so this is a peak-write guard rather than a
 complete progress solution. Remote and unknown providers retain their existing
 policy. Restart discards the cursor and starts discovery again; it never
