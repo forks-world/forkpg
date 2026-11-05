@@ -866,6 +866,59 @@ test_isolated_search_exhausted_progress(void)
 }
 
 static void
+test_large_newest_suffix_selection(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-large-suffix-XXXXXX";
+	PsLayerMap map;
+	uint64_t ids[PS_IMAGE_MERGE_MAX_INPUTS];
+	uint32_t n;
+
+	configure_core(0);
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open large suffix fixture");
+		return;
+	}
+	ps_layer_map_init(&map);
+	for (uint32_t i = 1; i <= 4000; i++)
+	{
+		PsLayerDesc d = {0};
+
+		d.layer_id = i;
+		d.kind = PS_LAYER_IMAGE;
+		d.location_count = 1;
+		d.locations[0].tier = PS_LAYER_TIER_LOCAL_HOT;
+		d.locations[0].available = true;
+		d.locations[0].size = 8192;
+		if (ps_layer_map_add(&map, &d) != 0)
+		{
+			check(0, "allocate large suffix fixture");
+			ps_layer_map_free(&map);
+			close_store();
+			remove_tree(store);
+			return;
+		}
+	}
+	n = ps_test_bounded_newest_suffix(&map, ids);
+	check(n == PS_IMAGE_MERGE_MAX_INPUTS && ids[0] == 4000 &&
+		  ids[n - 1] == 4000 - PS_IMAGE_MERGE_MAX_INPUTS + 1,
+		  "newest suffix remains selectable beyond the forward-search budget");
+	/* A changed physical order must still select by layer ID. */
+	{
+		PsLayerDesc tmp = map.layers[0];
+		map.layers[0] = map.layers[map.nlayers - 1];
+		map.layers[map.nlayers - 1] = tmp;
+	}
+	n = ps_test_bounded_newest_suffix(&map, ids);
+	check(n == PS_IMAGE_MERGE_MAX_INPUTS && ids[0] == 4000 &&
+		  ids[n - 1] == 4000 - PS_IMAGE_MERGE_MAX_INPUTS + 1,
+		  "suffix selection uses layer IDs instead of map order");
+	ps_layer_map_free(&map);
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_bounded_overlapping_suffix(int nonzero_floor)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-overlap-suffix-XXXXXX";
@@ -906,6 +959,88 @@ test_bounded_overlapping_suffix(int nonzero_floor)
 	close_store();
 	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) &&
 		  read_relation_at(0, 1069), "suffix merge survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_rejected_suffix_resumes_large_search(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-rejected-suffix-XXXXXX";
+	uint64_t before, attempted, materialized;
+
+	configure_core(1);
+	compact_layers = 2000;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  write_relation(0, 0, 1000), "open rejected large suffix fixture");
+	run_maintenance(32);
+	for (uint32_t i = 1; i <= 1600; i++)
+		check(write_relation(0, 0, 1000 + i), "write overlapping obsolete suffix version");
+	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 10000),
+		  "set a floor that makes an all-version merge ineligible");
+	before = ps_test_bounded_compaction_count();
+	materialized = ps_test_compaction_materialize_count();
+	compact_layers = 1;
+	for (int i = 0; i < 256 && ps_test_bounded_compaction_count() == before; i++)
+		(void) ps_core_maintenance();
+	attempted = ps_test_bounded_compaction_count();
+	check(attempted > before && ps_test_compaction_materialize_count() == materialized,
+		  "ineligible suffix continues unfinished search without full materialization");
+	run_maintenance(3);
+	check(ps_test_bounded_compaction_count() == attempted &&
+		  ps_test_compaction_materialize_count() == materialized &&
+		  read_relation_at(0, 2600),
+		  "unfinished search avoids retrying the same rejected suffix");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_mixed_control_suffix_merge(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-mixed-suffix-XXXXXX";
+	uint64_t before, version = 0;
+	uint32_t live_before = 0, live_after = 0;
+
+	configure_core(1);
+	compact_layers = 1000;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 1000) &&
+		  write_relation(0, 0, 1000), "open mixed suffix fixture");
+	run_maintenance(32);
+	for (uint32_t i = 1; i < 70; i++)
+		check(write_relation(0, 0, 1000 + i), "write mixed suffix history");
+	check(write_control(0, 2000, 900), "append control records to suffix");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_before++;
+	ps_unlock_map();
+	before = ps_test_bounded_nonzero_plan_count();
+	compact_layers = 1;
+	for (int i = 0; i < 32 && ps_test_bounded_nonzero_plan_count() == before; i++)
+		(void) ps_core_maintenance();
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_after++;
+	ps_unlock_map();
+	check(live_before > PS_IMAGE_MERGE_MAX_INPUTS && live_after < live_before &&
+		  ps_test_bounded_nonzero_plan_count() > before,
+		  "bounded merge accepts control data while preserving all versions");
+	check(read_relation_at(0, 1000) && read_relation_at(0, 1069) &&
+		  read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 2000, &version) && version == 2000,
+		  "mixed merge preserves historical relation and control pages");
+	close_store();
+	version = 0;
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) &&
+		  read_relation_at(0, 1069) &&
+		  read_control_at(0, PS_CONTROL_IMAGE_BLOCK, 2000, &version) && version == 2000,
+		  "mixed merge preserves pages after restart");
 	close_store();
 	remove_tree(store);
 }
@@ -4105,8 +4240,11 @@ main(void)
 	test_isolated_compaction_resumes_search(1, 0);
 	test_isolated_compaction_resumes_search(0, 1);
 	test_isolated_search_exhausted_progress();
+	test_large_newest_suffix_selection();
 	test_bounded_overlapping_suffix(0);
 	test_bounded_overlapping_suffix(1);
+	test_mixed_control_suffix_merge();
+	test_rejected_suffix_resumes_large_search();
 	test_isolated_bounded_pruning();
 	test_isolated_pruning_branch_view();
 	test_isolated_pruning_concurrent_change(0);

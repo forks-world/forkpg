@@ -32,6 +32,9 @@ extern int ps_compaction_relation_plan_open(const PsLayerDesc *layers,
 	uint32_t count, uint32_t max_group, PsPruneFence floor,
 	const PsViewFence *fences, uint32_t nfences, uint64_t inherited_below,
 	int has_inherited_below, PsCompactionRelationPlan **out);
+/* Only for all-version merge checks: pass through every non-relation version.
+ * Pruning and verification plans retain the default reject behavior. */
+extern void ps_compaction_relation_plan_retain_non_relation(PsCompactionRelationPlan *plan);
 extern int ps_compaction_relation_plan_step(PsCompactionRelationPlan *plan,
 	uint32_t max_groups, PsCompactionRelationVisitor visit, void *arg,
 	uint32_t *visited);

@@ -264,6 +264,8 @@ extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_reclaim_due(uint32_t timeline);
 extern uint32_t ps_test_wal_reclaim_watch_count(uint32_t timeline);
 extern uint64_t ps_test_compaction_count(void);
+struct PsLayerMap;
+extern uint32_t ps_test_bounded_newest_suffix(const struct PsLayerMap *map, uint64_t *ids);
 extern uint64_t ps_test_bounded_compaction_count(void);
 extern uint64_t ps_test_compaction_materialize_count(void);
 extern uint64_t ps_test_bounded_zero_floor_count(void);

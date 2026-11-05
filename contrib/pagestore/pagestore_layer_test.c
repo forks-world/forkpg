@@ -1269,6 +1269,21 @@ resumable_relation_plan_test(void)
 		  "later unsupported group invalidates all staged work and fails permanently");
 	ps_compaction_relation_plan_close(plan);
 	plan = NULL;
+	check(ps_compaction_relation_plan_open(&mixed, 1, 2,
+			(PsPruneFence) {150, UINT64_MAX}, NULL, 0, 0, 0, &plan) == 0,
+		  "open mixed all-version merge plan");
+	ps_compaction_relation_plan_retain_non_relation(plan);
+	memset(&probe, 0, sizeof(probe));
+	check(plan && ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 1 && visited == 1,
+		  "mixed merge plan keeps relation group validation");
+	memset(&probe, 0, sizeof(probe));
+	check(ps_compaction_relation_plan_step(plan, 1, visit_relation_plan,
+			&probe, &visited) == 0 && visited == 1 && probe.count == 1 &&
+		  probe.keep[0] && probe.closure[0],
+		  "mixed merge plan preserves control versions");
+	ps_compaction_relation_plan_close(plan);
+	plan = NULL;
 	memset(big, 0, sizeof(big));
 	for (uint32_t i = 0; i < 5; i++)
 	{
