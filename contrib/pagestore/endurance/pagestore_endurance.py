@@ -21,6 +21,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -133,6 +134,18 @@ def directory_kb(path: Path) -> int:
         if not vanished or attempt == 2:
             raise ValueError(f"du {path.name}: {result.stderr.strip()[:200]}")
     raise AssertionError("unreachable")
+
+
+def store_category_kb(store: Path) -> dict[str, int]:
+    """Collect optional per-entry allocated sizes without a large argv."""
+    categories = {}
+    with os.scandir(store) as entries:
+        for entry in entries:
+            info = entry.stat(follow_symlinks=False)
+            categories[entry.name] = (directory_kb(Path(entry.path))
+                                      if stat.S_ISDIR(info.st_mode)
+                                      else (info.st_blocks + 1) // 2)
+    return categories
 
 
 def space_snapshot(root: Path, store: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -1397,19 +1410,6 @@ recovery_target_action = 'promote'
             rec: dict[str, Any] = {"t": round(time.time(), 1), "round": self.round, "procs": {}}
             try:
                 rec["space"] = space_snapshot(self.root, self.store, self.args)
-                # Retain the existing per-store category metrics.
-                if self.store.exists():
-                    entries = sorted(self.store.iterdir())
-                    rec["store_kb"] = {}
-                    if entries:
-                        categories = subprocess.run(
-                            ["du", "-sk", "--", *map(str, entries)],
-                            capture_output=True, text=True, timeout=120)
-                        if categories.returncode != 0:
-                            raise ValueError(f"store categories: {categories.stderr.strip()[:200]}")
-                        rec["store_kb"] = {Path(line.split("\t", 1)[1]).name:
-                                           int(line.split("\t", 1)[0])
-                                           for line in categories.stdout.splitlines()}
                 unmeasured = 0
             except Failure as error:
                 self.async_failure = self.async_failure or error
@@ -1423,6 +1423,13 @@ recovery_target_action = 'promote'
             if self.async_failure:
                 out.write(json.dumps(rec) + "\n")
                 return
+            # This breakdown is diagnostic only: budget enforcement above
+            # remains active even if a concurrent layer removal prevents it.
+            if "space" in rec and self.store.exists():
+                try:
+                    rec["store_kb"] = store_category_kb(self.store)
+                except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+                    rec["store_kb_error"] = str(error)
             # The whole-run budget also covers local WAL. Expose it separately
             # to show when archive limiting moves backlog out of the page store.
             rec["compute_wal_kb"] = {}
