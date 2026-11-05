@@ -866,6 +866,123 @@ test_isolated_search_exhausted_progress(void)
 }
 
 static void
+legacy_budget_add_after_preflight(void *arg)
+{
+	int *wrote = arg;
+
+	ps_test_set_legacy_preflight_hook(NULL, NULL);
+	*wrote = write_relation(0, 2, 1200);
+	/* Exercise the legacy writer after the concurrent layer arrives. */
+	ps_test_force_legacy_compaction(0);
+}
+
+static void
+test_legacy_budget_rechecks_new_layer(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-legacy-budget-race-XXXXXX";
+	uint64_t rejects;
+	uint32_t live = 0;
+	int wrote = 0;
+
+	configure_core(1);
+	compact_layers = 100;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  write_relation(0, 0, 1000) && write_relation(0, 1, 1100),
+		  "prepare preflight budget race");
+	ps_test_set_legacy_record_limit(2);
+	rejects = ps_test_legacy_budget_rejections();
+	ps_test_set_legacy_preflight_hook(legacy_budget_add_after_preflight, &wrote);
+	compact_layers = 1;
+	for (int i = 0; i < 32 && !wrote; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_legacy_preflight_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live++;
+	ps_unlock_map();
+	check(wrote && ps_test_legacy_budget_rejections() > rejects && live == 3 &&
+		  read_relation_at(0, 1000) && read_relation_at(2, 1200),
+		  "new layer after preflight cannot bypass output budget");
+	ps_test_set_legacy_record_limit(0);
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) && read_relation_at(2, 1200),
+		  "budget race preserves source data after restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+legacy_budget_preflight_mark(void *arg)
+{
+	int *called = arg;
+
+	*called = 1;
+}
+
+static void
+test_legacy_output_budget_fairness(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-legacy-budget-XXXXXX";
+	uint64_t rejects, after;
+	uint32_t root_before = 0, root_after = 0, child_before = 0, child_after = 0;
+	int preflight_passed = 0;
+
+	configure_core(1);
+	compact_layers = 100;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  write_relation(0, 0, 1000) && write_relation(0, 1, 1100) &&
+		  write_relation(0, 2, 1200) && create_branch(1, 0, 1500) &&
+		  write_relation(1, 0, 2100) && write_relation(1, 1, 2200),
+		  "prepare over-budget parent and small child timelines");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting)
+		{
+			root_before += d->timeline == 0;
+			child_before += d->timeline == 1;
+		}
+	}
+	ps_unlock_map();
+	ps_test_set_legacy_record_limit(2);
+	rejects = ps_test_legacy_budget_rejections();
+	ps_test_set_legacy_preflight_hook(legacy_budget_preflight_mark, &preflight_passed);
+	compact_layers = 1;
+	for (int i = 0; i < 32 && ps_test_legacy_budget_rejections() == rejects; i++)
+		(void) ps_core_maintenance();
+	after = ps_test_legacy_budget_rejections();
+	ps_test_set_legacy_preflight_hook(NULL, NULL);
+	check(root_before >= 3 && child_before >= 2 && after > rejects && !preflight_passed,
+		  "oversized legacy fallback is refused before output");
+	for (int i = 0; i < 16; i++)
+		(void) ps_core_maintenance();
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting)
+		{
+			root_after += d->timeline == 0;
+			child_after += d->timeline == 1;
+		}
+	}
+	ps_unlock_map();
+	check(root_after == root_before && child_after < child_before &&
+		  read_relation_at(0, 1000) && read_relation_at(2, 1200),
+		  "budget rejection backs off while another timeline compacts");
+	ps_test_set_legacy_record_limit(0);
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) && read_relation_at(2, 1200),
+		  "rejected fallback preserves source data after restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_large_newest_suffix_selection(void)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-large-suffix-XXXXXX";
@@ -4240,6 +4357,8 @@ main(void)
 	test_isolated_compaction_resumes_search(1, 0);
 	test_isolated_compaction_resumes_search(0, 1);
 	test_isolated_search_exhausted_progress();
+	test_legacy_budget_rechecks_new_layer();
+	test_legacy_output_budget_fairness();
 	test_large_newest_suffix_selection();
 	test_bounded_overlapping_suffix(0);
 	test_bounded_overlapping_suffix(1);

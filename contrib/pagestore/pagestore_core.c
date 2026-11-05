@@ -4057,6 +4057,73 @@ static uint64_t test_bounded_zero_floor_count;
 static uint64_t test_bounded_nonzero_plan_count;
 static uint64_t test_bounded_prune_published_count;
 static uint64_t test_compaction_materialize_count;
+static uint64_t test_legacy_budget_rejections;
+static uint32_t test_legacy_record_limit;
+static uint32_t compaction_selection_cursor;
+static uint64_t legacy_budget_retry_at[MAX_TIMELINES][PS_MAX_CHANNELS];
+static unsigned char legacy_budget_reported[MAX_TIMELINES][PS_MAX_CHANNELS];
+static void (*legacy_preflight_test_hook)(void *);
+static void *legacy_preflight_test_hook_arg;
+
+void
+ps_test_set_legacy_preflight_hook(void (*hook)(void *), void *arg)
+{
+	legacy_preflight_test_hook = hook;
+	legacy_preflight_test_hook_arg = arg;
+}
+
+void
+ps_test_force_legacy_compaction(uint32_t shard)
+{
+	ps_lock_shard_wr(shard);
+	g_shards[shard].staged_compaction_retries = 2;
+	ps_unlock_shard(shard);
+}
+
+
+/* The legacy writer emits one page per selected record. Bound its worst-case
+ * page payload to the same record budget as a full bounded merge; image
+ * metadata adds a small amount. This is not a store-wide disk-space cap. */
+#define PS_LEGACY_COMPACTION_MAX_RECORDS \
+	(PS_IMAGE_BATCH_MAX_RECORDS * PS_IMAGE_MERGE_MAX_INPUTS)
+#define PS_LEGACY_BUDGET_RETRY_NS UINT64_C(5000000000)
+
+void
+ps_test_set_legacy_record_limit(uint32_t limit)
+{
+	__atomic_store_n(&test_legacy_record_limit, limit, __ATOMIC_RELAXED);
+}
+
+uint64_t
+ps_test_legacy_budget_rejections(void)
+{
+	return __atomic_load_n(&test_legacy_budget_rejections, __ATOMIC_RELAXED);
+}
+
+static uint32_t
+legacy_record_limit(void)
+{
+	uint32_t limit = __atomic_load_n(&test_legacy_record_limit, __ATOMIC_RELAXED);
+
+	return limit ? limit : PS_LEGACY_COMPACTION_MAX_RECORDS;
+}
+
+static void
+legacy_budget_defer(uint32_t timeline, uint32_t shard)
+{
+	uint64_t now = inspection_now_ns();
+
+	/* This is scheduling backoff, not a timeout or a storage failure. */
+	if (!__atomic_exchange_n(&legacy_budget_reported[timeline][shard], 1, __ATOMIC_RELAXED))
+		fprintf(stderr, "pagestore_core: local legacy compaction deferred for timeline %u shard %u: page payload may exceed %llu bytes\n",
+				timeline, shard, (unsigned long long) legacy_record_limit() * page_size);
+	__atomic_store_n(&legacy_budget_retry_at[timeline][shard],
+		now != 0 && now <= UINT64_MAX - PS_LEGACY_BUDGET_RETRY_NS ?
+		now + PS_LEGACY_BUDGET_RETRY_NS : 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&compaction_selection_cursor, (timeline + 1) % MAX_TIMELINES,
+					 __ATOMIC_RELAXED);
+}
+
 
 uint64_t
 ps_test_compaction_materialize_count(void)
@@ -5536,6 +5603,14 @@ gather_complete:
 	 * drop/recreate churn would keep every such layer alive forever. */
 	if (nrec == 0 && ndropped == 0)
 		goto cleanup;
+	/* New layers can arrive between preflight and this locked snapshot. Check
+	 * the actual output count before the legacy writer reserves any space. */
+	if (prune_abandon_local_only() && nrec > legacy_record_limit())
+	{
+		__atomic_fetch_add(&test_legacy_budget_rejections, 1, __ATOMIC_RELAXED);
+		rc = -2;
+		goto cleanup;
+	}
 	/* A single source with nothing to drop is already the compacted result.
 	 * Publishing an identical replacement and retiring the source rewrites
 	 * the whole layer and churns the manifest on every pass that finds
@@ -5840,6 +5915,9 @@ materialize_compaction_inputs(uint32_t timeline, uint32_t shard)
 {
 	PsLayerDesc *layers = NULL;
 	uint32_t	nlayers = 0;
+	uint64_t total_records = 0;
+	uint32_t record_limit = legacy_record_limit();
+	int local_budget = prune_abandon_local_only();
 	int			rc = -1;
 
 	__atomic_fetch_add(&test_compaction_materialize_count, 1, __ATOMIC_RELAXED);
@@ -5878,8 +5956,23 @@ materialize_compaction_inputs(uint32_t timeline, uint32_t shard)
 		PsImgIndexEnt *idx = NULL;
 		uint32_t	nidx = 0;
 
-		if (read_image_index_refreshing(&layers[i], &idx, &nidx) != 0 ||
-			verify_image_layer_refreshing(&layers[i]) != 0)
+		if (read_image_index_refreshing(&layers[i], &idx, &nidx) != 0)
+		{
+			free(idx);
+			goto out;
+		}
+		/* Refuse before writing any output. Duplicates and pruned records can
+		 * make this conservative, but cannot make the true output larger. */
+		if (local_budget && (total_records > record_limit ||
+			nidx > record_limit - total_records))
+		{
+			free(idx);
+			__atomic_fetch_add(&test_legacy_budget_rejections, 1, __ATOMIC_RELAXED);
+			rc = -2;
+			goto out;
+		}
+		total_records += nidx;
+		if (verify_image_layer_refreshing(&layers[i]) != 0)
 		{
 			free(idx);
 			goto out;
@@ -28625,6 +28718,8 @@ ps_core_maintenance_impl(void)
 	uint32_t	ftl = 0,
 				fsh = 0;
 	uint64_t	page_floor = 0;
+	uint64_t selection_now;
+	uint32_t selection_start;
 	int			found = 0;
 	int			did = 0;
 	int			skip_segment_gc;
@@ -29051,10 +29146,18 @@ ps_core_maintenance_impl(void)
 	 * Phase 1: scan under map read-lock to pick a timeline+shard whose image
 	 * layers are due for compaction.  A shared lock here lets reads proceed.
 	 */
+	selection_now = inspection_now_ns();
+	selection_start = __atomic_load_n(&compaction_selection_cursor, __ATOMIC_RELAXED);
+
 	ps_lock_map_rd();
-	for (uint32_t tl = 0; tl < MAX_TIMELINES && !found; tl++)
+	for (uint32_t pass = 0; pass < MAX_TIMELINES && !found; pass++)
+	{
+		uint32_t tl = (selection_start + pass) % MAX_TIMELINES;
+
 		for (uint32_t sh = 0; sh < ns; sh++)
-			if (ps_timeline_live(tl) &&
+			if ((selection_now == 0 || selection_now >=
+				 __atomic_load_n(&legacy_budget_retry_at[tl][sh], __ATOMIC_RELAXED)) &&
+				ps_timeline_live(tl) &&
 				(count_image_layers(tl, sh) > (uint32_t) compact_layers ||
 				 (__atomic_load_n(&page_prune_due[tl][sh], __ATOMIC_ACQUIRE) != 0 &&
 				  count_image_layers(tl, sh) > 0)))
@@ -29064,6 +29167,7 @@ ps_core_maintenance_impl(void)
 				found = 1;
 				break;
 			}
+	}
 	ps_unlock_map();
 
 	/*
@@ -29076,6 +29180,7 @@ ps_core_maintenance_impl(void)
 		int bounded_finished = 0;
 		int bounded_attempted = 0;
 		int large_local = 0;
+		int materialized;
 
 		/* Large local timelines can select and verify a bounded input set
 		 * themselves. Do that before the legacy all-layer materialization. */
@@ -29115,8 +29220,16 @@ ps_core_maintenance_impl(void)
 			for (uint32_t sh = ns; sh > 0; sh--)
 				ps_unlock_shard(sh - 1);
 		}
-		if (!bounded_finished && materialize_compaction_inputs(ftl, fsh) == 0)
+		materialized = bounded_finished ? 1 : materialize_compaction_inputs(ftl, fsh);
+
+		if (materialized == -2)
+			legacy_budget_defer(ftl, fsh);
+		if (materialized == 0)
 		{
+			int budget_retry_needed = 0;
+
+			if (legacy_preflight_test_hook != NULL)
+				legacy_preflight_test_hook(legacy_preflight_test_hook_arg);
 			/* Drain every shard before taking the admission sequence snapshot.
 			 * A writer on a different shard may have allocated its sequence but
 			 * still be waiting for map-rd; without this drain it could mutate a
@@ -29134,6 +29247,7 @@ ps_core_maintenance_impl(void)
 					NULL, NULL, NULL, NULL) == 0)
 			{
 				int		prune_deferred = 0;
+				int		compact_rc;
 				int		was_due = __atomic_exchange_n(&page_prune_due[ftl][fsh],
 													  0, __ATOMIC_ACQ_REL);
 
@@ -29142,7 +29256,11 @@ ps_core_maintenance_impl(void)
 				 * durable) is a fresh mark for the next pass, not one this
 				 * pass clears on its way out.  Zero disables pruning but
 				 * still permits a safe layer merge. */
-				did = compact_timeline(ftl, fsh, page_floor, &prune_deferred, bounded_attempted) > 0;
+				compact_rc = compact_timeline(ftl, fsh, page_floor, &prune_deferred, bounded_attempted);
+
+				did = compact_rc > 0;
+				if (compact_rc == -2)
+					budget_retry_needed = 1;
 				if ((!did && was_due) || prune_deferred)
 					__atomic_store_n(&page_prune_due[ftl][fsh], 1,
 									 __ATOMIC_RELEASE);
@@ -29151,6 +29269,8 @@ ps_core_maintenance_impl(void)
 			pthread_rwlock_unlock(&page_prune_lock);
 			for (uint32_t sh = ns; sh > 0; sh--)
 				ps_unlock_shard(sh - 1);
+			if (budget_retry_needed)
+				legacy_budget_defer(ftl, fsh);
 		}
 	}
 	/* Keep compaction inputs resident until due compaction has run.  Evicting
@@ -29642,6 +29762,13 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		PsFlushWatermark watermark;
 
 		g_shards[i].id = i;
+		if (i == 0)
+			__atomic_store_n(&compaction_selection_cursor, 0, __ATOMIC_RELAXED);
+		for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		{
+			__atomic_store_n(&legacy_budget_retry_at[tl][i], 0, __ATOMIC_RELAXED);
+			__atomic_store_n(&legacy_budget_reported[tl][i], 0, __ATOMIC_RELAXED);
+		}
 		memset(g_shards[i].isolated_search_next, 0,
 			   sizeof(g_shards[i].isolated_search_next));
 		memset(g_shards[i].isolated_suffix_tried, 0,

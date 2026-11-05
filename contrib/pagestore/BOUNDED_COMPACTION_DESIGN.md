@@ -28,9 +28,21 @@ A seed that itself exceeds a whole turn's budget is skipped in that pass to
 ensure progress; layer-map changes can also make a cursor miss a candidate.
 Neither proves the skipped component is ineligible. Once a pass ends without a
 candidate, or if the initial legacy-layer scan cannot complete, the caller can
-still use the legacy path. A policy for avoiding unbounded fallback in those
-cases remains separate work. Restart discards the cursor and starts discovery
-again; it never publishes or retires layers as part of discovery.
+still use the legacy path. For a local-only provider, the fallback now refuses a
+pass if the input index record count exceeds `PS_IMAGE_BATCH_MAX_RECORDS *
+PS_IMAGE_MERGE_MAX_INPUTS`. It checks again against the actual output record count
+under the compaction snapshot before writing; new layers between preflight and
+snapshot therefore cannot bypass it. This is a conservative upper bound on the
+page payload of a single legacy output (512 MiB at 8 KiB per page); metadata,
+retained sources, other writes, and existing oversized layers remain outside the
+bound. An over-budget timeline is deferred for five seconds and selection moves
+to another timeline. The interval is a retry backoff, not an I/O deadline or
+proof of failure; the process emits one diagnostic per timeline and shard per
+process lifetime when the budget first blocks a pass. A conservative refusal can delay useful pruning until the input set is
+made smaller by bounded compaction, so this is a peak-write guard rather than a
+complete progress solution. Remote and unknown providers retain their existing
+policy. Restart discards the cursor and starts discovery again; it never
+publishes or retires layers as part of discovery.
 
 Neon's pageserver partitions immutable layers by key range and compacts selected
 ranges; see its [storage design](https://github.com/neondatabase/neon/blob/main/docs/pageserver-storage.md).
