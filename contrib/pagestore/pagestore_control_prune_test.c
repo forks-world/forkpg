@@ -614,7 +614,7 @@ static void
 test_bounded_isolated_compaction(int nonzero_floor)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-isolated-merge-XXXXXX";
-	uint64_t before, nonzero_before, max_before = 0, replacement_bytes = 0;
+	uint64_t before, nonzero_before, materialize_before, max_before = 0, replacement_bytes = 0;
 	uint32_t live_before = 0, live_after = 0;
 	int concurrent_write = 0;
 
@@ -644,6 +644,7 @@ test_bounded_isolated_compaction(int nonzero_floor)
 	ps_unlock_map();
 	before = ps_test_bounded_compaction_count();
 	nonzero_before = ps_test_bounded_nonzero_plan_count();
+	materialize_before = ps_test_compaction_materialize_count();
 	compact_layers = 1;
 	ps_test_set_compaction_unlocked_hook(isolated_compaction_write, &concurrent_write);
 	(void) ps_core_maintenance();
@@ -663,6 +664,8 @@ test_bounded_isolated_compaction(int nonzero_floor)
 		  ps_test_bounded_compaction_count() > before &&
 		  (!nonzero_floor || ps_test_bounded_nonzero_plan_count() > nonzero_before),
 		  "isolated component compacts across a concurrent write");
+	check(ps_test_compaction_materialize_count() == materialize_before,
+		  "bounded selection does not materialize every unrelated layer");
 	check(replacement_bytes > 0 && replacement_bytes <=
 		  (uint64_t) 2 * PS_IMAGE_BATCH_MAX_RECORDS * page_size,
 		  "isolated replacement stays within its reserved output budget");

@@ -4055,6 +4055,13 @@ static uint64_t test_bounded_compaction_count;
 static uint64_t test_bounded_zero_floor_count;
 static uint64_t test_bounded_nonzero_plan_count;
 static uint64_t test_bounded_prune_published_count;
+static uint64_t test_compaction_materialize_count;
+
+uint64_t
+ps_test_compaction_materialize_count(void)
+{
+	return __atomic_load_n(&test_compaction_materialize_count, __ATOMIC_RELAXED);
+}
 
 uint64_t
 ps_test_bounded_prune_published_count(void)
@@ -5141,7 +5148,7 @@ done:
 
 static int
 compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
-				 int *prune_deferred)
+				 int *prune_deferred, int bounded_already_tried)
 {
 	PsLayerDesc *old;
 	uint32_t	nold = count_image_layers(timeline, shard);
@@ -5244,8 +5251,10 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 			compaction_fallback_test_hook(compaction_fallback_test_hook_arg);
 	}
 
-	/* Try the bounded relation-only pruning path before the legacy gather. */
-	if (page_floor != 0 && stage_unlocked)
+	/* A prior local attempt may have advanced these search cursors. Running
+	 * them again in the same maintenance turn can cycle the cursor and starve
+	 * the legacy pruning pass, so proceed directly to gather in that case. */
+	if (!bounded_already_tried && page_floor != 0 && stage_unlocked)
 	{
 		int bounded_prune = compact_timeline_pruned_bounded(timeline, shard,
 												 page_floor, prune_deferred);
@@ -5259,7 +5268,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 
 	/* At floor zero the prune planner retains every identity, for all key
 	 * classes. Skip its unbounded locked index gather in this case. */
-	if (page_floor == 0 && stage_unlocked && nold > 1)
+	if (!bounded_already_tried && page_floor == 0 && stage_unlocked && nold > 1)
 	{
 		uint64_t bounded_scanned = 0, bounded_kept = 0;
 		int bounded = compact_timeline_bounded(timeline, shard, 0,
@@ -5290,7 +5299,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 
 	/* Conservatively merge relation-only histories when bounded planning proves
 	 * every version is kept. A later pruning turn handles fork invalidation. */
-	if (page_floor != 0 && stage_unlocked && nold > 1)
+	if (!bounded_already_tried && page_floor != 0 && stage_unlocked && nold > 1)
 	{
 		uint64_t bounded_scanned = 0, bounded_kept = 0;
 		int bounded = compact_timeline_bounded(timeline, shard, page_floor,
@@ -5785,6 +5794,8 @@ materialize_compaction_inputs(uint32_t timeline, uint32_t shard)
 	uint32_t	nlayers = 0;
 	int			rc = -1;
 
+	__atomic_fetch_add(&test_compaction_materialize_count, 1, __ATOMIC_RELAXED);
+
 	ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 	{
@@ -5847,6 +5858,62 @@ out:
 			}
 	ps_unlock_map();
 	free(layers);
+	return rc;
+}
+
+/* Try the existing self-verifying bounded planners before materializing the
+ * entire local timeline. Caller holds the shard, prune and map locks; the
+ * planners release and reacquire them around their own selected-input I/O. */
+static int
+compact_large_local_first(uint32_t timeline, uint32_t shard, uint64_t floor,
+						  int *prune_deferred, int *attempted)
+{
+	uint64_t scanned = 0, kept = 0;
+	int rc;
+
+	if (!prune_abandon_local_only() || g_shards[shard].staged_compaction_retries >= 2 ||
+		count_image_layers(timeline, shard) <= PS_IMAGE_MERGE_MAX_INPUTS)
+		return 0;
+	/* Preserve compact_timeline's existing whole-timeline reader-pin rule. */
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == timeline &&
+			layer_shard_from_id(d->layer_id) == shard &&
+			__atomic_load_n(&d->cache_readers, __ATOMIC_ACQUIRE) != 0)
+			return 0;
+	}
+	*attempted = 1;
+	if (floor != 0)
+	{
+		rc = compact_timeline_pruned_bounded(timeline, shard, floor, prune_deferred);
+		if (rc != 0)
+			return rc;
+	}
+	rc = compact_timeline_bounded(timeline, shard, floor, &scanned, &kept, 1);
+	if (rc == 2)
+	{
+		if (floor != 0)
+			*prune_deferred = 1;
+		return 1;
+	}
+	if (rc > 0)
+	{
+		if (floor == 0)
+			__atomic_fetch_add(&test_bounded_zero_floor_count, 1, __ATOMIC_RELAXED);
+		else
+			*prune_deferred = 1;
+		if (metrics_header != NULL)
+		{
+			ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+			ps_fetch_add_u64(&metrics_header->page_prune_compactions, 1);
+			ps_fetch_add_u64(&metrics_header->page_prune_versions_scanned, scanned);
+			ps_fetch_add_u64(&metrics_header->page_prune_versions_kept, kept);
+			ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted, scanned - kept);
+			ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+		}
+	}
 	return rc;
 }
 
@@ -28958,7 +29025,49 @@ ps_core_maintenance_impl(void)
 	 */
 	if (found)
 	{
-		if (materialize_compaction_inputs(ftl, fsh) == 0)
+		int bounded_finished = 0;
+		int bounded_attempted = 0;
+		int large_local = 0;
+
+		/* Large local timelines can select and verify a bounded input set
+		 * themselves. Do that before the legacy all-layer materialization. */
+		if (prune_abandon_local_only())
+		{
+			ps_lock_map_rd();
+			large_local = count_image_layers(ftl, fsh) > PS_IMAGE_MERGE_MAX_INPUTS;
+			ps_unlock_map();
+		}
+		if (large_local)
+		{
+			for (uint32_t sh = 0; sh < ns; sh++)
+				ps_lock_shard_wr(sh);
+			pthread_rwlock_rdlock(&page_prune_lock);
+			ps_lock_map_wr();
+			if (ps_timeline_live(ftl) && prune_abandon_local_only() &&
+				g_shards[fsh].staged_compaction_retries < 2 &&
+				count_image_layers(ftl, fsh) > PS_IMAGE_MERGE_MAX_INPUTS &&
+				retention_effective_floor_internal(ftl, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+														   &page_floor, 1, NULL, NULL, NULL, NULL) == 0)
+			{
+				int deferred = 0;
+				int was_due = __atomic_exchange_n(&page_prune_due[ftl][fsh], 0, __ATOMIC_ACQ_REL);
+				int bounded = compact_large_local_first(ftl, fsh, page_floor, &deferred, &bounded_attempted);
+
+				if ((bounded <= 0 && was_due) || deferred)
+					__atomic_store_n(&page_prune_due[ftl][fsh], 1, __ATOMIC_RELEASE);
+				if (bounded != 0)
+				{
+					__atomic_fetch_add(&ps_test_compaction_pass_count, 1, __ATOMIC_RELAXED);
+					did = bounded > 0;
+					bounded_finished = 1;
+				}
+			}
+			ps_unlock_map();
+			pthread_rwlock_unlock(&page_prune_lock);
+			for (uint32_t sh = ns; sh > 0; sh--)
+				ps_unlock_shard(sh - 1);
+		}
+		if (!bounded_finished && materialize_compaction_inputs(ftl, fsh) == 0)
 		{
 			/* Drain every shard before taking the admission sequence snapshot.
 			 * A writer on a different shard may have allocated its sequence but
@@ -28985,7 +29094,7 @@ ps_core_maintenance_impl(void)
 				 * durable) is a fresh mark for the next pass, not one this
 				 * pass clears on its way out.  Zero disables pruning but
 				 * still permits a safe layer merge. */
-				did = compact_timeline(ftl, fsh, page_floor, &prune_deferred) > 0;
+				did = compact_timeline(ftl, fsh, page_floor, &prune_deferred, bounded_attempted) > 0;
 				if ((!did && was_due) || prune_deferred)
 					__atomic_store_n(&page_prune_due[ftl][fsh], 1,
 									 __ATOMIC_RELEASE);
