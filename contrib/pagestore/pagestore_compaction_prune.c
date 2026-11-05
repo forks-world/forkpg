@@ -92,6 +92,7 @@ struct PsCompactionRelationPlan
 	PsPruneFence floor;
 	uint64_t inherited_below;
 	int has_inherited_below;
+	int retain_non_relation;
 	int finished, failed;
 };
 
@@ -234,12 +235,26 @@ ps_compaction_relation_select_group(const PsImageGroupEntry *entries,
 	return 0;
 }
 
+void
+ps_compaction_relation_plan_retain_non_relation(PsCompactionRelationPlan *plan)
+{
+	if (plan != NULL)
+		plan->retain_non_relation = 1;
+}
+
 static int
 emit_group(PsCompactionRelationPlan *plan, PsCompactionRelationVisitor visit,
 		   void *arg)
 {
 	if (plan->group[0].entry.key.klass != PS_KLASS_RELATION)
-		return -1;
+	{
+		if (!plan->retain_non_relation)
+			return -1;
+		/* All-version merge only: never prune control or other key classes. */
+		memset(plan->keep, 1, plan->used);
+		memset(plan->closure, 1, plan->used);
+		return visit(plan->group, plan->used, plan->keep, plan->closure, arg);
+	}
 	for (uint32_t i = 0; i < plan->used; i++)
 	{
 		plan->versions[i].lsn = plan->group[i].entry.lsn;

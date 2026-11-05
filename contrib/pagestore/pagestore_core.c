@@ -2201,6 +2201,7 @@ typedef struct Shard
 	/* 0: initial stage; 1: admission retry; 2: locked fallback. */
 	unsigned	staged_compaction_retries;
 	uint32_t isolated_search_next[MAX_TIMELINES]; /* next map slot per timeline */
+	unsigned char isolated_suffix_tried[MAX_TIMELINES]; /* once per search sweep */
 	uint32_t prune_isolated_search_next[MAX_TIMELINES]; /* independent pruning search */
 	uint64_t	prune_relation_page_admissions; /* diagnostics, per shard */
 	uint64_t	rr_mem,			/* read-source counters */
@@ -4821,11 +4822,14 @@ budget_exhausted:
 	return 0;
 }
 
+/* Allow isolated discovery this many map positions before opportunistic suffix work. */
+#define PS_ISOLATED_SUFFIX_MIN_CURSOR 1024
+
 /* A newest-ID suffix can overlap omitted older layers: an equal identity in
  * the suffix already wins the read tie. The coverage check below preserves
  * every suffix winner, and publication rechecks all intervening layers. */
 static uint32_t
-bounded_newest_suffix_inputs(uint32_t timeline, uint32_t shard,
+bounded_newest_suffix_inputs(const PsLayerMap *map, uint32_t timeline, uint32_t shard,
 							 PsLayerDesc *inputs, uint64_t *bytes_out)
 {
 	const PsLayerDesc *newest[PS_IMAGE_MERGE_MAX_INPUTS];
@@ -4834,9 +4838,11 @@ bounded_newest_suffix_inputs(uint32_t timeline, uint32_t shard,
 
 	if (!prune_abandon_local_only())
 		return 0;
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	/* New layers are normally appended, so visit the newest map entries first.
+	 * Still compare IDs: recovery and deletion do not promise map ordering. */
+	for (uint32_t i = map->nlayers; i-- > 0;)
 	{
-		const PsLayerDesc *d = &ps_layer_map.layers[i];
+		const PsLayerDesc *d = &map->layers[i];
 		uint32_t pos;
 
 		if (++work > 100000)
@@ -4887,6 +4893,18 @@ bounded_newest_suffix_inputs(uint32_t timeline, uint32_t shard,
 	return best;
 }
 
+uint32_t
+ps_test_bounded_newest_suffix(const PsLayerMap *map, uint64_t *ids)
+{
+	PsLayerDesc inputs[PS_IMAGE_MERGE_MAX_INPUTS];
+	uint64_t bytes = 0;
+	uint32_t n = bounded_newest_suffix_inputs(map, 0, 0, inputs, &bytes);
+
+	for (uint32_t i = 0; i < n; i++)
+		ids[i] = inputs[i].layer_id;
+	return n;
+}
+
 /* Merge without pruning when a bounded replacement can reduce layer count.
  * Entry and exit both hold all shard locks, page_prune_lock and map-wr.
  * Return 0 when ineligible, 1 on work, 2 to resume discovery on a later
@@ -4904,6 +4922,7 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	uint64_t bytes = 0, retention_epoch, current_retention_epoch;
 	uint64_t timeline_epoch;
 	int result = -1, prepare_rc = 0, ambiguous = 0, eligible = 1, full_set = 1;
+	int isolated_pending = 0;
 	PsHistoryFence *fences = NULL, *storage_fences = NULL;
 	PsViewFence *views = NULL;
 	uint32_t nfences = 0, nstorage = 0;
@@ -4938,19 +4957,42 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 			return 0;
 		ninputs = bounded_isolated_inputs(timeline, shard, inputs, &bytes, 0);
 		if (ninputs == 0)
-			ninputs = bounded_newest_suffix_inputs(timeline, shard, inputs, &bytes);
+		{
+			g_shards[shard].isolated_suffix_tried[timeline] = 0;
+			ninputs = bounded_newest_suffix_inputs(&ps_layer_map, timeline, shard, inputs, &bytes);
+		}
+		else if (ninputs == UINT32_MAX &&
+				 g_shards[shard].isolated_search_next[timeline] >= PS_ISOLATED_SUFFIX_MIN_CURSOR &&
+				 !g_shards[shard].isolated_suffix_tried[timeline])
+		{
+			uint32_t suffix;
+
+			/* Give isolated components the first turns, then try a suffix at
+			 * most once per unfinished sweep. A rejected suffix must not force
+			 * legacy materialization before that sweep has finished. */
+			g_shards[shard].isolated_suffix_tried[timeline] = 1;
+			suffix = bounded_newest_suffix_inputs(&ps_layer_map, timeline, shard, inputs, &bytes);
+			if (suffix != 0)
+			{
+				isolated_pending = 1;
+				ninputs = suffix;
+			}
+		}
 	}
 	else
+	{
 		g_shards[shard].isolated_search_next[timeline] = 0;
+		g_shards[shard].isolated_suffix_tried[timeline] = 0;
+	}
 	if (ninputs == UINT32_MAX)
 		return 2; /* bounded search continues on a later maintenance turn */
 	if (ninputs < 2)
-		return 0;
+		return isolated_pending ? 2 : 0;
 	capacity = ninputs - 1;
 	/* Avoid staging a pass which cannot reasonably shrink the layer count.
 	 * Duplicates may make this conservative, which only chooses the old path. */
 	if (bytes > (uint64_t) capacity * PS_IMAGE_BATCH_MAX_RECORDS * page_size)
-		return 0;
+		return isolated_pending ? 2 : 0;
 	if (page_floor != 0)
 	{
 		if (page_prune_fences(timeline, &fences, &nfences) != 0 ||
@@ -5004,6 +5046,8 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 			PS_IMAGE_GROUP_MAX_VERSIONS, (PsPruneFence) {page_floor, UINT64_MAX},
 			views, nstorage, inherited, has_inherited, &plan);
 
+		if (plan_rc == 0)
+			ps_compaction_relation_plan_retain_non_relation(plan);
 		if (plan_rc == 0)
 			do {
 				plan_rc = ps_compaction_relation_plan_step(plan, 32,
@@ -5143,6 +5187,10 @@ done:
 			(void) ps_layer_store->delete_local_layer(&outputs[k]);
 	if (retired != 0)
 		result = 1;
+	if (result > 0)
+		g_shards[shard].isolated_suffix_tried[timeline] = 0;
+	if (result == 0 && isolated_pending)
+		return 2;
 	return result;
 }
 
@@ -29596,6 +29644,8 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		g_shards[i].id = i;
 		memset(g_shards[i].isolated_search_next, 0,
 			   sizeof(g_shards[i].isolated_search_next));
+		memset(g_shards[i].isolated_suffix_tried, 0,
+			   sizeof(g_shards[i].isolated_suffix_tried));
 		memset(g_shards[i].prune_isolated_search_next, 0,
 			   sizeof(g_shards[i].prune_isolated_search_next));
 		g_shards[i].cur_seg = -1;
