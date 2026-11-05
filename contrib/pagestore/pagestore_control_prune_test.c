@@ -865,6 +865,209 @@ test_isolated_search_exhausted_progress(void)
 	remove_tree(store);
 }
 
+static int
+legacy_budget_pin_root(int pin)
+{
+	int found = 0;
+
+	ps_lock_map_wr();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == 0)
+		{
+			if (pin)
+				__atomic_add_fetch(&d->cache_readers, 1, __ATOMIC_ACQ_REL);
+			else
+				__atomic_sub_fetch(&d->cache_readers, 1, __ATOMIC_ACQ_REL);
+			found = 1;
+			break;
+		}
+	}
+	ps_unlock_map();
+	return found;
+}
+
+static void
+legacy_budget_add_after_preflight(void *arg)
+{
+	int *wrote = arg;
+
+	ps_test_set_legacy_preflight_hook(NULL, NULL);
+	*wrote = write_relation(0, 2, 1200);
+	/* Exercise the legacy writer after the concurrent layer arrives. */
+	ps_test_force_legacy_compaction(0);
+}
+
+static void
+test_legacy_budget_rechecks_new_layer(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-legacy-budget-race-XXXXXX";
+	uint64_t rejects;
+	uint32_t live = 0;
+	int wrote = 0;
+
+	configure_core(1);
+	compact_layers = 100;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  write_relation(0, 0, 1000) && write_relation(0, 1, 1100),
+		  "prepare preflight budget race");
+	ps_test_set_legacy_record_limit(2);
+	rejects = ps_test_legacy_budget_rejections();
+	ps_test_set_legacy_preflight_hook(legacy_budget_add_after_preflight, &wrote);
+	compact_layers = 1;
+	for (int i = 0; i < 32 && !wrote; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_legacy_preflight_hook(NULL, NULL);
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live++;
+	ps_unlock_map();
+	check(wrote && ps_test_legacy_budget_rejections() > rejects && live <= 3 &&
+		  read_relation_at(0, 1000) && read_relation_at(2, 1200),
+		  "new layer after preflight cannot bypass output budget");
+	ps_test_set_legacy_record_limit(0);
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) && read_relation_at(2, 1200),
+		  "budget race preserves source data after restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+legacy_budget_preflight_mark(void *arg)
+{
+	int *called = arg;
+
+	*called = 1;
+}
+
+static void
+test_legacy_budget_retries_small_bounded(int conflicted)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-legacy-budget-small-XXXXXX";
+	uint64_t rejected, bounded, largest = 0;
+	uint32_t before = 0, after = 0;
+
+	configure_core(0);
+	segment_size = 64 * 1024 * 1024;
+	flush_pages = 2100;
+	compact_layers = 100;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
+		  "open small over-budget timeline");
+	for (uint32_t i = 0; i < 2100; i++)
+		check(write_relation(0, i, 1000 + i), "write large isolated source");
+	check(ps_test_resize_empty_memtable(0, 1) == 0 &&
+		  write_relation(0, 3000, 5000) && write_relation(0, 3000, 5100),
+		  "prepare two small sources disjoint from the oversized layer");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+		{
+			before++;
+			if (ps_layer_map.layers[i].location_count != 0 &&
+				ps_layer_map.layers[i].locations[0].size > largest)
+				largest = ps_layer_map.layers[i].locations[0].size;
+		}
+	ps_unlock_map();
+	ps_test_set_legacy_record_limit(2);
+	if (conflicted)
+		ps_test_force_legacy_compaction(0);
+	rejected = ps_test_legacy_budget_rejections();
+	bounded = ps_test_bounded_compaction_count();
+	compact_layers = 1;
+	for (int i = 0; i < 32 && ps_test_legacy_budget_rejections() == rejected; i++)
+		(void) ps_core_maintenance();
+	check(before == 3 && largest > (uint64_t) 2 * PS_IMAGE_BATCH_MAX_RECORDS * page_size &&
+		  ps_test_legacy_budget_rejections() > rejected,
+		  "small timeline contains an oversized layer and encounters the budget");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			after++;
+	ps_unlock_map();
+	check(ps_test_bounded_compaction_count() > bounded && after < before &&
+		  read_relation_at(0, 1000) && read_relation_at(2099, 3099) &&
+		  read_relation_at(3000, 5000) && read_relation_at(3000, 5100),
+		  conflicted ? "budget retry clears stale conflict and compacts bounded inputs" :
+		  "budget retry compacts bounded inputs on a small layer set");
+	ps_test_set_legacy_record_limit(0);
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) &&
+		  read_relation_at(2099, 3099) && read_relation_at(3000, 5000) &&
+		  read_relation_at(3000, 5100),
+		  "bounded budget retry preserves pages after restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_legacy_output_budget_fairness(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-legacy-budget-XXXXXX";
+	uint64_t rejects, after;
+	uint32_t root_before = 0, root_after = 0, child_before = 0, child_after = 0;
+	int preflight_passed = 0;
+
+	configure_core(1);
+	compact_layers = 100;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  write_relation(0, 0, 1000) && write_relation(0, 1, 1100) &&
+		  write_relation(0, 2, 1200) && create_branch(1, 0, 1500) &&
+		  write_relation(1, 0, 2100) && write_relation(1, 1, 2200),
+		  "prepare over-budget parent and small child timelines");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting)
+		{
+			root_before += d->timeline == 0;
+			child_before += d->timeline == 1;
+		}
+	}
+	ps_unlock_map();
+	check(legacy_budget_pin_root(1), "pin blocked parent input");
+	ps_test_set_legacy_record_limit(2);
+	rejects = ps_test_legacy_budget_rejections();
+	ps_test_set_legacy_preflight_hook(legacy_budget_preflight_mark, &preflight_passed);
+	compact_layers = 1;
+	for (int i = 0; i < 32 && ps_test_legacy_budget_rejections() == rejects; i++)
+		(void) ps_core_maintenance();
+	after = ps_test_legacy_budget_rejections();
+	ps_test_set_legacy_preflight_hook(NULL, NULL);
+	check(root_before >= 3 && child_before >= 2 && after > rejects && !preflight_passed,
+		  "oversized legacy fallback is refused before output");
+	for (int i = 0; i < 16; i++)
+		(void) ps_core_maintenance();
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting)
+		{
+			root_after += d->timeline == 0;
+			child_after += d->timeline == 1;
+		}
+	}
+	ps_unlock_map();
+	check(root_after == root_before && child_after < child_before &&
+		  read_relation_at(0, 1000) && read_relation_at(2, 1200),
+		  "budget rejection backs off while another timeline compacts");
+	check(legacy_budget_pin_root(0), "release blocked parent input");
+	ps_test_set_legacy_record_limit(0);
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) && read_relation_at(2, 1200),
+		  "rejected fallback preserves source data after restart");
+	close_store();
+	remove_tree(store);
+}
+
 static void
 test_large_newest_suffix_selection(void)
 {
@@ -4240,6 +4443,10 @@ main(void)
 	test_isolated_compaction_resumes_search(1, 0);
 	test_isolated_compaction_resumes_search(0, 1);
 	test_isolated_search_exhausted_progress();
+	test_legacy_budget_rechecks_new_layer();
+	test_legacy_output_budget_fairness();
+	test_legacy_budget_retries_small_bounded(0);
+	test_legacy_budget_retries_small_bounded(1);
 	test_large_newest_suffix_selection();
 	test_bounded_overlapping_suffix(0);
 	test_bounded_overlapping_suffix(1);
