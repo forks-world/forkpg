@@ -1569,18 +1569,54 @@ pagestore_archive_configured(ArchiveModuleState *state)
 	return pagestore_localsvc_read_lsn() == 0;
 }
 
+/* Reuse a verified store read across sequential XLogReader page requests. */
+typedef struct PageStoreIndexReadAhead
+{
+	XLogRecPtr	end;
+	XLogRecPtr	start;
+	int			length;
+	char		data[64 * 1024];
+} PageStoreIndexReadAhead;
+
 /* Index only WAL that the daemon has durably accepted. */
 static int
 pagestore_index_wal_page_read(XLogReaderState *state,
 							 XLogRecPtr targetPagePtr, int reqLen,
 							 XLogRecPtr targetRecPtr, char *readBuf)
 {
-	int			n = pagestore_localsvc_wal_read(pagestore_localsvc_timeline(),
-											(uint64) targetPagePtr,
-											XLOG_BLCKSZ, readBuf);
+	PageStoreIndexReadAhead *cache = state->private_data;
+	uint64		offset;
+	int			n;
 
-	(void) state;
 	(void) targetRecPtr;
+	if (targetPagePtr < cache->start ||
+		targetPagePtr - cache->start >= (uint64) cache->length ||
+		(uint64) cache->length - (targetPagePtr - cache->start) < reqLen)
+	{
+		uint64		remaining;
+		uint32		length;
+
+		if (targetPagePtr >= cache->end)
+			return -1;
+		remaining = cache->end - targetPagePtr;
+		length = Min(remaining, sizeof(cache->data));
+		cache->start = targetPagePtr;
+		cache->length = pagestore_localsvc_wal_read(
+			pagestore_localsvc_timeline(), targetPagePtr, length, cache->data);
+		/* WAL_READ reports the number of covered bytes, not the length of a
+		 * contiguous prefix.  Never cache a short read as though it were a
+		 * prefix; retry exactly the page as the original reader did. */
+		if (cache->length != length)
+		{
+			cache->length = 0;
+			n = pagestore_localsvc_wal_read(pagestore_localsvc_timeline(),
+									 targetPagePtr, XLOG_BLCKSZ, readBuf);
+			return n >= reqLen ? n : -1;
+		}
+	}
+	offset = targetPagePtr - cache->start;
+	n = Min((uint64) XLOG_BLCKSZ, (uint64) cache->length - offset);
+	memcpy(readBuf, cache->data + offset, n);
 	return n >= reqLen ? n : -1;
 }
 
@@ -1599,6 +1635,7 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store,
 {
 	XLogReaderState *volatile reader = NULL;
 	ReadLocalXLogPageNoWaitPrivate *volatile pd = NULL;
+	PageStoreIndexReadAhead *volatile cache = NULL;
 	XLogRecPtr	first;
 	XLogRecPtr	indexed_end = start;
 	PageStoreWalIndexEntry *volatile batch = NULL;
@@ -1608,9 +1645,13 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store,
 	{
 		batch = palloc(sizeof(*batch) * PAGESTORE_WAL_INDEX_BATCH_MAX);
 		if (from_store)
+		{
+			cache = palloc0(sizeof(*cache));
+			cache->end = end;
 			reader = XLogReaderAllocate(wal_segment_size, NULL,
 									 XL_ROUTINE(.page_read = &pagestore_index_wal_page_read),
-									 NULL);
+									 (void *) cache);
+		}
 		else
 		{
 			pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
@@ -1690,6 +1731,8 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store,
 			XLogReaderFree((XLogReaderState *) reader);
 		if (pd != NULL)
 			pfree((ReadLocalXLogPageNoWaitPrivate *) pd);
+		if (cache != NULL)
+			pfree((PageStoreIndexReadAhead *) cache);
 		if (batch != NULL)
 			pfree((PageStoreWalIndexEntry *) batch);
 	}
