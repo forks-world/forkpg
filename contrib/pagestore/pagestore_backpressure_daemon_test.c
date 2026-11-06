@@ -965,6 +965,91 @@ cleanup:
 	ps_test_remove_tree(store_dir);
 }
 
+static void
+test_admission_writer_does_not_block_reads(const char *daemon_path)
+{
+	char shm_name[64], store[256], pause[256], ready[256];
+	pid_t pid = -1;
+	int fd = -1, marker;
+	void *shm = MAP_FAILED;
+	PsChannel *writer = NULL, *reader = NULL;
+
+	snprintf(shm_name, sizeof(shm_name), "/psadmission_%d", (int) getpid());
+	snprintf(store, sizeof(store), "%s/admission-store", test_root);
+	snprintf(pause, sizeof(pause), "%s/admission-pause", test_root);
+	snprintf(ready, sizeof(ready), "%s/admission-ready", test_root);
+	ps_shm_unlink(shm_name);
+	pid = fork();
+	if (pid == 0)
+	{
+		execl(daemon_path, daemon_path, "--shm", shm_name, "--store", store,
+			  "--test-admission-pause-file", pause, ready, (char *) NULL);
+		_exit(127);
+	}
+	if (pid <= 0 || !wait_for_ready(shm_name))
+	{
+		check(0, "admission test daemon starts");
+		goto cleanup;
+	}
+	check(1, "admission test daemon starts");
+	fd = ps_shm_open(shm_name, O_RDWR, 0600);
+	check(fd >= 0, "admission test opens shared memory");
+	if (fd < 0)
+		goto cleanup;
+	shm = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	check(shm != MAP_FAILED, "admission test maps shared memory");
+	if (shm == MAP_FAILED)
+		goto cleanup;
+	writer = ps_channel(shm, 0);
+	reader = ps_channel(shm, 1);
+	marker = ps_cas(&writer->claimed, 0, 1) && ps_cas(&reader->claimed, 0, 1);
+	check(marker, "admission test claims two channels");
+	if (!marker)
+		goto cleanup;
+	marker = open(pause, O_CREAT | O_WRONLY, 0600);
+	check(marker >= 0, "admission test creates pause file");
+	if (marker < 0)
+		goto cleanup;
+	close(marker);
+	for (int i = 0; i < 5000 && access(ready, F_OK) != 0; i++)
+		sleep_ms(1);
+	check(access(ready, F_OK) == 0, "maintenance holds admission writer gate");
+	set_relation_key(writer, 7777);
+	writer->opcode = PS_OP_CREATE;
+	ps_request_generation_next(writer);
+	ps_store_release(&writer->state, PS_STATE_REQUEST);
+	sleep_ms(100);
+	check(ps_load_acquire(&writer->state) == PS_STATE_REQUEST,
+		  "mutation waits for admission writer");
+	set_relation_key(reader, 7777);
+	reader->opcode = PS_OP_EXISTS;
+	ps_request_generation_next(reader);
+	ps_store_release(&reader->state, PS_STATE_REQUEST);
+	check(wait_for_state(reader, PS_STATE_DONE, 2000) && reader->status == PS_STATUS_OK,
+		  "read completes while earlier mutation waits on admission");
+	unlink(pause);
+	check(wait_for_state(writer, PS_STATE_DONE, 5000) && writer->status == PS_STATUS_OK,
+		  "deferred mutation completes after admission is released");
+cleanup:
+	unlink(pause);
+	if (pid > 0)
+	{
+		kill(pid, SIGTERM);
+		if (!wait_for_exit(pid, 5000))
+		{
+			kill(pid, SIGKILL);
+			waitpid(pid, NULL, 0);
+		}
+	}
+	if (shm != MAP_FAILED)
+		munmap(shm, PS_SHM_SIZE);
+	if (fd >= 0)
+		close(fd);
+	ps_shm_unlink(shm_name);
+	unlink(ready);
+	ps_test_remove_tree(store);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -977,6 +1062,7 @@ main(int argc, char **argv)
 	ps_test_mkdtemp(test_root, sizeof(test_root));
 	(void) run_test(argv[1]);
 	test_forkmeta_request_classification(argv[1]);
+	test_admission_writer_does_not_block_reads(argv[1]);
 	if (argc == 3)
 		test_unsupported_backend_cli(argv[2]);
 	ps_test_remove_tree(test_root);

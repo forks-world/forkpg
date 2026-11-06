@@ -1461,6 +1461,41 @@ ps_admission_read_unlock(void)
 	pthread_mutex_unlock(&admission_turnstile);
 }
 
+int
+ps_admission_try_read_lock(void)
+{
+	int rc;
+
+	pthread_mutex_lock(&admission_turnstile);
+	if (admission_waiting_writers != 0 || admission_writer_active)
+	{
+		pthread_mutex_unlock(&admission_turnstile);
+		return 0;
+	}
+	if (admission_active_readers == UINT32_MAX)
+	{
+		pthread_mutex_unlock(&admission_turnstile);
+		abort();
+	}
+	admission_active_readers++;
+	pthread_mutex_unlock(&admission_turnstile);
+	rc = pthread_rwlock_tryrdlock(&admission_lock);
+	if (rc != 0)
+	{
+		pthread_mutex_lock(&admission_turnstile);
+		admission_active_readers--;
+		if (admission_active_readers == 0)
+			pthread_cond_broadcast(&admission_turnstile_cond);
+		pthread_mutex_unlock(&admission_turnstile);
+		if (rc == EBUSY || rc == EAGAIN)
+			return 0;
+		abort();
+	}
+	if (admission_read_test_hook != NULL)
+		admission_read_test_hook(admission_read_test_hook_arg);
+	return 1;
+}
+
 static int
 backpressure_stop_observed(const volatile sig_atomic_t *stop_flag)
 {

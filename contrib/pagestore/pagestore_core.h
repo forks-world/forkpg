@@ -143,6 +143,8 @@ extern void ps_lifecycle_write_unlock(void);
 
 /* Assign a fence sequence only after all prior mutation bodies have left. */
 extern void ps_admission_read_lock(void);
+/* Do not wait behind a queued or active admission writer. */
+extern int ps_admission_try_read_lock(void);
 extern void ps_admission_read_unlock(void);
 /* Nonblocking admission probe.  Returns 1 to admit, 0 to leave the channel in
  * REQUEST, and -1 when shutdown was observed. */

@@ -44,6 +44,8 @@
 static volatile sig_atomic_t stop_requested = 0;
 static PsShmHeader *daemon_hdr = NULL;
 static const char *maintenance_pause_file = NULL;
+static const char *test_admission_pause_file = NULL;
+static const char *test_admission_ready_file = NULL;
 static const char *shutdown_cancel_pause_file = NULL;
 static int shutdown_cancel_ready_fd = -1;
 
@@ -1034,8 +1036,8 @@ active_fence_epoch(void)
 	return epoch;
 }
 
-/* Returns zero when a relation mutation is intentionally left in REQUEST
- * until the checkpoint owner publishes and syncs its admission fence. */
+/* Returns zero when a mutation is intentionally left in REQUEST for
+ * backpressure, an admission writer, or a pending checkpoint fence. */
 static int
 run_request(uint32_t channel, PsChannel *ch)
 {
@@ -1135,7 +1137,13 @@ run_request(uint32_t channel, PsChannel *ch)
 	{
 		uint64_t	epoch = active_fence_epoch();
 
-		ps_admission_read_lock();
+		/* A maintenance writer may hold admission during slow proof I/O.
+		 * Leave this mutation queued so this shard can still serve reads. */
+		if (!ps_admission_try_read_lock())
+		{
+			ps_lifecycle_read_unlock();
+			return 0;
+		}
 		if (epoch != active_fence_epoch())
 		{
 			ps_admission_read_unlock();
@@ -1279,6 +1287,25 @@ maintenance_worker(void *arg)
 
 	while (!stop_requested)
 	{
+		/* Deterministic regression seam for a slow admission-writer pass. */
+		if (test_admission_pause_file != NULL &&
+			access(test_admission_pause_file, F_OK) == 0 &&
+			ps_admission_write_lock() == 0)
+		{
+			int fd = open(test_admission_ready_file,
+						  O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+			if (fd >= 0)
+				close(fd);
+			while (!stop_requested && access(test_admission_pause_file, F_OK) == 0)
+			{
+				struct timespec ts = {0, 1000000};
+
+				nanosleep(&ts, NULL);
+			}
+			ps_admission_write_unlock();
+			continue;
+		}
 		/* Test-only deterministic seam: keep the real maintenance thread alive
 		 * and refreshing controller state, while withholding reclaim progress. */
 		if (maintenance_pause_file != NULL &&
@@ -1421,6 +1448,12 @@ main(int argc, char **argv)
 		else if (strcmp(argv[i], "--test-maintenance-pause-file") == 0 &&
 				 i + 1 < argc)
 			maintenance_pause_file = argv[++i];
+		else if (strcmp(argv[i], "--test-admission-pause-file") == 0 &&
+				 i + 2 < argc)
+		{
+			test_admission_pause_file = argv[++i];
+			test_admission_ready_file = argv[++i];
+		}
 		else if (strcmp(argv[i], "--test-shutdown-cancel-pause-file") == 0 &&
 				 i + 1 < argc)
 			shutdown_cancel_pause_file = argv[++i];
@@ -1456,6 +1489,7 @@ main(int argc, char **argv)
 				"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] [--walidx-snapshot-bytes N] "
 				"[--forkmeta-high-water-bytes N --forkmeta-catch-up-bytes N] "
 					"[--test-maintenance-pause-file PATH] "
+					"[--test-admission-pause-file PATH READY_PATH] "
 					"[--test-shutdown-cancel-pause-file PATH] "
 					"[--test-shutdown-cancel-ready-fd N]\n",
 					argv[0]);
@@ -1502,6 +1536,7 @@ main(int argc, char **argv)
 				"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] [--walidx-snapshot-bytes N] "
 				"[--forkmeta-high-water-bytes N --forkmeta-catch-up-bytes N] "
 				"[--test-maintenance-pause-file PATH] "
+				"[--test-admission-pause-file PATH READY_PATH] "
 				"[--test-shutdown-cancel-pause-file PATH] "
 				"[--test-shutdown-cancel-ready-fd N]\n",
 				argv[0]);
