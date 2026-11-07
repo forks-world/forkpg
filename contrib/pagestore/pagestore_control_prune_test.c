@@ -1167,6 +1167,59 @@ test_bounded_overlapping_suffix(int nonzero_floor)
 }
 
 static void
+test_large_overlap_suffix_gets_early_turn(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-large-overlap-turn-XXXXXX";
+	uint64_t before;
+	uint64_t bytes_before = 0, bytes_after = 0;
+	uint32_t live_before = 0, live_after = 0;
+	int wrote = 1;
+
+	configure_core(1);
+	compact_layers = 2000;
+	segment_gc_enabled = 0;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
+		  "open large overlap scheduling fixture");
+	for (uint32_t i = 0; i < 1100; i++)
+		wrote &= write_relation(0, 0, 1000 + i);
+	check(wrote, "build more than a thousand overlapping layers");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+		{
+			live_before++;
+			bytes_before += ps_layer_map.layers[i].locations[0].size;
+		}
+	ps_unlock_map();
+	before = ps_test_bounded_compaction_count();
+	compact_layers = 1;
+	for (int i = 0; i < 4 && ps_test_bounded_compaction_count() == before; i++)
+		(void) ps_core_maintenance();
+	check(ps_test_bounded_compaction_count() > before,
+		  "large overlapping map attempts a newest suffix promptly");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+		{
+			live_after++;
+			bytes_after += ps_layer_map.layers[i].locations[0].size;
+		}
+	ps_unlock_map();
+	fprintf(stderr, "large overlapping map: %u -> %u live layers, %llu -> %llu bytes\n",
+			live_before, live_after, (unsigned long long) bytes_before,
+			(unsigned long long) bytes_after);
+	check(live_before >= 1024 && live_after < live_before,
+		  "early suffix merge reduces the live layer count");
+	check(read_relation_at(0, 1000) && read_relation_at(0, 2099),
+		  "early suffix scheduling preserves old and new versions");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) &&
+		  read_relation_at(0, 2099), "early suffix data survives restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_rejected_suffix_resumes_large_search(void)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-rejected-suffix-XXXXXX";
@@ -4451,6 +4504,7 @@ main(void)
 	test_bounded_overlapping_suffix(0);
 	test_bounded_overlapping_suffix(1);
 	test_mixed_control_suffix_merge();
+	test_large_overlap_suffix_gets_early_turn();
 	test_rejected_suffix_resumes_large_search();
 	test_isolated_bounded_pruning();
 	test_isolated_pruning_branch_view();
