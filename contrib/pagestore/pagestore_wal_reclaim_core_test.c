@@ -2746,6 +2746,8 @@ test_floor_scan_does_not_hold_reader_gates(void)
 	while (!gate.entered)
 		pthread_cond_wait(&gate.cond, &gate.mutex);
 	pthread_mutex_unlock(&gate.mutex);
+	check(!ps_admission_try_read_lock(),
+		  "mutation admission is deferred while reclaim holds the writer gate");
 	check(pthread_create(&reader, NULL, map_first_wal_readers_thread, &gate) == 0,
 		  "start map-first WAL readers during the floor scan");
 	pthread_mutex_lock(&gate.mutex);
@@ -2756,6 +2758,13 @@ test_floor_scan_does_not_hold_reader_gates(void)
 	pthread_mutex_unlock(&gate.mutex);
 	pthread_join(reader, NULL);
 	pthread_join(maintenance, NULL);
+	{
+		int admitted = ps_admission_try_read_lock();
+
+		check(admitted, "mutation admission resumes when reclaim releases the gate");
+		if (admitted)
+			ps_admission_read_unlock();
+	}
 	check(gate.wal_status == PS_STATUS_OK &&
 		  gate.walidx_status == PS_STATUS_OK,
 		  "map-first WAL and WAL-index reads do not deadlock with the floor scan");
