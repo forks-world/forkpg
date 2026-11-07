@@ -2732,6 +2732,7 @@ test_floor_scan_does_not_hold_reader_gates(void)
 	ReclaimFloorGate gate;
 	pthread_t maintenance;
 	pthread_t reader;
+	unsigned int before;
 
 	configure_core();
 	memset(&gate, 0, sizeof(gate));
@@ -2739,6 +2740,7 @@ test_floor_scan_does_not_hold_reader_gates(void)
 	pthread_cond_init(&gate.cond, NULL);
 	check(prepare_store(store, WAL_TOTAL, 0, 0, 1),
 		  "construct reclaimable WAL for the floor-scan lock test");
+	before = segment_count(store, 0);
 	ps_test_set_wal_reclaim_before_floor_hook(gate_reclaim_before_floor, &gate);
 	check(pthread_create(&maintenance, NULL, maintenance_thread, NULL) == 0,
 		  "pause reclaim after releasing reader-facing gates");
@@ -2768,7 +2770,13 @@ test_floor_scan_does_not_hold_reader_gates(void)
 	check(gate.wal_status == PS_STATUS_OK &&
 		  gate.walidx_status == PS_STATUS_OK,
 		  "map-first WAL and WAL-index reads do not deadlock with the floor scan");
+	check(segment_count(store, 0) == before,
+		  "interrupted retention proof does not reclaim a partial prefix");
 	ps_test_set_wal_reclaim_before_floor_hook(NULL, NULL);
+	ps_test_wal_reclaim_proof_changed();
+	usleep(30000);
+	check(maintenance_until_count(store, 0, 0),
+		  "reclamation retries and advances after mutation pressure ends");
 	pthread_cond_destroy(&gate.cond);
 	pthread_mutex_destroy(&gate.mutex);
 	close_store();
@@ -2929,6 +2937,7 @@ test_concurrent_admission(void)
 	AdmissionGate gate;
 	pthread_t maintenance;
 	pthread_t pin;
+	unsigned int before;
 
 	configure_core();
 	memset(&gate, 0, sizeof(gate));
@@ -2936,6 +2945,7 @@ test_concurrent_admission(void)
 	pthread_cond_init(&gate.cond, NULL);
 	check(prepare_store(store, WAL_TOTAL, 0, 0, 1),
 		  "construct concurrent-admission fixture");
+	before = segment_count(store, 0);
 	ps_test_set_admission_write_lock_hook(gate_admission_write, &gate);
 	check(pthread_create(&maintenance, NULL, maintenance_thread, NULL) == 0,
 		  "start maintenance under admission gate");
@@ -2954,9 +2964,13 @@ test_concurrent_admission(void)
 	pthread_mutex_unlock(&gate.mutex);
 	pthread_join(maintenance, NULL);
 	pthread_join(pin, NULL);
-	check(gate.pin_done && segment_count(store, 0) == 0,
-		  "admission mutation resumes only after the safe reclaim cutover");
+	check(gate.pin_done && segment_count(store, 0) == before,
+		  "queued admission mutation interrupts reclaim before its cutover");
 	ps_test_set_admission_write_lock_hook(NULL, NULL);
+	ps_test_wal_reclaim_proof_changed();
+	usleep(30000);
+	check(maintenance_until_count(store, 0, 0),
+		  "reclaim revalidates the new pin and progresses after admission");
 	pthread_cond_destroy(&gate.cond);
 	pthread_mutex_destroy(&gate.mutex);
 	close_store();

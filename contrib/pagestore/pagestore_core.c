@@ -429,6 +429,10 @@ static pthread_cond_t admission_turnstile_cond = PTHREAD_COND_INITIALIZER;
 static uint32_t admission_active_readers;
 static uint32_t admission_waiting_writers;
 static int admission_writer_active;
+/* Advisory only: a queued mutation asks a long WAL-reclaim proof to yield. */
+static uint64_t admission_mutation_epoch;
+static _Thread_local int wal_reclaim_floor_interruptible;
+static _Thread_local uint64_t wal_reclaim_admission_epoch;
 static PsForkmetaCutoverTestHook forkmeta_cutover_test_hook;
 static void *forkmeta_cutover_test_hook_arg;
 static PsForkmetaPostGcTestHook forkmeta_post_gc_test_hook;
@@ -1469,6 +1473,7 @@ ps_admission_try_read_lock(void)
 	pthread_mutex_lock(&admission_turnstile);
 	if (admission_waiting_writers != 0 || admission_writer_active)
 	{
+		__atomic_fetch_add(&admission_mutation_epoch, 1, __ATOMIC_RELEASE);
 		pthread_mutex_unlock(&admission_turnstile);
 		return 0;
 	}
@@ -2088,6 +2093,8 @@ admission_write_lock(void)
 
 	pthread_mutex_lock(&admission_turnstile);
 	admission_waiting_writers++;
+	if (admission_writer_active)
+		__atomic_fetch_add(&admission_mutation_epoch, 1, __ATOMIC_RELEASE);
 	if (admission_write_queued_test_hook != NULL)
 		admission_write_queued_test_hook(admission_write_queued_test_hook_arg);
 	if (admission_write_lock_test_hook != NULL)
@@ -17624,8 +17631,15 @@ wal_segment_reclaim_one(void)
 		return 0; /* SPDK and unknown providers have no safe R3b policy. */
 	if (!wal_reclaim_preselected(&now, 1, NULL))
 		return 0;
+	/* Never clear a shared signal: another reclaim attempt may be running. */
+	wal_reclaim_admission_epoch = __atomic_load_n(&admission_mutation_epoch,
+													 __ATOMIC_ACQUIRE);
 	if (admission_write_lock() != 0)
 		return 0;
+	pthread_mutex_lock(&admission_turnstile);
+	if (admission_waiting_writers != 0)
+		__atomic_fetch_add(&admission_mutation_epoch, 1, __ATOMIC_RELEASE);
+	pthread_mutex_unlock(&admission_turnstile);
 	for (uint32_t pass = 0; pass < MAX_TIMELINES; pass++)
 	{
 		uint32_t tl = (wal_reclaim_cursor + pass) % MAX_TIMELINES;
@@ -17771,11 +17785,16 @@ wal_segment_reclaim_one(void)
 		if (wal_reclaim_before_floor_test_hook != NULL)
 			wal_reclaim_before_floor_test_hook(tl,
 										 wal_reclaim_before_floor_test_hook_arg);
+		wal_reclaim_floor_interruptible = 1;
 		rc = rc != 0 ? rc : retention_effective_floor_internal(tl,
 											 PS_RETENTION_RESOURCE_WAL,
 											 &retention_floor, 0, &pin_floor,
 											 &note_timeline, &note_lsn,
 											 &note_seq);
+		wal_reclaim_floor_interruptible = 0;
+		if (__atomic_load_n(&admission_mutation_epoch, __ATOMIC_ACQUIRE) !=
+			wal_reclaim_admission_epoch)
+			rc = -1;
 		/* Residual 2 (a superseded control note stuck in the memtable):
 		 * decide here, in this same unlocked interval, since the decision
 		 * needs note I/O (control_checkpoint_cutoff -> control_note_redo,
@@ -18260,6 +18279,9 @@ wal_segment_reclaim_one(void)
 		}
 		if (target > store->end_lsn)
 			goto retry_timeline;
+		if (__atomic_load_n(&admission_mutation_epoch, __ATOMIC_ACQUIRE) !=
+			wal_reclaim_admission_epoch)
+			goto retry_timeline;
 		if (wal_reclaim_attempt_test_hook != NULL)
 			wal_reclaim_attempt_test_hook(tl, wal_reclaim_attempt_test_hook_arg);
 		rc = ps_wal_store_reclaim_prefix(store, target);
@@ -18274,7 +18296,12 @@ wal_segment_reclaim_one(void)
 
 retry_timeline:
 		if (attempt)
+		{
+			/* A slow proof may have outlived its original timestamp.  Base the
+			 * retry delay on completion, so queued mutations can make progress. */
+			(void) clock_gettime(CLOCK_MONOTONIC, &now);
 			wal_reclaim_backoff(tl, &now, proof_epoch);
+		}
 
 		/* Advance after every selected candidate, including fail-closed or failed
 		 * attempts, so it cannot starve later timelines on subsequent ticks. */
@@ -23522,6 +23549,12 @@ wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
 			PageVer *v = &notes->vers[i];
 			uint64_t redo;
 
+			/* A partial proof must never authorize reclamation.  Abort under the
+			 * same admission gate; the caller drops it and retries from scratch. */
+			if (wal_reclaim_floor_interruptible &&
+				__atomic_load_n(&admission_mutation_epoch, __ATOMIC_ACQUIRE) !=
+				wal_reclaim_admission_epoch)
+				return -1;
 			if (v->lsn > cap)
 				continue;
 			if (v->seg >= 0)
