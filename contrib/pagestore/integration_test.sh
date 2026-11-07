@@ -577,6 +577,10 @@ $P -c "CREATE TABLE rp(id int primary key, v text) TABLESPACE ts;
 # first modify after the checkpoint logs a full-page image of rp's block 0
 $P -c "UPDATE rp SET v='rp_later' WHERE id=1;" >/dev/null
 rlsn1=$($P -c "SELECT pg_current_wal_lsn();")
+# A retention owner protects an exact WAL-index horizon, not every later LSN.
+# Pin this query's horizon before shipping lets background pruning reach it.
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9003,1,7,'$rlsn1');")" "0" \
+	"pin the FPI reconstruction horizon"
 $P -c "SELECT pg_switch_wal();" >/dev/null
 wait_walidx_visible rp || true
 # reconstruct rp's block 0 image from WAL alone; it carries the committed row
@@ -587,6 +591,8 @@ else
 	echo "FAIL - could not reconstruct page image from WAL FPI (got '$rebuilt')"
 	fail=1
 fi
+assert "$($P -c "SELECT pagestore_retention_drop(0,1,9003,1);")" "0" \
+	"release the FPI reconstruction horizon"
 
 # --- 7. full single-page redo: materialize a page as of an LSN (redo_page_asof) -
 # The base full-page image plus every WAL record after it, replayed through the
@@ -605,6 +611,8 @@ $P -c "CREATE TABLE rpa(id int primary key, v text) WITH (autovacuum_enabled=off
        INSERT INTO rpa VALUES (2,'asof_two');
        INSERT INTO rpa VALUES (3,'asof_three');" >/dev/null
 alsn=$($P -c "SELECT pg_current_wal_lsn();")
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9004,1,7,'$alsn');")" "0" \
+	"pin the page redo horizon"
 $P -c "SELECT pg_switch_wal();" >/dev/null
 wait_walidx_visible rpa || true
 # The reconstruction must carry the base full-page image's rows (asof_one,
@@ -619,6 +627,8 @@ assert "$asof_all" "t" "page materialized as of LSN (base FPI + deltas via rm_re
 # the base image alone would lack the post-FPI delta; confirm it was applied
 asof_base=$($P -c "SELECT position('asof_three'::bytea in pagestore_redo_page('rpa',0,0,'$alsn')) > 0;")
 assert "$asof_base" "f" "the base FPI alone lacks the delta (so the match above came from redo)"
+assert "$($P -c "SELECT pagestore_retention_drop(0,1,9004,1);")" "0" \
+	"release the page redo horizon"
 
 # --- 8. non-relation object on the store via the PsKey klass discriminator -----
 # A non-relation object (klass != RELATION) rides the same store path as a
@@ -647,15 +657,23 @@ $P -c "CREATE TABLE trunc(id int, v text) WITH (autovacuum_enabled=off);
 tl0=$($P -c "SELECT pg_current_wal_lsn();")
 $P -c "UPDATE trunc SET v=v||'!' WHERE id=1;" >/dev/null  # first change after checkpoint -> FPI of block 0
 tl_before=$($P -c "SELECT pg_current_wal_lsn();")
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9005,1,7,'$tl_before');")" "0" \
+	"pin the pre-truncation redo horizon"
 $P -c "DELETE FROM trunc;" >/dev/null
 $P -c "VACUUM trunc;" >/dev/null                     # empties block 0 -> truncates it away
 tl_after=$($P -c "SELECT pg_current_wal_lsn();")
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9006,1,7,'$tl_after');")" "0" \
+	"pin the post-truncation redo horizon"
 $P -c "SELECT pg_switch_wal();" >/dev/null
 wait_walidx_visible trunc || true
 live_before=$($P -c "SELECT pagestore_redo_page_asof('trunc',0,0,'$tl_before') IS NOT NULL;")
 assert "$live_before" "t" "redo_page_asof materializes the block while it is live (before truncation)"
 live_after=$($P -c "SELECT pagestore_redo_page_asof('trunc',0,0,'$tl_after') IS NULL;")
 assert "$live_after" "t" "redo_page_asof returns NULL for a block truncated away as of the LSN (liveness)"
+assert "$($P -c "SELECT pagestore_retention_drop(0,1,9005,1);")" "0" \
+	"release the pre-truncation redo horizon"
+assert "$($P -c "SELECT pagestore_retention_drop(0,1,9006,1);")" "0" \
+	"release the post-truncation redo horizon"
 
 # --- 14. store-backed redo: replay base+deltas from the store's shipped WAL ------
 # With pagestore.redo_wal_from_store on, redo_page_asof reads its WAL records from
