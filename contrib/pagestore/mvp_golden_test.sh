@@ -828,6 +828,50 @@ assert_eq "$("${BP[@]}" -c "SELECT note FROM mvp_golden WHERE id=3;")" \
 	"branch_local" "branch write survives compute restart on timeline 1"
 assert_eq "$("${BP[@]}" -c "SELECT count(*) FROM mvp_golden WHERE id=2;")" \
 	"0" "branch ancestry cutoff survives compute restart"
+
+# A branch can still be generating WAL at positions numerically below the
+# store fork after bootstrap.  Crash after a checkpoint in that interval so
+# startup must query fork sizes while replaying the branch's own WAL.
+"${BP[@]}" -c "CHECKPOINT;" >/dev/null || fail "branch checkpoint before crash failed"
+assert_eq "$("${BP[@]}" -c "SELECT redo_lsn < '$fork_lsn'::pg_lsn FROM pg_control_checkpoint();")" \
+	"t" "branch crash checkpoint redo precedes its store fork"
+"${BP[@]}" -c "INSERT INTO mvp_golden VALUES (4, 'branch_crash_replay');" >/dev/null ||
+	fail "branch write before crash failed"
+"$BIN/pg_ctl" -D "$BRANCH" -l "$BRANCH/branch.log" -m immediate -w restart >/dev/null 2>&1 ||
+	fail "branch crash recovery before its store fork failed"
+assert_eq "$("${BP[@]}" -c "SELECT note FROM mvp_golden WHERE id=4;")" \
+	"branch_crash_replay" "branch crash recovery replays writes below the store fork"
+assert_eq "$("${BP[@]}" -c "SELECT count(*) FROM mvp_golden WHERE id=2;")" \
+	"0" "branch crash recovery keeps post-fork parent data hidden"
+
+# Exercise redo that must load an existing page rather than restore a full-page
+# image. The branch checkpoint still precedes the store's finite fork point.
+"${BP[@]}" -c "ALTER SYSTEM SET full_page_writes = off;" >/dev/null ||
+	fail "could not configure branch WAL without full-page writes"
+"${BP[@]}" -c "SELECT pg_reload_conf();" >/dev/null || fail "branch WAL reload failed"
+for _ in $(seq 1 50); do
+	[ "$("${BP[@]}" -c "SHOW full_page_writes;")" = "off" ] && break
+	sleep 0.1
+done
+assert_eq "$("${BP[@]}" -c "SHOW full_page_writes;")" "off" \
+	"branch WAL uses incremental page records"
+"${BP[@]}" -c "CHECKPOINT;" >/dev/null || fail "branch incremental redo checkpoint failed"
+assert_eq "$("${BP[@]}" -c "SELECT redo_lsn < '$fork_lsn'::pg_lsn FROM pg_control_checkpoint();")" \
+	"t" "incremental redo checkpoint precedes the store fork"
+"${BP[@]}" -c "UPDATE mvp_golden SET note = 'branch_delta_replay' WHERE id=4;" >/dev/null ||
+	fail "branch incremental write before crash failed"
+"${BP[@]}" -c "UPDATE mvp_golden SET note = 'branch_delta_replay_twice' WHERE id=4;" >/dev/null ||
+	fail "second branch incremental write before crash failed"
+"$BIN/pg_ctl" -D "$BRANCH" -l "$BRANCH/branch.log" -m immediate -w restart >/dev/null 2>&1 ||
+	fail "branch incremental crash recovery failed"
+assert_eq "$("${BP[@]}" -c "SELECT note FROM mvp_golden WHERE id=4;")" \
+	"branch_delta_replay_twice" "branch recovers multiple incremental WAL records below the store fork"
+assert_eq "$("${BP[@]}" -c "SELECT count(*) FROM mvp_golden WHERE id=2;")" \
+	"0" "incremental crash recovery keeps the parent snapshot isolated"
+"$BIN/pg_ctl" -D "$BRANCH" -l "$BRANCH/branch.log" -m immediate -w restart >/dev/null 2>&1 ||
+	fail "second branch crash recovery failed"
+assert_eq "$("${BP[@]}" -c "SELECT note FROM mvp_golden WHERE id=4;")" \
+	"branch_delta_replay_twice" "incremental recovery remains correct after a second crash"
 if grep -q 'pg_control mirror ship failed' "$BRANCH/branch.log"; then
 	fail "branch checkpoints failed to publish their CONTROL mirrors"
 fi

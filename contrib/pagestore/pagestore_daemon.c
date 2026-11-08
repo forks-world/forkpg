@@ -588,6 +588,9 @@ handle_request(PsChannel *ch)
 						read_result = read_resolve_fsm(tl, &ch->key,
 													 ch->blocknum + i, dst, &resolved);
 					}
+					else if (ch->is_redo == PS_READ_BRANCH_REDO && ch->req_seq == 0)
+						read_result = read_resolve_branch_redo(tl, &ch->key,
+															 ch->blocknum + i, rl, dst, &resolved);
 					else
 						read_result = read_resolve(tl, &ch->key, ch->blocknum + i, rl,
 												  ch->req_seq, dst, &resolved);
@@ -1703,7 +1706,7 @@ main(int argc, char **argv)
 	hdr->frontend_capabilities = PS_FRONTEND_CAP_RELATION_INSPECTION |
 		PS_FRONTEND_CAP_BRANCH_SEQ | PS_FRONTEND_CAP_ATOMIC_PINS |
 		PS_FRONTEND_CAP_FSM_RESET | PS_FRONTEND_CAP_WAL_BASE |
-		PS_FRONTEND_CAP_WAL_BASE_STATE;
+		PS_FRONTEND_CAP_WAL_BASE_STATE | PS_FRONTEND_CAP_BRANCH_REDO_READ;
 	hdr->daemon_instance = new_daemon_instance();
 	daemon_hdr = hdr;
 	ps_core_set_metrics_header(hdr);
