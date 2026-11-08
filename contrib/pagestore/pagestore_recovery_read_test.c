@@ -61,6 +61,11 @@ pagestore_test_recovery_read(PG_FUNCTION_ARGS)
 	uint64 metadata_cap;
 	uint64 expected_page;
 	uint64 expected_metadata;
+	PsShmHeader *hdr;
+	PsChannel  *ch;
+	PageStoreRelKey key = {0};
+	void *saved_shm;
+	bool redo_flag_ok;
 
 
 	test_recovery = mode != 0 && mode != 5;
@@ -82,5 +87,24 @@ pagestore_test_recovery_read(PG_FUNCTION_ARGS)
 	 * A page cap of 150 would incorrectly reload image 50. */
 	if (mode == 2 && !(page_cap == 200 && metadata_cap == 150))
 		PG_RETURN_BOOL(false);
-	PG_RETURN_BOOL(page_cap == expected_page && metadata_cap == expected_metadata);
+	/* The marker is capability-negotiated and must never survive channel reuse
+	 * into a reader, standby backend, ordinary write, or older daemon. */
+	hdr = palloc0(sizeof(*hdr));
+	ch = palloc0(sizeof(*ch));
+	saved_shm = ls_shm;
+	ls_shm = hdr;
+	hdr->frontend_capabilities = PS_FRONTEND_CAP_BRANCH_REDO_READ;
+	ch->req_lsn = page_cap;
+	ch->req_seq = localsvc_read_lsn ? 1 : 0;
+	ls_read_opcode(ch, &key);
+	redo_flag_ok = (ch->is_redo == PS_READ_BRANCH_REDO) ==
+		(test_recovery && test_startup && localsvc_read_lsn == 0);
+	hdr->frontend_capabilities = 0;
+	ch->is_redo = PS_READ_BRANCH_REDO;
+	ls_read_opcode(ch, &key);
+	redo_flag_ok = redo_flag_ok && ch->is_redo == 0;
+	ls_shm = saved_shm;
+	pfree(ch);
+	pfree(hdr);
+	PG_RETURN_BOOL(page_cap == expected_page && metadata_cap == expected_metadata && redo_flag_ok);
 }

@@ -11352,6 +11352,40 @@ fork_asof_query_allowed(uint32_t reader_timeline, uint64_t read_lsn,
 	}
 }
 
+/* A newly bootstrapped branch may replay its own WAL from an LSN before its
+ * fork point.  Its local fork events remain capped at the replay record, but
+ * inherited metadata belongs to the frozen parent snapshot at the fork. */
+static int
+fork_redo_needs_parent_snapshot(uint32_t timeline, uint64_t lsn, uint64_t seq)
+{
+	return seq == 0 && timeline_has_parent(timeline) &&
+		timeline_branch_seq(timeline) != PS_SEQ_UNBOUNDED &&
+		timelines[timeline].branch_lsn != UINT64_MAX &&
+		lsn < timelines[timeline].branch_lsn;
+}
+
+static int
+fork_redo_parent_snapshot_allowed(uint32_t timeline, uint64_t lsn)
+{
+	TlWalk w = tl_walk_first(timeline, lsn);
+
+	/* Do not bypass the child's own history frontier. */
+	if (!page_view_registered(w.tl, &w.cap) ||
+		!page_frontier_allows(w.tl, timeline, w.lsn, 0))
+		return 0;
+	w.cap.lsn = timelines[timeline].branch_lsn;
+	w.lsn = w.cap.lsn;
+	while (tl_walk_next(&w))
+	{
+		uint64_t seq = w.cap.strict_seq == PS_SEQ_UNBOUNDED ? 0 : w.cap.strict_seq;
+
+		if (!page_view_registered(w.tl, &w.cap) ||
+			!page_frontier_allows(w.tl, timeline, w.lsn, seq))
+			return 0;
+	}
+	return 1;
+}
+
 /* Caller holds map_lock. */
 static int
 walidx_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn)
@@ -11851,7 +11885,8 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
  * into this store.  A later CREATE/TRUNCATE is a logical visibility boundary,
  * not permission to reject an earlier FPI as beyond EOF. */
 static uint32_t
-fork_nblocks_recovery(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
+fork_nblocks_recovery(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
+					  int parent_snapshot)
 {
 	uint32_t maxnb = 0;
 	TlWalk w = tl_walk_first(timeline, read_lsn);
@@ -11863,9 +11898,17 @@ fork_nblocks_recovery(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
 		if (e != NULL)
 			for (uint32_t i = 0; i < e->nev; i++)
 				if (e->ev[i].lsn <= w.lsn &&
+					(!parent_snapshot || w.tl == timeline ||
+					 !fork_event_hidden(e, i, &w.cap, w.inherited_below,
+									w.has_inherited_below)) &&
 					(e->ev[i].kind == FEV_GROW || e->ev[i].kind == FEV_SET) &&
 					e->ev[i].nblocks > maxnb)
 					maxnb = e->ev[i].nblocks;
+		if (parent_snapshot && w.tl == timeline)
+		{
+			w.cap.lsn = timelines[timeline].branch_lsn;
+			w.lsn = w.cap.lsn;
+		}
 	} while (tl_walk_next(&w));
 	return maxnb;
 }
@@ -22851,7 +22894,7 @@ static int read_resolve_internal(uint32_t timeline, const PsKey *key,
 								 uint64_t read_seq, unsigned char *out,
 								 uint64_t *out_ver, uint64_t *out_seq,
 								 int reset_fsm, const ViewCap *index_cap,
-								 PsWalBaseState *index_state);
+								 PsWalBaseState *index_state, int branch_redo);
 
 /*
  * Resolve a read into out (page_size bytes): walk the timeline ancestry as
@@ -22880,7 +22923,15 @@ read_resolve_version(uint32_t timeline, const PsKey *key, uint32_t block,
 					 uint64_t *out_ver, uint64_t *out_seq)
 {
 	return read_resolve_internal(timeline, key, block, read_lsn, read_seq,
-								 out, out_ver, out_seq, 0, NULL, NULL);
+								 out, out_ver, out_seq, 0, NULL, NULL, 0);
+}
+
+int
+read_resolve_branch_redo(uint32_t timeline, const PsKey *key, uint32_t block,
+						 uint64_t read_lsn, unsigned char *out, uint64_t *out_ver)
+{
+	return read_resolve_internal(timeline, key, block, read_lsn, 0, out,
+								 out_ver, NULL, 0, NULL, NULL, 1);
 }
 
 int
@@ -22890,7 +22941,7 @@ read_resolve_fsm(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (key->klass != PS_KLASS_RELATION || key->forkNum != 1)
 		return -1;
 	return read_resolve_internal(timeline, key, block, UINT64_MAX, 0,
-								 out, out_ver, NULL, 1, NULL, NULL);
+								 out, out_ver, NULL, 1, NULL, NULL, 0);
 }
 
 static int read_resolve_wal_view(uint32_t timeline, const PsKey *key,
@@ -22959,7 +23010,7 @@ read_resolve_wal_view(uint32_t timeline, const PsKey *key, uint32_t block,
 		return -2;
 	result = read_resolve_internal(timeline, key, block, read_lsn, read_seq,
 								   out, &state->version_lsn, &state->version_seq,
-								   0, &cap, include_lifecycle ? state : NULL);
+								   0, &cap, include_lifecycle ? state : NULL, 0);
 	state->found = result > 0;
 	return result;
 }
@@ -22968,12 +23019,13 @@ static int
 read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 					  uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
 					  uint64_t *out_ver, uint64_t *out_seq, int reset_fsm,
-					  const ViewCap *index_cap, PsWalBaseState *index_state)
+					  const ViewCap *index_cap, PsWalBaseState *index_state, int branch_redo)
 {
 	Shard	   *s;				/* same shard across the ancestry walk */
 	TlWalk		walk[MAX_TIMELINES];
 	uint32_t	levels = 0;
 	TlWalk		w;
+	int			parent_snapshot = 0;
 
 	if (!core_process_valid())
 		return -1;
@@ -23004,6 +23056,16 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 	/* Copy ancestry while CREATE_BRANCH is excluded, then release map_lock
 	 * before a remote layer read can block. */
 	ps_lock_map_rd();
+	if (branch_redo && key->klass == PS_KLASS_RELATION && read_lsn != UINT64_MAX)
+		parent_snapshot = fork_redo_needs_parent_snapshot(timeline, read_lsn, read_seq);
+	if (parent_snapshot)
+	{
+		/* Child pages copied below the fork are stored at fork + 1.  During
+		 * crash recovery PostgreSQL reads the latest durable local image and
+		 * uses its embedded page LSN to decide which WAL records to replay. */
+		w.cap.lsn = timelines[timeline].branch_lsn + 1;
+		w.lsn = w.cap.lsn;
+	}
 	if (index_cap != NULL)
 		walidx_publish_rdlock();
 	do
@@ -23019,6 +23081,11 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 			return -2;
 		}
 		walk[levels++] = w;
+		if (parent_snapshot && w.tl == timeline)
+		{
+			w.cap.lsn = timelines[timeline].branch_lsn;
+			w.lsn = w.cap.lsn;
+		}
 	}
 	while (levels < MAX_TIMELINES && tl_walk_next(&w));
 	if (index_state != NULL)
@@ -27119,9 +27186,14 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_NBLOCKS:
+		{
+			int parent_snapshot = ch->is_redo && ch->req_lsn != 0 &&
+				fork_redo_needs_parent_snapshot(tl, ch->req_lsn, ch->req_seq);
+
 			/* req_lsn caps the horizon; 0 = newest (the writer path) */
 			if (ch->req_lsn != 0 &&
-				!fork_asof_query_allowed(tl, ch->req_lsn, ch->req_seq))
+				!(parent_snapshot ? fork_redo_parent_snapshot_allowed(tl, ch->req_lsn) :
+				  fork_asof_query_allowed(tl, ch->req_lsn, ch->req_seq)))
 			{
 				ch->status = PS_STATUS_ERROR;
 				break;
@@ -27147,11 +27219,13 @@ ps_handle_meta(PsChannel *ch)
 			}
 			ch->result = ch->is_redo ?
 				fork_nblocks_recovery(tl, &ch->key,
-					ch->req_lsn ? ch->req_lsn : UINT64_MAX) :
+					ch->req_lsn ? ch->req_lsn : UINT64_MAX,
+					parent_snapshot) :
 				fork_nblocks_through(tl, &ch->key,
 										  ch->req_lsn ? ch->req_lsn : UINT64_MAX,
 										  ch->req_seq);
 			break;
+		}
 
 		case PS_OP_TRUNCATE:
 			/*

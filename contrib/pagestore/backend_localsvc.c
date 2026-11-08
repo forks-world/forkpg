@@ -1015,6 +1015,13 @@ static void
 ls_read_opcode(PsChannel *ch, const PageStoreRelKey *key)
 {
 	ch->opcode = PS_OP_READV;
+	/* Channels are reused: never let this recovery-only authority leak into a
+	 * subsequent ordinary or explicitly pinned read. */
+	ch->is_redo = 0;
+	if (localsvc_read_lsn == 0 && ch->req_seq == 0 && RecoveryInProgress() &&
+		AmStartupProcess() &&
+		(((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_BRANCH_REDO_READ))
+		ch->is_redo = PS_READ_BRANCH_REDO;
 	if (key->forkNum == FSM_FORKNUM && ch->req_lsn == 0 && ch->req_seq == 0 &&
 		!RecoveryInProgress() &&
 		(((PsShmHeader *) ls_shm)->frontend_capabilities & PS_FRONTEND_CAP_FSM_RESET))

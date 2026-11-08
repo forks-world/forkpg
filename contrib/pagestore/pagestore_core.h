@@ -470,6 +470,10 @@ extern int	read_resolve_version(uint32_t timeline, const PsKey *key,
 extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 						 uint64_t read_lsn, uint64_t read_seq,
 						 unsigned char *out, uint64_t *out_ver);
+/* Startup redo reads a finite branch's inherited base at its fork snapshot. */
+extern int read_resolve_branch_redo(uint32_t timeline, const PsKey *key,
+								   uint32_t block, uint64_t read_lsn,
+								   unsigned char *out, uint64_t *out_ver);
 /* Current compute hint read: inherited WAL-less FSM hints may be rebuilt from
  * zeros. Ordinary/historical reads and authoritative data retain their errors. */
 extern int read_resolve_fsm(uint32_t timeline, const PsKey *key, uint32_t block,

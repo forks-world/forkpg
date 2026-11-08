@@ -365,6 +365,9 @@ typedef struct PsWalIndexEntry
 #define PS_FRONTEND_CAP_FSM_RESET (UINT32_C(1) << 3)
 #define PS_FRONTEND_CAP_WAL_BASE (UINT32_C(1) << 4)
 #define PS_FRONTEND_CAP_WAL_BASE_STATE (UINT32_C(1) << 5)
+#define PS_FRONTEND_CAP_BRANCH_REDO_READ (UINT32_C(1) << 6)
+/* READV only: a startup-process page read during branch crash recovery. */
+#define PS_READ_BRANCH_REDO UINT32_C(0x42525244)
 #define PS_WAL_BASE_VIEW_UNREGISTERED 1u
 #define PS_BARRIER_REGISTER UINT32_C(0x50494e35)
 /* PS_OP_ADMISSION_BARRIER error: checkpoint WAL-index history is gone. */

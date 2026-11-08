@@ -334,6 +334,34 @@ meta_request(PsOpcode opcode, const PsKey *key, uint64_t lsn,
 }
 
 static int
+recovery_nblocks_seq(uint32_t timeline, const PsKey *key, uint64_t lsn,
+					 uint64_t seq, PsChannel *result)
+{
+	PsChannel ch = {0};
+	uint32_t shard = ps_shard_of(key);
+
+	ch.opcode = PS_OP_NBLOCKS;
+	ch.timeline = timeline;
+	ch.key = *key;
+	ch.req_lsn = lsn;
+	ch.req_seq = seq;
+	ch.is_redo = 1;
+	ps_lock_shard_rd(shard);
+	ps_lock_map_rd();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_unlock_shard(shard);
+	*result = ch;
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
+recovery_nblocks(uint32_t timeline, const PsKey *key, uint64_t lsn, PsChannel *result)
+{
+	return recovery_nblocks_seq(timeline, key, lsn, 0, result);
+}
+
+static int
 create_branch_request(uint32_t timeline, uint32_t parent, uint64_t lsn)
 {
 	PsChannel ch;
@@ -5881,6 +5909,69 @@ test_invalidated_first_arrival_then_late_rewrite(void)
 
 /* Production branch caps must survive page and forkmeta reclamation together. */
 static void
+test_nested_branch_redo_before_fork(void)
+{
+	char store[512] = "pagestore-nested-redo.XXXXXX";
+	PsKey key = {1, 1, 32999, 0, PS_KLASS_RELATION};
+	PsChannel ch = {0};
+	unsigned char page[8192];
+
+	check(test_mkdtemp(store, sizeof(store)) != NULL, "create nested redo store");
+	flush_pages = 1;
+	compact_layers = 0;
+	check(ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
+		  append_relation_tag(&key, 0, 100, page, 0x29, NULL) == 0 &&
+		  meta_request(PS_OP_ZEROEXTEND, &key, 175, 0, 5, 0, NULL),
+		  "prepare root sizes at positions 100 and 175");
+	for (uint32_t child = 1; child <= 2; child++)
+	{
+		memset(&ch, 0, sizeof(ch));
+		ch.opcode = PS_OP_CREATE_BRANCH;
+		ch.timeline = child;
+		ch.parent_timeline = child - 1;
+		ch.req_lsn = child == 1 ? 200 : 150;
+		ch.is_redo = PS_BRANCH_R2_PROVEN;
+		ps_admission_read_lock();
+		ps_lock_shard_wr(0);
+		ps_lock_map_wr();
+		ps_handle_meta(&ch);
+		ps_unlock_map();
+		ps_unlock_shard(0);
+		ps_admission_read_unlock();
+		check(ch.status == PS_STATUS_OK &&
+			  ch.result == (PS_BRANCH_RESULT_NEW | PS_BRANCH_RESULT_FINITE),
+			  "create nested finite branch");
+	}
+	check(recovery_nblocks(2, &key, 120, &ch) && ch.result == 1,
+		  "nested redo uses its fork snapshot without advancing the older ancestor cap");
+	check(read_resolve_branch_redo(2, &key, 0, 120, page, NULL) == 1 && page[128] == 0x29,
+		  "nested redo reads the parent's retained page at the descendant fork");
+	check(meta_request_timeline(2, PS_OP_ZEROEXTEND, &key, 125, 0, 2, 1, NULL) &&
+		  meta_request_timeline(2, PS_OP_ZEROEXTEND, &key, 145, 0, 4, 3, NULL),
+		  "record child growth on both sides of the replay position");
+	check(recovery_nblocks(2, &key, 130, &ch) && ch.result == 3 &&
+		  recovery_nblocks(2, &key, 149, &ch) && ch.result == 7,
+		  "branch redo caps child-local metadata at its actual WAL position");
+	{
+		int a = append_relation_timeline_tag(2, &key, 0, 125, page, 0x35, NULL);
+		int b = append_relation_timeline_tag(2, &key, 0, 145, page, 0x45, NULL);
+		int got = read_resolve_branch_redo(2, &key, 0, 130, page, NULL);
+		if (a != 0 || b != 0 || got != 1 || page[128] != 0x45)
+			fprintf(stderr, "nested redo page: append=%d,%d read=%d tag=%02x\n", a, b, got, page[128]);
+		check(a == 0 && b == 0 && got == 1 && page[128] == 0x45,
+			  "branch redo reads the latest durable child page clamped to the fork");
+	}
+	close_runtime();
+	check(ps_core_open(store) == 0 && recovery_nblocks(2, &key, 130, &ch) && ch.result == 3,
+		  "child-local redo position remains bounded after store restart");
+	check(read_resolve_branch_redo(2, &key, 0, 130, page, NULL) == 1 && page[128] == 0x45,
+		  "durable child redo page remains visible after store restart");
+	close_runtime();
+	remove_tree(store);
+}
+
+static void
 test_finite_branch_cutovers(void)
 {
 	char		store[512] = "pagestore-finite-branch.XXXXXX";
@@ -5889,6 +5980,7 @@ test_finite_branch_cutovers(void)
 				frontier[1024];
 	PsKey		key = {1, 1, 33000, 0, PS_KLASS_RELATION};
 	PsKey		churn = {1, 1, 33001, 0, PS_KLASS_RELATION};
+	PsKey		redo_key = {1, 1, 33002, 0, PS_KLASS_RELATION};
 	PsKey control = {0};
 	unsigned char page[8192];
 	PsRetentionPin pin = {0};
@@ -5905,7 +5997,9 @@ test_finite_branch_cutovers(void)
 	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
 		  ps_core_open(store) == 0 &&
 		  meta_request(PS_OP_CREATE, &key, 100, 0, 0, 0, NULL) &&
-		  append_relation_tag(&key, 0, 100, page, 0x11, NULL) == 0,
+		  append_relation_tag(&key, 0, 100, page, 0x11, NULL) == 0 &&
+		  meta_request(PS_OP_CREATE, &redo_key, 100, 0, 0, 0, NULL) &&
+		  append_relation_tag(&redo_key, 0, 100, page, 0x15, NULL) == 0,
 		  "seed root page before finite branch cut");
 	control.klass = PS_KLASS_CONTROL;
 	check(finite_test_control_pair(100, 100, 0x71) &&
@@ -5925,6 +6019,18 @@ test_finite_branch_cutovers(void)
 	check(ch.status == PS_STATUS_OK &&
 		  ch.result == (PS_BRANCH_RESULT_NEW | PS_BRANCH_RESULT_FINITE),
 		  "create finite structural fence through production metadata path");
+	check(recovery_nblocks(1, &key, 150, &ch) && ch.result == 1,
+		  "branch redo before fork resolves inherited size at its finite snapshot");
+	check(read_resolve(1, &key, 0, 150, 0, page, NULL) == -2 &&
+		  read_resolve_branch_redo(1, &key, 0, 150, page, NULL) == 1 && page[128] == 0x11,
+		  "redo reads the retained parent page without granting ordinary historical reads");
+	check(meta_request(PS_OP_ZEROEXTEND, &redo_key, 100, 0, 10, 0, NULL) &&
+		  recovery_nblocks(1, &redo_key, 150, &ch) && ch.result == 1,
+		  "branch redo excludes a post-fork parent rewrite at the same LSN");
+	check(!meta_request_timeline(1, PS_OP_NBLOCKS, &key, 150, 0, 0, 0, &ch),
+		  "ordinary historical metadata read remains fenced before the branch");
+	check(!recovery_nblocks_seq(1, &key, 150, 1, &ch),
+		  "explicit historical sequence cannot use the branch redo exception");
 	check(finite_test_control_pair(100, 100, 0x72) &&
 		  finite_test_control_pair(150, 120, 0x62) &&
 		  finite_test_control_pair(3000, 500, 0x63),
@@ -5934,6 +6040,8 @@ test_finite_branch_cutovers(void)
 		  append_relation_tag(&key, 1, 150, page, 0x44, NULL) == 0 &&
 		  meta_request(PS_OP_TRUNCATE, &key, 100, 0, 0, 0, NULL),
 		  "late same-position rewrites and truncate on parent");
+	check(read_resolve_branch_redo(1, &key, 0, 150, page, NULL) == 1 && page[128] == 0x11,
+		  "branch redo cannot read a parent's post-fork same-LSN rewrite");
 	check(meta_request(PS_OP_CREATE, &churn, 500, 0, 0, 0, NULL) &&
 		  append_relation(&churn, 0, 500, page, &seq) == 0,
 		  "establish operational history above branch");
@@ -5994,6 +6102,13 @@ test_finite_branch_cutovers(void)
 			  read_resolve(1, &key, 1, UINT64_MAX, 0, page, NULL) == 1 &&
 			  page[128] == 0x33,
 			  "recovered capped pages match live cutover state");
+		{
+			int redo_ok = recovery_nblocks(1, &redo_key, 150, &ch);
+			if (!redo_ok || ch.result != 1)
+				fprintf(stderr, "branch redo after restart: status=%u nblocks=%u\n", ch.status, ch.result);
+			check(redo_ok && ch.result == 1,
+				  "branch redo keeps the finite parent snapshot after restart");
+		}
 	}
 	close_runtime();
 	remove_tree(store);
@@ -6798,6 +6913,7 @@ main(void)
 	test_inert_markers_compacted_after_cutover();
 	test_invalidated_first_arrival_then_late_rewrite();
 	test_closure_with_same_lsn_invalidation();
+	test_nested_branch_redo_before_fork();
 	test_finite_branch_cutovers();
 	test_inert_markers_kept_when_retained();
 	test_inert_markers_kept_on_preserve_survivors();

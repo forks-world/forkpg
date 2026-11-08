@@ -5061,6 +5061,9 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 
 		check((((PsShmHeader *) cl_shm)->frontend_capabilities &
 			   PS_FRONTEND_CAP_FSM_RESET) != 0, "daemon advertises FSM hint reset");
+		check((((PsShmHeader *) cl_shm)->frontend_capabilities &
+			   PS_FRONTEND_CAP_BRANCH_REDO_READ) != 0,
+			  "daemon advertises finite-branch recovery reads");
 		memset(rb, 0, ps);
 		for (int rewrite = 0; rewrite < 2; rewrite++)
 		{
