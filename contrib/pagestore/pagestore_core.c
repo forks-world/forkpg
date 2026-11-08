@@ -4936,8 +4936,11 @@ budget_exhausted:
 	return 0;
 }
 
-/* Allow isolated discovery this many map positions before opportunistic suffix work. */
+/* Give isolated discovery priority on small maps.  On a large map a single
+ * bounded discovery turn can exhaust its budget on one overlapping seed, so
+ * waiting for 1024 positions can postpone suffix work across many restarts. */
 #define PS_ISOLATED_SUFFIX_MIN_CURSOR 1024
+#define PS_LARGE_LAYER_MAP_SUFFIX_THRESHOLD 1024
 
 /* A newest-ID suffix can overlap omitted older layers: an equal identity in
  * the suffix already wins the read tie. The coverage check below preserves
@@ -5076,7 +5079,8 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 			ninputs = bounded_newest_suffix_inputs(&ps_layer_map, timeline, shard, inputs, &bytes);
 		}
 		else if (ninputs == UINT32_MAX &&
-				 g_shards[shard].isolated_search_next[timeline] >= PS_ISOLATED_SUFFIX_MIN_CURSOR &&
+				 (ps_layer_map.nlayers >= PS_LARGE_LAYER_MAP_SUFFIX_THRESHOLD ||
+				  g_shards[shard].isolated_search_next[timeline] >= PS_ISOLATED_SUFFIX_MIN_CURSOR) &&
 				 !g_shards[shard].isolated_suffix_tried[timeline])
 		{
 			uint32_t suffix;
