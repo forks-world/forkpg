@@ -178,9 +178,13 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
     when that marker falls too far behind.  The
     limiter stops only at complete segment boundaries and always includes the
     first writer-owned checkpoint completion observed for the current marker
-    (plus room for a crossing record), so recovery cannot be stranded behind a
-    partial segment or before its next usable restartpoint.  Writer checkpoint
-    state is separate from recovery's pg_control updates.  The release
+    (plus room for a crossing record). This makes that checkpoint readable,
+    but it may not be a usable restartpoint: resolving invalid-page references
+    can require later WAL and a later checkpoint beyond the limit. The limit
+    supports configuration reload, so an operator can temporarily raise it
+    without restarting the writer and restore it after the durable marker
+    advances. This is a manual intervention, not an automatic escape. Writer
+    checkpoint state is separate from recovery's pg_control updates. The release
     checkpoint is durably latched: later checkpoints cannot move the bound
     until materialization advances.  Any already-started segment is allowed to
     finish, including an interrupted bootstrap or a prefix left before the

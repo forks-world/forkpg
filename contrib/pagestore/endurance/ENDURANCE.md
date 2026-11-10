@@ -122,7 +122,7 @@ creates a fresh topology each hour; `--duration 259200` keeps one topology for
 writer's existing PostgreSQL archive lag limiters. Both default to zero
 (disabled). The driver first loads and verifies the initial data, replays a
 writer checkpoint and publishes a durable materializer marker. It then restarts
-the writer with the requested postmaster settings and verifies the effective
+the writer with the requested settings and verifies the effective
 values before starting the timed workload. Missing markers fail the setup;
 limits are never installed into bootstrap configurations before this gate.
 
@@ -139,6 +139,20 @@ supervisor's progress policy: if replay is ahead of the durable marker but has
 stopped advancing, it performs a fast restart to publish a restartpoint. The
 driver records each attempt as `archive_restartpoint`; it never bypasses either
 lag limiter or treats an unavailable marker as progress.
+
+Reading the latched checkpoint does not guarantee it is safe as a restartpoint.
+PostgreSQL can reject it while invalid-page references remain unresolved; if
+their resolving WAL and the next safe checkpoint are beyond the archive limit,
+the worker and archiver can stall even after a restart. The timeout preserves
+that failure and its diagnostics; increasing the timeout alone cannot make
+progress. The current limiter has no automatic bounded escape for this case.
+`pagestore.materializer_max_lag_mb` can be changed with `ALTER SYSTEM` followed
+by `pg_reload_conf()` without restarting the writer. An operator can temporarily
+raise the limit to let the materializer reach a later safe checkpoint, then
+restore the original value after verifying the durable marker has advanced.
+Monitor writer-local WAL, store allocation and filesystem headroom during this
+manual intervention; it does not advance the durable marker or relax the WAL
+retention fence. `pagestore.wal_index_max_lag_mb` remains a postmaster setting.
 
 ## Exit notifications and persistent status
 
