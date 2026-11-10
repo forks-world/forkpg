@@ -87,11 +87,15 @@ read pages at an LSN.
      complete segments and durably latches the first writer-owned checkpoint
      completion observed for each materialized marker, plus one segment for a
      crossing record.  This checkpoint state is published separately from
-     recovery's pg_control mirrors.  Recovery therefore never waits on a
-     partial segment or on a checkpoint record trapped behind the limiter,
+     recovery's pg_control mirrors. Recovery can read the selected checkpoint,
      while later writer checkpoints cannot keep moving the bound for a stalled
-     worker.  Any pre-existing partial segment can finish.  Markers and latches
-     are timeline-bound, so child timelines reject inherited parent progress.
+     worker. This does not guarantee a restartpoint: unresolved invalid pages
+     can require later WAL and another checkpoint beyond the bound. Restarting
+     the worker alone need not resolve this stall. The limit can be changed by
+     configuration reload without restarting the writer; restoring the old
+     limit after marker advancement remains an operator action. Any pre-existing
+     partial segment can finish. Markers and latches are timeline-bound, so child
+     timelines reject inherited parent progress.
      PostgreSQL's normal archive retry loop selects a new release checkpoint
      only after the marker advances.  The installed POSIX
      `pagestore_materializer_supervisor` now owns the restartpoint/restart

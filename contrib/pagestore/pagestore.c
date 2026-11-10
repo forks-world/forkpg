@@ -2202,8 +2202,9 @@ pagestore_wal_segments_after(uint64 lsn, uint64 nsegments)
  * Compute an exclusive, segment-aligned shipping boundary.  Besides the
  * configured lag, always finish the materializer's next input segment and the
  * segment after the latched release checkpoint's start (the checkpoint record
- * itself may cross a segment boundary).  Thus recovery can consume a complete
- * segment containing a checkpoint and publish a newer restartpoint.
+ * itself may cross a segment boundary).  The checkpoint is available to
+ * recovery, but unresolved invalid-page references can make it unsuitable as
+ * a restartpoint until recovery reads later WAL and another checkpoint.
  */
 static uint64
 pagestore_materializer_archive_limit(XLogRecPtr marker,
@@ -14891,10 +14892,10 @@ _PG_init(void)
 	DefineCustomIntVariable("pagestore.materializer_max_lag_mb",
 							"Pause WAL archiving when durable materialization falls too far behind.",
 							"Zero disables the limit. The boundary stays segment-aligned and "
-							"latches one completed checkpoint so recovery cannot strand.",
+							"latches one completed checkpoint; an unusable checkpoint can still stall recovery.",
 							&pagestore_materializer_max_lag_mb,
 							0, 0, INT_MAX,
-							PGC_POSTMASTER,
+							PGC_SIGHUP,
 							0,
 							NULL, NULL, NULL);
 	DefineCustomIntVariable("pagestore.wal_index_max_lag_mb",

@@ -251,10 +251,14 @@ echo "ok   - writer observes caught-up materializer state without claiming the w
 # archive boundary far enough for recovery to reach a real restartpoint.
 $WP -c "ALTER SYSTEM SET pagestore.materializer_max_lag_mb = '1';" >/dev/null ||
 	fail "could not configure materializer backpressure"
-"$BIN/pg_ctl" -D "$WRITER" -m fast -w stop >/dev/null 2>&1 ||
-	fail "writer backpressure stop failed"
-"$BIN/pg_ctl" -D "$WRITER" -l "$WRITER/writer.log" -w start >/dev/null 2>&1 ||
-	fail "writer backpressure start failed"
+writer_started=$($WP -c "SELECT pg_postmaster_start_time();") || fail "writer start time unavailable"
+$WP -c "SELECT pg_reload_conf();" >/dev/null || fail "writer backpressure reload failed"
+for _ in $(seq 1 100); do
+	[ "$( $WP -c "SHOW pagestore.materializer_max_lag_mb;" )" = "1" ] && break
+	sleep 0.1
+done
+[ "$( $WP -c "SHOW pagestore.materializer_max_lag_mb;" )" = "1" ] ||
+	fail "materializer backpressure did not reload"
 "$BIN/pg_ctl" -D "$REDO" -m fast -w stop >/dev/null 2>&1 ||
 	fail "could not stop the materializer for backpressure testing"
 blocked_target=
@@ -310,6 +314,45 @@ $WP -c "SELECT pg_reload_conf();" >/dev/null ||
 sleep 2
 [ -f "$WRITER/pg_wal/archive_status/$release_target.ready" ] ||
 	fail "a later writer checkpoint moved the latched bound before materialization advanced"
+# An operator can temporarily expand the boundary when a replayed checkpoint
+# is unusable, then restore it without restarting the writer or materializer.
+$WP -c "ALTER SYSTEM SET pagestore.materializer_max_lag_mb = '256';" >/dev/null ||
+	fail "could not expand archive backpressure"
+$WP -c "SELECT pg_reload_conf();" >/dev/null || fail "could not reload expanded archive backpressure"
+for _ in $(seq 1 600); do
+	[ -f "$WRITER/pg_wal/archive_status/$release_target.done" ] && break
+	sleep 0.1
+done
+[ -f "$WRITER/pg_wal/archive_status/$release_target.done" ] ||
+	fail "archiver did not reload the expanded materializer limit"
+[ "$( $WP -c "SELECT pg_postmaster_start_time();" )" = "$writer_started" ] ||
+	fail "writer restarted while expanding archive backpressure"
+$WP -c "ALTER SYSTEM SET pagestore.materializer_max_lag_mb = '1';" >/dev/null ||
+	fail "could not restore archive backpressure"
+$WP -c "SELECT pg_reload_conf();" >/dev/null || fail "could not reload original archive backpressure"
+for _ in $(seq 1 100); do
+	[ "$( $WP -c "SHOW pagestore.materializer_max_lag_mb;" )" = "1" ] && break
+	sleep 0.1
+done
+[ "$( $WP -c "SHOW pagestore.materializer_max_lag_mb;" )" = "1" ] ||
+	fail "materializer backpressure did not reload its original limit"
+for i in 1 2; do
+	$WP -c "SELECT pg_create_restore_point('lag_reload_$i');" >/dev/null || fail "could not generate WAL after restoring the limit"
+	release_lsn=$($WP -c "SELECT pg_switch_wal();") || fail "could not switch WAL after restoring the limit"
+	release_target=$($WP -c "SELECT pg_walfile_name('$release_lsn'::pg_lsn - 1);") || fail "could not identify WAL after restoring the limit"
+done
+$WP -c "CHECKPOINT;" >/dev/null || fail "could not checkpoint after restoring the limit"
+final_checkpoint_lsn=$($WP -c "SELECT pg_current_wal_lsn();") || fail "could not locate the final checkpoint"
+release_lsn=$($WP -c "SELECT pg_switch_wal();") || fail "could not switch the final checkpoint WAL"
+release_target=$($WP -c "SELECT pg_walfile_name('$release_lsn'::pg_lsn - 1);") || fail "could not identify the final checkpoint WAL"
+for _ in $(seq 1 300); do
+	[ -f "$WRITER/pg_wal/archive_status/$release_target.ready" ] && break
+	sleep 0.1
+done
+sleep 2
+[ -f "$WRITER/pg_wal/archive_status/$release_target.ready" ] ||
+	fail "restored materializer limit did not pause the later WAL segment"
+echo "ok   - materializer archive limit expands and tightens without writer restart"
 "$BIN/pg_ctl" -D "$REDO" -l "$REDO/redo.log" -w start >/dev/null 2>&1 ||
 	fail "materializer did not restart after backpressure"
 release_replayed=0
@@ -338,6 +381,7 @@ for _ in $(seq 1 600); do
 done
 [ "$archive_drained" -eq 1 ] ||
 	fail "archive backlog did not drain after materializer restart"
+wait_replay_lsn "$final_checkpoint_lsn" || fail "materializer did not replay the final checkpoint"
 backlog_replayed=0
 for _ in $(seq 1 400); do
 	backlog_value=$($RP -c "SELECT max(i) FROM materializer_backpressure_test;" \
