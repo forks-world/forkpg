@@ -232,6 +232,110 @@ restore_metadata_atomically(const char *directory,
 	return close(directory_fd);
 }
 
+/* The one-pass recovery hashes must reject corruption in every chunk, while
+ * retaining the original segment checksum and random-range read contract. */
+static void
+test_reopen_payload_integrity(const char *parent, const unsigned char *input)
+{
+	char directory[1024], path[1200];
+	uint32_t offsets[] = {10, PS_WAL_STORE_VERIFY_CHUNK_BYTES + 5,
+		TEST_SEGMENT_BYTES - 1};
+	PsWalStore store;
+	unsigned char out[1];
+	int fd;
+
+	snprintf(directory, sizeof(directory), "%s/reopen-payload", parent);
+	check(ps_wal_store_create(&store, directory, 88, 0, TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&store, 0, input, TEST_SEGMENT_BYTES) == 0,
+		  "create payload integrity fixture");
+	ps_wal_store_close(&store);
+	snprintf(path, sizeof(path), "%s/walv1_88_%020llu", directory, 0ULL);
+	fd = open(path, O_RDWR);
+	check(fd >= 0, "open WAL payload integrity fixture");
+	if (fd >= 0)
+	{
+		for (uint32_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++)
+		{
+			unsigned char bad = input[offsets[i]] ^ 0x80;
+
+			check(pwrite_all(fd, &bad, 1, PS_WAL_SEGMENT_HEADER_BYTES + offsets[i]) == 0,
+				  "corrupt a WAL payload chunk");
+			check(ps_wal_store_open_existing(&store, directory, 88, TEST_SEGMENT_BYTES) != 0,
+				  "startup rejects a corrupted WAL payload chunk");
+			check(pwrite_all(fd, input + offsets[i], 1,
+							 PS_WAL_SEGMENT_HEADER_BYTES + offsets[i]) == 0,
+				  "restore the WAL payload chunk");
+			check(ps_wal_store_open_existing(&store, directory, 88, TEST_SEGMENT_BYTES) == 0,
+				  "startup accepts the restored WAL payload");
+			check(ps_wal_store_read(&store, offsets[i], out, 1) == 0 &&
+				  out[0] == input[offsets[i]], "restored WAL byte remains readable");
+			ps_wal_store_close(&store);
+		}
+		close(fd);
+	}
+	ps_test_remove_tree(directory);
+}
+
+/* Exercise the parallel path with corruption and a hole at different points
+ * in the ordered segment sequence. */
+static void
+test_parallel_reopen(const char *parent, const unsigned char *input)
+{
+	const uint32_t segment_size = PS_WAL_SEGMENT_MIN_BYTES;
+	const uint32_t segments[] = {0, 7, 15};
+	char directory[1024], path[1200], saved[1200];
+	PsWalStore store;
+	unsigned char out[1];
+
+	snprintf(directory, sizeof(directory), "%s/parallel-reopen", parent);
+	if (ps_wal_store_create(&store, directory, 89, 0, segment_size) != 0)
+	{
+		check(0, "create parallel reopen fixture");
+		return;
+	}
+	check(ps_wal_store_append(&store, 0, input, 16 * segment_size) == 0,
+		  "append parallel reopen fixture");
+	ps_wal_store_close(&store);
+	for (uint32_t i = 0; i < sizeof(segments) / sizeof(segments[0]); i++)
+	{
+		uint32_t offset = segments[i] * segment_size + 123;
+		unsigned char bad = input[offset] ^ 0x80;
+		int fd;
+
+		snprintf(path, sizeof(path), "%s/walv1_89_%020u", directory, segments[i]);
+		fd = open(path, O_RDWR);
+		check(fd >= 0, "open parallel WAL segment");
+		if (fd < 0)
+			continue;
+		check(pwrite_all(fd, &bad, 1, PS_WAL_SEGMENT_HEADER_BYTES + 123) == 0,
+			  "corrupt parallel WAL segment");
+		check(ps_wal_store_open_existing(&store, directory, 89, segment_size) != 0,
+			  "parallel reopen rejects corrupt segment");
+		check(pwrite_all(fd, input + offset, 1, PS_WAL_SEGMENT_HEADER_BYTES + 123) == 0,
+			  "restore parallel WAL segment");
+		close(fd);
+		if (ps_wal_store_open_existing(&store, directory, 89, segment_size) == 0)
+		{
+			check(ps_wal_store_read(&store, offset, out, 1) == 0 && out[0] == input[offset],
+				  "parallel reopen preserves ordered segment reads");
+			ps_wal_store_close(&store);
+		}
+		else
+			check(0, "parallel reopen accepts restored segments");
+	}
+	snprintf(path, sizeof(path), "%s/walv1_89_%020u", directory, 7u);
+	snprintf(saved, sizeof(saved), "%s/parallel-saved", parent);
+	if (rename(path, saved) == 0)
+	{
+		check(ps_wal_store_open_existing(&store, directory, 89, segment_size) != 0,
+			  "parallel reopen rejects a missing segment");
+		check(rename(saved, path) == 0, "restore missing WAL segment");
+	}
+	else
+		check(0, "remove segment for gap test");
+	ps_test_remove_tree(directory);
+}
+
 int
 main(void)
 {
@@ -284,6 +388,8 @@ main(void)
 		  "retained-base getter rejects null, unopened, and invalid outputs");
 	for (uint32_t i = 0; i < first_len + TEST_SEGMENT_BYTES; i++)
 		input[i] = (unsigned char) (i * 31u + 7u);
+	test_reopen_payload_integrity(directory, input);
+	test_parallel_reopen(directory, input);
 	snprintf(path, sizeof(path), "%s/zero", directory);
 	check(ps_wal_store_create(&store, path, 0, 0, TEST_SEGMENT_BYTES) != 0 &&
 		  access(path, F_OK) != 0,

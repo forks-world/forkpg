@@ -26222,11 +26222,48 @@ replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
 	return 1;
 }
 
+/* Startup has exclusive ownership of the layer map.  Locally backed layers
+ * can be checksummed independently, but index replay below must remain in its
+ * original deterministic order.  Remote-only and other providers retain the
+ * serial lookup/refresh path. */
+typedef struct RecoveryVerifyJob
+{
+	PsLayerDesc *layer;
+	PsImgIndexEnt entry;
+	int verified;
+} RecoveryVerifyJob;
+
+typedef struct RecoveryVerifyBatch
+{
+	RecoveryVerifyJob *jobs;
+	uint32_t count;
+	uint32_t next;
+} RecoveryVerifyBatch;
+
+static void *
+recovery_verify_worker(void *arg)
+{
+	RecoveryVerifyBatch *batch = arg;
+
+	for (;;)
+	{
+		uint32_t i = __atomic_fetch_add(&batch->next, 1, __ATOMIC_RELAXED);
+
+		if (i >= batch->count)
+			break;
+		batch->jobs[i].verified =
+			ps_image_layer_verify_data(batch->jobs[i].layer, page_size) == 0;
+	}
+	return NULL;
+}
+
 static int
 recover_layer_prefix(uint32_t shard)
 {
 	Shard	   *s = &g_shards[shard];
 	LayerRecoverRec *recs = NULL;
+	RecoveryVerifyJob *verify_jobs = NULL;
+	uint32_t nverify = 0, verify_cap = 0;
 	unsigned char *batched = NULL;
 	uint32_t	nrec = 0,
 				cap = 0;
@@ -26280,20 +26317,51 @@ recover_layer_prefix(uint32_t shard)
 		}
 		if (first_covered >= 0 && !d->data_verified)
 		{
-			unsigned char *verify = malloc(page_size);
-			uint64_t	verified_lsn;
+			bool deferred = false;
 
-			if (!verify ||
-				ps_image_layer_lookup(d, &idx[first_covered].key,
-								  idx[first_covered].block,
-								  idx[first_covered].lsn, 0, verify, page_size,
-								  &verified_lsn, NULL) != 1)
+			/* The local provider permits independent reads from distinct immutable
+			 * layers. Other providers and remote-only layers keep the old path. */
+			if (ps_layer_store == &PsLayerStoreLocal &&
+				tier_local_location(d) != NULL && tier_remote_location(d) == NULL)
 			{
-				free(verify);
-				free(idx);
-				goto fail;
+				if (nverify == verify_cap)
+				{
+					uint32_t nc = verify_cap ? verify_cap * 2 : 256;
+					RecoveryVerifyJob *new_jobs = nc > verify_cap &&
+						(size_t) nc <= SIZE_MAX / sizeof(*new_jobs) ?
+						realloc(verify_jobs, (size_t) nc * sizeof(*new_jobs)) : NULL;
+
+					if (new_jobs != NULL)
+					{
+						verify_jobs = new_jobs;
+						verify_cap = nc;
+					}
+				}
+				if (nverify < verify_cap)
+				{
+					verify_jobs[nverify].layer = d;
+					verify_jobs[nverify].entry = idx[first_covered];
+					verify_jobs[nverify].verified = 0;
+					nverify++;
+					deferred = true;
+				}
 			}
-			free(verify);
+			if (!deferred)
+			{
+				unsigned char *verify = malloc(page_size);
+				uint64_t verified_lsn;
+
+				if (!verify ||
+					ps_image_layer_lookup(d, &idx[first_covered].key,
+						idx[first_covered].block, idx[first_covered].lsn, 0,
+						verify, page_size, &verified_lsn, NULL) != 1)
+				{
+					free(verify);
+					free(idx);
+					goto fail;
+				}
+				free(verify);
+			}
 		}
 		free(idx);
 		/*
@@ -26308,6 +26376,49 @@ recover_layer_prefix(uint32_t shard)
 			ps_layer_store->delete_local_layer(d) != 0)
 			goto fail;
 	}
+	if (nverify != 0)
+	{
+		RecoveryVerifyBatch batch = {verify_jobs, nverify, 0};
+		pthread_t workers[3];
+		uint32_t started = 0;
+		unsigned char *verify;
+
+		for (uint32_t i = 0; i < 3; i++)
+		{
+			if (pthread_create(&workers[started], NULL, recovery_verify_worker, &batch) != 0)
+				break;
+			started++;
+		}
+		(void) recovery_verify_worker(&batch);
+		for (uint32_t i = 0; i < started; i++)
+			if (pthread_join(workers[i], NULL) != 0)
+				abort(); /* the worker may still hold pointers into this batch */
+		for (uint32_t i = 0; i < nverify; i++)
+			if (!verify_jobs[i].verified)
+			{
+				errno = EIO;
+				goto fail;
+			}
+		verify = malloc(page_size);
+		if (!verify)
+			goto fail;
+		for (uint32_t i = 0; i < nverify; i++)
+		{
+			PsImgIndexEnt *entry = &verify_jobs[i].entry;
+			uint64_t verified_lsn;
+
+			if (ps_image_layer_lookup(verify_jobs[i].layer, &entry->key,
+					entry->block, entry->lsn, 0, verify, page_size,
+					&verified_lsn, NULL) != 1)
+			{
+				free(verify);
+				goto fail;
+			}
+		}
+		free(verify);
+	}
+	free(verify_jobs);
+	verify_jobs = NULL;
 
 	/* A deleting timeline can be the sole former owner of this shard's covered
 	 * prefix.  Its layers are intentionally absent from recovery, while shared
@@ -26383,6 +26494,7 @@ recover_layer_prefix(uint32_t shard)
 	return 0;
 
 fail:
+	free(verify_jobs);
 	free(batched);
 	free(recs);
 	return -1;

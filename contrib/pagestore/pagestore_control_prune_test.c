@@ -16,6 +16,7 @@
 #endif
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <pthread.h>
@@ -394,6 +395,61 @@ close_store(void)
 	ps_core_close();
 	if (ps_storage->close != NULL)
 		ps_storage->close();
+}
+
+static int read_relation_at(uint32_t block, uint64_t lsn);
+
+/* Recovery verifies every covered local layer even when checksums are computed
+ * concurrently; corrupting one must still fail startup before any page serves. */
+static void
+test_parallel_recovery_rejects_corrupt_layer(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-recovery-verify-XXXXXX";
+	char layer_path[4096] = {0};
+	unsigned char original = 0, damaged;
+	int fd;
+	uint32_t layers = 0;
+
+	configure_core(1);
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0,
+		  "open multi-layer recovery verification fixture");
+	for (uint32_t i = 0; i < 12; i++)
+		check(write_relation(0, i, 1000 + i), "write recovery verification layer");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->kind != PS_LAYER_IMAGE || d->deleting || d->location_count == 0)
+			continue;
+		layers++;
+		if (layer_path[0] == '\0')
+			snprintf(layer_path, sizeof(layer_path), "%s", d->locations[0].uri);
+	}
+	ps_unlock_map();
+	check(layers >= 4 && layer_path[0] != '\0', "fixture has multiple covered layers");
+	close_store();
+	fd = open(layer_path, O_RDWR);
+	check(fd >= 0 && pread(fd, &original, 1, 0) == 1,
+		  "read recovery layer byte before corruption");
+	if (fd >= 0)
+	{
+		damaged = original ^ 0x80;
+		check(pwrite(fd, &damaged, 1, 0) == 1 && fsync(fd) == 0,
+			  "corrupt one layer without changing its size");
+		close(fd);
+	}
+	check(ps_core_open(store) != 0, "recovery rejects a corrupt covered layer");
+	fd = open(layer_path, O_WRONLY);
+	check(fd >= 0 && pwrite(fd, &original, 1, 0) == 1 && fsync(fd) == 0,
+		  "restore the corrupted layer byte");
+	if (fd >= 0)
+		close(fd);
+	check(ps_core_open(store) == 0, "recovery accepts restored layers");
+	for (uint32_t i = 0; i < 12; i++)
+		check(read_relation_at(i, 1000 + i), "restored layer page is readable");
+	close_store();
+	remove_tree(store);
 }
 
 static int
@@ -4471,6 +4527,7 @@ test_compaction_source_read_batch(void)
 int
 main(void)
 {
+	test_parallel_recovery_rejects_corrupt_layer();
 	test_nonzero_floor_bounded_plan(0);
 	test_nonzero_floor_bounded_plan(1);
 	test_nonzero_bounded_plan_conflict(0);

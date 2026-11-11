@@ -435,6 +435,25 @@ wal_payload_hash(uint32_t hash, const void *data, size_t len)
 	return hash;
 }
 
+/* Compute the independent chunk hash and the rolling segment hash together.
+ * Both keep the existing FNV-1a format; the two dependency chains can run in
+ * parallel without reading the same payload through two separate loops. */
+static uint32_t
+wal_payload_hash_pair(uint32_t *segment_hash, const void *data, size_t len)
+{
+	const unsigned char *bytes = data;
+	uint32_t chunk_hash = 2166136261u;
+	uint32_t rolling = *segment_hash;
+
+	for (size_t i = 0; i < len; i++)
+	{
+		chunk_hash = (chunk_hash ^ bytes[i]) * 16777619u;
+		rolling = (rolling ^ bytes[i]) * 16777619u;
+	}
+	*segment_hash = rolling;
+	return chunk_hash;
+}
+
 /* Test-only gate used to prove that reclaim waits for a read which already
  * owns the WAL mutex.  Production callers never set these environment vars. */
 static void
@@ -474,17 +493,7 @@ build_chunk_hashes_and_payload_crc(const void *payload, uint32_t payload_len,
 		uint32_t off = i * PS_WAL_STORE_VERIFY_CHUNK_BYTES;
 		uint32_t amount = payload_len - off < PS_WAL_STORE_VERIFY_CHUNK_BYTES ?
 			payload_len - off : PS_WAL_STORE_VERIFY_CHUNK_BYTES;
-		uint32_t chunk_hash = 2166136261u;
-
-		/* Keep the payload and per-chunk FNV states in one pass. */
-		for (uint32_t j = 0; j < amount; j++)
-		{
-			chunk_hash ^= bytes[off + j];
-			chunk_hash *= 16777619u;
-			*payload_crc_out ^= bytes[off + j];
-			*payload_crc_out *= 16777619u;
-		}
-		hashes[i] = chunk_hash;
+		hashes[i] = wal_payload_hash_pair(payload_crc_out, bytes + off, amount);
 	}
 	*hashes_out = hashes;
 	*nchunks_out = nchunks;
@@ -749,7 +758,8 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 }
 
 static int
-load_segment(PsWalStore *store, uint64_t segment_no)
+read_segment(const PsWalStore *store, uint64_t segment_no,
+			 uint64_t expected_lsn, PsWalStoreEntry *entry)
 {
 	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
 	unsigned char buf[PS_WAL_STORE_VERIFY_CHUNK_BYTES];
@@ -773,7 +783,7 @@ load_segment(PsWalStore *store, uint64_t segment_no)
 		ps_wal_segment_decode(&header, encoded, sizeof(encoded)) != 0 ||
 		header.timeline != store->timeline ||
 		header.segment_no != segment_no ||
-		header.start_lsn != store->end_lsn ||
+		header.start_lsn != expected_lsn ||
 		header.segment_size != store->segment_size ||
 		header.payload_len != store->segment_size ||
 		st.st_size != (off_t) (PS_WAL_SEGMENT_HEADER_BYTES +
@@ -782,7 +792,7 @@ load_segment(PsWalStore *store, uint64_t segment_no)
 	nchunks = (header.payload_len + PS_WAL_STORE_VERIFY_CHUNK_BYTES - 1) /
 		PS_WAL_STORE_VERIFY_CHUNK_BYTES;
 	hashes = malloc((size_t) nchunks * sizeof(*hashes));
-	if (hashes == NULL || reserve_entry(store) != 0)
+	if (hashes == NULL)
 		goto cleanup;
 	for (uint32_t i = 0; i < nchunks; i++)
 	{
@@ -792,28 +802,118 @@ load_segment(PsWalStore *store, uint64_t segment_no)
 		if (read_all_at(fd, buf, amount,
 				PS_WAL_SEGMENT_HEADER_BYTES + (off_t) done) != 0)
 			goto cleanup;
-		hashes[i] = wal_payload_hash(2166136261u, buf, amount);
-		payload_crc = wal_payload_hash(payload_crc, buf, amount);
+		hashes[i] = wal_payload_hash_pair(&payload_crc, buf, amount);
 		done += amount;
 	}
 	if (payload_crc != header.payload_crc)
 		goto cleanup;
-	store->entries[store->nentries].header = header;
-	store->entries[store->nentries].chunk_hashes = hashes;
-	store->entries[store->nentries].nchunks = nchunks;
+	entry->header = header;
+	entry->chunk_hashes = hashes;
+	entry->nchunks = nchunks;
 	/* a segment found at open is served only after its payload identity
 	 * has been checked against the envelope once */
-	store->entries[store->nentries].identity_verified = 0;
+	entry->identity_verified = 0;
 	hashes = NULL;
-	store->nentries++;
-	store->next_segment_no++;
-	store->end_lsn += header.payload_len;
 	rc = 0;
 
 cleanup:
 	free(hashes);
 	if (fd >= 0)
 		close(fd);
+	return rc;
+}
+
+typedef struct WalRecoveryJob
+{
+	PsWalStoreEntry entry;
+	int verified;
+} WalRecoveryJob;
+
+typedef struct WalRecoveryBatch
+{
+	const PsWalStore *store;
+	WalRecoveryJob *jobs;
+	uint64_t count;
+	uint64_t next;
+} WalRecoveryBatch;
+
+static void *
+wal_recovery_worker(void *arg)
+{
+	WalRecoveryBatch *batch = arg;
+	uint64_t i;
+
+	while ((i = __atomic_fetch_add(&batch->next, 1, __ATOMIC_RELAXED)) < batch->count)
+		batch->jobs[i].verified =
+			read_segment(batch->store, batch->store->next_segment_no + i,
+					 batch->store->end_lsn + i * batch->store->segment_size,
+					 &batch->jobs[i].entry) == 0;
+	return NULL;
+}
+
+/* Validate independent immutable segments concurrently, then publish them
+ * in order. No worker modifies the store or its recovery frontier. */
+static int
+load_segments(PsWalStore *store, uint64_t count)
+{
+	WalRecoveryJob *jobs;
+	WalRecoveryBatch batch;
+	pthread_t workers[3];
+	uint32_t started = 0;
+	int rc = -1;
+
+	if (count > UINT32_MAX - store->nentries ||
+		count > (UINT64_MAX - store->end_lsn) / store->segment_size ||
+		count > UINT64_MAX - store->next_segment_no)
+		return -1;
+	if (count == 0)
+		return 0;
+	jobs = count <= SIZE_MAX / sizeof(*jobs) ? calloc((size_t) count, sizeof(*jobs)) : NULL;
+	if (jobs == NULL)
+	{
+		/* Memory pressure must not make an otherwise recoverable store fail. */
+		for (uint64_t i = 0; i < count; i++)
+		{
+			PsWalStoreEntry entry;
+
+			if (reserve_entry(store) != 0 ||
+				read_segment(store, store->next_segment_no, store->end_lsn, &entry) != 0)
+				return -1;
+			store->entries[store->nentries++] = entry;
+			store->next_segment_no++;
+			store->end_lsn += entry.header.payload_len;
+		}
+		return 0;
+	}
+	batch = (WalRecoveryBatch) {store, jobs, count, 0};
+	if (count >= 16)
+		for (uint32_t i = 0; i < 3; i++)
+		{
+			if (pthread_create(&workers[started], NULL, wal_recovery_worker, &batch) != 0)
+				break;
+			started++;
+		}
+	(void) wal_recovery_worker(&batch);
+	for (uint32_t i = 0; i < started; i++)
+		if (pthread_join(workers[i], NULL) != 0)
+			abort(); /* A worker may still access the batch. */
+	for (uint64_t i = 0; i < count; i++)
+		if (!jobs[i].verified)
+			goto cleanup;
+	for (uint64_t i = 0; i < count; i++)
+	{
+		if (reserve_entry(store) != 0)
+			goto cleanup;
+		store->entries[store->nentries++] = jobs[i].entry;
+		jobs[i].entry.chunk_hashes = NULL;
+		store->next_segment_no++;
+		store->end_lsn += jobs[i].entry.header.payload_len;
+	}
+	rc = 0;
+cleanup:
+	for (uint64_t i = 0; i < count; i++)
+		free(jobs[i].entry.chunk_hashes);
+	free(jobs);
 	return rc;
 }
 
@@ -1329,9 +1429,8 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 		store->residual_prefix_start_lsn = prefix_first * store->segment_size;
 		store->residual_prefix_target_lsn = store->start_lsn;
 	}
-	for (uint64_t i = 0; i < count; i++)
-		if (load_segment(store, store->next_segment_no) != 0)
-			goto cleanup;
+	if (load_segments(store, count) != 0)
+		goto cleanup;
 	if (!identity_missing && !identity_legacy)
 	{
 		if (metadata.end_lsn > store->end_lsn ||
