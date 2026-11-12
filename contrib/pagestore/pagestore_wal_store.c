@@ -12,6 +12,7 @@
 
 #include "pagestore_fault.h"
 #include "pagestore_compat.h"
+#include "pagestore_recovery_parallel.h"
 #include "pagestore_wal_store.h"
 #include "pagestore_format.h"
 
@@ -858,8 +859,9 @@ load_segments(PsWalStore *store, uint64_t count)
 {
 	WalRecoveryJob *jobs;
 	WalRecoveryBatch batch;
-	pthread_t workers[3];
+	pthread_t workers[PS_RECOVERY_MAX_WORKERS - 1];
 	uint32_t started = 0;
+	uint32_t worker_count;
 	int rc = -1;
 
 	if (count > UINT32_MAX - store->nentries ||
@@ -886,8 +888,9 @@ load_segments(PsWalStore *store, uint64_t count)
 		return 0;
 	}
 	batch = (WalRecoveryBatch) {store, jobs, count, 0};
+	worker_count = ps_recovery_worker_count(count);
 	if (count >= 16)
-		for (uint32_t i = 0; i < 3; i++)
+		for (uint32_t i = 1; i < worker_count; i++)
 		{
 			if (pthread_create(&workers[started], NULL, wal_recovery_worker, &batch) != 0)
 				break;
