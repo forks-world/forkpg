@@ -26327,9 +26327,10 @@ recover_layer_prefix(uint32_t shard)
 				if (nverify == verify_cap)
 				{
 					uint32_t nc = verify_cap ? verify_cap * 2 : 256;
+					size_t bytes = (size_t) nc * sizeof(*verify_jobs);
 					RecoveryVerifyJob *new_jobs = nc > verify_cap &&
-						(size_t) nc <= SIZE_MAX / sizeof(*new_jobs) ?
-						realloc(verify_jobs, (size_t) nc * sizeof(*new_jobs)) : NULL;
+						bytes / sizeof(*verify_jobs) == nc ?
+						realloc(verify_jobs, bytes) : NULL;
 
 					if (new_jobs != NULL)
 					{
