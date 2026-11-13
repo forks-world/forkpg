@@ -49,6 +49,7 @@
 #include "pagestore_admissible.h"
 #include "pagestore_artifact_format.h"
 #include "pagestore_compat.h"
+#include "pagestore_recovery_parallel.h"
 #include "pagestore_core.h"
 #include "pagestore_compaction_prune.h"
 #include "pagestore_format.h"
@@ -26380,11 +26381,12 @@ recover_layer_prefix(uint32_t shard)
 	if (nverify != 0)
 	{
 		RecoveryVerifyBatch batch = {verify_jobs, nverify, 0};
-		pthread_t workers[3];
+		pthread_t workers[PS_RECOVERY_MAX_WORKERS - 1];
 		uint32_t started = 0;
+		uint32_t worker_count = ps_recovery_worker_count(nverify);
 		unsigned char *verify;
 
-		for (uint32_t i = 0; i < 3; i++)
+		for (uint32_t i = 1; i < worker_count; i++)
 		{
 			if (pthread_create(&workers[started], NULL, recovery_verify_worker, &batch) != 0)
 				break;
