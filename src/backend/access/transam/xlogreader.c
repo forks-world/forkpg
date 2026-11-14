@@ -1610,8 +1610,13 @@ WALRead(XLogReaderState *state,
 		}
 
 #ifndef FRONTEND
-		pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_NORMAL, IOOP_READ,
-								io_start, 1, readbytes);
+		/* Some callers (notably the archiver's pagestore checkpoint verifier)
+		 * read WAL without having an IO stats row.  Keep XLogReader usable by
+		 * those auxiliary processes while accounting only supported operations. */
+		if (pgstat_tracks_io_op(MyBackendType, IOOBJECT_WAL,
+								IOCONTEXT_NORMAL, IOOP_READ))
+			pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_NORMAL, IOOP_READ,
+									io_start, 1, readbytes);
 #endif
 
 		/* Update state for read */

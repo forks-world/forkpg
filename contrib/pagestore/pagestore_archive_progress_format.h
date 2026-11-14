@@ -8,7 +8,7 @@
 #include "pagestore_archive_progress.h"
 #define PS_ARCHIVE_PROGRESS_FORMAT_BYTES 104u
 #define PS_ARCHIVE_PROGRESS_FORMAT_MAGIC UINT32_C(0x50534150)
-#define PS_ARCHIVE_PROGRESS_FORMAT_VERSION 2u
+#define PS_ARCHIVE_PROGRESS_FORMAT_VERSION 4u
 static inline void ps_ap_put32(unsigned char *p, uint32_t n)
 {
 	for (unsigned i = 0; i < 4; i++) p[i] = (unsigned char) (n >> (i * 8));
@@ -44,6 +44,7 @@ static inline int ps_archive_progress_encode(const PsArchiveProgress *s,
 	ps_ap_put32(out, PS_ARCHIVE_PROGRESS_FORMAT_MAGIC);
 	ps_ap_put32(out + 4, PS_ARCHIVE_PROGRESS_FORMAT_VERSION);
 	ps_ap_put32(out + 8, s->timeline);
+	ps_ap_put32(out + 12, s->candidate_wal_tli);
 	ps_ap_put64(out + 16, s->incarnation);
 	ps_ap_put64(out + 24, s->attempt);
 	ps_ap_put64(out + 32, s->marker);
@@ -54,6 +55,7 @@ static inline int ps_archive_progress_encode(const PsArchiveProgress *s,
 	ps_ap_put64(out + 72, s->max_extra);
 	ps_ap_put64(out + 80, s->start_nonce_hi);
 	ps_ap_put64(out + 88, s->start_nonce_lo);
+	ps_ap_put32(out + 96, s->budget_frozen | (s->grant_active << 1));
 	ps_ap_put32(out + 100, ps_ap_checksum(out, 100));
 	return 0;
 }
@@ -64,10 +66,11 @@ static inline int ps_archive_progress_decode(PsArchiveProgress *s,
 	if (!s || !in || n != PS_ARCHIVE_PROGRESS_FORMAT_BYTES ||
 		ps_ap_get32(in) != PS_ARCHIVE_PROGRESS_FORMAT_MAGIC ||
 		ps_ap_get32(in + 4) != PS_ARCHIVE_PROGRESS_FORMAT_VERSION ||
-		ps_ap_get32(in + 12) != 0 || ps_ap_get32(in + 96) != 0 ||
+		(ps_ap_get32(in + 96) & ~3u) != 0 ||
 		ps_ap_get32(in + 100) != ps_ap_checksum(in, 100))
 		return -1;
 	x.timeline = ps_ap_get32(in + 8);
+	x.candidate_wal_tli = ps_ap_get32(in + 12);
 	x.incarnation = ps_ap_get64(in + 16);
 	x.attempt = ps_ap_get64(in + 24);
 	x.marker = ps_ap_get64(in + 32);
@@ -78,6 +81,8 @@ static inline int ps_archive_progress_decode(PsArchiveProgress *s,
 	x.max_extra = ps_ap_get64(in + 72);
 	x.start_nonce_hi = ps_ap_get64(in + 80);
 	x.start_nonce_lo = ps_ap_get64(in + 88);
+	x.budget_frozen = ps_ap_get32(in + 96) & 1u;
+	x.grant_active = (ps_ap_get32(in + 96) >> 1) & 1u;
 	if (!ps_archive_progress_persistable(&x))
 		return -1;
 	*s = x;

@@ -60,6 +60,44 @@ int ps_archive_progress_registry_start(PsArchiveProgressRegistry *registry,
 										uint64_t marker, uint64_t incarnation,
 										uint64_t original_limit,
 										uint64_t max_extra, PsArchiveProgress *result);
+/* `replayed` reports an idempotent response from a previous durable START;
+ * callers must not treat it as current-attempt authorization. */
+int ps_archive_progress_registry_start_ex(PsArchiveProgressRegistry *registry,
+										   uint32_t timeline,
+										   uint64_t expected_attempt,
+										   uint64_t nonce_hi, uint64_t nonce_lo,
+										   uint64_t marker, uint64_t incarnation,
+										   uint64_t original_limit,
+										   uint64_t max_extra,
+										   PsArchiveProgress *result,
+										   int *replayed);
+int ps_archive_progress_registry_safe(PsArchiveProgressRegistry *registry,
+									   uint32_t timeline, uint64_t incarnation,
+									   uint64_t attempt, uint64_t marker,
+									   uint64_t safe_lsn,
+									   PsArchiveProgress *result);
+int ps_archive_progress_registry_freeze_budget(PsArchiveProgressRegistry *registry,
+									   uint32_t timeline, uint64_t incarnation,
+									   uint64_t attempt, uint64_t marker,
+									   uint64_t original_limit, uint64_t max_extra,
+									   PsArchiveProgress *result);
+int ps_archive_progress_registry_prepare(PsArchiveProgressRegistry *registry,
+									  uint32_t timeline, uint64_t incarnation,
+									  uint64_t attempt, uint64_t marker,
+									  uint32_t candidate_wal_tli,
+									  uint64_t target, uint64_t target_end,
+									  PsArchiveProgress *result);
+int ps_archive_progress_registry_activate(PsArchiveProgressRegistry *registry,
+									  uint32_t timeline, uint64_t incarnation,
+									  uint64_t attempt, uint64_t marker,
+									  uint32_t candidate_wal_tli,
+									  uint64_t target, uint64_t target_end,
+									  PsArchiveProgress *result);
 int ps_archive_progress_registry_snapshot(PsArchiveProgressRegistry *registry,
 										   uint32_t timeline, PsArchiveProgress *result);
+/* Only returns an active state whose marker and incarnation still match the
+ * marker authority under its lease. Empty state remains readable. */
+int ps_archive_progress_registry_authorized_snapshot(
+	PsArchiveProgressRegistry *registry, uint32_t timeline,
+	uint64_t incarnation, PsArchiveProgress *result);
 #endif

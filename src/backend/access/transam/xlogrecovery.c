@@ -34,6 +34,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
+#include "access/xlog.h"
 #include "access/xlogarchive.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogreader.h"
@@ -302,6 +303,9 @@ static bool backupEndRequired = false;
  * which then sets it to true upon receiving the signal.
  */
 bool		reachedConsistency = false;
+static bool recoveryProgressFeedbackComplete = false;
+static XLogRecPtr recoveryProgressSafeLSN = InvalidXLogRecPtr;
+static void MaybeReportRecoveryProgress(void);
 
 /* Buffers dedicated to consistency checks of size BLCKSZ */
 static char *replay_image_masked = NULL;
@@ -2149,6 +2153,16 @@ CheckTablespaceDirectory(void)
 	}
 }
 
+static void
+MaybeReportRecoveryProgress(void)
+{
+	if (reachedConsistency && !recoveryProgressFeedbackComplete &&
+		!ignore_invalid_pages && recovery_consistency_hook &&
+		XLogRecPtrIsValid(recoveryProgressSafeLSN))
+		recoveryProgressFeedbackComplete =
+			(*recovery_consistency_hook) (recoveryProgressSafeLSN);
+}
+
 /*
  * Checks if recovery has reached a consistent state. When consistency is
  * reached and we have a valid starting standby snapshot, tell postmaster
@@ -2226,11 +2240,14 @@ CheckRecoveryConsistency(void)
 		CheckTablespaceDirectory();
 
 		reachedConsistency = true;
+		recoveryProgressSafeLSN = lastReplayedEndRecPtr;
 		SendPostmasterSignal(PMSIGNAL_RECOVERY_CONSISTENT);
 		ereport(LOG,
 				errmsg("consistent recovery state reached at %X/%08X",
 					   LSN_FORMAT_ARGS(lastReplayedEndRecPtr)));
 	}
+
+	MaybeReportRecoveryProgress();
 
 	/*
 	 * Have we got a valid starting snapshot that will allow queries to be
@@ -3589,6 +3606,10 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 		XLogSource	oldSource = currentSource;
 		bool		startWalReceiver = false;
 
+		/* Never do this from nonblocking readahead; it may perform IPC. */
+		if (!nonblocking)
+			MaybeReportRecoveryProgress();
+
 		/*
 		 * First check if we failed to read from the current source, and
 		 * advance the state machine if so. The failure to read might've
@@ -3998,10 +4019,12 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 					 * immediately by the WAL receiver.
 					 */
 					(void) WaitLatch(&XLogRecoveryCtl->recoveryWakeupLatch,
-									 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH,
-									 -1L,
+									 WL_LATCH_SET | WL_TIMEOUT |
+									 WL_EXIT_ON_PM_DEATH,
+									 wal_retrieve_retry_interval,
 									 WAIT_EVENT_RECOVERY_WAL_STREAM);
 					ResetLatch(&XLogRecoveryCtl->recoveryWakeupLatch);
+					MaybeReportRecoveryProgress();
 					break;
 				}
 

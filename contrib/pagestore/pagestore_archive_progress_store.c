@@ -161,6 +161,42 @@ ps_archive_progress_registry_snapshot(PsArchiveProgressRegistry *registry,
 	return rc;
 }
 
+int
+ps_archive_progress_registry_authorized_snapshot(PsArchiveProgressRegistry *registry,
+												  uint32_t timeline,
+												  uint64_t incarnation,
+												  PsArchiveProgress *result)
+{
+	PsArchiveProgressStore *store;
+	uint64_t marker = 0, current_incarnation = 0;
+	int rc = -1, acquired = 0;
+
+	if (!registry || !result || timeline >= registry->capacity ||
+		pthread_mutex_lock(&registry->lock) != 0)
+		return -1;
+	store = registry_get_locked(registry, timeline);
+	if (!store ||
+		ps_archive_progress_txn_snapshot(&store->transaction, result) != 0)
+		goto done;
+	if (result->attempt == 0)
+	{
+		rc = incarnation != 0 ? 0 : -1;
+		goto done;
+	}
+	if (!registry->marker_acquire || !registry->marker_release ||
+		registry->marker_acquire(registry->marker_authority_arg, timeline,
+								 &marker, &current_incarnation) != 0)
+		goto done;
+	acquired = 1;
+	rc = result->timeline == timeline && result->incarnation == incarnation &&
+		result->incarnation == current_incarnation && result->marker == marker ? 0 : -1;
+done:
+	if (acquired)
+		registry->marker_release(registry->marker_authority_arg, timeline);
+	pthread_mutex_unlock(&registry->lock);
+	return rc;
+}
+
 typedef struct PsArchiveProgressStart
 {
 	uint32_t timeline;
@@ -182,8 +218,8 @@ start_transition(PsArchiveProgress *state, void *arg)
 		state->start_nonce_hi == request->nonce_hi &&
 		state->start_nonce_lo == request->nonce_lo)
 		return state->timeline == request->timeline &&
-			state->incarnation == request->incarnation && state->marker == request->marker &&
-			state->original_limit == request->original_limit && state->max_extra == request->max_extra ? 0 : -1;
+			state->incarnation == request->incarnation &&
+			state->marker == request->marker ? 0 : -1;
 	if (state->attempt != request->expected_attempt ||
 		(state->attempt && state->start_nonce_hi == request->nonce_hi &&
 		 state->start_nonce_lo == request->nonce_lo))
@@ -199,12 +235,13 @@ start_transition(PsArchiveProgress *state, void *arg)
 }
 
 int
-ps_archive_progress_registry_start(PsArchiveProgressRegistry *registry,
+ps_archive_progress_registry_start_ex(PsArchiveProgressRegistry *registry,
 								   uint32_t timeline, uint64_t expected_attempt,
 								   uint64_t nonce_hi, uint64_t nonce_lo,
 								   uint64_t marker, uint64_t incarnation,
 								   uint64_t original_limit,
-								   uint64_t max_extra, PsArchiveProgress *result)
+								   uint64_t max_extra, PsArchiveProgress *result,
+								   int *replayed)
 {
 	PsArchiveProgressStore *store;
 	PsArchiveProgress committed;
@@ -213,9 +250,12 @@ ps_archive_progress_registry_start(PsArchiveProgressRegistry *registry,
 	uint64_t current_marker = 0, current_incarnation = 0;
 	int rc = -1;
 
-	if (!registry || timeline >= registry->capacity ||
+	if (!registry || original_limit != 0 || max_extra != 0 ||
+		timeline >= registry->capacity ||
 		pthread_mutex_lock(&registry->lock) != 0)
 		return -1;
+	if (replayed)
+		*replayed = 0;
 	/* The caller's marker and timeline identity are not authority. Without a
 	 * configured control-store reader, reject rather than persist a guess. */
 	if (registry->marker_acquire == NULL || registry->marker_release == NULL ||
@@ -232,11 +272,11 @@ ps_archive_progress_registry_start(PsArchiveProgressRegistry *registry,
 		committed.start_nonce_lo == nonce_lo)
 	{
 		rc = committed.timeline == timeline &&
-			committed.incarnation == incarnation && committed.marker == marker &&
-			committed.original_limit == original_limit &&
-			committed.max_extra == max_extra ? 0 : -1;
+			committed.incarnation == incarnation && committed.marker == marker ? 0 : -1;
 		if (rc == 0 && result)
 			*result = committed;
+		if (rc == 0 && replayed)
+			*replayed = 1;
 		goto done;
 	}
 
@@ -254,4 +294,159 @@ ps_archive_progress_registry_start(PsArchiveProgressRegistry *registry,
 done:
 	pthread_mutex_unlock(&registry->lock);
 	return rc;
+}
+
+int
+ps_archive_progress_registry_start(PsArchiveProgressRegistry *registry,
+								   uint32_t timeline, uint64_t expected_attempt,
+								   uint64_t nonce_hi, uint64_t nonce_lo,
+								   uint64_t marker, uint64_t incarnation,
+								   uint64_t original_limit,
+								   uint64_t max_extra, PsArchiveProgress *result)
+{
+	return ps_archive_progress_registry_start_ex(registry, timeline,
+		expected_attempt, nonce_hi, nonce_lo, marker, incarnation,
+		original_limit, max_extra, result, NULL);
+}
+
+typedef struct PsArchiveProgressSafeRequest
+{
+	uint32_t timeline;
+	uint64_t incarnation, attempt, marker, safe_lsn;
+} PsArchiveProgressSafeRequest;
+
+static int
+safe_transition(PsArchiveProgress *state, void *arg)
+{
+	PsArchiveProgressSafeRequest *request = arg;
+	return ps_archive_progress_safe(state, request->timeline,
+		request->incarnation, request->attempt, request->marker,
+		request->safe_lsn);
+}
+
+typedef struct PsArchiveProgressPrepareRequest
+{
+	uint32_t timeline;
+	uint64_t incarnation, attempt, marker, target, target_end;
+	uint32_t candidate_wal_tli;
+} PsArchiveProgressPrepareRequest;
+
+typedef struct PsArchiveProgressFreezeRequest
+{
+	uint32_t timeline;
+	uint64_t incarnation, attempt, marker, original_limit, max_extra;
+} PsArchiveProgressFreezeRequest;
+
+static int
+freeze_transition(PsArchiveProgress *state, void *arg)
+{
+	PsArchiveProgressFreezeRequest *request = arg;
+	return ps_archive_progress_freeze_budget(state, request->timeline,
+		request->incarnation, request->attempt, request->marker,
+		request->original_limit, request->max_extra);
+}
+
+static int
+prepare_transition(PsArchiveProgress *state, void *arg)
+{
+	PsArchiveProgressPrepareRequest *request = arg;
+	return ps_archive_progress_prepare(state, request->timeline,
+		request->incarnation, request->attempt, request->marker,
+		request->candidate_wal_tli, request->target, request->target_end);
+}
+
+static int
+activate_transition(PsArchiveProgress *state, void *arg)
+{
+	PsArchiveProgressPrepareRequest *request = arg;
+	return ps_archive_progress_activate(state, request->timeline,
+		request->incarnation, request->attempt, request->marker,
+		request->candidate_wal_tli, request->target, request->target_end);
+}
+
+static int
+registry_apply_marker_authorized(PsArchiveProgressRegistry *registry,
+								 uint32_t timeline, uint64_t incarnation,
+								 uint64_t marker,
+								 PsArchiveProgressTransition transition,
+								 void *arg, PsArchiveProgress *result)
+{
+	PsArchiveProgressStore *store;
+	uint64_t current_marker = 0, current_incarnation = 0;
+	int rc = -1, acquired = 0;
+
+	if (!registry || timeline >= registry->capacity ||
+		pthread_mutex_lock(&registry->lock) != 0)
+		return -1;
+	if (!registry->marker_acquire || !registry->marker_release ||
+		registry->marker_acquire(registry->marker_authority_arg, timeline,
+								 &current_marker, &current_incarnation) != 0)
+		goto done;
+	acquired = 1;
+	if (current_marker != marker || current_incarnation != incarnation)
+		goto done;
+	store = registry_get_locked(registry, timeline);
+	if (store)
+		rc = ps_archive_progress_txn_apply(&store->transaction, transition,
+										   arg, result);
+done:
+	if (acquired)
+		registry->marker_release(registry->marker_authority_arg, timeline);
+	pthread_mutex_unlock(&registry->lock);
+	return rc;
+}
+
+int
+ps_archive_progress_registry_safe(PsArchiveProgressRegistry *registry,
+								  uint32_t timeline, uint64_t incarnation,
+								  uint64_t attempt, uint64_t marker,
+								  uint64_t safe_lsn, PsArchiveProgress *result)
+{
+	PsArchiveProgressSafeRequest request = {timeline, incarnation, attempt,
+											marker, safe_lsn};
+	return registry_apply_marker_authorized(registry, timeline, incarnation,
+		marker, safe_transition, &request, result);
+}
+
+int
+ps_archive_progress_registry_freeze_budget(PsArchiveProgressRegistry *registry,
+								  uint32_t timeline, uint64_t incarnation,
+								  uint64_t attempt, uint64_t marker,
+								  uint64_t original_limit, uint64_t max_extra,
+								  PsArchiveProgress *result)
+{
+	PsArchiveProgressFreezeRequest request = {timeline, incarnation, attempt,
+		marker, original_limit, max_extra};
+	return registry_apply_marker_authorized(registry, timeline, incarnation,
+		marker, freeze_transition, &request, result);
+}
+
+int
+ps_archive_progress_registry_prepare(PsArchiveProgressRegistry *registry,
+								 uint32_t timeline, uint64_t incarnation,
+								 uint64_t attempt, uint64_t marker,
+								 uint32_t candidate_wal_tli,
+								 uint64_t target, uint64_t target_end,
+								 PsArchiveProgress *result)
+{
+	PsArchiveProgressPrepareRequest request = {timeline, incarnation, attempt,
+										   marker, target, target_end,
+										   candidate_wal_tli};
+	return registry_apply_marker_authorized(registry, timeline, incarnation,
+		marker, prepare_transition, &request, result);
+}
+
+int
+ps_archive_progress_registry_activate(PsArchiveProgressRegistry *registry,
+								 uint32_t timeline, uint64_t incarnation,
+								 uint64_t attempt, uint64_t marker,
+								 uint32_t candidate_wal_tli,
+								 uint64_t target, uint64_t target_end,
+								 PsArchiveProgress *result)
+{
+	PsArchiveProgressPrepareRequest request = {timeline, incarnation, attempt,
+										   marker, target, target_end,
+										   candidate_wal_tli};
+	return registry_apply_marker_authorized(registry, timeline, incarnation,
+		marker, activate_transition, &request, result);
 }

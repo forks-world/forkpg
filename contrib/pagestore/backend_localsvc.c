@@ -26,6 +26,7 @@
 #include "postgres.h"
 
 #include "pagestore_artifact_format.h"
+#include "pagestore_archive_progress_format.h"
 
 #include "storage/bufpage.h"
 
@@ -2145,6 +2146,178 @@ pagestore_localsvc_walidx_commit(uint64 start_lsn, uint64 end_lsn)
 	ch->req_seq = end_lsn;
 	ch->incarnation = incarnation;
 	ls_exec(ch);
+}
+
+static bool
+pagestore_localsvc_archive_progress_call(uint32 timeline, uint64 incarnation,
+										 PsOpcode opcode, uint32 capability,
+										 const void *request, uint32 request_len,
+										 PsArchiveProgress *result,
+										 uint32 *result_flags,
+										 int timeout_ms)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch;
+	uint32		status;
+	volatile bool ok = false;
+	MemoryContext callercontext = CurrentMemoryContext;
+
+	if (result == NULL || (request_len != 0 && request == NULL) ||
+		request_len > PS_IO_UNIT)
+		return false;
+	PG_TRY();
+	{
+		/* Background workers may make this their first localsvc operation. */
+		ls_attach();
+		if ((((PsShmHeader *) ls_shm)->frontend_capabilities & capability) != 0)
+		{
+			ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL, timeline);
+			ch->key.klass = PS_KLASS_CONTROL;
+			ch->timeline = timeline;
+			ch->incarnation = incarnation;
+			ch->opcode = opcode;
+			ch->result = 0;
+			ch->datalen = request_len;
+			if (request_len != 0)
+				memcpy(ch->data, request, request_len);
+			status = ls_exec_wait(ch, timeout_ms);
+			if (status == PS_STATUS_OK &&
+				ch->datalen == PS_ARCHIVE_PROGRESS_FORMAT_BYTES &&
+				ps_archive_progress_decode(result, ch->data, ch->datalen) == 0)
+			{
+				if (result_flags != NULL)
+					*result_flags = ch->result;
+				ok = true;
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(callercontext);
+		edata = CopyErrorData();
+
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+bool
+pagestore_localsvc_archive_progress_snapshot(uint32 timeline, uint64 incarnation,
+												 PsArchiveProgress *result,
+												 int timeout_ms)
+{
+	return pagestore_localsvc_archive_progress_call(timeline, incarnation,
+		PS_OP_ARCHIVE_PROGRESS_SNAPSHOT,
+		PS_FRONTEND_CAP_ARCHIVE_PROGRESS_SNAPSHOT, NULL, 0, result, NULL,
+		timeout_ms);
+}
+
+bool
+pagestore_localsvc_archive_progress_authorized_snapshot(uint32 timeline,
+												 uint64 incarnation,
+															 PsArchiveProgress *result,
+															 int timeout_ms)
+{
+	return pagestore_localsvc_archive_progress_call(timeline, incarnation,
+		PS_OP_ARCHIVE_PROGRESS_AUTHORIZED_SNAPSHOT,
+		PS_FRONTEND_CAP_ARCHIVE_PROGRESS_COORDINATION, NULL, 0, result, NULL,
+		timeout_ms);
+}
+
+bool
+pagestore_localsvc_archive_progress_start(uint32 timeline, uint64 incarnation,
+											  uint64 expected_attempt,
+											  uint64 nonce_hi, uint64 nonce_lo,
+											  uint64 marker, uint64 original_limit,
+											  uint64 max_extra,
+											  PsArchiveProgress *result,
+											  bool *replayed, int timeout_ms)
+{
+	PsArchiveProgressStartRequest request = {expected_attempt, nonce_hi, nonce_lo,
+		marker, incarnation};
+	uint32 flags = 0;
+	bool ok;
+
+	(void) original_limit;
+	(void) max_extra;
+	ok = pagestore_localsvc_archive_progress_call(timeline, incarnation,
+		PS_OP_ARCHIVE_PROGRESS_START, PS_FRONTEND_CAP_ARCHIVE_PROGRESS_COORDINATION,
+		&request, sizeof(request), result, &flags, timeout_ms);
+	if (replayed != NULL)
+		*replayed = ok && (flags & PS_ARCHIVE_PROGRESS_START_REPLAYED) != 0;
+	return ok;
+}
+
+bool
+pagestore_localsvc_archive_progress_safe(uint32 timeline, uint64 incarnation,
+										 uint64 attempt, uint64 marker,
+										 uint64 safe_lsn,
+										 PsArchiveProgress *result,
+										 int timeout_ms)
+{
+	PsArchiveProgressSafeRequest request = {incarnation, attempt, marker, safe_lsn};
+	return pagestore_localsvc_archive_progress_call(timeline, incarnation,
+		PS_OP_ARCHIVE_PROGRESS_SAFE, PS_FRONTEND_CAP_ARCHIVE_PROGRESS_COORDINATION,
+		&request, sizeof(request), result, NULL, timeout_ms);
+}
+
+bool
+pagestore_localsvc_archive_progress_freeze(uint32 timeline,
+											  uint64 incarnation,
+											  uint64 attempt, uint64 marker,
+											  uint64 original_limit,
+											  uint64 max_extra,
+											  PsArchiveProgress *result,
+											  int timeout_ms)
+{
+	PsArchiveProgressFreezeRequest request = {incarnation, attempt, marker,
+		original_limit, max_extra};
+	return pagestore_localsvc_archive_progress_call(timeline, incarnation,
+		PS_OP_ARCHIVE_PROGRESS_FREEZE,
+		PS_FRONTEND_CAP_ARCHIVE_PROGRESS_COORDINATION,
+		&request, sizeof(request), result, NULL, timeout_ms);
+}
+
+bool
+pagestore_localsvc_archive_progress_prepare(uint32 timeline, uint64 incarnation,
+										uint64 attempt, uint64 marker,
+										uint64 target, uint64 target_end,
+										uint32 candidate_wal_tli,
+										PsArchiveProgress *result,
+										int timeout_ms)
+{
+	PsArchiveProgressPrepareRequest request = {incarnation, attempt, marker,
+		target, target_end, candidate_wal_tli, 0};
+	return pagestore_localsvc_archive_progress_call(timeline, incarnation,
+		PS_OP_ARCHIVE_PROGRESS_PREPARE, PS_FRONTEND_CAP_ARCHIVE_PROGRESS_COORDINATION,
+		&request, sizeof(request), result, NULL, timeout_ms);
+}
+
+bool
+pagestore_localsvc_archive_progress_activate(uint32 timeline,
+											 uint64 incarnation, uint64 attempt,
+											 uint64 marker, uint64 target,
+											 uint64 target_end,
+											 uint32 candidate_wal_tli,
+											 PsArchiveProgress *result,
+											 int timeout_ms)
+{
+	PsArchiveProgressPrepareRequest request = {incarnation, attempt, marker,
+		target, target_end, candidate_wal_tli, 0};
+	return pagestore_localsvc_archive_progress_call(timeline, incarnation,
+		PS_OP_ARCHIVE_PROGRESS_ACTIVATE,
+		PS_FRONTEND_CAP_ARCHIVE_PROGRESS_COORDINATION,
+		&request, sizeof(request), result, NULL, timeout_ms);
 }
 
 /* Return this timeline's parent and fork point, or false for the root. */

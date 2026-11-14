@@ -30,7 +30,9 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		53	/* 53: compaction conflict and fallback metrics.
+#define PS_SHM_VERSION		56	/* 56: archive progress PREPARE/ACTIVATE split.
+								 * 55: archive progress FREEZE request payload.
+								 * 53: compaction conflict and fallback metrics.
 								 * 52: recovery writes carry the active replay
 								 * position in req_lsn, enabling safe stale-page
 								 * suppression; mixed versions must not attach.
@@ -189,6 +191,13 @@ typedef enum PsOpcode
 	PS_OP_READV_FSM,
 	PS_OP_WAL_BASE_READ,		/* retained index-view base; no PAGE read grant */
 	PS_OP_WAL_BASE_STATE,		/* base and lifecycle at the same index view */
+	PS_OP_ARCHIVE_PROGRESS_SNAPSHOT, /* read-only; capability negotiated */
+	PS_OP_ARCHIVE_PROGRESS_START, /* fenced, durable materializer attempt */
+	PS_OP_ARCHIVE_PROGRESS_SAFE, /* consistency-checked replay feedback */
+	PS_OP_ARCHIVE_PROGRESS_PREPARE, /* persist one fixed, not-yet-active candidate */
+	PS_OP_ARCHIVE_PROGRESS_AUTHORIZED_SNAPSHOT, /* marker-checked current state */
+	PS_OP_ARCHIVE_PROGRESS_FREEZE, /* writer-frozen original bound and cap */
+	PS_OP_ARCHIVE_PROGRESS_ACTIVATE, /* activate only after segment flush proof */
 } PsOpcode;
 
 typedef enum PsTimelineState
@@ -366,6 +375,48 @@ typedef struct PsWalIndexEntry
 #define PS_FRONTEND_CAP_WAL_BASE (UINT32_C(1) << 4)
 #define PS_FRONTEND_CAP_WAL_BASE_STATE (UINT32_C(1) << 5)
 #define PS_FRONTEND_CAP_BRANCH_REDO_READ (UINT32_C(1) << 6)
+#define PS_FRONTEND_CAP_ARCHIVE_PROGRESS_SNAPSHOT (UINT32_C(1) << 7)
+#define PS_FRONTEND_CAP_ARCHIVE_PROGRESS_COORDINATION (UINT32_C(1) << 8)
+
+/* Fixed payloads for the optional archive-progress mutation operations. */
+typedef struct PsArchiveProgressStartRequest
+{
+	uint64_t expected_attempt;
+	uint64_t nonce_hi;
+	uint64_t nonce_lo;
+	uint64_t marker;
+	uint64_t incarnation;
+} PsArchiveProgressStartRequest;
+
+typedef struct PsArchiveProgressSafeRequest
+{
+	uint64_t incarnation;
+	uint64_t attempt;
+	uint64_t marker;
+	uint64_t safe_lsn;
+} PsArchiveProgressSafeRequest;
+
+typedef struct PsArchiveProgressFreezeRequest
+{
+	uint64_t incarnation;
+	uint64_t attempt;
+	uint64_t marker;
+	uint64_t original_limit;
+	uint64_t max_extra;
+} PsArchiveProgressFreezeRequest;
+
+typedef struct PsArchiveProgressPrepareRequest
+{
+	uint64_t incarnation;
+	uint64_t attempt;
+	uint64_t marker;
+	uint64_t target;
+	uint64_t target_end;
+	uint32_t candidate_wal_tli;
+	uint32_t reserved;
+} PsArchiveProgressPrepareRequest;
+
+#define PS_ARCHIVE_PROGRESS_START_REPLAYED 1u
 /* READV only: a startup-process page read during branch crash recovery. */
 #define PS_READ_BRANCH_REDO UINT32_C(0x42525244)
 #define PS_WAL_BASE_VIEW_UNREGISTERED 1u
