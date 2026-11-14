@@ -23,6 +23,9 @@
 
 #include "pagestore_core.h"
 #include "pagestore_retention.h"
+#include "pagestore_archive_progress_authority.h"
+#include "pagestore_archive_progress_store.h"
+#include "pagestore_artifact_format.h"
 
 #define WAL_SEGMENT (1024u * 1024u)
 #define WAL_SEGMENTS 3u
@@ -30,6 +33,28 @@
 
 static int checks;
 static int failed;
+static void close_store(void);
+
+typedef struct ArchiveProgressStartThread
+{
+	PsArchiveProgressRegistry *registry;
+	uint64_t marker;
+	int result;
+} ArchiveProgressStartThread;
+
+static void *
+archive_progress_start_thread(void *arg)
+{
+	ArchiveProgressStartThread *start = arg;
+
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	start->result = ps_archive_progress_registry_start(start->registry, 0,
+		1, 0xA11CE, 0x55, start->marker, 1, 0, 0, NULL);
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+	return NULL;
+}
 
 typedef struct AdmissionCallCounter
 {
@@ -431,6 +456,160 @@ write_relation_page(uint32_t timeline, uint32_t block, uint64_t lsn)
 	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
 
 	return write_keyed_page(timeline, &key, block, lsn);
+}
+
+static int
+write_materializer_marker(uint64_t version, uint64_t materialized_lsn,
+						  uint32_t format_version)
+{
+	PsKey key = {0, 0, 0, 0, PS_KLASS_CONTROL};
+	PsMaterializerMarkerFormat marker;
+	unsigned char page[PS_IO_UNIT];
+	int rc;
+
+	memset(page, 0, sizeof(page));
+	memset(&marker, 0, sizeof(marker));
+	marker.magic = PS_MATERIALIZER_MARKER_MAGIC;
+	marker.version = format_version;
+	marker.timeline = 0;
+	marker.materialized_lsn = materialized_lsn;
+	marker.materialized_lsn_complement = ~materialized_lsn;
+	memcpy(page, &marker, sizeof(marker));
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = append_page(0, &key, PS_MATERIALIZER_MARKER_BLOCK, page, version, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc == 0 && ps_storage->sync() == 0;
+}
+
+static void
+test_archive_progress_marker_authority(void)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-archive-authority-XXXXXX";
+	PsArchiveProgressRegistry registry;
+	PsArchiveProgress snapshot;
+	PsTimelineState timeline_state;
+	uint64_t incarnation = 0;
+	pthread_t writer;
+	ArchiveProgressStartThread start;
+
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open store for archive progress marker authority");
+		return;
+	}
+	check(write_materializer_marker(100, 100, PS_MATERIALIZER_MARKER_VERSION),
+		  "write a valid durable materializer marker");
+	ps_lock_map_rd();
+	check(ps_timeline_state(0, &timeline_state, &incarnation) == 1 &&
+		  timeline_state == PS_TIMELINE_LIVE && incarnation == 1,
+		  "read live main timeline incarnation");
+	ps_unlock_map();
+	check(ps_archive_progress_registry_open(&registry, ps_storage, 1024) == 0,
+		  "open archive progress authority registry");
+	check(ps_archive_progress_registry_set_marker_authority(
+			  &registry, ps_archive_progress_marker_acquire,
+			  ps_archive_progress_marker_release, NULL) == 0,
+		  "install production marker authority callbacks");
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	check(ps_archive_progress_registry_start(&registry, 0, 0,
+			  0xA11CE, 0x55, 100, incarnation, 0, 0, &snapshot) == 0 &&
+		  snapshot.attempt == 1 && snapshot.marker == 100 &&
+		  snapshot.incarnation == incarnation,
+		  "START accepts a synced marker and returns its timeline incarnation");
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+
+	/* An invalid replacement must fail after acquisition and unwind every
+	 * shard lock so a subsequent write lock can be taken. */
+	check(write_materializer_marker(200, 200, PS_MATERIALIZER_MARKER_VERSION + 1),
+		  "write an unknown marker version");
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	check(ps_archive_progress_registry_start(&registry, 0, 1,
+			  0xA11CE, 0x56, 200, incarnation, 0, 0, NULL) != 0,
+		  "reject an unknown marker format");
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+	for (uint32_t shard = 0; shard < ps_nshards; shard++)
+		ps_lock_shard_wr(shard);
+	for (uint32_t shard = ps_nshards; shard-- > 0;)
+		ps_unlock_shard(shard);
+
+	/* Hold the same shard domain used by marker writers, queue START, then
+	 * publish a newer marker before releasing the writer. START must observe
+	 * the new durable value rather than authorize the stale request value. */
+	for (uint32_t shard = 0; shard < ps_nshards; shard++)
+		ps_lock_shard_wr(shard);
+	start.registry = &registry;
+	start.marker = 200;
+	start.result = 0;
+	check(pthread_create(&writer, NULL, archive_progress_start_thread, &start) == 0,
+		  "start concurrent marker authority request");
+	usleep(20000);
+	{
+		PsKey key = {0, 0, 0, 0, PS_KLASS_CONTROL};
+		PsMaterializerMarkerFormat marker;
+		unsigned char page[PS_IO_UNIT];
+		memset(page, 0, sizeof(page));
+		memset(&marker, 0, sizeof(marker));
+		marker.magic = PS_MATERIALIZER_MARKER_MAGIC;
+		marker.version = PS_MATERIALIZER_MARKER_VERSION;
+		marker.timeline = 0;
+		marker.materialized_lsn = 300;
+		marker.materialized_lsn_complement = ~marker.materialized_lsn;
+		memcpy(page, &marker, sizeof(marker));
+		check(append_page(0, &key, PS_MATERIALIZER_MARKER_BLOCK,
+						  page, 300, NULL) == 0 && ps_storage->sync() == 0,
+			  "publish a newer marker while START is queued");
+	}
+	for (uint32_t shard = ps_nshards; shard-- > 0;)
+		ps_unlock_shard(shard);
+	check(pthread_join(writer, NULL) == 0 && start.result != 0,
+		  "concurrent START rejects the stale marker after serialization");
+	check(ps_archive_progress_registry_snapshot(&registry, 0, &snapshot) == 0 &&
+		  snapshot.attempt == 1 && snapshot.marker == 100,
+		  "failed stale START leaves the committed generation unchanged");
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	check(ps_archive_progress_registry_authorized_snapshot(&registry, 0, 1,
+			  &snapshot) != 0,
+		  "authority lease rejects the old progress state after marker advance");
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+
+	ps_archive_progress_registry_close(&registry);
+	close_store();
+	{
+		pid_t child = fork();
+		int status;
+		if (child == 0)
+		{
+			PsArchiveProgressRegistry recovered;
+			PsArchiveProgress state;
+			if (ps_core_open(store) != 0 ||
+				ps_archive_progress_registry_open(&recovered, ps_storage, 1024) != 0 ||
+				ps_archive_progress_registry_set_marker_authority(
+					&recovered, ps_archive_progress_marker_acquire,
+					ps_archive_progress_marker_release, NULL) != 0)
+				_exit(1);
+			ps_lifecycle_read_lock();
+			ps_admission_read_lock();
+		if (ps_archive_progress_registry_start(&recovered, 0, 0,
+				0xA11CE, 0x55, 100, 1, 0, 0, &state) != 0 ||
+				state.attempt != 1 || state.marker != 100 || state.incarnation != 1)
+				_exit(2);
+			ps_admission_read_unlock();
+			ps_lifecycle_read_unlock();
+			ps_archive_progress_registry_close(&recovered);
+			close_store();
+			_exit(0);
+		}
+		check(child > 0 && waitpid(child, &status, 0) == child &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+			  "daemon authority and fixed attempt survive process restart");
+	}
+	remove_tree(store);
 }
 
 
@@ -3953,6 +4132,13 @@ main(int argc, char **argv)
 		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 		return failed != 0;
 	}
+	if (argc == 2 && strcmp(argv[1], "--archive-progress-authority") == 0)
+	{
+		test_archive_progress_marker_authority();
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	test_archive_progress_marker_authority();
 	check(ps_test_walidx_raw_first() == 0, "sorted WAL dependency summary matches full scan");
 	test_materializer_retains_replay_proof_interval();
 	test_reindex_compacted_recovery_proof();

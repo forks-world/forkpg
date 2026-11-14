@@ -788,7 +788,9 @@ XLogInsertRecord(XLogRecData *rdata,
 				 uint8 flags,
 				 int num_fpi,
 				 uint64 fpi_bytes,
-				 bool topxid_included)
+				 bool topxid_included,
+				 bool check_switch_segment,
+				 XLogSegNo expected_switch_segment)
 {
 	XLogCtlInsert *Insert = &XLogCtl->Insert;
 	pg_crc32c	rdata_crc;
@@ -809,6 +811,10 @@ XLogInsertRecord(XLogRecData *rdata,
 		else if (info == XLOG_CHECKPOINT_REDO)
 			class = WALINSERT_SPECIAL_CHECKPOINT;
 	}
+
+	/* Conditional insertion is only defined for the segment-switch record. */
+	if (check_switch_segment && class != WALINSERT_SPECIAL_SWITCH)
+		elog(ERROR, "conditional WAL insertion is only valid for XLOG_SWITCH");
 
 	/* we assume that all of the record header is in the first chunk */
 	Assert(rdata->len >= SizeOfXLogRecord);
@@ -909,6 +915,7 @@ XLogInsertRecord(XLogRecData *rdata,
 	}
 	else if (class == WALINSERT_SPECIAL_SWITCH)
 	{
+		Assert(!check_switch_segment || class == WALINSERT_SPECIAL_SWITCH);
 		/*
 		 * In order to insert an XLOG_SWITCH record, we need to hold all of
 		 * the WAL insertion locks, not just one, so that no one else can
@@ -922,6 +929,24 @@ XLogInsertRecord(XLogRecData *rdata,
 		 */
 		Assert(!XLogRecPtrIsValid(fpw_lsn));
 		WALInsertLockAcquireExclusive();
+		if (check_switch_segment)
+		{
+			XLogRecPtr insertptr;
+			XLogSegNo current_segment;
+
+			/* Recheck under the exclusive insertion-lock set. Another backend
+			 * may have switched segments since the caller observed the pointer. */
+			SpinLockAcquire(&Insert->insertpos_lck);
+			insertptr = XLogBytePosToEndRecPtr(Insert->CurrBytePos);
+			SpinLockRelease(&Insert->insertpos_lck);
+			XLByteToSeg(insertptr, current_segment, wal_segment_size);
+			if (current_segment != expected_switch_segment)
+			{
+				WALInsertLockRelease();
+				END_CRIT_SECTION();
+				return InvalidXLogRecPtr;
+			}
+		}
 		inserted = ReserveXLogSwitch(&StartPos, &EndPos, &rechdr->xl_prev);
 	}
 	else
@@ -4651,9 +4676,10 @@ control_file_flush_hook_type control_file_flush_hook = NULL;
 
 /* Post-buffer-flush publication point for recovery materializers. */
 recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook = NULL;
-recovery_restartpoint_rejected_hook_type recovery_restartpoint_rejected_hook = NULL;
 recovery_restartpoint_pre_control_hook_type recovery_restartpoint_pre_control_hook = NULL;
+recovery_restartpoint_rejected_hook_type recovery_restartpoint_rejected_hook = NULL;
 recovery_start_hook_type recovery_start_hook = NULL;
+recovery_consistency_hook_type recovery_consistency_hook = NULL;
 
 static inline void
 CallControlFileFlushHook(void)
@@ -8884,6 +8910,15 @@ RequestXLogSwitch(bool mark_unimportant)
 	RecPtr = XLogInsert(RM_XLOG_ID, XLOG_SWITCH);
 
 	return RecPtr;
+}
+
+/* Conditional form used by the pagestore progress worker. The expected
+ * segment is checked atomically while all WAL insertion locks are held. */
+XLogRecPtr
+RequestXLogSwitchIfSegment(XLogSegNo expected_segment)
+{
+	XLogBeginInsert();
+	return XLogInsertIfSegment(RM_XLOG_ID, XLOG_SWITCH, expected_segment);
 }
 
 /*

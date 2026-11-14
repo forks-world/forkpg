@@ -226,8 +226,8 @@ typedef struct PsWriterCheckpointFormat
 	uint64_t	checkpoint_lsn_complement;
 } PsWriterCheckpointFormat;
 
-/* block 6: a checkpoint rejected because recovery still has invalid pages.
- * This hint affects bounded WAL shipping only; it is not a retention receipt. */
+/* block 6: a checkpoint recovery rejected for unresolved invalid pages.
+ * This is a bounded shipping hint, never a durability or retention marker. */
 #define PS_MATERIALIZER_REJECTED_BLOCK 6u
 #define PS_MATERIALIZER_REJECTED_MAGIC 0x5053524au /* "PSRJ" */
 #define PS_MATERIALIZER_REJECTED_VERSION 1u
