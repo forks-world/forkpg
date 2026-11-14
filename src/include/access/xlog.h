@@ -216,7 +216,9 @@ extern XLogRecPtr XLogInsertRecord(struct XLogRecData *rdata,
 								   uint8 flags,
 								   int num_fpi,
 								   uint64 fpi_bytes,
-								   bool topxid_included);
+								   bool topxid_included,
+								   bool check_switch_segment,
+								   XLogSegNo expected_switch_segment);
 extern void XLogFlush(XLogRecPtr record);
 extern bool XLogBackgroundFlush(void);
 extern bool XLogNeedsFlush(XLogRecPtr record);
@@ -293,11 +295,19 @@ typedef void (*recovery_restartpoint_pre_control_hook_type) (XLogRecPtr replay_l
 														XLogRecPtr restart_redo_lsn);
 extern PGDLLIMPORT recovery_restartpoint_pre_control_hook_type recovery_restartpoint_pre_control_hook;
 
+/* Called in the startup process when a checkpoint cannot be a restartpoint. */
+typedef void (*recovery_restartpoint_rejected_hook_type) (XLogRecPtr checkpoint_lsn);
+extern PGDLLIMPORT recovery_restartpoint_rejected_hook_type recovery_restartpoint_rejected_hook;
+
 /* Called in the startup process after the checkpoint redo pointer is known
  * and before the checkpoint or redo WAL is read.  Consumers that depend on
  * retained history use this point to establish their durable protection. */
 typedef void (*recovery_start_hook_type) (XLogRecPtr redo_lsn);
 extern PGDLLIMPORT recovery_start_hook_type recovery_start_hook;
+
+/* Advisory progress feedback; return true once durably accepted. */
+typedef bool (*recovery_consistency_hook_type) (XLogRecPtr replay_lsn);
+extern PGDLLIMPORT recovery_consistency_hook_type recovery_consistency_hook;
 extern XLogRecPtr GetXLogInsertEndRecPtr(void);
 extern XLogRecPtr GetXLogWriteRecPtr(void);
 

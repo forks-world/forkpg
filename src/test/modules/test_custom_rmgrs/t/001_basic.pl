@@ -59,5 +59,9 @@ my $result = $node->safe_psql(
 is($result, $expected,
 	'custom WAL resource manager has successfully written a WAL record');
 
+is($node->safe_psql('postgres',
+	'SELECT test_custom_rmgrs_conditional_switch_stale_segment()'), 't',
+	'conditional segment switch rejects a stale expected segment');
+
 $node->stop;
 done_testing();

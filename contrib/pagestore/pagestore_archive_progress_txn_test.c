@@ -20,9 +20,12 @@ static int begin(PsArchiveProgress *s, void *arg) {
 static int safe(PsArchiveProgress *s, void *arg) {
 	(void) arg; return ps_archive_progress_safe(s, 3, 1, 1, 100, 180);
 }
+static int freeze(PsArchiveProgress *s, void *arg) {
+	(void) arg; return ps_archive_progress_freeze_budget(s, 3, 1, 1, 100, 192, 64);
+}
 static int pin(PsArchiveProgress *s, void *arg) {
 	uint64_t target = *(uint64_t *)arg;
-	return ps_archive_progress_pin(s, 3, 1, 1, 100, target, 256);
+	return ps_archive_progress_prepare(s, 3, 1, 1, 100, 1, target, 256);
 }
 static void *worker(void *arg) {
 	Request *r = arg; r->rc = ps_archive_progress_txn_apply(r->tx, pin, &r->target, NULL); return NULL;
@@ -33,19 +36,20 @@ int main(void) {
 	CHECK(ps_archive_progress_txn_init(&tx, &zero, save, &f) == 0);
 	CHECK(ps_archive_progress_txn_apply(&tx, begin, NULL, NULL) == 0);
 	CHECK(ps_archive_progress_txn_apply(&tx, safe, NULL, NULL) == 0);
+	CHECK(ps_archive_progress_txn_apply(&tx, freeze, NULL, NULL) == 0);
 	CHECK(pthread_create(&ta, NULL, worker, &a) == 0);
 	CHECK(pthread_create(&tb, NULL, worker, &b) == 0);
 	CHECK(pthread_join(ta, NULL) == 0 && pthread_join(tb, NULL) == 0);
 	CHECK((a.rc == 0) != (b.rc == 0));
 	CHECK(f.durable.target == (a.rc == 0 ? a.target : b.target));
 	CHECK(ps_archive_progress_txn_snapshot(&tx, &snapshot) == 0 &&
-		  snapshot.target == f.durable.target && f.writes == 3);
+			snapshot.target == f.durable.target && f.writes == 4);
 	f.fail = 1;
 	CHECK(ps_archive_progress_txn_apply(&tx, safe, NULL, NULL) != 0);
 	CHECK(ps_archive_progress_txn_snapshot(&tx, &snapshot) != 0);
 	f.fail = 0;
 	CHECK(ps_archive_progress_txn_apply(&tx, safe, NULL, NULL) != 0);
-	CHECK(f.writes == 4);
+	CHECK(f.writes == 5);
 	ps_archive_progress_txn_destroy(&tx);
 	CHECK(ps_archive_progress_txn_init(&tx, &f.durable, save, &f) == 0);
 	CHECK(ps_archive_progress_txn_apply(&tx, pin, &f.durable.target, NULL) == 0);

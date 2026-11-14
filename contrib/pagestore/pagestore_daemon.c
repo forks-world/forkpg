@@ -40,14 +40,47 @@
 #include "pagestore_core.h"
 #include "pagestore_pgcache.h"
 #include "pagestore_fault.h"
+#include "pagestore_archive_progress_store.h"
+#include "pagestore_archive_progress_format.h"
+#include "pagestore_archive_progress_authority.h"
 
 static volatile sig_atomic_t stop_requested = 0;
+static PsArchiveProgressRegistry archive_progress_registry;
+static int archive_progress_registry_ready = 0;
 static PsShmHeader *daemon_hdr = NULL;
 static const char *maintenance_pause_file = NULL;
 static const char *test_admission_pause_file = NULL;
 static const char *test_admission_ready_file = NULL;
 static const char *shutdown_cancel_pause_file = NULL;
 static int shutdown_cancel_ready_fd = -1;
+static time_t archive_progress_error_logged[PS_INSPECTION_MAX_TIMELINES];
+
+static void
+archive_progress_log_rejection(uint32_t timeline, PsOpcode opcode)
+{
+	unsigned char encoded[PS_ARCHIVE_PROGRESS_FORMAT_BYTES];
+	time_t now = time(NULL);
+	int status = -1;
+
+	if (timeline < PS_INSPECTION_MAX_TIMELINES &&
+		archive_progress_error_logged[timeline] != 0 &&
+		now >= archive_progress_error_logged[timeline] &&
+		now - archive_progress_error_logged[timeline] < 30)
+		return;
+	if (timeline < PS_INSPECTION_MAX_TIMELINES)
+		archive_progress_error_logged[timeline] = now;
+	if (ps_storage && ps_storage->archive_progress_read)
+		status = ps_storage->archive_progress_read(timeline, encoded, sizeof(encoded));
+	if (status == 0 && ps_ap_get32(encoded + 4) != PS_ARCHIVE_PROGRESS_FORMAT_VERSION)
+		fprintf(stderr,
+				"pagestore_daemon: archive progress opcode %u rejected for timeline %u: durable format v%u is unsupported (expected v%u); no automatic migration\n",
+				opcode, timeline, ps_ap_get32(encoded + 4),
+				PS_ARCHIVE_PROGRESS_FORMAT_VERSION);
+	else
+		fprintf(stderr,
+				"pagestore_daemon: archive progress opcode %u rejected for timeline %u (stale identity, unsupported/corrupt state, unavailable marker authority, or invalid request); fail closed\n",
+				opcode, timeline);
+}
 
 /* Test-only startup seam; this is consumed only by the POSIX standalone
  * daemon tests and lets them exercise the pthread-create error path. */
@@ -423,6 +456,132 @@ handle_request(PsChannel *ch)
 		ch->status = PS_STATUS_ERROR;
 		return;
 	}
+	if (ch->opcode == PS_OP_ARCHIVE_PROGRESS_SNAPSHOT)
+	{
+		PsArchiveProgress snapshot;
+
+		if (!archive_progress_registry_ready ||
+			!ps_timeline_request_allowed(tl, ch->incarnation) ||
+			ps_archive_progress_registry_snapshot(&archive_progress_registry, tl, &snapshot) != 0 ||
+			ps_archive_progress_encode(&snapshot, ch->data, PS_ARCHIVE_PROGRESS_FORMAT_BYTES) != 0)
+		{
+			ch->status = PS_STATUS_ERROR;
+			archive_progress_log_rejection(tl, (PsOpcode) ch->opcode);
+		}
+		else
+		{
+			ch->datalen = PS_ARCHIVE_PROGRESS_FORMAT_BYTES;
+			ch->result = snapshot.attempt != 0;
+		}
+		return;
+	}
+	if (ch->opcode == PS_OP_ARCHIVE_PROGRESS_AUTHORIZED_SNAPSHOT)
+	{
+		PsArchiveProgress snapshot;
+
+		if (!archive_progress_registry_ready ||
+			!ps_timeline_request_allowed(tl, ch->incarnation) ||
+			ps_archive_progress_registry_authorized_snapshot(&archive_progress_registry,
+				tl, ch->incarnation, &snapshot) != 0 ||
+			ps_archive_progress_encode(&snapshot, ch->data,
+				PS_ARCHIVE_PROGRESS_FORMAT_BYTES) != 0)
+		{
+			ch->status = PS_STATUS_ERROR;
+			archive_progress_log_rejection(tl, (PsOpcode) ch->opcode);
+		}
+		else
+		{
+			ch->datalen = PS_ARCHIVE_PROGRESS_FORMAT_BYTES;
+			ch->result = snapshot.attempt != 0;
+		}
+		return;
+	}
+	if (ch->opcode == PS_OP_ARCHIVE_PROGRESS_START ||
+		ch->opcode == PS_OP_ARCHIVE_PROGRESS_SAFE ||
+		ch->opcode == PS_OP_ARCHIVE_PROGRESS_PREPARE ||
+		ch->opcode == PS_OP_ARCHIVE_PROGRESS_FREEZE ||
+		ch->opcode == PS_OP_ARCHIVE_PROGRESS_ACTIVATE)
+	{
+		PsArchiveProgress progress;
+		int replayed = 0;
+		int rc = -1;
+
+		if (!archive_progress_registry_ready ||
+			!ps_timeline_request_allowed(tl, ch->incarnation))
+			goto progress_reply;
+		if (ch->opcode == PS_OP_ARCHIVE_PROGRESS_START &&
+			ch->datalen == sizeof(PsArchiveProgressStartRequest))
+		{
+			PsArchiveProgressStartRequest request;
+			memcpy(&request, ch->data, sizeof(request));
+			if (request.incarnation == ch->incarnation)
+				rc = ps_archive_progress_registry_start_ex(&archive_progress_registry,
+					tl, request.expected_attempt, request.nonce_hi, request.nonce_lo,
+					request.marker, request.incarnation, 0, 0,
+					&progress, &replayed);
+		}
+		else if (ch->opcode == PS_OP_ARCHIVE_PROGRESS_SAFE &&
+				 ch->datalen == sizeof(PsArchiveProgressSafeRequest))
+		{
+			PsArchiveProgressSafeRequest request;
+			memcpy(&request, ch->data, sizeof(request));
+			if (request.incarnation == ch->incarnation)
+				rc = ps_archive_progress_registry_safe(&archive_progress_registry,
+					tl, request.incarnation, request.attempt, request.marker,
+					request.safe_lsn, &progress);
+		}
+		else if (ch->opcode == PS_OP_ARCHIVE_PROGRESS_FREEZE &&
+				 ch->datalen == sizeof(PsArchiveProgressFreezeRequest))
+		{
+			PsArchiveProgressFreezeRequest request;
+			memcpy(&request, ch->data, sizeof(request));
+			if (request.incarnation == ch->incarnation)
+				rc = ps_archive_progress_registry_freeze_budget(
+					&archive_progress_registry, tl, request.incarnation,
+					request.attempt, request.marker, request.original_limit,
+					request.max_extra, &progress);
+		}
+		else if (ch->opcode == PS_OP_ARCHIVE_PROGRESS_PREPARE &&
+				 ch->datalen == sizeof(PsArchiveProgressPrepareRequest))
+		{
+			PsArchiveProgressPrepareRequest request;
+			memcpy(&request, ch->data, sizeof(request));
+			if (request.incarnation == ch->incarnation && request.reserved == 0 &&
+				request.candidate_wal_tli != 0)
+				rc = ps_archive_progress_registry_prepare(&archive_progress_registry,
+					tl, request.incarnation, request.attempt, request.marker,
+					request.candidate_wal_tli, request.target,
+					request.target_end, &progress);
+		}
+		else if (ch->opcode == PS_OP_ARCHIVE_PROGRESS_ACTIVATE &&
+				 ch->datalen == sizeof(PsArchiveProgressPrepareRequest))
+		{
+			PsArchiveProgressPrepareRequest request;
+			memcpy(&request, ch->data, sizeof(request));
+			if (request.incarnation == ch->incarnation && request.reserved == 0 &&
+				request.candidate_wal_tli != 0)
+				rc = ps_archive_progress_registry_activate(
+					&archive_progress_registry, tl, request.incarnation,
+					request.attempt, request.marker,
+					request.candidate_wal_tli, request.target,
+					request.target_end, &progress);
+		}
+		if (rc == 0 && ps_archive_progress_encode(&progress, ch->data,
+											 PS_ARCHIVE_PROGRESS_FORMAT_BYTES) == 0)
+		{
+			ch->datalen = PS_ARCHIVE_PROGRESS_FORMAT_BYTES;
+			ch->result = replayed ? PS_ARCHIVE_PROGRESS_START_REPLAYED : 0;
+		}
+		else
+		{
+			ch->status = PS_STATUS_ERROR;
+			archive_progress_log_rejection(tl, (PsOpcode) ch->opcode);
+		}
+progress_reply:
+		if (rc != 0)
+			ch->status = PS_STATUS_ERROR;
+		return;
+	}
 	if (ch->key.klass == PS_KLASS_ARTIFACT ||
 		((ch->key.klass == PS_KLASS_SLRU || ch->key.klass == PS_KLASS_READER_SNAPSHOT) &&
 		 ch->opcode == PS_OP_WRITEV && ch->nblocks != 1))
@@ -723,6 +882,13 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_INDEX_ADD:
 		case PS_OP_WAL_INDEX_ADD_BATCH:
 		case PS_OP_IMMEDSYNC:
+		case PS_OP_ARCHIVE_PROGRESS_SNAPSHOT:
+		case PS_OP_ARCHIVE_PROGRESS_AUTHORIZED_SNAPSHOT:
+		case PS_OP_ARCHIVE_PROGRESS_START:
+		case PS_OP_ARCHIVE_PROGRESS_SAFE:
+		case PS_OP_ARCHIVE_PROGRESS_PREPARE:
+		case PS_OP_ARCHIVE_PROGRESS_FREEZE:
+		case PS_OP_ARCHIVE_PROGRESS_ACTIVATE:
 			return 1;
 		case PS_OP_EXISTS:
 		case PS_OP_BLOCK_DEATH:
@@ -837,7 +1003,14 @@ run_request_admitted(PsChannel *ch)
 	 * purges every per-shard incarnation-local index/cache, so exclude all
 	 * shard workers before taking map_lock (the established shard->map order).
 	 */
-	if (op == PS_OP_RETENTION_PIN_LOOKUP || op == PS_OP_RETENTION_PIN_RESERVE ||
+	if (op == PS_OP_ARCHIVE_PROGRESS_SNAPSHOT ||
+		op == PS_OP_ARCHIVE_PROGRESS_AUTHORIZED_SNAPSHOT ||
+		op == PS_OP_ARCHIVE_PROGRESS_START ||
+		op == PS_OP_ARCHIVE_PROGRESS_SAFE ||
+		op == PS_OP_ARCHIVE_PROGRESS_PREPARE ||
+		op == PS_OP_ARCHIVE_PROGRESS_FREEZE ||
+		op == PS_OP_ARCHIVE_PROGRESS_ACTIVATE ||
+		op == PS_OP_RETENTION_PIN_LOOKUP || op == PS_OP_RETENTION_PIN_RESERVE ||
 		op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP)
 	{
 		int		timeline_ok;
@@ -1687,6 +1860,18 @@ main(int argc, char **argv)
 		close(fd);
 		return 1;
 	}
+	/* A provider without the optional capability remains available for all
+	 * existing operations; it never advertises progress coordination. */
+	if (ps_storage->archive_progress_read && ps_storage->archive_progress_replace &&
+		ps_archive_progress_registry_open(&archive_progress_registry, ps_storage, 1024) == 0)
+	{
+		if (ps_archive_progress_registry_set_marker_authority(
+				&archive_progress_registry, ps_archive_progress_marker_acquire,
+				ps_archive_progress_marker_release, NULL) == 0)
+			archive_progress_registry_ready = 1;
+		else
+			ps_archive_progress_registry_close(&archive_progress_registry);
+	}
 
 	/*
 	 * Initialize the shared region.  NB: this zeroes the whole segment, so the
@@ -1707,6 +1892,9 @@ main(int argc, char **argv)
 		PS_FRONTEND_CAP_BRANCH_SEQ | PS_FRONTEND_CAP_ATOMIC_PINS |
 		PS_FRONTEND_CAP_FSM_RESET | PS_FRONTEND_CAP_WAL_BASE |
 		PS_FRONTEND_CAP_WAL_BASE_STATE | PS_FRONTEND_CAP_BRANCH_REDO_READ;
+	if (archive_progress_registry_ready)
+		hdr->frontend_capabilities |= PS_FRONTEND_CAP_ARCHIVE_PROGRESS_SNAPSHOT |
+			PS_FRONTEND_CAP_ARCHIVE_PROGRESS_COORDINATION;
 	hdr->daemon_instance = new_daemon_instance();
 	daemon_hdr = hdr;
 	ps_core_set_metrics_header(hdr);
@@ -1730,6 +1918,8 @@ main(int argc, char **argv)
 			fprintf(stderr, "pagestore_daemon: cannot allocate worker slots\n");
 			free(workers);
 			free(threads);
+			if (archive_progress_registry_ready)
+				ps_archive_progress_registry_close(&archive_progress_registry);
 			ps_core_close();
 			munmap(shm, PS_SHM_SIZE);
 			release_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
@@ -1850,6 +2040,8 @@ main(int argc, char **argv)
 				(unsigned long long) rs, (unsigned long long) ch,
 				(unsigned long long) cm, (unsigned long long) ce);
 	}
+	if (archive_progress_registry_ready)
+		ps_archive_progress_registry_close(&archive_progress_registry);
 	ps_core_close();			/* flush the memtable so restart rebuilds from layers */
 	munmap(shm, PS_SHM_SIZE);
 	if (daemon_lease_held)

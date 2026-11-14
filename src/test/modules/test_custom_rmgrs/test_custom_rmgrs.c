@@ -138,3 +138,62 @@ test_custom_rmgrs_insert_wal_record(PG_FUNCTION_ARGS)
 
 	PG_RETURN_LSN(lsn);
 }
+
+/*
+ * Exercise the conditional segment switch used by the pagestore progress
+ * worker.  Switch away from the captured segment, write in the next one, and
+ * verify that a stale expected segment cannot insert another switch record.
+ */
+PG_FUNCTION_INFO_V1(test_custom_rmgrs_conditional_switch_stale_segment);
+Datum
+test_custom_rmgrs_conditional_switch_stale_segment(PG_FUNCTION_ARGS)
+{
+	static const char before_payload[] = "before-switch";
+	static const char after_payload[] = "after-switch";
+	xl_testcustomrmgrs_message xlrec;
+	XLogSegNo	expected_segno;
+	XLogSegNo	current_segno;
+	XLogRecPtr	after_lsn;
+	XLogRecPtr	switch_lsn;
+
+	/* Ensure the segment is nonempty so the unconditional switch advances. */
+	xlrec.message_size = sizeof(before_payload) - 1;
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfTestCustomRmgrsMessage);
+	XLogRegisterData((char *) before_payload, xlrec.message_size);
+	(void) XLogInsert(RM_TESTCUSTOMRMGRS_ID, XLOG_TEST_CUSTOM_RMGRS_MESSAGE);
+
+	XLByteToSeg(GetXLogInsertRecPtr(), expected_segno, wal_segment_size);
+	switch_lsn = RequestXLogSwitch(false);
+	if (!XLogRecPtrIsValid(switch_lsn))
+		ereport(ERROR,
+				(errmsg("unconditional WAL switch did not return a valid LSN")));
+
+	/* Put a record in the next segment, making expected_segno stale. */
+	xlrec.message_size = sizeof(after_payload) - 1;
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfTestCustomRmgrsMessage);
+	XLogRegisterData((char *) after_payload, xlrec.message_size);
+	(void) XLogInsert(RM_TESTCUSTOMRMGRS_ID, XLOG_TEST_CUSTOM_RMGRS_MESSAGE);
+
+	XLByteToSeg(GetXLogInsertRecPtr(), current_segno, wal_segment_size);
+	if (current_segno <= expected_segno)
+		ereport(ERROR,
+				(errmsg("test WAL did not advance to the next segment"),
+				 errdetail("expected a segment after %X, found %X",
+						   (unsigned int) expected_segno,
+						   (unsigned int) current_segno)));
+
+	switch_lsn = RequestXLogSwitchIfSegment(expected_segno);
+	after_lsn = GetXLogInsertRecPtr();
+	if (XLogRecPtrIsValid(switch_lsn))
+		ereport(ERROR,
+				(errmsg("stale conditional WAL switch was not rejected")));
+
+	XLByteToSeg(after_lsn, current_segno, wal_segment_size);
+	if (current_segno <= expected_segno)
+		ereport(ERROR,
+				(errmsg("stale conditional WAL switch advanced the WAL segment")));
+
+	PG_RETURN_BOOL(true);
+}

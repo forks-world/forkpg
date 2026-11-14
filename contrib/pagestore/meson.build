@@ -29,6 +29,13 @@ pagestore = shared_module('pagestore',
 )
 contrib_targets += pagestore
 
+pagestore_archive_policy_test = executable('pagestore_archive_policy_test',
+  files('pagestore_archive_policy_test.c'),
+  install: false,
+)
+test('pagestore_archive_policy', pagestore_archive_policy_test,
+  suite: ['pagestore'], timeout: 30)
+
 pagestore_archive_progress_test = executable('pagestore_archive_progress_test',
   files('pagestore_archive_progress_test.c'),
   install: false,
@@ -59,7 +66,6 @@ storage_archive_progress_test = executable('storage_archive_progress_test',
 )
 test('storage_archive_progress', storage_archive_progress_test,
   suite: ['pagestore'], timeout: 30)
-
 
 # Backend-only fault tests use private copies of the real mirror drains.
 pagestore_mirror_error_test = shared_module('pagestore_mirror_error_test',
@@ -143,6 +149,8 @@ endif
 # includes only pagestore_ipc.h and libc, no PostgreSQL libraries.
 pagestore_daemon = executable('pagestore_daemon',
   files('pagestore_daemon.c', 'pagestore_core.c', 'storage_posix.c',
+		'pagestore_archive_progress_store.c', 'pagestore_archive_progress_txn.c',
+		'pagestore_archive_progress_authority.c',
         'pagestore_fault.c',
         'pagestore_layer.c', 'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
         'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c', 'pagestore_compaction_prune.c',
@@ -280,6 +288,14 @@ test('pagestore_standalone',
   depends: [pagestore_daemon, pagestore_inspect],
   suite: ['pagestore'],
   timeout: 120,
+)
+test('pagestore_archive_progress_daemon_snapshot',
+  pagestore_test,
+  args: [pagestore_daemon, pagestore_inspect],
+  env: ['PAGESTORE_TEST_ARCHIVE_PROGRESS_ONLY=1'],
+  depends: [pagestore_daemon, pagestore_inspect],
+  suite: ['pagestore'],
+  timeout: 30,
 )
 
 # Focused POSIX mailbox lifecycle coverage.  It drives only the inspector and
@@ -442,6 +458,8 @@ test('pagestore_viewcap',
 pagestore_wal_reclaim_core_test = executable('pagestore_wal_reclaim_core_test',
   files('pagestore_wal_reclaim_core_test.c', 'pagestore_core.c',
         'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_archive_progress_authority.c',
+        'pagestore_archive_progress_store.c', 'pagestore_archive_progress_txn.c',
         'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
         'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c', 'pagestore_compaction_prune.c',
         'pagestore_retention.c', 'pagestore_wal_store.c',
@@ -456,6 +474,12 @@ test('pagestore_wal_reclaim_core',
   pagestore_wal_reclaim_core_test,
   suite: ['pagestore'],
   timeout: 60,
+)
+test('pagestore_archive_progress_authority',
+  pagestore_wal_reclaim_core_test,
+  args: ['--archive-progress-authority'],
+  suite: ['pagestore'],
+  timeout: 30,
 )
 
 # Control-object retention during image compaction: the newest pg_control

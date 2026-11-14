@@ -1,151 +1,127 @@
-# Materializer / WAL archive progress protocol — proposed design
+# Materializer archive progress: implemented scope and limits
 
-Status: **design for review; not implemented**. This document describes a
-candidate protocol, its safety boundaries, and decisions that must be settled
-before implementation. It does not change the current archive policy.
+Status: **experimental partial implementation; not a general deadlock fix**.
+The current worktree implements the v4 durable progress record and localsvc
+START, SAFE, FREEZE, PREPARE, ACTIVATE, and authorized-SNAPSHOT operations.
+It can extend the writer's archive boundary only for a fixed, CRC-verified
+completed checkpoint whose containing segment fits the per-timeline cap. A
+standalone writer background worker can seal that already prepared candidate
+without blocking in the archive callback. It does not create a checkpoint or
+advance an arbitrary WAL gap.
 
-## Failure observed
+## Failure addressed
 
-In the 2026-11-13 endurance run, the materializer rejected checkpoint
-`3/31000060` because recovery had unresolved invalid-page references. The
-persisted materializer marker was `3/2CFDF818`. Recovery subsequently reached
-consistency and replayed to `3/34FFF960`, but the archiver had exhausted its
-fixed two-segment recovery allowance at `3/35000000`. Each side then waited for
-the other: the materializer needed a later checkpoint to make a restartpoint,
-while the archiver needed the marker to advance. The next complete writer
-checkpoint record in the retained WAL was `3/35A06D10`. It is a candidate,
-not proof of a safe restartpoint.
+In the 2026-11-13 endurance run, the materializer rejected a checkpoint while
+recovery still had unresolved invalid-page references. Its existing fixed
+archive allowance was exhausted before a later completed writer checkpoint
+could be replayed. Recovery then waited for WAL that the writer would not
+archive. This progress path is intended to cover the bounded case where
+recovery has since passed PostgreSQL's consistency and invalid-page checks and
+the writer has a suitable completed checkpoint within the frozen extension
+cap.
 
-The existing rejected-checkpoint hint and fixed allowance deliberately do not
-ratchet on archive retries. Retaining that property matters: blindly raising
-or repeatedly extending a limit can consume unbounded storage when a
-materializer is unavailable. A larger fixed allowance also cannot guarantee that
-a checkpoint or the WAL resolving invalid-page references lies within it.
+## Current protocol
 
-## Goals and non-goals
+The daemon stores one v4 progress record per timeline. START records a
+monotonic startup attempt and fresh nonce, but carries no writer archive
+budget. Exact nonce retries are idempotent. A different nonce that has
+advanced the attempt fences the old startup, which must be restarted by its
+supervisor. The nonce is an idempotency token, not caller authentication.
 
-* Break the circular wait when the materializer has recovered enough to seek a
-  later safe restartpoint, without relying on a particular filesystem or
-  direct access to the writer's `pg_wal`.
-* Keep the durable materialization marker and all retention/reclamation fences
-  tied to an actual completed restartpoint, never to a progress hint.
-* Do not turn repeated polls, archiver restarts, stale hints or writer
-  checkpoints into automatically increasing archive grants.
-* Bound both each grant and the outstanding extra WAL. If the bound is
-  exhausted or progress cannot be demonstrated, surface a distinct blocked
-  condition instead of claiming the protocol guarantees unconditional progress.
-* This design does not establish an absolute bound on disk usage independent of
-  writer-local WAL, concurrent writes and retention owners. Those require
-  explicit admission/backpressure policies and operational disk monitoring.
+SAFE is sent only after PostgreSQL reaches recovery consistency and
+`XLogCheckInvalidPages()` succeeds with invalid-page bypass disabled. Its LSN
+is fixed for that startup attempt and retried with bounded RPC timeouts while
+WAL is unavailable. The recovery wait loop periodically retries the same
+feedback, so a transient daemon outage at EOF does not suppress all later
+attempts. Failure to publish progress does not prevent PostgreSQL from
+announcing consistency or serving read-only traffic.
 
-## Participants and transport
+At the writer's existing archive boundary, the writer freezes its own policy
+once for the marker. `original_limit` is the old computed archive boundary,
+including any existing rejected-checkpoint allowance exactly once;
+`max_extra` is the separate `pagestore.materializer_progress_extra_segments`
+allowance (default eight WAL segments). Retries and configuration reloads
+reuse the durable values. A marker advance clears the old frozen budget and
+target; a same-marker attempt restart keeps an activated grant but clears SAFE
+feedback and any inactive candidate. Setting the GUC to zero disables both
+new progress work and consumption of an existing grant; re-enabling it reuses
+the persisted per-marker values.
 
-The writer archiver and materializer startup process are separate processes,
-usually in separate PostgreSQL instances. Both use the existing localsvc
-protocol to communicate with the pagestore daemon. Control records in the
-store, with validated version, timeline and identity fields, are one possible
-durable transport; no shared process memory, POSIX locking, path, or filesystem
-semantics are assumed. A message is advisory and is never a retention receipt.
+The writer checks its CRC-valid `pg_control` checkpoint against the local WAL
+record, obtains the full record end, computes the exclusive end of the segment
+containing that record, checks the timeline, and PREPAREs the fixed candidate
+under the daemon marker-authority lease. PREPARE persists a candidate but does
+not authorize archive. A standalone writer background worker observes pending
+candidates, rechecks the candidate tuple under authority, and checks the local
+flush and exact WAL insertion pointers. If the target segment is not yet
+sealed, it requests a conditional switch that rechecks the expected segment
+while holding the WAL insertion locks. Once the matching timeline's durable
+flush pointer reaches the segment end, the worker ACTIVATEs the candidate
+under the marker-authority lease. Archive authorization only raises the old
+limit to the persisted `grant_end` for that same marker, incarnation, attempt,
+SAFE, frozen budget, WAL timeline, and active grant. Repeated polls cannot
+ratchet the target or budget. The archive callback itself does not wait for a
+checkpoint or switch.
 
-A generation must identify **this actual startup-process attempt**, not just
-the retention-owner generation: inspect and define how a unique attempt is
-allocated, authenticated/fenced, invalidated on every recovery restart, and
-observed by the archiver. Existing retention generation may survive a worker
-restart and therefore must not be assumed to suffice. If no authoritative
-attempt identity can be obtained and checked atomically, this protocol must
-fail closed; an unchecked PID or timestamp is not a substitute.
+Progress records use format v4. v1/v2/v3 and unknown/corrupt records are
+rejected fail-closed; there is no automatic migration. The daemon emits a
+rate-limited diagnostic for rejected operations and unsupported stored
+formats.
 
-## Candidate state machine
+## Trust and lock assumptions
 
-For a timeline, durable marker `M` and recovery attempt `G`:
+The current localsvc shared-memory endpoint is protected by the existing
+same-OS-UID trust boundary. Any process with that UID can issue the progress
+operations and can modify the local store; the nonce and role fields do not
+authenticate a PostgreSQL writer or materializer. This implementation does
+not provide isolation between clients sharing that UID. Marker receipts are
+obtained through the daemon's serialized marker-authority path and durable
+store sync; absent authority, stale incarnation, or marker mismatch fails
+closed. Only the POSIX provider has been exercised for this progress state.
 
-1. **Normal.** Existing limits and the pinned release checkpoint remain in
-   force. A rejected restartpoint records its existing advisory hint.
-2. **Recovery progress.** Once PostgreSQL has actually reached recovery
-   consistency with no unresolved invalid-page references, recovery may
-   publish `(timeline, M, G, safe_replay_lsn)` to the daemon. A successful
-   consistency check is evidence for this recovery attempt only, not a
-   checkpoint, a restartpoint, or evidence that pages are durable. If recovery
-   can become unsafe again, invalidate the hint before it can authorize more
-   WAL. A hint must not be published when invalid-page checks were bypassed.
-3. **Fixed grant.** After validating the hint and current identity, the
-   archiver selects a completed writer checkpoint strictly after the reported
-   safe replay point and pins `(timeline, M, G, safe_replay_lsn, target)` in
-   durable control state before shipping beyond the existing boundary. Round
-   to cover the complete target record/segment. The target remains fixed on
-   repeated requests, process restarts and newer writer checkpoints. A target
-   is merely a candidate: only PostgreSQL recovery determines if it is safe.
-   If no suitable checkpoint exists, request one through a defined writer-side
-   mechanism; do not assume a checkpoint will appear while the writer is idle.
-4. **Consume.** The archiver ships through the fixed target, subject to a
-   separately specified maximum outstanding grant and existing WAL-index and
-   resource constraints. It does not advance `M`. The materializer replays
-   the WAL and PostgreSQL decides whether a restartpoint can be made.
-5. **Complete or blocked.** A completed restartpoint advances the durable
-   marker using the existing durability ordering and invalidates the grant.
-   If the target is rejected, no target exists within the configured bound,
-   the materializer fails, or any identity/record cannot be validated, stop
-   at the bound and expose the reason. A further grant, if supported, must be
-   tied to newly verified recovery progress and a separately bounded budget;
-   repeated rejection must not silently turn this into unlimited growth.
+## Explicit limits and unresolved requirements
 
-The writer checkpoint selected must be a **completed checkpoint record**, not
-just its redo start. It may be in an incomplete WAL segment: specify how the
-writer produces/switches the segment without inducing uncontrolled checkpoint
-or WAL generation. Segment math must handle overflow and an already partially
-shipped segment. Existing durable prefix and WAL-index invariants still apply.
+* The extension cap is per timeline. There is **no global cumulative
+  outstanding-grant budget across timelines** in this implementation. A
+  deployment with multiple timelines can therefore reserve/ship the sum of
+their individual caps. Global admission/backpressure is required before
+claiming the design's cumulative-space bound.
+* PREPARE only selects the current completed checkpoint. If no suitable
+  checkpoint exists, the candidate is beyond the frozen cap, the candidate
+  belongs to another WAL timeline, or the worker cannot prove and seal its
+  segment, the writer remains fail-closed with a blocked/deferred diagnostic.
+  It does not request a checkpoint, and it does not keep issuing switches from
+  an archive retry loop.
+* The segment check and conditional switch prevent the observed stale-pointer
+  race from sealing a later segment. A finite cap still cannot guarantee
+  progress through an arbitrarily large WAL gap. There is no upstream write
+  backpressure policy here; over-cap candidates remain blocked and require
+  operator/supervisor action or a separately designed controller.
+* A progress grant is not a restartpoint, retention receipt, marker update, or
+  permission to reclaim WAL. Those remain governed by PostgreSQL's completed
+  and synchronously durable restartpoint path.
+* A strict reproduction against a fresh run-1 clone passed in a private mount
+  namespace. Before startup it asserted all six `35.ready` through `3A.ready`
+  files, shipped WAL end `3/35000000`, materializer marker `3/2CFDF818`, and
+  release checkpoint `3/31000060`. With progress GUC zero, archive file 35
+  remained blocked. After recovery published SAFE at `3/34FFF960`, reloading
+  the private writer with an eight-segment cap caused durable FREEZE and
+  PREPARE for checkpoint record `3/3B1D9618`, then the independent worker
+  activated through `3/3C000000` without a manual switch. Archive files 35
+  through 3B completed and the materializer replayed past the former wait
+  point. A writer/materializer restart preserved the same budget and grant,
+  advanced the attempt, republished SAFE, replayed through `3/3C000000`, and
+  advanced the durable materializer marker to `3/35FDDC48` after a completed
+  restartpoint. The original run-1 store was not modified, and the host mount
+  view was unchanged after each private namespace exited.
+* Unit, storage, daemon IPC/restart, and full build checks pass. The
+  `test_custom_rmgrs` TAP test captures segment N, switches and writes in
+  N+1, then calls the conditional API with stale N. It verifies the API
+  returns an invalid LSN and does not advance the current segment. A
+  simultaneous competing-backend switch race test remains
+  outstanding.
 
-## Concurrency, crash and downgrade requirements
-
-* The authority must serialize attempt changes and fixed-target installation,
-  or offer an atomic compare-and-set/fencing operation. Before granting, check
-  the identity and marker against that same authority; separate unchecked
-  reads admit a restart-between-check-and-use race.
-* A process crash after target publication but before shipping must reuse the
-  exact target. A crash during publication must yield either a validated whole
-  record or no grant; torn, missing, stale or unknown-version records fail
-  closed. The implementation must define the publication and sync ordering.
-* If an attempt dies after a grant was committed, whether that fixed grant may
-  finish must be explicit: permitting it can ship at most the already durable
-  fixed bound, but cannot authorize another grant. It is not evidence that the
-  replacement attempt is safe. Replacing it requires fenced new feedback.
-* New state must not overwrite unrelated control blocks, change versioned
-  layouts implicitly, or be read as valid by older binaries. Define on-disk
-  artifact versions, mixed-version behavior, upgrade/downgrade and existing
-  fixture identities before writing code. Unknown feedback must not extend a
-  limit. Preserve existing provider and retention semantics.
-* Polling and notification are optimizations; correctness must hold under
-  dropped, duplicated, reordered or delayed responses and independent process
-  restarts. An unavailable daemon must not cause marker advancement.
-
-## Required evidence before implementation approval
-
-The design review must resolve: (1) authoritative attempt identity and atomic
-fencing; (2) safe-consistency hook and invalid-page bypass handling; (3)
-checkpoint creation and complete-segment publication; (4) hard and cumulative
-space limits, including what an operator sees when they are reached; and
-(5) durable control format and mixed-version behavior. In particular, the
-proposed feedback mechanism cannot guarantee recovery through an arbitrarily
-large gap under a finite space bound. Any claim of unconditional liveness must
-specify how upstream writes are backpressured and where retained WAL lives.
-
-## Validation plan
-
-1. Extend the existing real PostgreSQL rejected-checkpoint scenario in
-   `continuous_redo_demo.sh`: resolve the invalid page before consistency,
-   place the next completed checkpoint beyond the old two-segment allowance,
-   demonstrate the old policy stalls, then demonstrate the protocol reaches
-   that checkpoint, completes a restartpoint and unblocks archive. Check data,
-   marker ordering, branch reads and WAL retention throughout.
-2. Exercise a recovery crash before/after consistency feedback, during target
-   publication, after target publication, mid-segment and before marker sync;
-   restart writer, daemon and materializer independently and together. Verify
-   no stale feedback or duplicate request extends the grant.
-3. Cover missing/invalid/old-generation hints, rejected target, no later
-   checkpoint, disabled invalid-page checking, no progress, exhausted budget,
-   delayed/reordered responses, concurrent controllers, integer boundaries,
-   and unknown/downgraded formats. Assert bounded archive and visible blocked
-   status, not merely eventual timeout.
-4. After deterministic tests pass, run a 72-hour workload with mixed writes,
-   vacuum, process faults and branch churn. Record archive wait, replay and
-   marker lag, grant usage, retention, storage growth and failure diagnostics.
+Accordingly, this implementation must not be described as satisfying the
+design's global cumulative bound or as generally resolving the observed
+deadlock. Any release/PR review should require explicit acceptance of these
+limits or further implementation and end-to-end evidence.

@@ -388,6 +388,7 @@ GetRmgr(RmgrId rmid)
  */
 extern pg_time_t GetLastSegSwitchData(XLogRecPtr *lastSwitchLSN);
 extern XLogRecPtr RequestXLogSwitch(bool mark_unimportant);
+extern XLogRecPtr RequestXLogSwitchIfSegment(XLogSegNo expected_segment);
 
 extern void GetOldestRestartPoint(XLogRecPtr *oldrecptr, TimeLineID *oldtli);
 
