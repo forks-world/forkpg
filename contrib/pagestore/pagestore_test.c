@@ -5065,6 +5065,16 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 			   PS_FRONTEND_CAP_BRANCH_REDO_READ) != 0,
 			  "daemon advertises finite-branch recovery reads");
 		memset(rb, 0, ps);
+		cl_setkey(ch, REL_B, 1);
+		ch->timeline = 1;
+		ch->opcode = PS_OP_READV;
+		ch->blocknum = 0;
+		ch->nblocks = 1;
+		ch->req_lsn = 1600;
+		ch->is_redo = PS_READ_BRANCH_REDO;
+		check(cl_exec()->status == PS_STATUS_OK && memcmp(ch->data, rb, ps) == 0,
+			  "branch WAL recovery rebuilds inherited WAL-less FSM hints");
+		ch->is_redo = 0;
 		for (int rewrite = 0; rewrite < 2; rewrite++)
 		{
 			if (rewrite)
