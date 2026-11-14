@@ -145,6 +145,14 @@ typedef struct PsStorage
 	 * to reconcile the selected snapshot with whichever name survived.
 	 */
 	int			(*fork_meta_rewrite) (const void *buf, uint32_t len);
+
+	/* Optional archive progress snapshot, scoped by timeline. The caller
+	 * serializes replacements and fences ambiguous failures until reopen.
+	 * read: 0 found, 1 absent, -1 error; replace: 0 durably published, -1
+	 * failure (possibly after publication). Providers lacking this capability
+	 * leave both NULL; the archive protocol must then remain fail-closed. */
+	int			(*archive_progress_read) (uint32_t tl, void *buf, uint32_t len);
+	int			(*archive_progress_replace) (uint32_t tl, const void *buf, uint32_t len);
 } PsStorage;
 
 /* the active backend, selected at startup */

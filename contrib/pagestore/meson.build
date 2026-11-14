@@ -29,6 +29,38 @@ pagestore = shared_module('pagestore',
 )
 contrib_targets += pagestore
 
+pagestore_archive_progress_test = executable('pagestore_archive_progress_test',
+  files('pagestore_archive_progress_test.c'),
+  install: false,
+)
+test('pagestore_archive_progress', pagestore_archive_progress_test,
+  suite: ['pagestore'], timeout: 30)
+
+pagestore_archive_progress_txn_test = executable('pagestore_archive_progress_txn_test',
+  files('pagestore_archive_progress_txn.c', 'pagestore_archive_progress_txn_test.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_archive_progress_txn', pagestore_archive_progress_txn_test,
+  suite: ['pagestore'], timeout: 30)
+
+pagestore_archive_progress_format_test = executable('pagestore_archive_progress_format_test',
+  files('pagestore_archive_progress_format_test.c'),
+  install: false,
+)
+test('pagestore_archive_progress_format', pagestore_archive_progress_format_test,
+  suite: ['pagestore'], timeout: 30)
+
+storage_archive_progress_test = executable('storage_archive_progress_test',
+  files('storage_archive_progress_test.c', 'storage_posix.c', 'pagestore_store_owner.c',
+        'pagestore_archive_progress_txn.c', 'pagestore_archive_progress_store.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('storage_archive_progress', storage_archive_progress_test,
+  suite: ['pagestore'], timeout: 30)
+
+
 # Backend-only fault tests use private copies of the real mirror drains.
 pagestore_mirror_error_test = shared_module('pagestore_mirror_error_test',
   files('pagestore_control_error_test.c', 'pagestore_slru_error_test.c',
