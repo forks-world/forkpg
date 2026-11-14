@@ -292,6 +292,9 @@ extern PGDLLIMPORT recovery_restartpoint_flush_hook_type recovery_restartpoint_f
 typedef void (*recovery_restartpoint_pre_control_hook_type) (XLogRecPtr replay_lsn,
 														XLogRecPtr restart_redo_lsn);
 extern PGDLLIMPORT recovery_restartpoint_pre_control_hook_type recovery_restartpoint_pre_control_hook;
+/* Called in startup when a checkpoint is rejected due to unresolved pages. */
+typedef void (*recovery_restartpoint_rejected_hook_type) (XLogRecPtr checkpoint_lsn);
+extern PGDLLIMPORT recovery_restartpoint_rejected_hook_type recovery_restartpoint_rejected_hook;
 
 /* Called in the startup process after the checkpoint redo pointer is known
  * and before the checkpoint or redo WAL is read.  Consumers that depend on

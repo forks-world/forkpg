@@ -43,6 +43,8 @@ static const PsFormatIdentity header_identities[] = {
 	 PS_MATERIALIZER_RELEASE_MAGIC, PS_MATERIALIZER_RELEASE_VERSION},
 	{"control", "control object block 5 writer checkpoint",
 	 PS_WRITER_CHECKPOINT_MAGIC, PS_WRITER_CHECKPOINT_VERSION},
+	{"control", "control object block 6 rejected materializer restartpoint",
+	 PS_MATERIALIZER_REJECTED_MAGIC, PS_MATERIALIZER_REJECTED_VERSION},
 	{"slru_mirror", "watermark object (value at 0, identity trailer)",
 	 PS_SLRU_WATERMARK_MAGIC, PS_SLRU_WATERMARK_VERSION},
 	{"slru_mirror", "truncation tombstone object (value at 0, identity trailer)",

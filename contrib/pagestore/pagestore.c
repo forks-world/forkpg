@@ -71,6 +71,7 @@
 #include "pagestore_fault.h"
 #include "pagestore_ipc.h"
 #include "pagestore_artifact_format.h"
+#include "pagestore_archive_policy.h"
 #include "pagestore_materializer_marker.h"
 #include "port/pg_iovec.h"
 #include "postmaster/bgworker.h"
@@ -207,6 +208,7 @@ static char *pagestore_retention_owner_generation_str = NULL;
 static uint64 pagestore_retention_owner_id = 0;
 static uint32 pagestore_retention_owner_generation = 0;
 static int pagestore_materializer_max_lag_mb = 0;
+static int pagestore_materializer_recovery_extra_segments = 2;
 static int pagestore_wal_index_max_lag_mb = 0;
 /* Per-request bound for explicit, potentially large SLRU snapshots. */
 static int pagestore_slru_snapshot_timeout_ms = 60000;
@@ -222,6 +224,7 @@ static ExecutorRun_hook_type prev_executor_run_hook = NULL;
 static recovery_start_hook_type prev_recovery_start_hook = NULL;
 static recovery_restartpoint_pre_control_hook_type prev_restartpoint_pre_control_hook = NULL;
 static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL;
+static recovery_restartpoint_rejected_hook_type prev_restartpoint_rejected_hook = NULL;
 
 /* Fault probes below are scoped to the portable bootstrap installer.  Legacy
  * branch installs and reader installs must keep their existing fault surface. */
@@ -1880,6 +1883,66 @@ pagestore_materializer_shipped_lsn(int timeout_ms)
 }
 
 static XLogRecPtr pagestore_materialized_wal_lsn_internal(void);
+
+/* A rejected checkpoint hint never advances the durable materializer marker.
+ * It only records that this marker needs a bounded amount of later WAL. */
+static void
+pagestore_materializer_restartpoint_rejected(XLogRecPtr checkpoint)
+{
+	if (prev_restartpoint_rejected_hook)
+		(*prev_restartpoint_rejected_hook) (checkpoint);
+
+	MemoryContext oldcontext = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		PageStoreRelKey key = {0};
+		PsMaterializerRejectedFormat hint = {0};
+		XLogRecPtr marker = pagestore_materialized_wal_lsn_internal();
+		char page[BLCKSZ];
+
+		if (XLogRecPtrIsValid(marker) && checkpoint > marker)
+		{
+			hint.magic = PS_MATERIALIZER_REJECTED_MAGIC;
+			hint.version = PS_MATERIALIZER_REJECTED_VERSION;
+			hint.timeline = pagestore_localsvc_timeline();
+			hint.materialized_lsn = marker;
+			hint.materialized_lsn_complement = ~hint.materialized_lsn;
+			hint.checkpoint_lsn = checkpoint;
+			hint.checkpoint_lsn_complement = ~hint.checkpoint_lsn;
+			memset(page, 0, sizeof(page));
+			memcpy(page, &hint, sizeof(hint));
+			pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key,
+				PS_MATERIALIZER_REJECTED_BLOCK, page, (uint64) checkpoint,
+				PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+			pagestore_localsvc_store_sync_timeout(PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+			ereport(LOG,
+					(errmsg("pagestore materializer rejected restartpoint at %X/%08X",
+						(uint32) (checkpoint >> 32), (uint32) checkpoint),
+				 errdetail("The durable materializer watermark remains %X/%08X.",
+						   (uint32) (marker >> 32), (uint32) marker)));
+		}
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		ereport(WARNING,
+				(errmsg("pagestore could not publish rejected restartpoint: %s",
+						edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+}
 
 /* Publish a restartpoint marker after relation pages are durable. */
 static void
@@ -14898,6 +14961,15 @@ _PG_init(void)
 							PGC_SIGHUP,
 							0,
 							NULL, NULL, NULL);
+	DefineCustomIntVariable("pagestore.materializer_recovery_extra_segments",
+							"Bound extra archived WAL after recovery rejects a checkpoint.",
+							"The fixed allowance applies once per durable materializer watermark; "
+							"zero disables the allowance. It may be changed by configuration reload.",
+							&pagestore_materializer_recovery_extra_segments,
+							2, 0, INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
 	DefineCustomIntVariable("pagestore.wal_index_max_lag_mb",
 							"Pause WAL archiving when durable WAL indexing falls too far behind.",
 							"Zero disables the limit. Headroom for one maximum-size WAL record "
@@ -15014,6 +15086,9 @@ _PG_init(void)
 		prev_restartpoint_flush_hook = recovery_restartpoint_flush_hook;
 		recovery_restartpoint_flush_hook =
 			pagestore_materializer_restartpoint_flush;
+		prev_restartpoint_rejected_hook = recovery_restartpoint_rejected_hook;
+		recovery_restartpoint_rejected_hook =
+			pagestore_materializer_restartpoint_rejected;
 	}
 	if (pagestore_backend_name != NULL &&
 		strcmp(pagestore_backend_name, "localsvc") == 0 &&

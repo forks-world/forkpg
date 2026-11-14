@@ -4651,6 +4651,7 @@ control_file_flush_hook_type control_file_flush_hook = NULL;
 
 /* Post-buffer-flush publication point for recovery materializers. */
 recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook = NULL;
+recovery_restartpoint_rejected_hook_type recovery_restartpoint_rejected_hook = NULL;
 recovery_restartpoint_pre_control_hook_type recovery_restartpoint_pre_control_hook = NULL;
 recovery_start_hook_type recovery_start_hook = NULL;
 
@@ -8321,6 +8322,8 @@ RecoveryRestartPoint(const CheckPoint *checkPoint, XLogReaderState *record)
 	 */
 	if (XLogHaveInvalidPages())
 	{
+		if (recovery_restartpoint_rejected_hook)
+			(*recovery_restartpoint_rejected_hook) (record->ReadRecPtr);
 		elog(DEBUG2,
 			 "could not record restart point at %X/%08X because there are unresolved references to invalid pages",
 			 LSN_FORMAT_ARGS(checkPoint->redo));

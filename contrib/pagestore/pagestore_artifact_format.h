@@ -226,6 +226,24 @@ typedef struct PsWriterCheckpointFormat
 	uint64_t	checkpoint_lsn_complement;
 } PsWriterCheckpointFormat;
 
+/* block 6: a checkpoint rejected because recovery still has invalid pages.
+ * This hint affects bounded WAL shipping only; it is not a retention receipt. */
+#define PS_MATERIALIZER_REJECTED_BLOCK 6u
+#define PS_MATERIALIZER_REJECTED_MAGIC 0x5053524au /* "PSRJ" */
+#define PS_MATERIALIZER_REJECTED_VERSION 1u
+
+typedef struct PsMaterializerRejectedFormat
+{
+	uint32_t magic;
+	uint32_t version;
+	uint32_t timeline;
+	uint32_t pad;
+	uint64_t materialized_lsn;
+	uint64_t materialized_lsn_complement;
+	uint64_t checkpoint_lsn;
+	uint64_t checkpoint_lsn_complement;
+} PsMaterializerRejectedFormat;
+
 /* ---- SLRU mirror objects ---------------------------------------------- */
 
 /* PS_KLASS_SLRU_WM, object 0, block 0: the mirror's visibility watermark

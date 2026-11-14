@@ -29,6 +29,13 @@ pagestore = shared_module('pagestore',
 )
 contrib_targets += pagestore
 
+pagestore_archive_policy_test = executable('pagestore_archive_policy_test',
+  files('pagestore_archive_policy_test.c'),
+  install: false,
+)
+test('pagestore_archive_policy', pagestore_archive_policy_test,
+  suite: ['pagestore'], timeout: 30)
+
 pagestore_archive_progress_test = executable('pagestore_archive_progress_test',
   files('pagestore_archive_progress_test.c'),
   install: false,
