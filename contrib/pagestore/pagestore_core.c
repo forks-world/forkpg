@@ -23185,9 +23185,9 @@ read_resolve_internal(uint32_t timeline, const PsKey *key, uint32_t block,
 			{
 				/* FSM is a rebuildable hint tree, not authoritative data.
 				 * Never inherit the parent's current WAL-less hint bytes.
-				 * Only the explicit current-compute operation may instead
-				 * start with an empty hint page. No I/O failure is hidden. */
-				if (reset_fsm && key->forkNum == 1) /* FSM_FORKNUM */
+				 * A current compute or branch WAL recovery may instead start
+				 * with an empty hint page. No I/O failure is hidden. */
+				if ((reset_fsm || branch_redo) && key->forkNum == 1) /* FSM_FORKNUM */
 					return 0;
 				return -1;
 			}
