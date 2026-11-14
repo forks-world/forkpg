@@ -1912,6 +1912,8 @@ static uint64 pagestore_materializer_archive_limit(XLogRecPtr marker,
 static void
 pagestore_materializer_restartpoint_rejected(XLogRecPtr checkpoint)
 {
+	MemoryContext callercontext = CurrentMemoryContext;
+
 	if (prev_restartpoint_rejected_hook)
 		(*prev_restartpoint_rejected_hook) (checkpoint);
 
@@ -1947,10 +1949,9 @@ pagestore_materializer_restartpoint_rejected(XLogRecPtr checkpoint)
 	PG_CATCH();
 	{
 		ErrorData *edata;
-		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
 
+		MemoryContextSwitchTo(callercontext);
 		edata = CopyErrorData();
-		MemoryContextSwitchTo(old);
 		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
 			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
 		{
@@ -2074,20 +2075,56 @@ pagestore_materializer_progress_start_try(XLogRecPtr redo_lsn)
 				(errmsg("pagestore materializer archive progress START is pending")));
 		return;
 	}
+	if (materializer_progress_start_expected_attempt == UINT64_MAX)
+		materializer_progress_start_expected_attempt = previous.attempt;
 	{
 		XLogRecPtr current_marker = pagestore_materialized_wal_lsn_internal();
 
-		if (XLogRecPtrIsValid(current_marker) &&
-			current_marker != materializer_progress_start_marker)
+		/* Reconcile a possibly committed START receipt before comparing marker
+		 * values. This also handles the case where the first retry already
+		 * updated its local marker but the prior nonce still names an old receipt. */
+		if (materializer_progress_start_expected_attempt != UINT64_MAX &&
+			previous.attempt == materializer_progress_start_expected_attempt + 1 &&
+			previous.start_nonce_hi == materializer_progress_start_nonce[0] &&
+			previous.start_nonce_lo == materializer_progress_start_nonce[1])
+		{
+			if (XLogRecPtrIsValid(current_marker) &&
+				previous.marker != (uint64) current_marker)
+			{
+				uint64 refreshed_nonce[2];
+
+				if (!pg_strong_random(refreshed_nonce, sizeof(refreshed_nonce)) ||
+					(refreshed_nonce[0] == 0 && refreshed_nonce[1] == 0))
+				{
+					ereport(DEBUG1,
+							(errmsg("pagestore materializer archive progress marker refresh is pending")));
+					return;
+				}
+				materializer_progress_start_expected_attempt = previous.attempt;
+				materializer_progress_start_nonce[0] = refreshed_nonce[0];
+				materializer_progress_start_nonce[1] = refreshed_nonce[1];
+			}
+		}
+		else if (previous.attempt != materializer_progress_start_expected_attempt)
 			ereport(FATAL,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("pagestore materializer archive progress marker was fenced"),
+					 errmsg("pagestore materializer archive progress startup was fenced"),
+					 errdetail("A different recovery attempt committed while the durable marker advanced."),
 					 errhint("Restart the materializer under a fresh retention-owner generation.")));
+
+		if (XLogRecPtrIsValid(current_marker) &&
+			current_marker != materializer_progress_start_marker)
+		{
+			/* Rebind to the authority's current marker. The attempt/nonce check
+			 * above distinguishes a lost local reply from a competing START. */
+			materializer_progress_start_marker = current_marker;
+			ereport(DEBUG1,
+					(errmsg("pagestore materializer archive progress START refreshed after durable marker advancement")));
+		}
 	}
-	if (materializer_progress_start_expected_attempt == UINT64_MAX)
-		materializer_progress_start_expected_attempt = previous.attempt;
-	else if (previous.attempt > materializer_progress_start_expected_attempt &&
-		(previous.attempt != materializer_progress_start_expected_attempt + 1 ||
+	if (previous.attempt > materializer_progress_start_expected_attempt &&
+		(materializer_progress_start_expected_attempt == UINT64_MAX ||
+		 previous.attempt != materializer_progress_start_expected_attempt + 1 ||
 		 previous.start_nonce_hi != materializer_progress_start_nonce[0] ||
 		 previous.start_nonce_lo != materializer_progress_start_nonce[1]))
 		ereport(FATAL,
@@ -2506,6 +2543,7 @@ static XLogRecPtr
 pagestore_materializer_latest_checkpoint_for_log(void)
 {
 	volatile XLogRecPtr latest = InvalidXLogRecPtr;
+	MemoryContext callercontext = CurrentMemoryContext;
 
 	PG_TRY();
 	{
@@ -2515,10 +2553,9 @@ pagestore_materializer_latest_checkpoint_for_log(void)
 	PG_CATCH();
 	{
 		ErrorData *edata;
-		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
 
+		MemoryContextSwitchTo(callercontext);
 		edata = CopyErrorData();
-		MemoryContextSwitchTo(old);
 		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
 			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
 		{

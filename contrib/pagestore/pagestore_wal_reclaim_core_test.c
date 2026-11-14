@@ -609,6 +609,28 @@ test_archive_progress_marker_authority(void)
 			  WIFEXITED(status) && WEXITSTATUS(status) == 0,
 			  "daemon authority and fixed attempt survive process restart");
 	}
+	check(ps_core_open(store) == 0 &&
+		  ps_archive_progress_registry_open(&registry, ps_storage, 1024) == 0 &&
+		  ps_archive_progress_registry_set_marker_authority(
+			  &registry, ps_archive_progress_marker_acquire,
+			  ps_archive_progress_marker_release, NULL) == 0,
+		  "reopen authority to test START after durable marker advancement");
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	check(ps_archive_progress_registry_start(&registry, 0, 1,
+			  0xA11CF, 0x57, 300, incarnation, 0, 0, &snapshot) == 0 &&
+		  snapshot.attempt == 2 && snapshot.marker == 300 && snapshot.safe_lsn == 0,
+		  "a new START CAS rebinds progress after durable marker advancement");
+	check(ps_archive_progress_registry_safe(&registry, 0, incarnation, 1,
+			  100, 200, NULL) != 0,
+		  "the prior attempt cannot publish SAFE after marker rebind");
+	check(ps_archive_progress_registry_safe(&registry, 0, incarnation, 2,
+			  300, 301, &snapshot) == 0 && snapshot.safe_lsn == 301,
+		  "the rebound attempt can publish SAFE only beyond its current marker");
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+	ps_archive_progress_registry_close(&registry);
+	close_store();
 	remove_tree(store);
 }
 
