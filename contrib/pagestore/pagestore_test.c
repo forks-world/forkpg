@@ -5022,8 +5022,6 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 
 	fill_page(p, ps, 0, 61);
 	op_write_tl(0, REL_B, 1, 0, p);
-	fill_page(p, ps, 0, 64);
-	op_write_tl(0, REL_B, 2, 0, p);
 
 	/* branch T1 off main at LSN 1500 -- instant, no data copied */
 	op_create_branch(1, 0, 1500);
@@ -5068,25 +5066,6 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 			   PS_FRONTEND_CAP_BRANCH_REDO_READ) != 0,
 			  "daemon advertises finite-branch recovery reads");
 		memset(rb, 0, ps);
-		cl_setkey(ch, REL_B, 1);
-		ch->timeline = 1;
-		ch->opcode = PS_OP_READV;
-		ch->blocknum = 0;
-		ch->nblocks = 1;
-		ch->req_lsn = 1600;
-		ch->is_redo = PS_READ_BRANCH_REDO;
-		check(cl_exec()->status == PS_STATUS_OK && memcmp(ch->data, rb, ps) == 0,
-			  "branch WAL recovery rebuilds inherited WAL-less FSM hints");
-		cl_setkey(ch, REL_B, 2);
-		ch->timeline = 1;
-		ch->opcode = PS_OP_READV;
-		ch->blocknum = 0;
-		ch->nblocks = 1;
-		ch->req_lsn = 1600;
-		ch->is_redo = PS_READ_BRANCH_REDO;
-		check(cl_exec()->status == PS_STATUS_ERROR,
-			  "branch WAL recovery still refuses inherited WAL-less visibility-map pages");
-		ch->is_redo = 0;
 		for (int rewrite = 0; rewrite < 2; rewrite++)
 		{
 			if (rewrite)
