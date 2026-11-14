@@ -71,6 +71,8 @@ static int test_fail_wal_rewrite_before_rename;
 static int test_fail_wal_rewrite_dir_fsync;
 static int test_fail_fork_meta_rewrite_before_rename;
 static int test_fail_fork_meta_rewrite_dir_fsync;
+static int test_fail_archive_progress_read_dir_fsync;
+static int test_fail_archive_progress_replace_dir_fsync;
 static int test_fail_timeline_cleanup_private_dir_fsync;
 static int test_fail_timeline_cleanup_shared_scan;
 static int test_fail_seg_remove_before_unlink;
@@ -433,6 +435,10 @@ posix_open(const char *path, uint64_t segment_size)
 		test_fail_fork_meta_rewrite_before_rename = value ? atoi(value) : 0;
 		value = getenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_DIR_FSYNC");
 		test_fail_fork_meta_rewrite_dir_fsync = value ? atoi(value) : 0;
+		value = getenv("PAGESTORE_TEST_FAIL_ARCHIVE_PROGRESS_READ_DIR_FSYNC");
+		test_fail_archive_progress_read_dir_fsync = value ? atoi(value) : 0;
+		value = getenv("PAGESTORE_TEST_FAIL_ARCHIVE_PROGRESS_REPLACE_DIR_FSYNC");
+		test_fail_archive_progress_replace_dir_fsync = value ? atoi(value) : 0;
 	}
 	/* A prior metadata rename whose directory sync failed must be made durable
 	 * before this process can accept writes against its visible replacement. */
@@ -2793,11 +2799,25 @@ posix_archive_progress_read(uint32_t tl, void *buf, uint32_t len)
 	char path[4096];
 	struct stat st;
 	uint32_t done = 0;
-	int fd, rc = -1;
+	int fd, dfd, rc = -1;
 
 	if (posix_require_owner() != 0 || !buf || !len || len > 4096)
 		return -1;
 	if (snprintf(path, sizeof(path), "%s/archive_progress_%u", posix_dir, tl) >= (int) sizeof(path))
+		return -1;
+	/* A prior replace may have renamed successfully but failed its directory
+	 * fsync. Reconcile the visible name before returning either found or absent,
+	 * including when only the progress store (not the provider) is reopened. */
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dfd < 0)
+		return -1;
+	if ((test_fail_archive_progress_read_dir_fsync > 0 &&
+		 --test_fail_archive_progress_read_dir_fsync == 0) || fsync(dfd) != 0)
+	{
+		close(dfd);
+		return -1;
+	}
+	if (close(dfd) != 0)
 		return -1;
 	fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
 	if (fd < 0)
@@ -2858,7 +2878,8 @@ posix_archive_progress_replace(uint32_t tl, const void *buf, uint32_t len)
 	if (rename(tmp, path) != 0)
 		goto out;
 	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-	if (dfd < 0 || fsync(dfd) != 0)
+	if (dfd < 0 || (test_fail_archive_progress_replace_dir_fsync > 0 &&
+		--test_fail_archive_progress_replace_dir_fsync == 0) || fsync(dfd) != 0)
 		goto out;
 	rc = 0;
 out:

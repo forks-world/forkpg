@@ -148,7 +148,8 @@ typedef struct PsStorage
 
 	/* Optional archive progress snapshot, scoped by timeline. The caller
 	 * serializes replacements and fences ambiguous failures until reopen.
-	 * read: 0 found, 1 absent, -1 error; replace: 0 durably published, -1
+	 * read must reconcile any ambiguous prior publication before returning either
+	 * found or absent: 0 found, 1 absent, -1 error. replace: 0 durably published, -1
 	 * failure (possibly after publication). Providers lacking this capability
 	 * leave both NULL; the archive protocol must then remain fail-closed. */
 	int			(*archive_progress_read) (uint32_t tl, void *buf, uint32_t len);

@@ -17,6 +17,14 @@ static int begin_second(PsArchiveProgress *s, void *arg)
 	s->start_nonce_hi = 2;
 	return 0;
 }
+static int begin_first(PsArchiveProgress *s, void *arg)
+{
+	(void) arg;
+	if (ps_archive_progress_begin(s, 3, 1, 1, 100, 192, 64) != 0)
+		return -1;
+	s->start_nonce_hi = 1;
+	return 0;
+}
 static int stale_safe(PsArchiveProgress *s, void *arg)
 {
 	(void) arg;
@@ -278,6 +286,22 @@ int main(void)
 	CHECK(recovered.attempt == 1 && recovered.target == 200 && recovered.grant_end == 256);
 	ps_archive_progress_registry_close(&registry);
 	PsStoragePosix.close();
+	/* A rename can be visible despite a failed directory fsync. Reopening only
+	 * the progress store must not clear the fence until reconciliation works. */
+	CHECK(setenv("PAGESTORE_TEST_FAIL_ARCHIVE_PROGRESS_READ_DIR_FSYNC", "2", 1) == 0);
+	CHECK(setenv("PAGESTORE_TEST_FAIL_ARCHIVE_PROGRESS_REPLACE_DIR_FSYNC", "1", 1) == 0);
+	CHECK(PsStoragePosix.open(dir, 0) == 0);
+	CHECK(ps_archive_progress_store_open(&progress, &PsStoragePosix, 3) == 0);
+	CHECK(ps_archive_progress_txn_apply(&progress.transaction, begin_first, NULL, NULL) != 0);
+	CHECK(progress.transaction.poisoned);
+	ps_archive_progress_store_close(&progress);
+	CHECK(ps_archive_progress_store_open(&progress, &PsStoragePosix, 3) != 0);
+	CHECK(ps_archive_progress_store_open(&progress, &PsStoragePosix, 3) == 0);
+	CHECK(progress.transaction.state.attempt == 1 && progress.transaction.state.marker == 100);
+	ps_archive_progress_store_close(&progress);
+	PsStoragePosix.close();
+	CHECK(unsetenv("PAGESTORE_TEST_FAIL_ARCHIVE_PROGRESS_READ_DIR_FSYNC") == 0);
+	CHECK(unsetenv("PAGESTORE_TEST_FAIL_ARCHIVE_PROGRESS_REPLACE_DIR_FSYNC") == 0);
 	ps_test_remove_tree(dir);
 	puts("archive progress storage tests passed");
 	return 0;
