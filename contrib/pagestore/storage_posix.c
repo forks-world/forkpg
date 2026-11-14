@@ -71,6 +71,8 @@ static int test_fail_wal_rewrite_before_rename;
 static int test_fail_wal_rewrite_dir_fsync;
 static int test_fail_fork_meta_rewrite_before_rename;
 static int test_fail_fork_meta_rewrite_dir_fsync;
+static int test_fail_archive_progress_read_dir_fsync;
+static int test_fail_archive_progress_replace_dir_fsync;
 static int test_fail_timeline_cleanup_private_dir_fsync;
 static int test_fail_timeline_cleanup_shared_scan;
 static int test_fail_seg_remove_before_unlink;
@@ -433,6 +435,10 @@ posix_open(const char *path, uint64_t segment_size)
 		test_fail_fork_meta_rewrite_before_rename = value ? atoi(value) : 0;
 		value = getenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_DIR_FSYNC");
 		test_fail_fork_meta_rewrite_dir_fsync = value ? atoi(value) : 0;
+		value = getenv("PAGESTORE_TEST_FAIL_ARCHIVE_PROGRESS_READ_DIR_FSYNC");
+		test_fail_archive_progress_read_dir_fsync = value ? atoi(value) : 0;
+		value = getenv("PAGESTORE_TEST_FAIL_ARCHIVE_PROGRESS_REPLACE_DIR_FSYNC");
+		test_fail_archive_progress_replace_dir_fsync = value ? atoi(value) : 0;
 	}
 	/* A prior metadata rename whose directory sync failed must be made durable
 	 * before this process can accept writes against its visible replacement. */
@@ -2785,6 +2791,107 @@ out:
 	return rc;
 }
 
+/* The core must serialize per-timeline updates and fence ambiguous failures.
+ * A snapshot has a fixed length chosen by the protocol, never a partial read. */
+static int
+posix_archive_progress_read(uint32_t tl, void *buf, uint32_t len)
+{
+	char path[4096];
+	struct stat st;
+	uint32_t done = 0;
+	int fd, dfd, rc = -1;
+
+	if (posix_require_owner() != 0 || !buf || !len || len > 4096)
+		return -1;
+	if (snprintf(path, sizeof(path), "%s/archive_progress_%u", posix_dir, tl) >= (int) sizeof(path))
+		return -1;
+	/* A prior replace may have renamed successfully but failed its directory
+	 * fsync. Reconcile the visible name before returning either found or absent,
+	 * including when only the progress store (not the provider) is reopened. */
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dfd < 0)
+		return -1;
+	if ((test_fail_archive_progress_read_dir_fsync > 0 &&
+		 --test_fail_archive_progress_read_dir_fsync == 0) || fsync(dfd) != 0)
+	{
+		close(dfd);
+		return -1;
+	}
+	if (close(dfd) != 0)
+		return -1;
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+	if (fd < 0)
+		return errno == ENOENT ? 1 : -1;
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+		st.st_size != (off_t) len)
+		goto out;
+	while (done < len)
+	{
+		ssize_t n = read(fd, (char *) buf + done, len - done);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto out;
+		done += (uint32_t) n;
+	}
+	rc = 0;
+out:
+	if (close(fd) != 0)
+		rc = -1;
+	return rc;
+}
+
+static int
+posix_archive_progress_replace(uint32_t tl, const void *buf, uint32_t len)
+{
+	char path[4096], tmp[4096];
+	uint32_t done = 0;
+	int fd = -1, dfd = -1, rc = -1;
+
+	if (posix_require_owner() != 0 || !buf || !len || len > 4096)
+		return -1;
+	if (snprintf(path, sizeof(path), "%s/archive_progress_%u", posix_dir, tl) >= (int) sizeof(path) ||
+		snprintf(tmp, sizeof(tmp), "%s/archive_progress_%u.tmp.XXXXXX", posix_dir, tl) >= (int) sizeof(tmp))
+		return -1;
+	fd = mkstemp(tmp);
+	if (fd < 0)
+		return -1;
+	if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0)
+		goto out;
+	while (done < len)
+	{
+		ssize_t n = write(fd, (const char *) buf + done, len - done);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto out;
+		done += (uint32_t) n;
+	}
+	if (fsync(fd) != 0)
+		goto out;
+	if (close(fd) != 0)
+	{
+		fd = -1;
+		goto out;
+	}
+	fd = -1;
+	if (rename(tmp, path) != 0)
+		goto out;
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dfd < 0 || (test_fail_archive_progress_replace_dir_fsync > 0 &&
+		--test_fail_archive_progress_replace_dir_fsync == 0) || fsync(dfd) != 0)
+		goto out;
+	rc = 0;
+out:
+	if (fd >= 0)
+		close(fd);
+	if (dfd >= 0 && close(dfd) != 0)
+		rc = -1;
+	if (rc != 0)
+		(void) unlink(tmp);
+	return rc;
+}
+
 const PsStorage PsStoragePosix = {
 	.name = "posix",
 	.open = posix_open,
@@ -2815,6 +2922,8 @@ const PsStorage PsStoragePosix = {
 	.fork_meta_truncate = posix_fork_meta_truncate,
 	.fork_meta_size = posix_fork_meta_size,
 	.fork_meta_rewrite = posix_fork_meta_rewrite,
+	.archive_progress_read = posix_archive_progress_read,
+	.archive_progress_replace = posix_archive_progress_replace,
 };
 
 /*
