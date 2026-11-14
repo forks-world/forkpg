@@ -210,6 +210,14 @@ int main(void)
 	pthread_mutex_unlock(&authority.lock);
 	CHECK(ps_archive_progress_registry_start(&registry, 7, 0, 42, 43, 99, 100, 192, 64, &recovered) == 0);
 	CHECK(ps_archive_progress_registry_start(&registry, 7, 1, 44, 45, 99, 100, 192, 64, NULL) != 0);
+	/* A lost reply may be retried after daemon restart and marker advance. */
+	ps_archive_progress_registry_close(&registry);
+	CHECK(ps_archive_progress_registry_open(&registry, &PsStoragePosix, 8) == 0);
+	CHECK(ps_archive_progress_registry_set_marker_authority(&registry,
+		  marker_authority, marker_release, &authority) == 0);
+	CHECK(ps_archive_progress_registry_start(&registry, 7, 0, 42, 43, 99, 100, 192, 64, &recovered) == 0);
+	CHECK(recovered.attempt == 1 && recovered.marker == 99);
+	CHECK(ps_archive_progress_registry_start(&registry, 7, 1, 44, 45, 99, 100, 192, 64, NULL) != 0);
 	pthread_mutex_lock(&authority.lock);
 	authority.marker = 99;
 	pthread_mutex_unlock(&authority.lock);

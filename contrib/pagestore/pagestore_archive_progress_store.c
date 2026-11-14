@@ -216,11 +216,16 @@ ps_archive_progress_registry_start(PsArchiveProgressRegistry *registry,
 	if (!registry || timeline >= registry->capacity ||
 		pthread_mutex_lock(&registry->lock) != 0)
 		return -1;
+	/* The caller's marker and timeline identity are not authority. Without a
+	 * configured control-store reader, reject rather than persist a guess. */
+	if (registry->marker_acquire == NULL || registry->marker_release == NULL ||
+		(store = registry_get_locked(registry, timeline)) == NULL)
+		goto done;
+
 	/* A lost successful reply is idempotent even if the marker later moved.
-	 * This returns the already committed generation only; it cannot grant a
-	 * new one or alter its fixed target. */
-	store = registry->stores[timeline];
-	if (store && expected_attempt != UINT64_MAX &&
+	 * Load the durable snapshot before asking for today's marker: this returns
+	 * only the already committed generation and cannot grant a new one. */
+	if (expected_attempt != UINT64_MAX &&
 		ps_archive_progress_txn_snapshot(&store->transaction, &committed) == 0 &&
 		committed.attempt == expected_attempt + 1 &&
 		committed.start_nonce_hi == nonce_hi &&
@@ -232,13 +237,10 @@ ps_archive_progress_registry_start(PsArchiveProgressRegistry *registry,
 			committed.max_extra == max_extra ? 0 : -1;
 		if (rc == 0 && result)
 			*result = committed;
-		pthread_mutex_unlock(&registry->lock);
-		return rc;
+		goto done;
 	}
-	/* The caller's marker and timeline identity are not authority. Without a
-	 * configured control-store reader, reject rather than persist a guess. */
-	if (registry->marker_acquire == NULL || registry->marker_release == NULL ||
-		registry->marker_acquire(registry->marker_authority_arg, timeline,
+
+	if (registry->marker_acquire(registry->marker_authority_arg, timeline,
 								 &current_marker, &current_incarnation) != 0)
 		goto done;
 	if (current_marker != marker || current_incarnation != incarnation)
@@ -246,10 +248,8 @@ ps_archive_progress_registry_start(PsArchiveProgressRegistry *registry,
 		registry->marker_release(registry->marker_authority_arg, timeline);
 		goto done;
 	}
-	store = registry_get_locked(registry, timeline);
-	if (store)
-		rc = ps_archive_progress_txn_apply(&store->transaction, start_transition,
-										   &request, result);
+	rc = ps_archive_progress_txn_apply(&store->transaction, start_transition,
+									   &request, result);
 	registry->marker_release(registry->marker_authority_arg, timeline);
 done:
 	pthread_mutex_unlock(&registry->lock);
