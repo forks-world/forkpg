@@ -58,6 +58,16 @@ extern int ps_manifest_publish_image_batch_newer(const PsLayerDesc *inputs,
 	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs, uint32_t batch_index);
 extern int ps_manifest_retire_image_source_newer(const PsLayerDesc *inputs,
 	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs, uint32_t source_index);
+/* Retire all sources with one checksummed durable record. The caller must
+ * prove coverage, own source pins, fence concurrent state and verify all
+ * output bytes. Failure may be durably ambiguous and requires replay. A
+ * durable guard makes older readers reject the store until manifest compaction. */
+extern int ps_manifest_retire_image_sources_atomic_newer(const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs);
+/* The caller must also independently verify staged outputs, all dropped-group
+ * coverage and that retained copies preserve their global winners. */
+extern int ps_manifest_retire_image_sources_atomic(const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs);
 extern int ps_manifest_publish_image_batch_disjoint(const PsLayerDesc *inputs,
 	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs, uint32_t batch_index);
 extern int ps_manifest_retire_image_source_disjoint(const PsLayerDesc *inputs,

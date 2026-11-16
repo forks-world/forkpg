@@ -26,6 +26,8 @@
 #include "pagestore_archive_progress_authority.h"
 #include "pagestore_archive_progress_store.h"
 #include "pagestore_artifact_format.h"
+#include "pagestore_fault.h"
+#include "pagestore_layer_store.h"
 
 #define WAL_SEGMENT (1024u * 1024u)
 #define WAL_SEGMENTS 3u
@@ -2075,6 +2077,412 @@ test_backoff_epoch_predates_attempt_inputs(void)
 	check(reclaimed && segment_count(store, 0) == 0 && elapsed_ms < 300.0,
 		  "the epoch snapshotted before this attempt's inputs makes the advance"
 		  " due once the rate-limit floor passes, well under the 1 s clock");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+count_note_read(void *arg)
+{
+	(*(unsigned int *) arg)++;
+}
+
+static void
+test_blocked_wal_floor_yields_to_maintenance(void)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-note-short-XXXXXX";
+	unsigned int reads = 0;
+	const uint64_t blocked = WAL_SEGMENT / 2;
+	uint64_t exact;
+
+	configure_core();
+	check(prepare_store(store, blocked, 0, 0, 1),
+		  "create WAL with an old control note below the next boundary");
+	for (uint32_t i = 1; i < 64; i++)
+		check(write_control(0, WAL_TOTAL + (uint64_t) i * 8192, blocked + i),
+			  "add durable newer control version");
+	close_store();
+	flush_pages = 256;
+	check(ps_core_open(store) == 0, "reopen with control notes resident in layers");
+	ps_test_set_wal_note_read_hook(count_note_read, &reads);
+	check(ps_test_wal_reclaim_maintenance() == 0 && segment_count(store, 0) == 3,
+		  "old durable note prevents reclaiming the first segment");
+	check(reads < 64, "blocked reclaim yields without reading all newer notes");
+	fprintf(stderr, "BENCH reclaim_note_reads=%u\n", reads);
+	reads = 0;
+	exact = effective_floor(0, PS_RETENTION_RESOURCE_WAL);
+	fprintf(stderr, "BENCH public_floor=%llu reads=%u\n", (unsigned long long) exact, reads);
+	check(exact == blocked && reads == 64,
+		  "public WAL floor still verifies all notes and returns the exact floor");
+	check(write_control(0, WAL_TOTAL + 64 * 8192, blocked / 2),
+		  "add an unflushed newer note with an older redo");
+	reads = 0;
+	ps_test_wal_reclaim_proof_changed();
+	usleep(50000);
+	check(ps_test_wal_reclaim_maintenance() == 0 && reads == 65 &&
+		  segment_count(store, 0) == 3,
+		  "unflushed older redo forces a full proof and keeps the WAL");
+	reads = 0;
+	check(effective_floor(0, PS_RETENTION_RESOURCE_WAL) == blocked / 2 &&
+		  reads == 65, "exact floor observes the new older redo");
+	ps_test_set_wal_note_read_hook(NULL, NULL);
+	close_store();
+	remove_tree(store);
+
+	configure_core();
+	strcpy(store, "pagestore-wal-note-boundary-XXXXXX");
+	check(prepare_store(store, WAL_SEGMENT, 0, 0, 1),
+		  "create a note exactly at the next complete segment boundary");
+	close_store();
+	check(ps_core_open(store) == 0, "reopen the exact-boundary note");
+	check(ps_test_wal_reclaim_maintenance() == 1 && segment_count(store, 0) == 2,
+		  "a note exactly at the boundary still permits reclaim of one segment");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+pin_during_control_coverage(void *arg)
+{
+	int *success = arg;
+
+	*success = reserve_pin(0, PS_RETENTION_OWNER_READER, 899, 1,
+		PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL, WAL_TOTAL);
+}
+
+static int
+write_control_fence(uint64_t version, uint64_t redo)
+{
+	PsKey key = {0};
+	PsAdmissionFence fence = {0};
+	unsigned char page[8192] = {0};
+	int rc;
+
+	key.klass = PS_KLASS_CONTROL;
+	fence.magic = 0x50534146;
+	fence.version = 1;
+	fence.redo_lsn = redo;
+	fence.admission_seq = 1;
+	memcpy(page, &fence, sizeof(fence));
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = append_page(0, &key, PS_ADMISSION_FENCE_BLOCK, page, version, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc == 0 && ps_storage->sync() == 0;
+}
+
+static void
+test_control_coverage_preflight(void)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-control-preflight-XXXXXX";
+	uint32_t candidates = 0, covered = 0, full_candidates = 0;
+	int pinned = 0;
+
+	configure_core();
+	check(prepare_store(store, WAL_SEGMENT / 2, 0, 0, 1), "create old checkpoint");
+	check(ps_test_control_pair_coverage(0, UINT32_MAX, NULL, NULL,
+			&candidates, &covered) == 0 && candidates == 0 && covered == 0,
+		  "incomplete checkpoint pairs yield no paired candidates");
+	check(write_control_fence(WAL_TOTAL, WAL_SEGMENT / 2), "complete old checkpoint fence");
+	for (uint32_t i = 1; i < 70; i++)
+		check(write_control(0, WAL_TOTAL + (uint64_t) i * 8192,
+							WAL_TOTAL + (uint64_t) (i - 1) * 8192) &&
+			  (i == 1 || write_control_fence(WAL_TOTAL + (uint64_t) i * 8192,
+							WAL_TOTAL + (uint64_t) (i - 1) * 8192)),
+			  "create checkpoint history across independent layers");
+	check(append_wal_bytes(0, WAL_TOTAL, 70 * 8192) &&
+		  wal_index_progress(0, WAL_TOTAL, WAL_TOTAL + 70 * 8192),
+		  "ship WAL through checkpoint history");
+	close_store();
+	flush_pages = 128;
+	check(ps_core_open(store) == 0, "reopen control preflight fixture");
+	check(ps_test_control_note_coverage(0, UINT32_MAX, NULL, NULL,
+			&candidates, &covered) == 0 && candidates > 0 && covered == candidates,
+		  "global obsolete notes have complete physical coverage when all layers selected");
+	full_candidates = candidates;
+	check(ps_test_control_note_coverage(0, 1, NULL, NULL, &candidates, &covered) == 0 &&
+		  candidates == full_candidates && covered < candidates,
+		  "unselected layers prevent retiring their obsolete notes");
+	check(ps_test_control_pair_coverage(0, UINT32_MAX, NULL, NULL,
+			&candidates, &covered) == 0 && candidates > 0 &&
+		  candidates < full_candidates && covered == candidates,
+		  "complete control groups are covered and an incomplete group is retained");
+	full_candidates = candidates;
+	check(ps_test_control_pair_coverage(0, 2, NULL, NULL, &candidates, &covered) == 0 &&
+		  candidates == full_candidates && covered == 0,
+		  "selected image and note without their fence cannot retire the group");
+	{
+		PsKey key = {0};
+		unsigned char page[8192] = {0};
+		uint64_t redo = WAL_SEGMENT / 2;
+		int rc;
+
+		key.klass = PS_KLASS_CONTROL;
+		memcpy(page, &redo, sizeof(redo));
+		ps_lock_shard_wr(ps_shard_of(&key));
+		rc = append_page(0, &key, PS_REDO_NOTE_BLOCK, page, WAL_TOTAL, NULL);
+		ps_unlock_shard(ps_shard_of(&key));
+		check(rc == 0 && ps_test_control_pair_coverage(0, UINT32_MAX, NULL, NULL,
+				&candidates, &covered) == 0 && candidates + 1 == full_candidates &&
+			  covered == candidates,
+			  "an unflushed note keeps its entire checkpoint group");
+	}
+	candidates = covered = 42;
+	check(ps_test_control_pair_coverage(0, UINT32_MAX, pin_during_control_coverage,
+			&pinned, &candidates, &covered) == -1 && pinned && candidates == 0 && covered == 0,
+		  "pin acquired during unlocked scan invalidates the combined preflight");
+	check(ps_test_control_note_coverage(0, UINT32_MAX, NULL, NULL,
+			&candidates, &covered) == 0 && candidates == 0 && covered == 0,
+		  "newly pinned global history leaves no obsolete control candidates");
+	check(ps_test_control_pair_coverage(0, UINT32_MAX, NULL, NULL,
+			&candidates, &covered) == 0 && candidates == 0 && covered == 0,
+		  "pin protects complete control groups");
+	check(segment_count(store, 0) == 3,
+		  "read-only preflight leaves dependent WAL untouched");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+pin_during_control_compaction(void *arg)
+{
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	pin_during_control_coverage(arg);
+}
+
+static void
+write_during_control_compaction(void *arg)
+{
+	int *written = arg;
+
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	*written = write_control(0, WAL_TOTAL + 27 * 8192, WAL_TOTAL + 26 * 8192) &&
+		write_control_fence(WAL_TOTAL + 27 * 8192, WAL_TOTAL + 26 * 8192);
+}
+
+static void
+test_control_compaction_concurrent_change(int writer)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-control-race-XXXXXX";
+	uint64_t before;
+	int pinned = 0, ok;
+
+	configure_core();
+	ok = prepare_store(store, WAL_SEGMENT / 2, 0, 0, 1) &&
+		write_control_fence(WAL_TOTAL, WAL_SEGMENT / 2);
+	for (uint32_t i = 1; i <= 25 && ok; i++)
+		ok = write_control(0, WAL_TOTAL + (uint64_t) i * 8192,
+						   WAL_TOTAL + (uint64_t) (i - 1) * 8192) &&
+			write_control_fence(WAL_TOTAL + (uint64_t) i * 8192,
+							WAL_TOTAL + (uint64_t) (i - 1) * 8192);
+	ok = ok && append_wal_bytes(0, WAL_TOTAL, 26 * 8192) &&
+		wal_index_progress(0, WAL_TOTAL, WAL_TOTAL + 26 * 8192);
+	close_store();
+	check(ok && ps_core_open(store) == 0, "prepare control compaction pin race");
+	before = ps_test_bounded_prune_published_count();
+	ps_test_set_legacy_record_limit(2);
+	ps_test_set_compaction_unlocked_hook(writer ? write_during_control_compaction :
+		pin_during_control_compaction, &pinned);
+	for (int i = 0; i < 10 && !pinned; i++)
+		(void) ps_core_maintenance();
+	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	check(pinned && ps_test_bounded_prune_published_count() == before &&
+		  effective_floor(0, PS_RETENTION_RESOURCE_WAL) == WAL_SEGMENT / 2 &&
+		  segment_count(store, 0) == 3,
+		  "concurrent control change aborts staged pruning before publication");
+	ps_test_set_legacy_record_limit(0);
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  effective_floor(0, PS_RETENTION_RESOURCE_WAL) == WAL_SEGMENT / 2 &&
+		  segment_count(store, 0) == 3,
+		  "concurrent control change and protected WAL survive restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_control_pair_crash(const char *fault)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-control-crash-XXXXXX";
+	char control[TEST_STORE_PATH_MAX] = "pagestore-control-fault-XXXXXX";
+	char arm[TEST_STORE_PATH_MAX + 16];
+	uint64_t last = WAL_TOTAL + 25 * 8192;
+	int status = 0, ok, readers_ok = 1;
+	pid_t child;
+	FILE *file;
+
+	configure_core();
+	ok = prepare_store(store, WAL_SEGMENT / 2, 0, 0, 1) &&
+		write_control_fence(WAL_TOTAL, WAL_SEGMENT / 2);
+	for (uint32_t i = 1; i <= 25 && ok; i++)
+		ok = write_control(0, WAL_TOTAL + (uint64_t) i * 8192,
+						   WAL_TOTAL + (uint64_t) (i - 1) * 8192) &&
+			write_control_fence(WAL_TOTAL + (uint64_t) i * 8192,
+							WAL_TOTAL + (uint64_t) (i - 1) * 8192);
+	ok = ok && append_wal_bytes(0, WAL_TOTAL, 26 * 8192) &&
+		wal_index_progress(0, WAL_TOTAL, WAL_TOTAL + 26 * 8192);
+	close_store();
+	if (!test_mkdtemp(control, sizeof(control)) ||
+		snprintf(arm, sizeof(arm), "%s/arm", control) >= (int) sizeof(arm) ||
+		(file = fopen(arm, "w")) == NULL)
+	{
+		check(0, "prepare control compaction crash fault");
+		remove_tree(store);
+		return;
+	}
+	fclose(file);
+	child = fork();
+	if (child == 0)
+	{
+		if (!ok || setenv("PAGESTORE_TEST_FAULT_NAME", fault, 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_DIR", control, 1) != 0 ||
+			ps_fault_init(store) != 0 || ps_core_open(store) != 0)
+			_exit(91);
+		ps_test_set_legacy_record_limit(2);
+		for (int i = 0; i < 100; i++)
+		{
+			(void) ps_core_maintenance();
+			usleep(10000);
+		}
+		_exit(92);
+	}
+	check(child > 0 && waitpid(child, &status, 0) == child &&
+		  WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT,
+		  "control compaction reaches the requested crash boundary");
+	check(ps_core_open(store) == 0, "recover after control compaction crash");
+	for (uint32_t block = 0; block < PS_CONTROL_PAIRED_BLOCKS; block++)
+	{
+		PsKey key = {0};
+		unsigned char page[8192];
+		int rc;
+
+		key.klass = PS_KLASS_CONTROL;
+		ps_lifecycle_read_lock();
+		ps_lock_shard_rd(ps_shard_of(&key));
+		rc = read_resolve(0, &key, block, last, 0, page, NULL);
+		ps_unlock_shard(ps_shard_of(&key));
+		ps_lifecycle_read_unlock();
+		readers_ok &= rc == 1;
+		if (rc == 1 && block == PS_REDO_NOTE_BLOCK)
+		{
+			uint64_t redo;
+			memcpy(&redo, page, sizeof(redo));
+			readers_ok &= redo == last - 8192;
+		}
+		if (rc == 1 && block == PS_ADMISSION_FENCE_BLOCK)
+		{
+			PsAdmissionFence fence;
+			memcpy(&fence, page, sizeof(fence));
+			readers_ok &= fence.magic == 0x50534146 && fence.redo_lsn == last - 8192;
+		}
+	}
+	check(readers_ok && effective_floor(0, PS_RETENTION_RESOURCE_WAL) >= WAL_SEGMENT / 2 &&
+		  segment_count(store, 0) == 3,
+		  "crash recovery keeps the current control triplet and all WAL until reclaim");
+	close_store();
+	remove_tree(store);
+	remove_tree(control);
+}
+
+static void
+test_many_control_layers_release_wal(int pinned, int generic_provider)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-many-control-XXXXXX";
+	uint64_t floor;
+	uint64_t bounded_before;
+	uint64_t oldest = 0;
+	uint32_t total = 0, kept = 0;
+	int oldest_kept = 0;
+	PsLayerStore local_like = PsLayerStoreLocal;
+	const PsLayerStore *saved_provider = ps_layer_store;
+
+	configure_core();
+	check(prepare_store(store, WAL_SEGMENT / 2, 0, 0, 1),
+		  "create a retained old control checkpoint");
+	check(write_control_fence(WAL_TOTAL, WAL_SEGMENT / 2),
+		  "write the old checkpoint admission fence");
+	for (uint32_t i = 1; i < 70; i++)
+		check(write_control(0, WAL_TOTAL + (uint64_t) i * 8192,
+							WAL_TOTAL + (uint64_t) (i - 1) * 8192) &&
+			  write_control_fence(WAL_TOTAL + (uint64_t) i * 8192,
+							WAL_TOTAL + (uint64_t) (i - 1) * 8192),
+			  "add a later control checkpoint in its own layer");
+	check(append_wal_bytes(0, WAL_TOTAL, 70 * 8192) &&
+		  wal_index_progress(0, WAL_TOTAL, WAL_TOTAL + 70 * 8192),
+		  "ship and index WAL beyond the later checkpoint versions");
+	close_store();
+	check(ps_core_open(store) == 0, "reopen more than 64 control layers");
+	if (generic_provider)
+	{
+		local_like.remote_uri = NULL;
+		local_like.upload_layer = NULL;
+		ps_layer_store = &local_like;
+	}
+	if (pinned)
+		check(reserve_pin(0, PS_RETENTION_OWNER_READER, 313, 1,
+						  PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL,
+						  WAL_TOTAL),
+			  "pin the view that still needs the oldest control checkpoint");
+	check(ps_test_control_note_plan(0, &oldest, &total, &kept, &oldest_kept) == 0 &&
+		  oldest == WAL_TOTAL && total == 70 && oldest_kept == pinned,
+		  "global control-chain proof drops the old note only without its pin");
+	fprintf(stderr, "BENCH global_note_plan total=%u kept=%u oldest_kept=%d\n",
+			total, kept, oldest_kept);
+	fprintf(stderr, "BENCH page_floor=%llu\n", (unsigned long long)
+			effective_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY));
+	ps_test_set_legacy_record_limit(2);
+	bounded_before = ps_test_bounded_prune_published_count();
+	/* Include at least two real retry windows: a tight loop alone can finish
+	 * before the controller's five-second legacy-budget backoff expires. */
+	{
+		struct timespec start, now;
+
+		clock_gettime(CLOCK_MONOTONIC, &start);
+		do
+		{
+			(void) ps_core_maintenance();
+			usleep(10000);
+			clock_gettime(CLOCK_MONOTONIC, &now);
+		} while (now.tv_sec - start.tv_sec < 12);
+	}
+	fprintf(stderr, "BENCH compactions=%llu bounded=%llu pruned=%llu legacy_rejections=%llu due=%d\n",
+			(unsigned long long) ps_test_compaction_count(),
+			(unsigned long long) ps_test_bounded_compaction_count(),
+			(unsigned long long) ps_test_bounded_prune_published_count(),
+			(unsigned long long) ps_test_legacy_budget_rejections(),
+			ps_test_page_prune_due(0, 0));
+	floor = effective_floor(0, PS_RETENTION_RESOURCE_WAL);
+	fprintf(stderr, "BENCH control_floor=%llu remaining_segments=%u notes=%u\n",
+			(unsigned long long) floor, segment_count(store, 0),
+			ps_test_page_version_count(0, &(PsKey){.klass = PS_KLASS_CONTROL}, PS_REDO_NOTE_BLOCK));
+	if (pinned)
+	{
+		check(floor == WAL_SEGMENT / 2 && segment_count(store, 0) == 3,
+			  "a retained view keeps its control note and dependent WAL");
+	}
+	else
+	{
+		if (generic_provider)
+			check(ps_test_bounded_prune_published_count() > bounded_before,
+				  "capability-compatible non-default provider uses bounded control pruning");
+		check(floor > WAL_SEGMENT / 2,
+			  "bounded maintenance retires the superseded old control note");
+		check(segment_count(store, 0) < 3,
+			  "WAL reclaim advances after the old control note is retired");
+	}
+	ps_test_set_legacy_record_limit(0);
+	ps_layer_store = saved_provider;
+	close_store();
+	check(ps_core_open(store) == 0, "reopen after bounded control-group compaction");
+	if (pinned)
+		check(effective_floor(0, PS_RETENTION_RESOURCE_WAL) == WAL_SEGMENT / 2 &&
+			  segment_count(store, 0) == 3,
+			  "restart preserves the pinned control floor and WAL");
+	else
+		check(effective_floor(0, PS_RETENTION_RESOURCE_WAL) > WAL_SEGMENT / 2 &&
+			  segment_count(store, 0) < 3,
+			  "restart preserves the advanced control floor and WAL reclamation");
 	close_store();
 	remove_tree(store);
 }
@@ -4160,6 +4568,52 @@ main(int argc, char **argv)
 		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 		return failed != 0;
 	}
+	if (argc == 2 && strcmp(argv[1], "--blocked-wal-floor") == 0)
+	{
+		test_blocked_wal_floor_yields_to_maintenance();
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--many-control-layers") == 0)
+	{
+		test_many_control_layers_release_wal(0, 0);
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--control-coverage") == 0)
+	{
+		test_control_coverage_preflight();
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--control-crash") == 0)
+	{
+		test_control_pair_crash("page_prune.after_frontier");
+		test_control_pair_crash("page_compaction.after_publish");
+		test_control_pair_crash("page_gc.after_mark_delete");
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--control-race") == 0)
+	{
+		test_control_compaction_concurrent_change(0);
+		test_control_compaction_concurrent_change(1);
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--many-control-layers-pinned") == 0)
+	{
+		test_many_control_layers_release_wal(1, 0);
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--control-provider") == 0)
+	{
+		test_many_control_layers_release_wal(0, 1);
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	test_control_coverage_preflight();
 	test_archive_progress_marker_authority();
 	check(ps_test_walidx_raw_first() == 0, "sorted WAL dependency summary matches full scan");
 	test_materializer_retains_replay_proof_interval();
@@ -4200,6 +4654,7 @@ main(int argc, char **argv)
 	test_fpi_between_protected_and_progress_retires();
 	test_watch_does_not_refire_on_satisfied_base_evidence();
 	test_walidx_only_pin_drop_requests_compaction();
+	test_blocked_wal_floor_yields_to_maintenance();
 	test_dependency_cutoffs();
 	test_death_base_survives_prefix_prune();
 	test_natural_nonzero_start();

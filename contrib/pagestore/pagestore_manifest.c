@@ -25,6 +25,9 @@
 #define PS_MANIFEST_MAGIC	0x504d414e	/* "PMAN" */
 #define PS_MANIFEST_VERSION 3	/* 3: per-record CRC (over the header + payload) */
 #define PS_MANIFEST_FNV_INIT	2166136261u
+/* Old readers reject this valid v3 record rather than truncate a later event. */
+#define PS_MANIFEST_BATCH_GUARD_SEG UINT32_C(0x50534247)
+#define PS_MANIFEST_BATCH_GUARD_OFF UINT64_C(0x4354524c42415443)
 
 typedef enum PsManifestEventType
 {
@@ -36,6 +39,7 @@ typedef enum PsManifestEventType
 	PS_MANIFEST_SET_FLUSH_WATERMARK = 6,
 	PS_MANIFEST_SET_REMOTE_LOCATION = 7,
 	PS_MANIFEST_REBASE_FLUSH_WATERMARK = 8,
+	PS_MANIFEST_MARK_DELETE_BATCH = 9,
 } PsManifestEventType;
 
 typedef struct PsManifestRecord
@@ -52,6 +56,14 @@ typedef struct PsManifestLayerIdEvent
 	uint64_t	layer_id;
 	uint64_t	value;
 } PsManifestLayerIdEvent;
+
+/* One checksummed record is the commit point for an inseparable source set. */
+typedef struct PsManifestDeleteBatchEvent
+{
+	uint32_t count;
+	uint32_t reserved;
+	uint64_t layer_ids[PS_IMAGE_MERGE_MAX_INPUTS];
+} PsManifestDeleteBatchEvent;
 
 typedef struct PsManifestKeyDisk
 {
@@ -290,6 +302,8 @@ manifest_type_payload_len(uint32_t type)
 			return (int) sizeof(PsManifestLayerIdEvent);
 		case PS_MANIFEST_SET_REMOTE_LOCATION:
 			return (int) sizeof(PsManifestRemoteLocationEvent);
+		case PS_MANIFEST_MARK_DELETE_BATCH:
+			return (int) sizeof(PsManifestDeleteBatchEvent);
 		case PS_MANIFEST_SET_FLUSH_WATERMARK:
 		case PS_MANIFEST_REBASE_FLUSH_WATERMARK:
 			return (int) sizeof(PsFlushWatermark);
@@ -705,6 +719,7 @@ ps_manifest_replay(PsLayerMap *map)
 	off_t		good_off = 0;
 	int			truncate_tail = 0;
 	int			file_v2;
+	int			batch_guard_seen = 0;
 	off_t		file_size;
 	struct stat st;
 
@@ -773,6 +788,7 @@ ps_manifest_replay(PsLayerMap *map)
 			unsigned char bytes[sizeof(PsManifestLayerDisk)];
 			PsManifestLayerDisk layer;
 			PsManifestLayerIdEvent ev;
+			PsManifestDeleteBatchEvent delete_batch;
 			PsManifestRemoteLocationEvent remote_location;
 			PsFlushWatermark watermark;
 		}			payload;
@@ -890,6 +906,45 @@ ps_manifest_replay(PsLayerMap *map)
 					break;
 				}
 
+			case PS_MANIFEST_MARK_DELETE_BATCH:
+				{
+					PsManifestDeleteBatchEvent *batch = &payload.delete_batch;
+
+					if (!batch_guard_seen || file_v2 || batch->count == 0 ||
+						batch->count > PS_IMAGE_MERGE_MAX_INPUTS ||
+						batch->reserved != 0)
+					{
+						close(fd);
+						return -1;
+					}
+					for (uint32_t i = 0; i < batch->count; i++)
+					{
+						PsLayerDesc *layer = manifest_find_layer(map, batch->layer_ids[i]);
+
+						if (!layer || layer->deleting || layer->kind != PS_LAYER_IMAGE ||
+							layer->remote_durable)
+						{
+							close(fd);
+							return -1;
+						}
+						for (uint32_t j = 0; j < i; j++)
+							if (batch->layer_ids[j] == batch->layer_ids[i])
+							{
+								close(fd);
+								return -1;
+							}
+					}
+					for (uint32_t i = batch->count; i < PS_IMAGE_MERGE_MAX_INPUTS; i++)
+						if (batch->layer_ids[i] != 0)
+						{
+							close(fd);
+							return -1;
+						}
+					for (uint32_t i = 0; i < batch->count; i++)
+						manifest_find_layer(map, batch->layer_ids[i])->deleting = true;
+					break;
+				}
+
 			case PS_MANIFEST_REMOVE_LAYER:
 				manifest_remove_from_map(map, payload.ev.layer_id);
 				break;
@@ -952,6 +1007,18 @@ ps_manifest_replay(PsLayerMap *map)
 				break;
 
 			case PS_MANIFEST_REBASE_FLUSH_WATERMARK:
+				if (payload.watermark.shard == UINT32_MAX &&
+					payload.watermark.seg_id == PS_MANIFEST_BATCH_GUARD_SEG &&
+					payload.watermark.seg_off == PS_MANIFEST_BATCH_GUARD_OFF)
+				{
+					if (file_v2)
+					{
+						close(fd);
+						return -1;
+					}
+					batch_guard_seen = 1;
+					break;
+				}
 				if (payload.watermark.shard >= PS_MAX_CHANNELS ||
 					!flush_watermark_valid[payload.watermark.shard] ||
 					payload.watermark.seg_id !=
@@ -1076,6 +1143,80 @@ ps_manifest_retire_image_source_newer(const PsLayerDesc *inputs, uint32_t ninput
 			outputs, noutputs, source_index))
 		return -1;
 	return ps_manifest_mark_delete(inputs[source_index].layer_id);
+}
+
+static int
+manifest_retire_image_sources_atomic(const PsLayerDesc *inputs, uint32_t ninputs)
+{
+	PsManifestDeleteBatchEvent batch = {0};
+	PsFlushWatermark guard = {UINT32_MAX, PS_MANIFEST_BATCH_GUARD_SEG,
+		PS_MANIFEST_BATCH_GUARD_OFF};
+
+	batch.count = ninputs;
+	for (uint32_t i = 0; i < ninputs; i++)
+		batch.layer_ids[i] = inputs[i].layer_id;
+	/* The old-reader guard must reach stable storage before the new event. */
+	if (manifest_append(PS_MANIFEST_REBASE_FLUSH_WATERMARK, &guard, sizeof(guard)) != 0)
+		return -1;
+	if (manifest_append(PS_MANIFEST_MARK_DELETE_BATCH, &batch, sizeof(batch)) != 0)
+		return -1;
+	for (uint32_t i = 0; i < ninputs; i++)
+	{
+		PsLayerDesc *layer = manifest_find_layer(&ps_layer_map, inputs[i].layer_id);
+
+		/* Validation ran under the caller's map lock before the append. */
+		if (!layer)
+			return -1;
+		layer->deleting = true;
+	}
+	return 0;
+}
+
+int
+ps_manifest_retire_image_sources_atomic_newer(const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs)
+{
+	if (!ps_image_compaction_retirement_valid_newer(&ps_layer_map, inputs, ninputs,
+			outputs, noutputs, 0))
+		return -1;
+	return manifest_retire_image_sources_atomic(inputs, ninputs);
+}
+
+int
+ps_manifest_retire_image_sources_atomic(const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs)
+{
+	if (!inputs || !outputs || ninputs == 0 || ninputs > PS_IMAGE_MERGE_MAX_INPUTS ||
+		noutputs == 0 || noutputs > PS_IMAGE_PREPARE_MAX_OUTPUTS)
+		return -1;
+	for (uint32_t i = 0; i < ninputs; i++)
+	{
+		PsLayerDesc *current = manifest_find_layer(&ps_layer_map, inputs[i].layer_id);
+
+		if (!current || inputs[i].kind != PS_LAYER_IMAGE || inputs[i].deleting ||
+			inputs[i].remote_durable || inputs[i].legacy_shard_zero ||
+			!ps_image_snapshot_descriptor_equal(current, &inputs[i]) ||
+			__atomic_load_n(&current->cache_readers, __ATOMIC_ACQUIRE) == 0)
+			return -1;
+		for (uint32_t j = 0; j < i; j++)
+			if (inputs[i].layer_id == inputs[j].layer_id)
+				return -1;
+	}
+	for (uint32_t i = 0; i < noutputs; i++)
+	{
+		PsLayerDesc *current = manifest_find_layer(&ps_layer_map, outputs[i].layer_id);
+
+		if (!current || outputs[i].kind != PS_LAYER_IMAGE || outputs[i].deleting ||
+			!ps_image_snapshot_descriptor_equal(current, &outputs[i]))
+			return -1;
+		for (uint32_t j = 0; j < ninputs; j++)
+			if (outputs[i].layer_id == inputs[j].layer_id)
+				return -1;
+		for (uint32_t j = 0; j < i; j++)
+			if (outputs[i].layer_id == outputs[j].layer_id)
+				return -1;
+	}
+	return manifest_retire_image_sources_atomic(inputs, ninputs);
 }
 
 int

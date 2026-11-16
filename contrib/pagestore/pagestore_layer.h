@@ -100,6 +100,10 @@ extern uint32_t ps_layer_map_count(const PsLayerMap *map);
 /* Conservative disjointness of the inclusive image key and block bounds. */
 extern int ps_image_layer_ranges_disjoint(const PsLayerDesc *a, const PsLayerDesc *b);
 
+/* Compare immutable routing and durable layer metadata; excludes reader
+ * counts and cache-only hints. The caller must hold the map lock. */
+extern int ps_image_snapshot_descriptor_equal(const PsLayerDesc *a, const PsLayerDesc *b);
+
 /* ---------------------------------------------------------------------------
  * Image layer file format (phase 2).
  *
@@ -230,6 +234,12 @@ extern int ps_image_layer_visit_index(const PsLayerDesc *layer,
 typedef struct PsImageIndexCursor PsImageIndexCursor;
 extern int ps_image_index_cursor_open(const PsLayerDesc *layer,
 									   PsImageIndexCursor **out);
+/* Open without the full-index precheck. Each next reads at most one 64 KiB
+ * index chunk. Entries are untrusted until next returns 0 after checksum and
+ * ordering checks; every effect must remain staged until then. The layer must
+ * remain immutable and pinned throughout. */
+extern int ps_image_index_cursor_open_staged(const PsLayerDesc *layer,
+										  PsImageIndexCursor **out);
 extern int ps_image_index_cursor_next(PsImageIndexCursor *cursor,
 									   PsImgIndexEnt *entry);
 extern void ps_image_index_cursor_close(PsImageIndexCursor *cursor);
@@ -292,6 +302,19 @@ extern int ps_image_compaction_stage_selected_batch(const PsLayerDesc *layers,
 	uint32_t count, const PsImageGroupEntry *selected, uint32_t nselected,
 	uint64_t output_id, uint32_t page_size, PsLayerDesc *out,
 	uint64_t *uncertain_id);
+/* Reuse verified immutable source bounds across batches while every source is
+ * caller-pinned. Revalidate before publication; changes or failed verification
+ * invalidate the entire staged operation. */
+typedef struct PsImageVerifiedSources PsImageVerifiedSources;
+extern int ps_image_compaction_sources_open(const PsLayerDesc *layers, uint32_t count,
+	uint32_t page_size, PsImageVerifiedSources **out);
+extern int ps_image_compaction_sources_revalidate(PsImageVerifiedSources *sources);
+extern void ps_image_compaction_sources_close(PsImageVerifiedSources *sources);
+extern int ps_image_compaction_stage_verified_batch(const PsImageVerifiedSources *sources,
+	const PsImageGroupEntry *selected, uint32_t nselected, uint64_t output_id,
+	PsLayerDesc *out, uint64_t *uncertain_id);
+extern int ps_image_compaction_verify_verified_batch(const PsImageVerifiedSources *sources,
+	const PsImageGroupEntry *selected, uint32_t nselected, const PsLayerDesc *output);
 
 /* Independently verify that each selected entry is present in its named
  * source index and that the sealed output contains exactly those identities,

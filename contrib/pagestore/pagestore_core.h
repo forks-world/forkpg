@@ -384,6 +384,7 @@ extern void ps_test_set_wal_reclaim_attempt_hook(
 	PsWalReclaimAttemptTestHook hook, void *arg);
 extern void ps_test_set_wal_reclaim_before_floor_hook(
 	PsWalReclaimBeforeFloorTestHook hook, void *arg);
+extern void ps_test_set_wal_note_read_hook(void (*hook)(void *), void *arg);
 extern void ps_test_set_wal_read_before_lock_hook(
 	PsWalReadBeforeLockTestHook hook, void *arg);
 extern void ps_test_set_walidx_observation_error_hook(
@@ -391,6 +392,13 @@ extern void ps_test_set_walidx_observation_error_hook(
 extern void ps_test_set_backpressure_slow_path_hook(
 	PsBackpressureSlowPathTestHook hook, void *arg);
 extern int ps_test_control_fence_selections(void);
+extern int ps_test_control_note_plan(uint32_t timeline, uint64_t *oldest_lsn,
+	uint32_t *total, uint32_t *kept, int *oldest_kept);
+extern int ps_test_control_note_coverage(uint32_t timeline, uint32_t selected_limit,
+	void (*unlocked_hook)(void *), void *hook_arg, uint32_t *candidates, uint32_t *covered);
+extern int ps_test_control_pair_coverage(uint32_t timeline, uint32_t selected_limit,
+	void (*unlocked_hook)(void *), void *hook_arg, uint32_t *candidates, uint32_t *covered);
+extern int ps_test_control_note_decisions(uint32_t n);
 extern int ps_test_timeline_page_scan_segment(uint32_t timeline);
 extern int ps_test_timeline_page_proof_segment(uint32_t timeline);
 extern int ps_test_timeline_page_proof_shard(uint32_t timeline);

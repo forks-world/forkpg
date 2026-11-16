@@ -434,6 +434,16 @@ static int admission_writer_active;
 static uint64_t admission_mutation_epoch;
 static _Thread_local int wal_reclaim_floor_interruptible;
 static _Thread_local uint64_t wal_reclaim_admission_epoch;
+static _Thread_local uint64_t wal_reclaim_next_segment_boundary;
+static void (*wal_note_read_test_hook)(void *);
+static void *wal_note_read_test_hook_arg;
+
+void
+ps_test_set_wal_note_read_hook(void (*hook)(void *), void *arg)
+{
+	wal_note_read_test_hook = hook;
+	wal_note_read_test_hook_arg = arg;
+}
 static PsForkmetaCutoverTestHook forkmeta_cutover_test_hook;
 static void *forkmeta_cutover_test_hook_arg;
 static PsForkmetaPostGcTestHook forkmeta_post_gc_test_hook;
@@ -4208,6 +4218,8 @@ ps_test_bounded_zero_floor_count(void)
 #define PS_BOUNDED_PRUNE_MAX_SELECTED (PS_BOUNDED_PRUNE_MAX_OUTPUTS * PS_IMAGE_BATCH_MAX_RECORDS)
 #define PS_BOUNDED_PRUNE_MAX_DROPPED 8192
 #define PS_BOUNDED_PRUNE_INDEX_BATCH 128
+#define PS_CONTROL_PRUNE_MAX_OUTPUTS PS_IMAGE_PREPARE_MAX_OUTPUTS
+#define PS_CONTROL_PRUNE_MAX_SELECTED (PS_CONTROL_PRUNE_MAX_OUTPUTS * PS_IMAGE_BATCH_MAX_RECORDS)
 typedef struct BoundedPruneStage
 {
 	PsImageGroupEntry *selected, *dropped, *sel_group, *drop_group;
@@ -4228,6 +4240,28 @@ bounded_prune_collect(const PsImageGroupEntry *entries, uint32_t count,
 			stage->sel_group, PS_IMAGE_GROUP_MAX_VERSIONS, &ns,
 			stage->drop_group, PS_IMAGE_GROUP_MAX_VERSIONS, &nd) != 0 ||
 		stage->nselected + ns > PS_BOUNDED_PRUNE_MAX_SELECTED ||
+		stage->ndropped + nd > PS_BOUNDED_PRUNE_MAX_DROPPED)
+		return -1;
+	memcpy(stage->selected + stage->nselected, stage->sel_group, (size_t) ns * sizeof(*stage->selected));
+	memcpy(stage->dropped + stage->ndropped, stage->drop_group, (size_t) nd * sizeof(*stage->dropped));
+	stage->nselected += ns;
+	stage->ndropped += nd;
+	return 0;
+}
+
+static int
+bounded_control_collect(const PsImageGroupEntry *entries, uint32_t count,
+		const unsigned char *keep, const unsigned char *closure, void *arg)
+{
+	BoundedPruneStage *stage = arg;
+	uint32_t ns, nd;
+
+	(void) closure;
+	stage->scanned += count;
+	if (ps_compaction_control_select_group(entries, count, keep,
+			stage->sel_group, PS_IMAGE_GROUP_MAX_VERSIONS, &ns,
+			stage->drop_group, PS_IMAGE_GROUP_MAX_VERSIONS, &nd) != 0 ||
+		stage->nselected + ns > PS_CONTROL_PRUNE_MAX_SELECTED ||
 		stage->ndropped + nd > PS_BOUNDED_PRUNE_MAX_DROPPED)
 		return -1;
 	memcpy(stage->selected + stage->nselected, stage->sel_group, (size_t) ns * sizeof(*stage->selected));
@@ -4269,6 +4303,9 @@ static uint32_t page_prune_fast_batch_count(uint32_t timeline,
 	const PsImgRec *recs, uint32_t nrec);
 static uint32_t bounded_isolated_inputs(uint32_t timeline, uint32_t shard,
 	PsLayerDesc *inputs, uint64_t *bytes_out, int pruning);
+static int compact_control_pairs_bounded(uint32_t timeline, uint32_t shard,
+	uint64_t floor, int *prune_deferred);
+static int control_prune_provider_supported(void);
 
 static int
 selected_prune_fence_valid(int disjoint, const PsLayerMap *map,
@@ -5423,7 +5460,11 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	 * the legacy pruning pass, so proceed directly to gather in that case. */
 	if (!bounded_already_tried && page_floor != 0 && stage_unlocked)
 	{
-		int bounded_prune = compact_timeline_pruned_bounded(timeline, shard,
+		int bounded_prune = control_prune_provider_supported() ?
+			compact_control_pairs_bounded(timeline, shard, page_floor, prune_deferred) : 0;
+
+		if (bounded_prune == 0)
+			bounded_prune = compact_timeline_pruned_bounded(timeline, shard,
 												 page_floor, prune_deferred);
 
 		if (bounded_prune != 0)
@@ -6054,6 +6095,19 @@ out:
 	return rc;
 }
 
+/* A provider with no upload interface cannot race a tier worker. The bundled
+ * local provider also exposes upload callbacks when its object tier is off. */
+static int
+control_prune_provider_supported(void)
+{
+	if (!ps_layer_store || !ps_layer_store->create_local_layer ||
+		!ps_layer_store->write_local_layer_at || !ps_layer_store->seal_local_layer ||
+		!ps_layer_store->read_layer_block || !ps_layer_store->delete_local_layer)
+		return 0;
+	return (!ps_layer_store->remote_uri && !ps_layer_store->upload_layer) ||
+		prune_abandon_local_only();
+}
+
 /* Try the existing self-verifying bounded planners before materializing the
  * entire local timeline. Caller holds the shard, prune and map locks; the
  * planners release and reacquire them around their own selected-input I/O. */
@@ -6063,8 +6117,10 @@ compact_local_first(uint32_t timeline, uint32_t shard, uint64_t floor,
 {
 	uint64_t scanned = 0, kept = 0;
 	int rc;
+	int legacy_supported = prune_abandon_local_only();
+	int control_supported = control_prune_provider_supported();
 
-	if (!prune_abandon_local_only() || g_shards[shard].staged_compaction_retries >= 2 ||
+	if ((!legacy_supported && !control_supported) || g_shards[shard].staged_compaction_retries >= 2 ||
 		count_image_layers(timeline, shard) == 0 ||
 		(!allow_small && count_image_layers(timeline, shard) <= PS_IMAGE_MERGE_MAX_INPUTS))
 		return 0;
@@ -6079,6 +6135,14 @@ compact_local_first(uint32_t timeline, uint32_t shard, uint64_t floor,
 			return 0;
 	}
 	*attempted = 1;
+	if (floor != 0 && control_supported)
+	{
+		rc = compact_control_pairs_bounded(timeline, shard, floor, prune_deferred);
+		if (rc != 0)
+			return rc;
+	}
+	if (!legacy_supported)
+		return 0;
 	if (floor != 0)
 	{
 		rc = compact_timeline_pruned_bounded(timeline, shard, floor, prune_deferred);
@@ -17707,6 +17771,7 @@ wal_segment_reclaim_one(void)
 		uint64_t proof_epoch = 0;
 		uint64_t fence_epoch = 0;
 		uint64_t snapshot_generation = 0;
+		uint64_t next_segment_boundary = 0;
 		WalReclaimWatchEntry watch_items[WAL_RECLAIM_WATCH_MAX];
 		uint32_t watch_n = 0;
 		unsigned char watch_overflow = 0;
@@ -17779,6 +17844,8 @@ wal_segment_reclaim_one(void)
 																		 store->start_lsn + store->segment_size > store->end_lsn)))
 			goto unlock_timeline;
 		attempt = 1;
+		if (!residual_pending)
+			next_segment_boundary = store->start_lsn + store->segment_size;
 		if (residual_pending)
 		{
 			/* The durable frontier is already published.  The residual retry is
@@ -17834,12 +17901,18 @@ wal_segment_reclaim_one(void)
 			wal_reclaim_before_floor_test_hook(tl,
 										 wal_reclaim_before_floor_test_hook_arg);
 		wal_reclaim_floor_interruptible = 1;
+		/* A blocking raw-index dependency may require a snapshot request in the
+		 * normal no-progress path. Do not skip that request. */
+		wal_reclaim_next_segment_boundary =
+			(raw_floor == 0 || raw_floor >= next_segment_boundary) ?
+			next_segment_boundary : 0;
 		rc = rc != 0 ? rc : retention_effective_floor_internal(tl,
 											 PS_RETENTION_RESOURCE_WAL,
 											 &retention_floor, 0, &pin_floor,
 											 &note_timeline, &note_lsn,
 											 &note_seq);
 		wal_reclaim_floor_interruptible = 0;
+		wal_reclaim_next_segment_boundary = 0;
 		if (__atomic_load_n(&admission_mutation_epoch, __ATOMIC_ACQUIRE) !=
 			wal_reclaim_admission_epoch)
 			rc = -1;
@@ -22697,6 +22770,10 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	best_seq = 0;
 	uint64_t	best_layer = 0;
 	uint32_t	shard = ps_shard_of(key);
+	PsLayerDesc page_range = {0};
+
+	page_range.start_key = page_range.end_key = *key;
+	page_range.start_block = page_range.end_block = block;
 
 	if (!tmp)
 		return 0;
@@ -22712,6 +22789,7 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 
 		if (d->kind == PS_LAYER_IMAGE && d->timeline == timeline &&
 			layer_matches_read_shard(d, shard) && !d->deleting &&
+			!ps_image_layer_ranges_disjoint(d, &page_range) &&
 			(expected_lsn == 0 ||
 			 (expected_lsn >= d->lsn_start && expected_lsn <= d->lsn_end)))
 			nlayers++;
@@ -22727,6 +22805,7 @@ layer_map_lookup_impl(uint32_t timeline, const PsKey *key, uint32_t block,
 
 			if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline ||
 				!layer_matches_read_shard(d, shard) || d->deleting ||
+				ps_image_layer_ranges_disjoint(d, &page_range) ||
 				(expected_lsn != 0 &&
 				 (expected_lsn < d->lsn_start || expected_lsn > d->lsn_end)))
 				continue;
@@ -23629,6 +23708,8 @@ wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
 				return -1;
 			if (v->lsn > cap)
 				continue;
+			if (wal_note_read_test_hook != NULL)
+				wal_note_read_test_hook(wal_note_read_test_hook_arg);
 			if (v->seg >= 0)
 			{
 				if (read_version(v, tmp) != 0)
@@ -23649,6 +23730,38 @@ wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
 										  PS_REDO_NOTE_VERSION) != 0)
 				return -1;
 			memcpy(&redo, tmp, sizeof(redo));
+			/* The reclaimer needs a complete segment before it can advance.
+			 * A verified, layer-resident note below that boundary is already
+			 * sufficient to deny this attempt.  Yield without claiming a floor:
+			 * the caller takes its existing no-progress retry path, allowing
+			 * page maintenance to remove superseded durable notes.  Exact floor
+			 * queries and memtable notes must still scan the entire history. */
+			if (wal_reclaim_floor_interruptible && v->seg < 0 && redo != 0 &&
+				wal_reclaim_next_segment_boundary != 0 &&
+				redo < wal_reclaim_next_segment_boundary)
+			{
+				bool remaining_durable = true;
+
+				/* Any not-yet-flushed note may have a still older redo,
+				 * including one already examined. The complete proof must see
+				 * it to request the control flush. */
+				for (int j = 0; j < notes->nver; j++)
+					if (notes->vers[j].lsn <= cap && notes->vers[j].seg >= 0)
+					{
+						remaining_durable = false;
+						break;
+					}
+				if (remaining_durable)
+				{
+					if (getenv("PAGESTORE_BENCH_RECOVERY") != NULL)
+						fprintf(stderr, "BENCH blocked_note timeline=%u version=%llu redo=%llu boundary=%llu scanned=%d total=%d\n",
+								timeline, (unsigned long long) v->lsn,
+								(unsigned long long) redo,
+								(unsigned long long) wal_reclaim_next_segment_boundary,
+								i + 1, notes->nver);
+					return -1;
+				}
+			}
 			if (redo == 0)
 			{
 				*floor = 1;
@@ -23739,6 +23852,41 @@ prune_version_cmp(const void *va, const void *vb)
 		return a->lsn < b->lsn ? -1 : 1;
 	if (a->admission_seq != b->admission_seq)
 		return a->admission_seq < b->admission_seq ? -1 : 1;
+	return 0;
+}
+
+static int
+control_note_ptr_cmp(const void *va, const void *vb)
+{
+	const PageVer *a = *(PageVer *const *) va, *b = *(PageVer *const *) vb;
+
+	if (a->lsn != b->lsn)
+		return a->lsn < b->lsn ? -1 : 1;
+	if (a->admission_seq != b->admission_seq)
+		return a->admission_seq < b->admission_seq ? -1 : 1;
+	/* The original linear search retains the first equal identity. */
+	return a > b ? -1 : a < b;
+}
+
+static int
+control_note_redo_cached(uint32_t timeline, const PsKey *key, const PageEnt *notes,
+	const PageVer *note, unsigned char *tmp, uint64_t *values, unsigned char *valid,
+	uint64_t *redo)
+{
+	size_t index = (size_t) (note - notes->vers);
+
+	if (values && valid && index < (size_t) notes->nver && valid[index])
+	{
+		*redo = values[index];
+		return 0;
+	}
+	if (control_note_redo(timeline, key, note, tmp, redo) != 0)
+		return -1;
+	if (values && valid && index < (size_t) notes->nver)
+	{
+		values[index] = *redo;
+		valid[index] = 1;
+	}
 	return 0;
 }
 
@@ -23838,6 +23986,10 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		PageEnt    *notes = page_find(timeline, key, PS_CONTROL_NOTE_BLOCK);
 		unsigned char *tmp = notes != NULL ? malloc(page_size) : NULL;
+		PageVer **note_selections = NULL;
+		PageVer **note_sorted = NULL;
+		uint64_t *redo_values = NULL;
+		unsigned char *redo_valid = NULL;
 		uint32_t	nkept = plan->nkept;
 
 		if (notes != NULL && tmp == NULL)
@@ -23848,26 +24000,71 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 			memset(plan, 0, sizeof(*plan));
 			return -1;
 		}
+		if (notes != NULL && notes->nver > 0)
+		{
+			note_sorted = malloc((size_t) notes->nver * sizeof(*note_sorted));
+			redo_values = calloc((size_t) notes->nver, sizeof(*redo_values));
+			redo_valid = calloc((size_t) notes->nver, 1);
+			if (!redo_values || !redo_valid)
+			{
+				free(redo_values);
+				free(redo_valid);
+				redo_values = NULL;
+				redo_valid = NULL;
+			}
+			if (note_sorted)
+			{
+				for (int i = 0; i < notes->nver; i++)
+					note_sorted[i] = &notes->vers[i];
+				qsort(note_sorted, (size_t) notes->nver, sizeof(*note_sorted), control_note_ptr_cmp);
+			}
+		}
 		for (uint32_t k = 0; k < nkept && notes != NULL; k++)
 		{
 			const PageVer *note = NULL;
-			const PageVer *twin = NULL;
+			PsPruneVersion twin = {0};
+			bool have_twin = false;
 			uint64_t	redo = 0;
 			int			already = 0;
 
-			for (int i = 0; i < notes->nver; i++)
-				if (notes->vers[i].lsn == plan->kept[k].lsn &&
-					walidx_base_version_durable(&notes->vers[i]) &&
-					(note == NULL ||
-					 notes->vers[i].admission_seq > note->admission_seq))
-					note = &notes->vers[i];
+			if (note_sorted)
+			{
+				uint32_t lo = 0, hi = (uint32_t) notes->nver;
+				while (lo < hi)
+				{
+					uint32_t mid = lo + (hi - lo) / 2;
+					if (note_sorted[mid]->lsn <= plan->kept[k].lsn)
+						lo = mid + 1;
+					else
+						hi = mid;
+				}
+				while (lo > 0 && note_sorted[lo - 1]->lsn == plan->kept[k].lsn)
+				{
+					PageVer *v = note_sorted[--lo];
+					if (walidx_base_version_durable(v))
+					{
+						note = v;
+						break;
+					}
+				}
+			}
+			else
+				for (int i = 0; i < notes->nver; i++)
+					if (notes->vers[i].lsn == plan->kept[k].lsn &&
+						walidx_base_version_durable(&notes->vers[i]) &&
+						(note == NULL || notes->vers[i].admission_seq > note->admission_seq))
+						note = &notes->vers[i];
 			if (note == NULL)
 				continue;
 			/* A note that cannot be read is not a note without a twin: planning
 			 * on without it could retire the exact-redo image the note names.
 			 * Fail the plan closed and let a later pass retry. */
-			if (control_note_redo(timeline, key, note, tmp, &redo) != 0)
+			if (control_note_redo_cached(timeline, key, notes, note, tmp,
+					redo_values, redo_valid, &redo) != 0)
 			{
+				free(note_sorted);
+				free(redo_values);
+				free(redo_valid);
 				free(tmp);
 				free(plan->chain);
 				free(plan->kept);
@@ -23882,19 +24079,30 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 					already = 1;
 			if (already)
 				continue;
-			for (int i = 0; i < e->nver; i++)
-				if (e->vers[i].lsn == redo &&
-					walidx_base_version_durable(&e->vers[i]) &&
-					(twin == NULL ||
-					 e->vers[i].admission_seq > twin->admission_seq))
-					twin = &e->vers[i];
-			if (twin != NULL)
 			{
-				plan->kept[plan->nkept].lsn = twin->lsn;
-				plan->kept[plan->nkept].admission_seq = twin->admission_seq;
+				uint32_t lo = 0, hi = plan->nchain;
+				while (lo < hi)
+				{
+					uint32_t mid = lo + (hi - lo) / 2;
+					if (plan->chain[mid].lsn <= redo)
+						lo = mid + 1;
+					else
+						hi = mid;
+				}
+				if (lo > 0 && plan->chain[lo - 1].lsn == redo)
+				{
+					twin = plan->chain[lo - 1];
+					have_twin = true;
+				}
+			}
+			if (have_twin)
+			{
+				plan->kept[plan->nkept] = twin;
 				plan->nkept++;
 			}
 		}
+		if (notes != NULL && nfences != 0)
+			note_selections = control_fence_selections(notes, fences, nfences);
 		/* A branch restores the exact-redo twin, which may be older than
 		 * the image selected at L. Select that twin under the branch's S;
 		 * a post-S rewrite of the twin cannot replace it. */
@@ -23910,11 +24118,17 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 
 			if (cap.seq == PS_SEQ_UNBOUNDED)
 				continue;
-			note = page_select(notes, &cap, B, has_B);
+			note = note_selections != NULL ? note_selections[f] :
+				page_select(notes, &cap, B, has_B);
 			if (note == NULL)
 				continue;
-			if (control_note_redo(timeline, key, note, tmp, &redo) != 0)
+			if (control_note_redo_cached(timeline, key, notes, note, tmp,
+					redo_values, redo_valid, &redo) != 0)
 			{
+				free(note_selections);
+				free(note_sorted);
+				free(redo_values);
+				free(redo_valid);
 				free(tmp);
 				free(plan->chain);
 				free(plan->kept);
@@ -23937,6 +24151,10 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 			if (!already)
 				plan->kept[plan->nkept++] = (PsPruneVersion) {twin->lsn, twin->admission_seq};
 		}
+		free(note_selections);
+		free(note_sorted);
+		free(redo_values);
+		free(redo_valid);
 		free(tmp);
 	}
 	plan->valid = 1;
@@ -23959,28 +24177,91 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
  */
 /* These selections depend only on the page and fences, not the version being
  * classified.  Allocation failure falls back to the original per-version path. */
+typedef struct ControlSelectionRef
+{
+	PageVer *version;
+	uint32_t index;
+} ControlSelectionRef;
+
+static int
+control_selection_ref_cmp(const void *va, const void *vb)
+{
+	const ControlSelectionRef *a = va, *b = vb;
+	if (a->version->lsn != b->version->lsn)
+		return a->version->lsn < b->version->lsn ? -1 : 1;
+	if (a->version->admission_seq != b->version->admission_seq)
+		return a->version->admission_seq < b->version->admission_seq ? -1 : 1;
+	return a->index < b->index ? -1 : a->index > b->index;
+}
+
 static PageVer **
 control_fence_selections(const PageEnt *entry, const PsHistoryFence *fences,
 						 uint32_t nfences)
 {
 	PageVer **selections;
+	ControlSelectionRef *sorted;
 	bool has_B;
 	uint64_t B;
 
-	if (nfences == 0 || sizeof(*selections) > SIZE_MAX / nfences)
+	if (nfences == 0 || sizeof(*selections) > SIZE_MAX / nfences ||
+		entry->nver < 0 || (size_t) entry->nver > SIZE_MAX / sizeof(*sorted))
 		return NULL;
 	selections = calloc(nfences, sizeof(*selections));
-	if (selections == NULL)
-		return NULL;
-	B = timeline_inherited_below(entry->timeline, &has_B);
-	for (uint32_t i = 0; i < nfences; i++)
+	sorted = entry->nver ? malloc((size_t) entry->nver * sizeof(*sorted)) : NULL;
+	if (!selections || (entry->nver && !sorted))
 	{
-		ViewCap cap = {fences[i].lsn, fences[i].seq,
-			fences[i].admission_seq, false};
-
-		if (cap.seq != PS_SEQ_UNBOUNDED)
-			selections[i] = page_select(entry, &cap, B, has_B);
+		free(selections);
+		free(sorted);
+		return NULL;
 	}
+	for (int i = 0; i < entry->nver; i++)
+	{
+		sorted[i].version = &entry->vers[i];
+		sorted[i].index = (uint32_t) i;
+	}
+	if (entry->nver > 1)
+		qsort(sorted, (size_t) entry->nver, sizeof(*sorted), control_selection_ref_cmp);
+	B = timeline_inherited_below(entry->timeline, &has_B);
+	for (uint32_t f = 0; f < nfences; f++)
+	{
+		PsAdmitCap cap = {fences[f].lsn, fences[f].seq, fences[f].admission_seq};
+		uint32_t lo = 0, hi = (uint32_t) entry->nver;
+
+		if (cap.seq == PS_SEQ_UNBOUNDED)
+			continue;
+		while (lo < hi)
+		{
+			uint32_t mid = lo + (hi - lo) / 2;
+			if (sorted[mid].version->lsn <= cap.lsn)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		hi = lo;
+		while (hi != 0)
+		{
+			uint32_t first = hi - 1;
+			uint64_t lsn = sorted[first].version->lsn;
+			while (first != 0 && sorted[first - 1].version->lsn == lsn)
+				first--;
+			for (uint32_t j = hi; j > first; j--)
+			{
+				PageVer *v = sorted[j - 1].version;
+				bool min = v->admission_seq != 0 && v->admission_seq > cap.seq &&
+					v->admission_seq == sorted[first].version->admission_seq;
+
+				if (ps_version_admissible(v->lsn, v->admission_seq, min, &cap, B, has_B))
+				{
+					selections[f] = v;
+					break;
+				}
+			}
+			if (selections[f])
+				break;
+			hi = first;
+		}
+	}
+	free(sorted);
 	return selections;
 }
 
@@ -24053,10 +24334,22 @@ control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
 	if (!lsn_retained)
 	{
 		int			in_flight = 0;
+		uint32_t lo = 0, hi = plan->nchain;
 
-		for (uint32_t i = 0; i < plan->nchain; i++)
-			if (plan->chain[i].lsn == v->lsn)
-				return 0;		/* durable image planned away */
+		/* control_chain_plan sorts the full durable chain. Looking it up once
+		 * per note with a linear scan makes large checkpoint histories quadratic
+		 * while the shard and map locks are held. */
+		while (lo < hi)
+		{
+			uint32_t mid = lo + (hi - lo) / 2;
+
+			if (plan->chain[mid].lsn < v->lsn)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		if (lo < plan->nchain && plan->chain[lo].lsn == v->lsn)
+			return 0;			/* durable image planned away */
 		for (uint32_t i = 0; i < plan->npending && !in_flight; i++)
 			if (plan->pending[i] == v->lsn)
 				in_flight = 1;	/* image written, not durably covered yet */
@@ -24075,6 +24368,865 @@ control_chain_keeps(const PsControlChainPlan *plan, const PageEnt *entry,
 				walidx_base_version_durable(&entry->vers[i]))
 				return 0;
 	return 1;
+}
+
+/* Immutable, fail-closed projection of the full control-note plan.  This is
+ * not publication authority: callers must separately prove complete physical
+ * coverage and revalidate the retention, timeline, admission and map fences. */
+typedef struct ControlNoteDecision
+{
+	uint64_t lsn;
+	uint64_t seq;
+	bool keep;
+} ControlNoteDecision;
+
+static int
+control_note_decision_cmp(const void *va, const void *vb)
+{
+	const ControlNoteDecision *a = va, *b = vb;
+
+	if (a->lsn != b->lsn)
+		return a->lsn < b->lsn ? -1 : 1;
+	return a->seq < b->seq ? -1 : a->seq > b->seq;
+}
+
+/* Caller holds the shard and map locks and has a valid global chain plan. */
+static int
+control_note_decisions_build(const PsControlChainPlan *plan, const PageEnt *notes,
+							 const PsHistoryFence *fences, uint32_t nfences,
+							 ControlNoteDecision **out, uint32_t *count)
+{
+	ControlNoteDecision *items;
+	PageVer **selections = NULL;
+
+	*out = NULL;
+	*count = 0;
+	if (!plan || !plan->valid || !notes || notes->nver <= 0 ||
+		(size_t) notes->nver > SIZE_MAX / sizeof(*items))
+		return -1;
+	items = malloc((size_t) notes->nver * sizeof(*items));
+	if (!items)
+		return -1;
+	if (nfences != 0)
+	{
+		selections = control_fence_selections(notes, fences, nfences);
+		if (!selections)
+		{
+			free(items);
+			return -1;
+		}
+	}
+	for (int i = 0; i < notes->nver; i++)
+	{
+		const PageVer *v = &notes->vers[i];
+		PsPruneVersion version = {v->lsn, v->admission_seq};
+
+		items[i].lsn = v->lsn;
+		items[i].seq = v->admission_seq;
+		items[i].keep = control_chain_keeps(plan, notes, PS_CONTROL_NOTE_BLOCK,
+										   &version, fences, nfences, selections) != 0;
+	}
+	free(selections);
+	qsort(items, (size_t) notes->nver, sizeof(*items), control_note_decision_cmp);
+	for (int i = 1; i < notes->nver; i++)
+		if (items[i - 1].lsn == items[i].lsn && items[i - 1].seq == items[i].seq &&
+			items[i - 1].keep != items[i].keep)
+		{
+			free(items);
+			return -1;
+		}
+	*out = items;
+	*count = (uint32_t) notes->nver;
+	return 0;
+}
+
+/* Unknown versions must never be dropped. */
+static bool
+control_note_decision_keep(const ControlNoteDecision *items, uint32_t count,
+						   uint64_t lsn, uint64_t seq)
+{
+	uint32_t lo = 0, hi = count;
+
+	while (lo < hi)
+	{
+		uint32_t mid = lo + (hi - lo) / 2;
+		const ControlNoteDecision *v = &items[mid];
+
+		if (v->lsn < lsn || (v->lsn == lsn && v->seq < seq))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo == count || items[lo].lsn != lsn || items[lo].seq != seq ||
+		items[lo].keep;
+}
+
+/* Diagnostic for the large-control-history regression: use the same global
+ * chain and fence policy as whole-timeline compaction, but publish nothing. */
+int
+ps_test_control_note_plan(uint32_t timeline, uint64_t *oldest_lsn,
+						  uint32_t *total, uint32_t *kept, int *oldest_kept)
+{
+	PsKey key = {0};
+	PsControlChainPlan plan = {0};
+	PsHistoryFence *fences = NULL;
+	ControlNoteDecision *decisions = NULL;
+	uint32_t ndecisions = 0;
+	PageEnt *notes;
+	uint32_t nfences = 0;
+	uint64_t floor = 0;
+	int rc = -1;
+
+	if (!oldest_lsn || !total || !kept || !oldest_kept)
+		return -1;
+	key.klass = PS_KLASS_CONTROL;
+	ps_lifecycle_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	ps_lock_map_rd();
+	if (retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+			&floor, 1, NULL, NULL, NULL, NULL) != 0 || floor == 0 ||
+		control_prune_fences(timeline, &fences, &nfences) != 0 ||
+		control_chain_plan(timeline, &key, PS_CONTROL_IMAGE_BLOCK, floor,
+						   fences, nfences, &plan) != 0 || !plan.valid)
+		goto done;
+	notes = page_find(timeline, &key, PS_CONTROL_NOTE_BLOCK);
+	if (notes == NULL || notes->nver == 0)
+		goto done;
+	if (control_note_decisions_build(&plan, notes, fences, nfences,
+								 &decisions, &ndecisions) != 0)
+		goto done;
+	if (!control_note_decision_keep(NULL, 0, UINT64_MAX, UINT64_MAX))
+		goto done;
+	*oldest_lsn = UINT64_MAX;
+	*total = (uint32_t) notes->nver;
+	*kept = 0;
+	*oldest_kept = 0;
+	for (int i = 0; i < notes->nver; i++)
+	{
+		PageVer *v = &notes->vers[i];
+		int retain = control_note_decision_keep(decisions, ndecisions,
+										  v->lsn, v->admission_seq);
+
+		if (retain)
+			(*kept)++;
+		if (v->lsn < *oldest_lsn)
+		{
+			*oldest_lsn = v->lsn;
+			*oldest_kept = retain;
+		}
+	}
+	rc = 0;
+done:
+	free(decisions);
+	free(fences);
+	free(plan.chain);
+	free(plan.kept);
+	free(plan.pending);
+	ps_unlock_map();
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	return rc;
+}
+
+typedef struct ControlPairCandidate
+{
+	PsImgIndexEnt identity;
+	bool keep;
+} ControlPairCandidate;
+
+static int
+control_pair_candidate_cmp(const void *va, const void *vb)
+{
+	const ControlPairCandidate *a = va, *b = vb;
+
+	if (a->identity.lsn != b->identity.lsn)
+		return a->identity.lsn < b->identity.lsn ? -1 : 1;
+	if (a->identity.block != b->identity.block)
+		return a->identity.block < b->identity.block ? -1 : 1;
+	return a->identity.admission_seq < b->identity.admission_seq ? -1 :
+		a->identity.admission_seq > b->identity.admission_seq;
+}
+
+/* Caller holds shard and map locks. An LSN is eligible only when every known
+ * member of all three control blocks is durable and the global plan drops it.
+ * Unknown/incomplete pairs are excluded, and later physical coverage must
+ * prove that all copies of every identity are among the selected layers. */
+static int
+control_pair_candidates(uint32_t timeline, const PsKey *key,
+	const PsControlChainPlan *plan, const PsHistoryFence *fences, uint32_t nfences,
+	PsImgIndexEnt **out, uint32_t *out_count)
+{
+	PageEnt *entries[PS_CONTROL_PAIRED_BLOCKS] = {0};
+	ControlPairCandidate *all = NULL;
+	PsImgIndexEnt *eligible = NULL;
+	uint32_t total = 0, used = 0, count = 0;
+	int rc = -1;
+
+	*out = NULL;
+	*out_count = 0;
+	for (uint32_t block = 0; block < PS_CONTROL_PAIRED_BLOCKS; block++)
+	{
+		entries[block] = page_find(timeline, key, block);
+		if (!entries[block] || entries[block]->nver <= 0)
+			return 0; /* no complete group */
+		if ((uint32_t) entries[block]->nver > UINT32_MAX - total)
+			return -1;
+		total += (uint32_t) entries[block]->nver;
+	}
+	if ((size_t) total > SIZE_MAX / sizeof(*all) ||
+		(size_t) total > SIZE_MAX / sizeof(*eligible))
+		return -1;
+	all = calloc(total, sizeof(*all));
+	eligible = calloc(total, sizeof(*eligible));
+	if (!all || !eligible)
+		goto done;
+	for (uint32_t block = 0; block < PS_CONTROL_PAIRED_BLOCKS; block++)
+	{
+		PageEnt *entry = entries[block];
+		PageVer **selections = block != PS_CONTROL_IMAGE_BLOCK && nfences != 0 ?
+			control_fence_selections(entry, fences, nfences) : NULL;
+
+		if (block != PS_CONTROL_IMAGE_BLOCK && nfences != 0 && !selections)
+			goto done;
+		for (int i = 0; i < entry->nver; i++)
+		{
+			PageVer *v = &entry->vers[i];
+			PsPruneVersion version = {v->lsn, v->admission_seq};
+
+			all[used].identity.key = *key;
+			all[used].identity.block = block;
+			all[used].identity.lsn = v->lsn;
+			all[used].identity.admission_seq = v->admission_seq;
+			all[used].keep = !walidx_base_version_durable(v) ||
+				control_chain_keeps(plan, entry, block, &version, fences, nfences, selections);
+			used++;
+		}
+		free(selections);
+	}
+	qsort(all, used, sizeof(*all), control_pair_candidate_cmp);
+	for (uint32_t first = 0; first < used;)
+	{
+		uint32_t end = first, blocks = 0;
+		bool keep = false;
+
+		while (end < used && all[end].identity.lsn == all[first].identity.lsn)
+		{
+			blocks |= 1u << all[end].identity.block;
+			keep |= all[end].keep;
+			end++;
+		}
+		if (!keep && blocks == (1u << PS_CONTROL_PAIRED_BLOCKS) - 1)
+			for (uint32_t i = first; i < end; i++)
+				if (i == first || control_pair_candidate_cmp(&all[i - 1], &all[i]) != 0)
+					eligible[count++] = all[i].identity;
+		first = end;
+	}
+	*out = eligible;
+	*out_count = count;
+	eligible = NULL;
+	rc = 0;
+done:
+	free(all);
+	free(eligible);
+	return rc;
+}
+
+static int
+control_layer_id_cmp(const void *va, const void *vb)
+{
+	const PsLayerDesc *a = va, *b = vb;
+
+	return a->layer_id < b->layer_id ? -1 : a->layer_id > b->layer_id;
+}
+
+static int oldest_artifact_candidates(uint32_t timeline, uint32_t shard,
+	uint64_t floor, PsImgIndexEnt **out, uint32_t *count);
+
+/* Retire complete, globally obsolete control groups in one durable manifest
+ * transaction. Called with all shard locks, prune lock and map write lock;
+ * those locks are released during index scanning, staging and verification. */
+static int
+compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
+	int *prune_deferred)
+{
+	PsKey key = {0};
+	PsControlChainPlan global = {0};
+	PsHistoryFence *fences = NULL;
+	PsLayerDesc *layers = NULL, inputs[PS_IMAGE_MERGE_MAX_INPUTS];
+	PsLayerDesc outputs[PS_CONTROL_PRUNE_MAX_OUTPUTS] = {0};
+	PsImgIndexEnt *candidates = NULL, *drop = NULL;
+	PsImgIndexEnt *winner_ids = NULL;
+	PsImgRec *dropped_recs = NULL;
+	unsigned char *selected = NULL, *coverage = NULL;
+	uint64_t *pin_ids = NULL, output_ids[PS_CONTROL_PRUNE_MAX_OUTPUTS];
+	PsCompactionCoverage *scan = NULL;
+	PsCompactionCoverage *drop_scan = NULL;
+	PsCompactionCoverage *winner_scan = NULL;
+	PsCompactionRelationPlan *plan = NULL;
+	PsImageVerifiedSources *verified_sources = NULL;
+	PsCompactionPruneFence captured = {0}, current = {0};
+	PsTimelineState state;
+	BoundedPruneStage stage = {0};
+	uint32_t nfences = 0, nlayers = 0, npinned = 0, ninputs = 0, ncandidates = 0, nfirst = 0;
+	uint32_t ndrop = 0, noutputs = 0, staged = 0, published = 0, visited = 0;
+	uint64_t kept = 0, verified_drop = 0, uncertain = 0;
+	uint64_t page_epoch;
+	int rc = 0, scan_rc = -1, plan_rc = -1, ambiguous = 0, committed = 0;
+	int winner_rc = -2, winner_valid = -1;
+	int artifact_mode;
+
+	key.klass = PS_KLASS_CONTROL;
+	if (floor == 0 || ps_manifest_poisoned())
+		return 0;
+	page_epoch = g_shards[shard].page_index_epoch;
+	if (page_epoch == UINT64_MAX)
+		return 0;
+	if (ps_retention_epoch(&captured.retention_epoch) != 0 ||
+		!ps_timeline_state(timeline, &state, &captured.timeline_incarnation) ||
+		state != PS_TIMELINE_LIVE ||
+		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+			&captured.page_floor, 1, NULL, NULL, NULL, NULL) != 0 ||
+		captured.page_floor != floor)
+		goto done;
+	artifact_mode = oldest_artifact_candidates(timeline, shard, floor,
+		&candidates, &ncandidates);
+	if (artifact_mode < 0)
+		goto done;
+	if (!artifact_mode)
+	{
+		if (shard != ps_shard_of(&key) ||
+			control_prune_fences(timeline, &fences, &nfences) != 0 ||
+			control_chain_plan(timeline, &key, PS_CONTROL_IMAGE_BLOCK, floor,
+				fences, nfences, &global) != 0 || !global.valid ||
+			control_pair_candidates(timeline, &key, &global, fences, nfences,
+				&candidates, &ncandidates) != 0)
+			goto done;
+	}
+	if (getenv("PAGESTORE_BENCH_RECOVERY") != NULL)
+	{
+		if (artifact_mode)
+			fprintf(stderr, "BENCH artifact_candidates timeline=%u count=%u lsn=%llu\n",
+					timeline, ncandidates,
+					(unsigned long long) (ncandidates ? candidates[0].lsn : 0));
+		else
+		{
+		PageEnt *old_notes = page_find(timeline, &key, PS_CONTROL_NOTE_BLOCK);
+		uint64_t oldest = UINT64_MAX;
+		uint32_t members[PS_CONTROL_PAIRED_BLOCKS] = {0};
+		uint32_t retained[PS_CONTROL_PAIRED_BLOCKS] = {0};
+
+		if (old_notes)
+			for (int i = 0; i < old_notes->nver; i++)
+				if (old_notes->vers[i].lsn < oldest)
+					oldest = old_notes->vers[i].lsn;
+		for (uint32_t block = 0; block < PS_CONTROL_PAIRED_BLOCKS; block++)
+		{
+			PageEnt *entry = page_find(timeline, &key, block);
+
+			if (!entry)
+				continue;
+			for (int i = 0; i < entry->nver; i++)
+				if (entry->vers[i].lsn == oldest)
+				{
+					PsPruneVersion version = {entry->vers[i].lsn, entry->vers[i].admission_seq};
+					members[block]++;
+					retained[block] += !walidx_base_version_durable(&entry->vers[i]) ||
+						control_chain_keeps(&global, entry, block, &version, fences, nfences, NULL);
+				}
+		}
+		fprintf(stderr, "BENCH control_pair_candidates timeline=%u count=%u fences=%u\n",
+				timeline, ncandidates, nfences);
+		fprintf(stderr, "BENCH control_oldest note=%llu first_candidate=%llu members=%u,%u,%u retained=%u,%u,%u\n",
+				(unsigned long long) oldest,
+				(unsigned long long) (ncandidates ? candidates[0].lsn : 0),
+				members[0], members[1], members[2], retained[0], retained[1], retained[2]);
+		{
+			static bool reported;
+
+			if (!reported && oldest != UINT64_MAX)
+			{
+				reported = true;
+				for (uint32_t sh = 0; sh < core_shards(); sh++)
+					for (uint32_t b = 0; b < IDX_BUCKETS; b++)
+						for (PageEnt *entry = g_shards[sh].page_idx[b]; entry; entry = entry->next)
+							if (entry->timeline == timeline &&
+								(entry->key.klass == PS_KLASS_SLRU || entry->key.klass == PS_KLASS_READER_SNAPSHOT))
+								for (int i = 0; i < entry->nver; i++)
+									if (entry->vers[i].lsn == oldest)
+										fprintf(stderr, "BENCH control_oldest_artifact klass=%u spc=%u db=%u rel=%u fork=%d block=%u versions=%d seq=%llu\n",
+											entry->key.klass, entry->key.spcOid, entry->key.dbOid,
+											entry->key.relNumber, entry->key.forkNum, entry->block, entry->nver,
+											(unsigned long long) entry->vers[i].admission_seq);
+			}
+		}
+		}
+	}
+	if (ncandidates == 0)
+		goto done;
+	while (nfirst < ncandidates && candidates[nfirst].lsn == candidates[0].lsn)
+		nfirst++;
+	if (nfirst > PS_BOUNDED_PRUNE_MAX_DROPPED)
+		goto done;
+	captured.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	captured.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		const PsLayerDesc *d = &ps_layer_map.layers[i];
+		if (d->timeline == timeline && layer_shard_from_id(d->layer_id) == shard &&
+			d->kind == PS_LAYER_IMAGE && !d->deleting)
+			nlayers++;
+	}
+	if (nlayers == 0)
+		goto done;
+	layers = calloc(nlayers, sizeof(*layers));
+	pin_ids = calloc(nlayers, sizeof(*pin_ids));
+	selected = calloc(nlayers, 1);
+	coverage = calloc(ncandidates, 1);
+	drop = calloc(ncandidates, sizeof(*drop));
+	stage.selected = calloc(PS_CONTROL_PRUNE_MAX_SELECTED, sizeof(*stage.selected));
+	stage.dropped = calloc(PS_BOUNDED_PRUNE_MAX_DROPPED, sizeof(*stage.dropped));
+	stage.sel_group = calloc(PS_IMAGE_GROUP_MAX_VERSIONS, sizeof(*stage.sel_group));
+	stage.drop_group = calloc(PS_IMAGE_GROUP_MAX_VERSIONS, sizeof(*stage.drop_group));
+	dropped_recs = calloc(PS_BOUNDED_PRUNE_MAX_DROPPED, sizeof(*dropped_recs));
+	if (!layers || !pin_ids || !selected || !coverage || !drop || !stage.selected ||
+		!stage.dropped || !stage.sel_group || !stage.drop_group || !dropped_recs)
+		goto done;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		if (d->timeline != timeline || layer_shard_from_id(d->layer_id) != shard ||
+			d->kind != PS_LAYER_IMAGE || d->deleting)
+			continue;
+		if (d->legacy_shard_zero || d->remote_durable || tier_local_location(d) == NULL ||
+			__atomic_load_n(&d->cache_readers, __ATOMIC_ACQUIRE) != 0)
+			goto done;
+		__atomic_add_fetch(&d->cache_readers, 1, __ATOMIC_ACQ_REL);
+		layers[npinned] = *d;
+		pin_ids[npinned++] = d->layer_id;
+	}
+	qsort(layers, nlayers, sizeof(*layers), control_layer_id_cmp);
+	for (uint32_t i = 0; i < PS_CONTROL_PRUNE_MAX_OUTPUTS; i++)
+	{
+		output_ids[i] = alloc_layer_id(&g_shards[shard]);
+		if (output_ids[i] <= layers[nlayers - 1].layer_id ||
+			(i != 0 && output_ids[i] <= output_ids[i - 1]))
+			goto done;
+	}
+	if (ps_compaction_coverage_open(layers, nlayers, selected, candidates, nfirst, &scan) != 0 ||
+		(!artifact_mode && ps_compaction_coverage_require_control_groups(scan) != 0) ||
+		ps_compaction_coverage_bind_snapshot(scan, &ps_layer_map, &captured) != 0)
+		goto done;
+	ps_unlock_map();
+	pthread_rwlock_unlock(&page_prune_lock);
+	for (uint32_t s = core_shards(); s > 0; s--)
+		ps_unlock_shard(s - 1);
+	do { scan_rc = ps_compaction_coverage_step(scan, 128); } while (scan_rc == 1);
+	if (scan_rc == 0)
+	{
+		int found = ps_compaction_coverage_select_found_sources(scan, UINT32_MAX,
+			PS_IMAGE_MERGE_MAX_INPUTS, selected, nlayers);
+
+		if (found > 0)
+		{
+			for (uint32_t i = 0; i < nlayers; i++)
+				if (selected[i])
+					inputs[ninputs++] = layers[i];
+			if (ps_compaction_coverage_open(layers, nlayers, selected,
+					candidates, ncandidates, &drop_scan) == 0 &&
+				(artifact_mode || ps_compaction_coverage_require_control_groups(drop_scan) == 0))
+			{
+				int drop_rc;
+
+				do { drop_rc = ps_compaction_coverage_step(drop_scan, 128); } while (drop_rc == 1);
+				if (drop_rc == 0 && ps_compaction_coverage_results(drop_scan, coverage, ncandidates) == 0)
+					for (uint32_t first = 0; first < ncandidates;)
+					{
+						uint32_t end = first;
+						bool complete = true;
+
+						while (end < ncandidates && candidates[end].lsn == candidates[first].lsn)
+							complete &= coverage[end++] != 0;
+						if (complete && end - first <= PS_BOUNDED_PRUNE_MAX_DROPPED - ndrop)
+						{
+							memcpy(drop + ndrop, candidates + first,
+								(size_t) (end - first) * sizeof(*drop));
+							ndrop += end - first;
+						}
+						first = end;
+					}
+			}
+		}
+		if (ndrop != 0 && ps_compaction_control_plan_open(inputs, ninputs,
+				PS_IMAGE_GROUP_MAX_VERSIONS, drop, ndrop, &plan) == 0)
+		{
+			do { plan_rc = ps_compaction_relation_plan_step(plan, 32,
+					bounded_control_collect, &stage, &visited); } while (plan_rc == 1);
+			ps_compaction_relation_plan_close(plan);
+			plan = NULL;
+		}
+	}
+	if (plan_rc == 0 && stage.ndropped == ndrop && stage.nselected != 0)
+	{
+		winner_ids = calloc(stage.nselected, sizeof(*winner_ids));
+		if (!winner_ids)
+			plan_rc = -1;
+		for (uint32_t i = 0; plan_rc == 0 && i < stage.nselected; i++)
+			winner_ids[i] = stage.selected[i].entry;
+		if (plan_rc == 0 && ps_compaction_coverage_open(layers, nlayers, selected,
+				winner_ids, stage.nselected, &winner_scan) == 0)
+		{
+			do { winner_rc = ps_compaction_coverage_step(winner_scan, 128); }
+			while (winner_rc == 1);
+			winner_valid = winner_rc == 0 && ps_compaction_coverage_selected_winners_valid(
+					winner_scan, stage.selected, stage.nselected);
+			if (!winner_valid)
+				plan_rc = -1;
+		}
+		else
+			plan_rc = -1;
+		if (plan_rc == 0 && ps_image_compaction_sources_open(inputs, ninputs,
+				page_size, &verified_sources) != 0)
+			plan_rc = -1;
+		noutputs = (stage.nselected + PS_IMAGE_BATCH_MAX_RECORDS - 1) / PS_IMAGE_BATCH_MAX_RECORDS;
+		for (uint32_t i = 0; plan_rc == 0 && i < noutputs; i++)
+		{
+			uint32_t offset = i * PS_IMAGE_BATCH_MAX_RECORDS;
+			uint32_t count = stage.nselected - offset;
+			int write_rc;
+			if (count > PS_IMAGE_BATCH_MAX_RECORDS)
+				count = PS_IMAGE_BATCH_MAX_RECORDS;
+			write_rc = ps_image_compaction_stage_verified_batch(verified_sources,
+				stage.selected + offset, count, output_ids[i], &outputs[i], &uncertain);
+			if (write_rc != 0)
+			{
+				plan_rc = -1;
+				ambiguous = write_rc == -2;
+				break;
+			}
+			staged++;
+		}
+		if (plan_rc == 0 && ps_image_compaction_sources_revalidate(verified_sources) != 0)
+			plan_rc = -1;
+		if (plan_rc == 0)
+			plan_rc = ps_compaction_verify_control_plan(inputs, ninputs, outputs, noutputs,
+				page_size, PS_IMAGE_GROUP_MAX_VERSIONS, drop, ndrop,
+				bounded_prune_check_drops, &stage, &kept, &verified_drop);
+		if (plan_rc == 0 && (kept != stage.nselected || verified_drop != ndrop ||
+			stage.checked != ndrop))
+			plan_rc = -1;
+	}
+	else
+		plan_rc = -1;
+	if (getenv("PAGESTORE_BENCH_RECOVERY") != NULL)
+		fprintf(stderr, "BENCH control_pair_stage timeline=%u layers=%u inputs=%u scan=%d drop=%u selected=%u staged_drop=%u winner_rc=%d winner_valid=%d outputs=%u staged=%u plan=%d\n",
+				timeline, nlayers, ninputs, scan_rc, ndrop, stage.nselected,
+				stage.ndropped, winner_rc, winner_valid, noutputs, staged, plan_rc);
+	if (plan_rc == 0)
+		for (uint32_t i = 0; i < ndrop; i++)
+		{
+			dropped_recs[i].key = stage.dropped[i].entry.key;
+			dropped_recs[i].block = stage.dropped[i].entry.block;
+			dropped_recs[i].lsn = stage.dropped[i].entry.lsn;
+			dropped_recs[i].admission_seq = stage.dropped[i].entry.admission_seq;
+		}
+	if (plan_rc == 0 && compaction_unlocked_test_hook != NULL)
+		compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
+	for (uint32_t s = 0; s < core_shards(); s++)
+		ps_lock_shard_wr(s);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	if (plan_rc != 0 || ps_manifest_poisoned() ||
+		ps_retention_epoch(&current.retention_epoch) != 0 ||
+		!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
+		state != PS_TIMELINE_LIVE ||
+		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+			&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+		goto done;
+	current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	if (g_shards[shard].page_index_epoch != page_epoch ||
+		!ps_compaction_coverage_inputs_match(scan, inputs, ninputs) ||
+		!ps_compaction_coverage_publication_valid(scan, &ps_layer_map, &current,
+			outputs, noutputs, 0))
+		goto done;
+	if (page_frontier_advance(timeline, floor,
+			captured.admission_epoch ? captured.admission_epoch - 1 : 0) != 0 ||
+		ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) != 0)
+		goto done;
+	for (uint32_t i = 0; i < noutputs; i++)
+	{
+		if (!ps_compaction_coverage_publication_valid(scan, &ps_layer_map, &current,
+				outputs, noutputs, i) || ps_manifest_add_new_layer(&outputs[i]) != 0)
+		{
+			ambiguous = 1;
+			rc = -1;
+			goto done;
+		}
+		published++;
+	}
+	if (ps_fault_probe(PS_FAULT_POINT_PAGE_COMPACTION_AFTER_PUBLISH) != 0)
+		goto done;
+	if (!ps_compaction_coverage_publication_valid(scan, &ps_layer_map, &current,
+			outputs, noutputs, noutputs) ||
+		ps_manifest_retire_image_sources_atomic(inputs, ninputs, outputs, noutputs) != 0)
+	{
+		ambiguous = 1;
+		rc = -1;
+		goto done;
+	}
+	committed = 1;
+	/* A crash here must replay either all source tombstones or none. If a
+	 * non-crash probe fails, still reconcile the live in-memory index. */
+	(void) ps_fault_probe(PS_FAULT_POINT_PAGE_GC_AFTER_MARK_DELETE);
+	page_remove_compacted_versions(timeline, dropped_recs, ndrop);
+	if (metrics_header != NULL)
+	{
+		ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+		ps_fetch_add_u64(&metrics_header->page_prune_compactions, 1);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_scanned, stage.scanned);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_kept, stage.nselected);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted, stage.scanned - stage.nselected);
+		ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+	}
+	if (getenv("PAGESTORE_BENCH_RECOVERY") != NULL)
+		fprintf(stderr, "BENCH control_pair_prune timeline=%u layers=%u inputs=%u candidates=%u dropped=%u\n",
+				timeline, nlayers, ninputs, ncandidates, ndrop);
+	__atomic_fetch_add(&test_bounded_prune_published_count, 1, __ATOMIC_RELAXED);
+	inspection_metrics_changed();
+	*prune_deferred = 1;
+	rc = 1;
+done:
+	ps_compaction_relation_plan_close(plan);
+	ps_image_compaction_sources_close(verified_sources);
+	ps_compaction_coverage_close(drop_scan);
+	ps_compaction_coverage_close(winner_scan);
+	ps_compaction_coverage_close(scan);
+	if (npinned != 0)
+	{
+		qsort(pin_ids, npinned, sizeof(*pin_ids), cmp_u64);
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (bsearch(&ps_layer_map.layers[i].layer_id, pin_ids, npinned,
+						sizeof(*pin_ids), cmp_u64) != NULL)
+				__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+	}
+	/* Any submitted or ambiguous output survives for manifest replay. */
+	if (!committed)
+		for (uint32_t i = published + (ambiguous ? 1 : 0); i < staged; i++)
+			(void) ps_layer_store->delete_local_layer(&outputs[i]);
+	free(fences);
+	free(global.chain);
+	free(global.kept);
+	free(global.pending);
+	free(layers);
+	free(pin_ids);
+	free(selected);
+	free(coverage);
+	free(candidates);
+	free(drop);
+	free(winner_ids);
+	free(stage.selected);
+	free(stage.dropped);
+	free(stage.sel_group);
+	free(stage.drop_group);
+	free(dropped_recs);
+	return rc;
+}
+
+/* Integrated preflight only; never publishes or removes control records. */
+static int
+control_coverage_preflight(uint32_t timeline, uint32_t selected_limit, bool paired,
+	void (*unlocked_hook)(void *), void *hook_arg, uint32_t *candidates, uint32_t *covered)
+{
+	PsKey key = {0};
+	PsControlChainPlan plan = {0};
+	PsHistoryFence *fences = NULL;
+	ControlNoteDecision *decisions = NULL;
+	PsLayerDesc *layers = NULL;
+	uint64_t *pin_ids = NULL;
+	PsImgIndexEnt *identities = NULL;
+	unsigned char *selected = NULL, *results = NULL;
+	PsCompactionCoverage *scan = NULL;
+	PsCompactionPruneFence captured = {0}, current = {0};
+	PsTimelineState state;
+	PageEnt *notes;
+	uint32_t nfences = 0, ndecisions = 0, nlayers = 0, n = 0, npinned = 0;
+	uint32_t shard, observed = 0;
+	int rc = -1, scan_rc = -1;
+
+	if (!candidates || !covered || selected_limit == 0)
+		return -1;
+	*candidates = *covered = 0;
+	key.klass = PS_KLASS_CONTROL;
+	shard = ps_shard_of(&key);
+	ps_lifecycle_read_lock();
+	for (uint32_t s = 0; s < core_shards(); s++)
+		ps_lock_shard_wr(s);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	if (ps_manifest_poisoned() || ps_retention_epoch(&captured.retention_epoch) != 0 ||
+		!ps_timeline_state(timeline, &state, &captured.timeline_incarnation) ||
+		state != PS_TIMELINE_LIVE ||
+		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+			&captured.page_floor, 1, NULL, NULL, NULL, NULL) != 0 ||
+		captured.page_floor == 0 ||
+		control_prune_fences(timeline, &fences, &nfences) != 0 ||
+		control_chain_plan(timeline, &key, PS_CONTROL_IMAGE_BLOCK, captured.page_floor,
+			fences, nfences, &plan) != 0 || !plan.valid)
+		goto done;
+	captured.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	captured.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	notes = page_find(timeline, &key, PS_CONTROL_NOTE_BLOCK);
+	if (!notes || control_note_decisions_build(&plan, notes, fences, nfences,
+											 &decisions, &ndecisions) != 0)
+		goto done;
+	if (paired)
+	{
+		if (control_pair_candidates(timeline, &key, &plan, fences, nfences,
+									&identities, &n) != 0)
+			goto done;
+	}
+	else
+	{
+		identities = calloc(ndecisions, sizeof(*identities));
+		if (!identities)
+			goto done;
+		for (uint32_t i = 0; i < ndecisions; i++)
+		{
+			if (decisions[i].keep || (i > 0 && decisions[i].lsn == decisions[i - 1].lsn &&
+				decisions[i].seq == decisions[i - 1].seq))
+				continue;
+			identities[n].key = key;
+			identities[n].block = PS_CONTROL_NOTE_BLOCK;
+			identities[n].lsn = decisions[i].lsn;
+			identities[n].admission_seq = decisions[i].seq;
+			n++;
+		}
+	}
+	if (n == 0)
+	{
+		rc = 0;
+		goto done;
+	}
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		if (d->timeline == timeline && layer_shard_from_id(d->layer_id) == shard &&
+			d->kind == PS_LAYER_IMAGE && !d->deleting)
+			nlayers++;
+	}
+	if (nlayers == 0)
+		goto done;
+	layers = calloc(nlayers, sizeof(*layers));
+	pin_ids = calloc(nlayers, sizeof(*pin_ids));
+	selected = calloc(nlayers, 1);
+	results = calloc(n, 1);
+	if (!layers || !pin_ids || !selected || !results)
+		goto done;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		if (d->timeline != timeline || layer_shard_from_id(d->layer_id) != shard ||
+			d->kind != PS_LAYER_IMAGE || d->deleting)
+			continue;
+		if (__atomic_load_n(&d->cache_readers, __ATOMIC_ACQUIRE) == UINT32_MAX)
+			goto done;
+		__atomic_add_fetch(&d->cache_readers, 1, __ATOMIC_ACQ_REL);
+		layers[npinned] = *d;
+		pin_ids[npinned] = d->layer_id;
+		selected[npinned] = npinned < selected_limit;
+		npinned++;
+	}
+	if (ps_compaction_coverage_open(layers, nlayers, selected, identities, n, &scan) != 0 ||
+		(paired && ps_compaction_coverage_require_control_groups(scan) != 0) ||
+		ps_compaction_coverage_bind_snapshot(scan, &ps_layer_map, &captured) != 0)
+		goto done;
+	ps_unlock_map();
+	pthread_rwlock_unlock(&page_prune_lock);
+	for (uint32_t s = core_shards(); s > 0; s--)
+		ps_unlock_shard(s - 1);
+	do { scan_rc = ps_compaction_coverage_step(scan, 128); } while (scan_rc == 1);
+	if (unlocked_hook)
+		unlocked_hook(hook_arg);
+	for (uint32_t s = 0; s < core_shards(); s++)
+		ps_lock_shard_wr(s);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	if (scan_rc != 0 || ps_manifest_poisoned() ||
+		ps_retention_epoch(&current.retention_epoch) != 0 ||
+		!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
+		state != PS_TIMELINE_LIVE ||
+		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+			&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+		goto done;
+	current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	if (!ps_compaction_coverage_snapshot_valid(scan, &ps_layer_map, &current) ||
+		ps_compaction_coverage_results(scan, results, n) != 0)
+		goto done;
+	if (paired)
+	{
+		for (uint32_t first = 0; first < n;)
+		{
+			uint32_t end = first;
+			bool complete = true;
+
+			while (end < n && identities[end].lsn == identities[first].lsn)
+				complete &= results[end++] != 0;
+			observed += complete;
+			(*candidates)++;
+			first = end;
+		}
+	}
+	else
+	{
+		for (uint32_t i = 0; i < n; i++)
+			observed += results[i] != 0;
+		*candidates = n;
+	}
+	*covered = observed;
+	rc = 0;
+done:
+	if (npinned != 0)
+	{
+		qsort(pin_ids, npinned, sizeof(*pin_ids), cmp_u64);
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (bsearch(&ps_layer_map.layers[i].layer_id, pin_ids, npinned,
+						sizeof(*pin_ids), cmp_u64) != NULL)
+				__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+	}
+	ps_compaction_coverage_close(scan);
+	free(results);
+	free(selected);
+	free(pin_ids);
+	free(layers);
+	free(identities);
+	free(decisions);
+	free(fences);
+	free(plan.chain);
+	free(plan.kept);
+	free(plan.pending);
+	ps_unlock_map();
+	pthread_rwlock_unlock(&page_prune_lock);
+	for (uint32_t s = core_shards(); s > 0; s--)
+		ps_unlock_shard(s - 1);
+	ps_lifecycle_read_unlock();
+	return rc;
+}
+
+int
+ps_test_control_note_coverage(uint32_t timeline, uint32_t selected_limit,
+	void (*unlocked_hook)(void *), void *hook_arg, uint32_t *candidates, uint32_t *covered)
+{
+	return control_coverage_preflight(timeline, selected_limit, false,
+		unlocked_hook, hook_arg, candidates, covered);
+}
+
+int
+ps_test_control_pair_coverage(uint32_t timeline, uint32_t selected_limit,
+	void (*unlocked_hook)(void *), void *hook_arg, uint32_t *candidates, uint32_t *covered)
+{
+	return control_coverage_preflight(timeline, selected_limit, true,
+		unlocked_hook, hook_arg, candidates, covered);
 }
 
 static int
@@ -24163,6 +25315,68 @@ control_chain_keeps_reference(const PsControlChainPlan *plan, const PageEnt *ent
 	return 1;
 }
 
+/* Exercise the immutable projection with a checkpoint chain of realistic
+ * length; compare sparse samples against the original linear policy. */
+int
+ps_test_control_note_decisions(uint32_t n)
+{
+	PageEnt notes = {0};
+	PsControlChainPlan plan = {0};
+	ControlNoteDecision *decisions = NULL;
+	PsPruneVersion last;
+	uint32_t count = 0;
+	int rc = -1;
+
+	if (n < 2 || n > 100000)
+		return -1;
+	notes.vers = calloc(n, sizeof(*notes.vers));
+	plan.chain = calloc(n, sizeof(*plan.chain));
+	if (!notes.vers || !plan.chain)
+		goto done;
+	notes.nver = (int) n;
+	plan.nchain = n;
+	plan.nkept = 1;
+	plan.kept = &last;
+	plan.image_max_lsn = (uint64_t) n * 2;
+	plan.valid = 1;
+	for (uint32_t i = 0; i < n; i++)
+	{
+		notes.vers[i].lsn = (uint64_t) (i + 1) * 2;
+		notes.vers[i].admission_seq = i + 1;
+		notes.vers[i].seg = -1;
+		plan.chain[i] = (PsPruneVersion) {notes.vers[i].lsn, i + 1};
+	}
+	last = plan.chain[n - 1];
+	if (control_note_decisions_build(&plan, &notes, NULL, 0,
+								 &decisions, &count) != 0 || count != n)
+		goto done;
+	for (uint32_t i = 0; i < n; i++)
+	{
+		bool keep = control_note_decision_keep(decisions, count,
+											 notes.vers[i].lsn, notes.vers[i].admission_seq);
+
+		if (keep != (i == n - 1))
+			goto done;
+		if (i % 127 == 0)
+		{
+			PsPruneVersion v = {notes.vers[i].lsn, notes.vers[i].admission_seq};
+
+			if (keep != (control_chain_keeps_reference(&plan, &notes,
+						PS_CONTROL_NOTE_BLOCK, &v, NULL, 0) != 0))
+				goto done;
+		}
+	}
+	if (!control_note_decision_keep(decisions, count, 1, 1) ||
+		!control_note_decision_keep(decisions, count, 2, UINT64_MAX))
+		goto done;
+	rc = 0;
+done:
+	free(decisions);
+	free(notes.vers);
+	free(plan.chain);
+	return rc;
+}
+
 
 /* Differential coverage for finite fences, duplicate versions and retries. */
 int
@@ -24198,6 +25412,7 @@ ps_test_control_fence_selections(void)
 		}
 		plan.nkept = (uint32_t) (trial % 25);
 		plan.nchain = (uint32_t) ((trial * 3) % 25);
+		qsort(chain, plan.nchain, sizeof(*chain), prune_version_cmp);
 		plan.npending = (uint32_t) ((trial * 7) % 25);
 		plan.image_max_lsn = 20;
 		for (int i = 0; i < 12; i++)
@@ -24210,6 +25425,19 @@ ps_test_control_fence_selections(void)
 		selected = control_fence_selections(&entry, fences, 12);
 		if (selected == NULL)
 			return -1;
+		for (int f = 0; f < 12; f++)
+			if (fences[f].seq != PS_SEQ_UNBOUNDED)
+			{
+				bool has_B;
+				uint64_t B = timeline_inherited_below(entry.timeline, &has_B);
+				ViewCap cap = {fences[f].lsn, fences[f].seq, fences[f].admission_seq, false};
+
+				if (selected[f] != page_select(&entry, &cap, B, has_B))
+				{
+					free(selected);
+					return trial + 1;
+				}
+			}
 		for (uint32_t block = 0; block <= PS_CONTROL_PAIRED_BLOCKS; block++)
 			for (int i = 0; i < 24; i++)
 			{
@@ -24549,6 +25777,147 @@ artifact_fence_snapshot(uint32_t timeline, uint64_t **lsns_out,
 	return 0;
 }
 
+/* Reuse the established whole-object artifact policy on a bounded in-memory
+ * metadata snapshot, then propose only obsolete versions at the oldest fence.
+ * Payloads and unrelated objects are not gathered. Caller holds all shard,
+ * page-prune and map locks. Pending or unprovable objects fail closed. */
+static int
+oldest_artifact_candidates(uint32_t timeline, uint32_t shard, uint64_t floor,
+	PsImgIndexEnt **out, uint32_t *count)
+{
+	uint64_t oldest = UINT64_MAX;
+	uint32_t pending = 0;
+	bool report = false;
+	static uint64_t last_reported_oldest;
+
+	*out = NULL;
+	*count = 0;
+	pthread_mutex_lock(&artifact_fence_lock);
+	if (nartifact_fences == UINT32_MAX)
+	{
+		pthread_mutex_unlock(&artifact_fence_lock);
+		return -1;
+	}
+	for (uint32_t i = 0; i < nartifact_fences; i++)
+		if (artifact_fences[i].timeline == timeline &&
+			(artifact_fences[i].versions || artifact_fences[i].pending) &&
+			artifact_fences[i].lsn < oldest)
+		{
+			oldest = artifact_fences[i].lsn;
+			pending = artifact_fences[i].pending;
+		}
+	pthread_mutex_unlock(&artifact_fence_lock);
+	if (getenv("PAGESTORE_BENCH_RECOVERY") != NULL && oldest != last_reported_oldest)
+	{
+		last_reported_oldest = oldest;
+		report = true;
+		fprintf(stderr, "BENCH oldest_artifact_scan timeline=%u shard=%u lsn=%llu floor=%llu pending=%u\n",
+				timeline, shard, (unsigned long long) oldest, (unsigned long long) floor, pending);
+	}
+	if (oldest == UINT64_MAX || pending || oldest >= floor)
+		return 0;
+	for (uint32_t b = 0; b < IDX_BUCKETS; b++)
+		for (PageEnt *entry = g_shards[shard].page_idx[b]; entry; entry = entry->next)
+		{
+			ForkEnt *object;
+			PsImgRec *records = NULL, *dropped = NULL;
+			CompactOrder *order = NULL;
+			PsImgIndexEnt *identities = NULL;
+			uint32_t total = 0, nrecords, ndropped = 0, n = 0;
+			bool found = false, too_large = false;
+			int plan_rc;
+
+			if (entry->timeline != timeline ||
+				(entry->key.klass != PS_KLASS_READER_SNAPSHOT && entry->key.klass != PS_KLASS_SLRU))
+				continue;
+			for (int i = 0; i < entry->nver; i++)
+				if (entry->vers[i].lsn == oldest)
+					found = true;
+			if (found && report)
+				fprintf(stderr, "BENCH oldest_artifact_entry klass=%u rel=%u block=%u versions=%d\n",
+						entry->key.klass, entry->key.relNumber, entry->block, entry->nver);
+			if (!found || !(object = fork_find(timeline, &entry->key)))
+				continue;
+			for (PageEnt *page = object->pages; page; page = page->fork_next)
+			{
+				if (page->nver < 0 || (uint32_t) page->nver > 262144u - total)
+				{
+					too_large = true;
+					break;
+				}
+				total += (uint32_t) page->nver;
+			}
+			if (too_large || total == 0)
+				continue;
+			records = calloc(total, sizeof(*records));
+			if (!records)
+				return -1;
+			nrecords = 0;
+			for (PageEnt *page = object->pages; page; page = page->fork_next)
+				for (int i = 0; i < page->nver; i++)
+				{
+					records[nrecords].key = page->key;
+					records[nrecords].block = page->block;
+					records[nrecords].lsn = page->vers[i].lsn;
+					records[nrecords].admission_seq = page->vers[i].admission_seq;
+					nrecords++;
+				}
+			order = compact_build_order(records, nrecords);
+			plan_rc = order ? prune_compaction_records(timeline, records, &nrecords,
+				floor, order, &dropped, &ndropped) : -1;
+			free(order);
+			free(records);
+			if (plan_rc != 0)
+			{
+				free(dropped);
+				return -1;
+			}
+			identities = calloc(ndropped ? ndropped : 1, sizeof(*identities));
+			if (!identities)
+			{
+				free(dropped);
+				return -1;
+			}
+			for (uint32_t i = 0; i < ndropped; i++)
+			{
+				PsImgRec *v = &dropped[i];
+				PageEnt *page;
+				bool durable = true;
+
+				if (v->lsn != oldest ||
+					(v->key.klass != PS_KLASS_READER_SNAPSHOT && v->key.klass != PS_KLASS_SLRU))
+					continue;
+				page = page_find(timeline, &v->key, v->block);
+				if (!page)
+					continue;
+				for (int j = 0; j < page->nver; j++)
+					if (page->vers[j].lsn == v->lsn &&
+						page->vers[j].admission_seq == v->admission_seq &&
+						!walidx_base_version_durable(&page->vers[j]))
+						durable = false;
+				if (!durable)
+					continue;
+				identities[n].key = v->key;
+				identities[n].block = v->block;
+				identities[n].lsn = v->lsn;
+				identities[n].admission_seq = v->admission_seq;
+				n++;
+			}
+			free(dropped);
+			if (report)
+				fprintf(stderr, "BENCH oldest_artifact_plan rel=%u block=%u dropped=%u eligible=%u\n",
+						entry->key.relNumber, entry->block, ndropped, n);
+			if (n)
+			{
+				*out = identities;
+				*count = n;
+				return 1;
+			}
+			free(identities);
+		}
+	return 0;
+}
+
 /* Caller holds map-rd or map-wr.  Callers that act on the snapshot also
  * fence pin mutations with admission-rd or the page-prune read fence. */
 static int
@@ -24848,6 +26217,16 @@ control_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 		{
 			free(fences);
 			return -1;
+		}
+		if (getenv("PAGESTORE_BENCH_RECOVERY") != NULL && timeline == 0)
+		{
+			uint64_t oldest = UINT64_MAX;
+
+			for (uint32_t i = 0; i < nartifacts; i++)
+				if (artifacts[i] < oldest)
+					oldest = artifacts[i];
+			fprintf(stderr, "BENCH control_artifact_fences count=%u oldest=%llu prior=%u\n",
+					nartifacts, (unsigned long long) oldest, nfences);
 		}
 		if (nartifacts != 0)
 		{
@@ -26265,6 +27644,8 @@ recover_layer_prefix(uint32_t shard)
 	LayerRecoverRec *recs = NULL;
 	RecoveryVerifyJob *verify_jobs = NULL;
 	uint32_t nverify = 0, verify_cap = 0;
+	bool bench = getenv("PAGESTORE_BENCH_RECOVERY") != NULL;
+	uint64_t bench_start = bench ? inspection_now_ns() : 0, bench_last = bench_start;
 	unsigned char *batched = NULL;
 	uint32_t	nrec = 0,
 				cap = 0;
@@ -26378,6 +27759,12 @@ recover_layer_prefix(uint32_t shard)
 			ps_layer_store->delete_local_layer(d) != 0)
 			goto fail;
 	}
+	if (bench)
+	{
+		fprintf(stderr, "BENCH index_collect_ns=%llu records=%u layers=%u\n",
+				(unsigned long long) (inspection_now_ns() - bench_last), nrec, nverify);
+		bench_last = inspection_now_ns();
+	}
 	if (nverify != 0)
 	{
 		RecoveryVerifyBatch batch = {verify_jobs, nverify, 0};
@@ -26420,6 +27807,12 @@ recover_layer_prefix(uint32_t shard)
 		}
 		free(verify);
 	}
+	if (bench)
+	{
+		fprintf(stderr, "BENCH verify_ns=%llu\n",
+				(unsigned long long) (inspection_now_ns() - bench_last));
+		bench_last = inspection_now_ns();
+	}
 	free(verify_jobs);
 	verify_jobs = NULL;
 
@@ -26458,6 +27851,12 @@ recover_layer_prefix(uint32_t shard)
 	batched = calloc(nrec, sizeof(*batched));
 	if (batched != NULL)
 		layer_growth_batch(recs, nrec, batched);
+	if (bench)
+	{
+		fprintf(stderr, "BENCH sort_batch_ns=%llu\n",
+				(unsigned long long) (inspection_now_ns() - bench_last));
+		bench_last = inspection_now_ns();
+	}
 	for (uint32_t i = 0; i < nrec; i++)
 	{
 		PsImgIndexEnt *e = &recs[i].ent;
@@ -26492,6 +27891,10 @@ recover_layer_prefix(uint32_t shard)
 			goto fail;
 		}
 	}
+	if (bench)
+		fprintf(stderr, "BENCH replay_ns=%llu total_ns=%llu\n",
+				(unsigned long long) (inspection_now_ns() - bench_last),
+				(unsigned long long) (inspection_now_ns() - bench_start));
 	free(batched);
 	free(recs);
 	return 0;
@@ -28985,7 +30388,8 @@ compact_budget_retry_now(uint32_t timeline, uint32_t shard, uint32_t nshards)
 	ps_lock_map_wr();
 	/* A rejected legacy pass cannot clear a stale staged-conflict latch. */
 	g_shards[shard].staged_compaction_retries = 0;
-	if (ps_timeline_live(timeline) && prune_abandon_local_only() &&
+	if (ps_timeline_live(timeline) &&
+		(prune_abandon_local_only() || control_prune_provider_supported()) &&
 		count_image_layers(timeline, shard) != 0 &&
 		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
 			&floor, 1, NULL, NULL, NULL, NULL) == 0)
@@ -29491,7 +30895,7 @@ ps_core_maintenance_impl(void)
 
 		/* Large local timelines and budget-deferred retries can select and
 		 * verify bounded inputs before legacy all-layer materialization. */
-		if (prune_abandon_local_only())
+		if (prune_abandon_local_only() || control_prune_provider_supported())
 		{
 			uint32_t count;
 
@@ -29506,7 +30910,8 @@ ps_core_maintenance_impl(void)
 				ps_lock_shard_wr(sh);
 			pthread_rwlock_rdlock(&page_prune_lock);
 			ps_lock_map_wr();
-			if (ps_timeline_live(ftl) && prune_abandon_local_only() &&
+			if (ps_timeline_live(ftl) &&
+				(prune_abandon_local_only() || control_prune_provider_supported()) &&
 				g_shards[fsh].staged_compaction_retries < 2 &&
 				count_image_layers(ftl, fsh) != 0 &&
 				(retry_budget || count_image_layers(ftl, fsh) > PS_IMAGE_MERGE_MAX_INPUTS) &&
@@ -30376,6 +31781,8 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		if (tl == 0 || timelines[tl].defined || timeline_is_used(tl))
 		{
 			PsTimelineState timeline_state;
+			bool bench_wal = getenv("PAGESTORE_BENCH_RECOVERY") != NULL;
+			uint64_t bench_wal_start = bench_wal ? inspection_now_ns() : 0;
 
 			/* A crash can leave any prefix of a DELETING timeline's private
 			 * WAL set behind.  Do not parse or reopen those artifacts: the
@@ -30395,6 +31802,9 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 						"for timeline %u\n", tl);
 				return OPEN_STEP("sync immutable WAL segments");
 			}
+			if (bench_wal)
+				fprintf(stderr, "BENCH wal_recover_ns=%llu timeline=%u\n",
+						(unsigned long long) (inspection_now_ns() - bench_wal_start), tl);
 			walidx_progress_init(tl, wal_log_start(tl));
 			{
 				char directory[4096];
