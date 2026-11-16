@@ -24573,8 +24573,8 @@ control_pair_candidates(uint32_t timeline, const PsKey *key,
 			return -1;
 		total += (uint32_t) entries[block]->nver;
 	}
-	if ((size_t) total > SIZE_MAX / sizeof(*all) ||
-		(size_t) total > SIZE_MAX / sizeof(*eligible))
+	if (total != 0 && (sizeof(*all) > SIZE_MAX / (size_t) total ||
+		sizeof(*eligible) > SIZE_MAX / (size_t) total))
 		return -1;
 	all = calloc(total, sizeof(*all));
 	eligible = calloc(total, sizeof(*eligible));

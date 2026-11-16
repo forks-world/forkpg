@@ -100,7 +100,7 @@ ps_compaction_coverage_require_control_groups(PsCompactionCoverage *scan)
 	PsKey key;
 
 	if (!scan || scan->started || scan->control_lsns || scan->state != 0 ||
-		(size_t) scan->nidentities > SIZE_MAX / sizeof(*lsns))
+		(scan->nidentities != 0 && sizeof(*lsns) > SIZE_MAX / (size_t) scan->nidentities))
 		return -1;
 	key = scan->identities[0].identity.key;
 	if (key.klass != PS_KLASS_CONTROL)
@@ -137,9 +137,9 @@ ps_compaction_coverage_open(const PsLayerDesc *layers, uint32_t nlayers,
 		return -1;
 	*out = NULL;
 	if (!layers || !selected || !identities || nlayers == 0 || nidentities == 0 ||
-		(size_t) nlayers > SIZE_MAX / sizeof(*scan->layers) ||
-		(size_t) nlayers > SIZE_MAX / sizeof(*scan->layer_refs) ||
-		(size_t) nidentities > SIZE_MAX / sizeof(*scan->identities))
+		sizeof(*scan->layers) > SIZE_MAX / (size_t) nlayers ||
+		sizeof(*scan->layer_refs) > SIZE_MAX / (size_t) nlayers ||
+		sizeof(*scan->identities) > SIZE_MAX / (size_t) nidentities)
 		return -1;
 	scan = calloc(1, sizeof(*scan));
 	if (!scan)
@@ -703,7 +703,7 @@ ps_compaction_control_plan_open(const PsLayerDesc *layers, uint32_t count,
 	if (!out)
 		return -1;
 	*out = NULL;
-	if (!drop || ndrop == 0 || (size_t) ndrop > SIZE_MAX / sizeof(*plan->control_drop) ||
+	if (!drop || ndrop == 0 || sizeof(*plan->control_drop) > SIZE_MAX / (size_t) ndrop ||
 		ps_compaction_relation_plan_open(layers, count, max_group,
 			(PsPruneFence) {1, 1}, NULL, 0, 0, 0, &plan) != 0)
 		return -1;
