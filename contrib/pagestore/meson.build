@@ -475,6 +475,16 @@ test('pagestore_wal_reclaim_core',
   suite: ['pagestore'],
   timeout: 60,
 )
+test('pagestore_control_group_reclaim', pagestore_wal_reclaim_core_test,
+  args: ['--many-control-layers'], suite: ['pagestore'], timeout: 45)
+test('pagestore_control_group_pinned', pagestore_wal_reclaim_core_test,
+  args: ['--many-control-layers-pinned'], suite: ['pagestore'], timeout: 45)
+test('pagestore_control_group_provider', pagestore_wal_reclaim_core_test,
+  args: ['--control-provider'], suite: ['pagestore'], timeout: 45)
+test('pagestore_control_group_crash', pagestore_wal_reclaim_core_test,
+  args: ['--control-crash'], suite: ['pagestore'], timeout: 45)
+test('pagestore_control_group_race', pagestore_wal_reclaim_core_test,
+  args: ['--control-race'], suite: ['pagestore'], timeout: 30)
 test('pagestore_archive_progress_authority',
   pagestore_wal_reclaim_core_test,
   args: ['--archive-progress-authority'],
@@ -503,6 +513,9 @@ test('pagestore_control_prune',
   suite: ['pagestore'],
   timeout: 60,
 )
+test('pagestore_artifact_bounded_crash', pagestore_control_prune_test,
+  args: ['--artifact-crash'],
+  suite: 'pagestore')
 
 pagestore_artifact_lifecycle_test = executable('pagestore_artifact_lifecycle_test',
   files('pagestore_artifact_lifecycle_test.c', 'pagestore_core.c',
@@ -529,6 +542,8 @@ test('pagestore_artifact_lifecycle_reader',
   suite: ['pagestore'],
   timeout: 60,
 )
+test('pagestore_artifact_bounded_reader', pagestore_artifact_lifecycle_test,
+  args: ['--bounded-reader'], suite: ['pagestore'], timeout: 60)
 
 # Bounded fork-lifecycle history: invalidated page versions leave image
 # layers, and forkmeta compaction keeps only base, fence, and growth per

@@ -165,6 +165,71 @@ make_slru_layer(uint64_t id)
 	return d;
 }
 
+static void
+test_atomic_source_retirement(void)
+{
+	char dir[PS_TEST_TEMP_PATH_MAX] = "psmanifestbatchXXXXXX";
+	char path[4096];
+	PsLayerDesc inputs[2], output, duplicate[2];
+	int fd;
+	off_t end, before;
+	TestManifestRecord guard_record;
+	PsFlushWatermark guard;
+
+	check(ps_test_mkdtemp(dir, sizeof(dir)) != NULL, "create batch manifest directory");
+	inputs[0] = make_slru_layer(101);
+	inputs[1] = make_slru_layer(102);
+	output = make_slru_layer(103);
+	check(ps_manifest_open(dir) == 0 && ps_manifest_add_layer(&inputs[0]) == 0 &&
+		  ps_manifest_add_layer(&inputs[1]) == 0 && ps_manifest_add_layer(&output) == 0,
+		  "create pinned batch retirement fixture");
+	ps_layer_map.layers[0].cache_readers = 1;
+	ps_layer_map.layers[1].cache_readers = 1;
+	duplicate[0] = inputs[0];
+	duplicate[1] = inputs[0];
+	check(ps_manifest_retire_image_sources_atomic(duplicate, 2, &output, 1) == -1 &&
+		  !ps_layer_map.layers[0].deleting && !ps_layer_map.layers[1].deleting,
+		  "invalid batch leaves every source live");
+	snprintf(path, sizeof(path), "%s/layers.manifest", dir);
+	fd = open(path, O_RDONLY);
+	before = fd >= 0 ? lseek(fd, 0, SEEK_END) : -1;
+	if (fd >= 0)
+		close(fd);
+	check(ps_manifest_retire_image_sources_atomic(inputs, 2, &output, 1) == 0 &&
+		  ps_layer_map.layers[0].deleting && ps_layer_map.layers[1].deleting &&
+		  !ps_layer_map.layers[2].deleting,
+		  "one batch marks every source and preserves output");
+	ps_manifest_close();
+	fd = open(path, O_RDONLY);
+	check(before >= 0 && fd >= 0 &&
+		  pread(fd, &guard_record, sizeof(guard_record), before) == sizeof(guard_record) &&
+		  pread(fd, &guard, sizeof(guard), before + sizeof(guard_record)) == sizeof(guard) &&
+		  guard_record.type == TEST_MANIFEST_REBASE_FLUSH_WATERMARK &&
+		  guard_record.len == sizeof(guard) && guard.shard == UINT32_MAX &&
+		  guard_record.crc == test_manifest_crc(&guard_record, &guard, sizeof(guard)),
+		  "batch is preceded by a valid legacy record that older readers reject");
+	if (fd >= 0)
+		close(fd);
+	check(ps_manifest_open(dir) == 0 && ps_manifest_replay(&ps_layer_map) == 0 &&
+		  ps_layer_map.layers[0].deleting && ps_layer_map.layers[1].deleting &&
+		  !ps_layer_map.layers[2].deleting,
+		  "restart replays the entire source retirement batch");
+	ps_manifest_close();
+	fd = open(path, O_RDWR);
+	end = fd >= 0 ? lseek(fd, 0, SEEK_END) : -1;
+	check(end > 0 && ftruncate(fd, end - 1) == 0 && fsync(fd) == 0,
+		  "simulate a torn source retirement record");
+	if (fd >= 0)
+		close(fd);
+	check(ps_manifest_open(dir) == 0 && ps_manifest_replay(&ps_layer_map) == 0 &&
+		  ps_layer_map_count(&ps_layer_map) == 3 &&
+		  !ps_layer_map.layers[0].deleting && !ps_layer_map.layers[1].deleting &&
+		  !ps_layer_map.layers[2].deleting,
+		  "torn retirement replays none of the source deletions");
+	ps_manifest_close();
+	ps_test_remove_tree(dir);
+}
+
 int
 main(void)
 {
@@ -177,6 +242,8 @@ main(void)
 	PsLayerDesc *got;
 	PsFlushWatermark watermark;
 	PsLayerLocation remote;
+
+	test_atomic_source_retirement();
 
 	if (!ps_test_mkdtemp(dir, sizeof(dir)))
 	{

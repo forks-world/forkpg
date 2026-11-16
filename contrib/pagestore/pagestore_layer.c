@@ -871,8 +871,8 @@ image_cursor_precheck(const PsImgIndexEnt *entry, void *arg)
 	return 0;
 }
 
-int
-ps_image_index_cursor_open(const PsLayerDesc *layer, PsImageIndexCursor **out)
+static int
+image_index_cursor_open(const PsLayerDesc *layer, PsImageIndexCursor **out, int precheck)
 {
 	const PsLayerLocation *loc;
 	PsImageIndexCursor *cursor;
@@ -881,7 +881,7 @@ ps_image_index_cursor_open(const PsLayerDesc *layer, PsImageIndexCursor **out)
 	if (out == NULL || layer == NULL)
 		return -1;
 	*out = NULL;
-	if (ps_image_layer_visit_index(layer, image_cursor_precheck, NULL) != 0)
+	if (precheck && ps_image_layer_visit_index(layer, image_cursor_precheck, NULL) != 0)
 		return -1;
 	loc = img_local_loc(layer);
 	if (loc == NULL || loc->size < sizeof(PsImgFooter))
@@ -912,6 +912,18 @@ ps_image_index_cursor_open(const PsLayerDesc *layer, PsImageIndexCursor **out)
 fail:
 	free(cursor);
 	return -1;
+}
+
+int
+ps_image_index_cursor_open(const PsLayerDesc *layer, PsImageIndexCursor **out)
+{
+	return image_index_cursor_open(layer, out, 1);
+}
+
+int
+ps_image_index_cursor_open_staged(const PsLayerDesc *layer, PsImageIndexCursor **out)
+{
+	return image_index_cursor_open(layer, out, 0);
 }
 
 int
@@ -1166,11 +1178,83 @@ image_compaction_data_end(const PsLayerDesc *layer, uint32_t page_size,
 	return 0;
 }
 
+struct PsImageVerifiedSources
+{
+	PsLayerDesc layers[PS_IMAGE_MERGE_MAX_INPUTS];
+	uint64_t data_ends[PS_IMAGE_MERGE_MAX_INPUTS];
+	uint32_t count, page_size;
+	int valid;
+};
+
+void
+ps_image_compaction_sources_close(PsImageVerifiedSources *sources)
+{
+	free(sources);
+}
+
 int
-ps_image_compaction_stage_selected_batch(const PsLayerDesc *layers,
+ps_image_compaction_sources_revalidate(PsImageVerifiedSources *sources)
+{
+	if (!sources || !sources->valid)
+		return -1;
+	for (uint32_t i = 0; i < sources->count; i++)
+	{
+		uint64_t end;
+
+		if (image_compaction_data_end(&sources->layers[i], sources->page_size, &end) != 0 ||
+			end != sources->data_ends[i])
+		{
+			sources->valid = 0;
+			return -1;
+		}
+	}
+	return 0;
+}
+
+int
+ps_image_compaction_sources_open(const PsLayerDesc *layers, uint32_t count,
+	uint32_t page_size, PsImageVerifiedSources **out)
+{
+	PsImageVerifiedSources *sources;
+
+	if (!out)
+		return -1;
+	*out = NULL;
+	if (!layers || count == 0 || count > PS_IMAGE_MERGE_MAX_INPUTS ||
+		page_size == 0 || page_size > IMAGE_STREAM_BYTES)
+		return -1;
+	sources = calloc(1, sizeof(*sources));
+	if (!sources)
+		return -1;
+	sources->count = count;
+	sources->page_size = page_size;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		if (layers[i].kind != PS_LAYER_IMAGE || layers[i].deleting ||
+			layers[i].remote_durable || layers[i].legacy_shard_zero ||
+			layers[i].timeline != layers[0].timeline ||
+			(layers[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
+			(layers[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) ||
+			image_compaction_data_end(&layers[i], page_size, &sources->data_ends[i]) != 0)
+			goto fail;
+		for (uint32_t j = 0; j < i; j++)
+			if (layers[i].layer_id == layers[j].layer_id)
+				goto fail;
+		sources->layers[i] = layers[i];
+	}
+	sources->valid = 1;
+	*out = sources;
+	return 0;
+fail:
+	free(sources);
+	return -1;
+}
+
+static int
+image_compaction_stage_selected_batch(const PsLayerDesc *layers,
 	uint32_t count, const PsImageGroupEntry *selected, uint32_t nselected,
 	uint64_t output_id, uint32_t page_size, PsLayerDesc *out,
-	uint64_t *uncertain_id)
+	uint64_t *uncertain_id, const uint64_t *verified_ends)
 {
 	uint64_t data_ends[PS_IMAGE_MERGE_MAX_INPUTS], max_id = 0;
 	PsImgRec *batch = NULL;
@@ -1204,7 +1288,9 @@ ps_image_compaction_stage_selected_batch(const PsLayerDesc *layers,
 		(layers[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT))
 		return -1;
 	for (uint32_t i = 0; i < count; i++)
-		if (image_compaction_data_end(&layers[i], page_size, &data_ends[i]) != 0)
+		if (verified_ends != NULL)
+			data_ends[i] = verified_ends[i];
+		else if (image_compaction_data_end(&layers[i], page_size, &data_ends[i]) != 0)
 			return -1;
 	batch = calloc(nselected, sizeof(*batch));
 	sources = calloc(nselected, sizeof(*sources));
@@ -1260,6 +1346,30 @@ done:
 	free(batch);
 	free(sources);
 	return rc;
+}
+
+int
+ps_image_compaction_stage_selected_batch(const PsLayerDesc *layers,
+	uint32_t count, const PsImageGroupEntry *selected, uint32_t nselected,
+	uint64_t output_id, uint32_t page_size, PsLayerDesc *out, uint64_t *uncertain_id)
+{
+	return image_compaction_stage_selected_batch(layers, count, selected, nselected,
+		output_id, page_size, out, uncertain_id, NULL);
+}
+
+int
+ps_image_compaction_stage_verified_batch(const PsImageVerifiedSources *sources,
+	const PsImageGroupEntry *selected, uint32_t nselected, uint64_t output_id,
+	PsLayerDesc *out, uint64_t *uncertain_id)
+{
+	if (!sources || !sources->valid)
+	{
+		if (uncertain_id)
+			*uncertain_id = 0;
+		return -1;
+	}
+	return image_compaction_stage_selected_batch(sources->layers, sources->count,
+		selected, nselected, output_id, sources->page_size, out, uncertain_id, sources->data_ends);
 }
 
 int
@@ -1466,10 +1576,10 @@ image_metadata_equal(const PsImgIndexEnt *a, const PsImgIndexEnt *b)
 		a->seg_id == b->seg_id && a->flags == b->flags;
 }
 
-int
-ps_image_compaction_verify_selected_batch(const PsLayerDesc *layers,
+static int
+image_compaction_verify_selected_batch(const PsLayerDesc *layers,
 	uint32_t count, const PsImageGroupEntry *selected, uint32_t nselected,
-	const PsLayerDesc *output, uint32_t page_size)
+	const PsLayerDesc *output, uint32_t page_size, const uint64_t *verified_ends)
 {
 	PsImageIndexMerge *src = NULL;
 	PsImageIndexCursor *dst = NULL;
@@ -1489,8 +1599,11 @@ ps_image_compaction_verify_selected_batch(const PsLayerDesc *layers,
 			layers[i].remote_durable || layers[i].legacy_shard_zero ||
 			layers[i].timeline != layers[0].timeline ||
 			(layers[i].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) !=
-			(layers[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT) ||
-			image_compaction_data_end(&layers[i], page_size, &data_ends[i]) != 0)
+			(layers[0].layer_id >> PS_IMAGE_LAYER_SHARD_SHIFT))
+			return -1;
+		if (verified_ends != NULL)
+			data_ends[i] = verified_ends[i];
+		else if (image_compaction_data_end(&layers[i], page_size, &data_ends[i]) != 0)
 			return -1;
 		if (layers[i].layer_id > max_id)
 			max_id = layers[i].layer_id;
@@ -1571,10 +1684,29 @@ done:
 	return rc;
 }
 
+int
+ps_image_compaction_verify_selected_batch(const PsLayerDesc *layers,
+	uint32_t count, const PsImageGroupEntry *selected, uint32_t nselected,
+	const PsLayerDesc *output, uint32_t page_size)
+{
+	return image_compaction_verify_selected_batch(layers, count, selected, nselected,
+		output, page_size, NULL);
+}
+
+int
+ps_image_compaction_verify_verified_batch(const PsImageVerifiedSources *sources,
+	const PsImageGroupEntry *selected, uint32_t nselected, const PsLayerDesc *output)
+{
+	if (!sources || !sources->valid)
+		return -1;
+	return image_compaction_verify_selected_batch(sources->layers, sources->count,
+		selected, nselected, output, sources->page_size, sources->data_ends);
+}
+
 /* Compare durable/routing properties, not transient reader counts or cache
  * verification hints. A tier transition invalidates the captured snapshot. */
-static int
-image_snapshot_descriptor_equal(const PsLayerDesc *a, const PsLayerDesc *b)
+int
+ps_image_snapshot_descriptor_equal(const PsLayerDesc *a, const PsLayerDesc *b)
 {
 	if (a->layer_id != b->layer_id || a->kind != b->kind ||
 		a->timeline != b->timeline || key_cmp(&a->start_key, &b->start_key) != 0 ||
@@ -1663,7 +1795,7 @@ image_compaction_snapshot_valid(const PsLayerMap *map,
 				expected.deleting = retiring && j < retired_prefix;
 				if ((seen_input_bits & (UINT64_C(1) << j)) != 0 ||
 					(retiring && __atomic_load_n(&current->cache_readers, __ATOMIC_ACQUIRE) == 0) ||
-					!image_snapshot_descriptor_equal(current, &expected))
+					!ps_image_snapshot_descriptor_equal(current, &expected))
 					return 0;
 				seen_input_bits |= UINT64_C(1) << j;
 				seen_inputs++;
@@ -1676,7 +1808,7 @@ image_compaction_snapshot_valid(const PsLayerMap *map,
 			if (current->layer_id == outputs[j].layer_id)
 			{
 				if ((seen_output_bits & (UINT64_C(1) << j)) != 0 ||
-					!image_snapshot_descriptor_equal(current, &outputs[j]))
+					!ps_image_snapshot_descriptor_equal(current, &outputs[j]))
 					return 0;
 				seen_output_bits |= UINT64_C(1) << j;
 				seen_outputs++;
