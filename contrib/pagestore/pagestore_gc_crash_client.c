@@ -279,7 +279,7 @@ attach(const char *name)
 	if (page_size == 0 || page_size > PS_IO_UNIT)
 		die("invalid daemon page size");
 	for (uint32_t i = 0; i < header->nchannels; i++)
-		if (ps_cas(&ps_channel(shm_base, i)->claimed, 0, 1))
+		if (ps_cas_u64(&ps_channel(shm_base, i)->claimed, 0, 1))
 		{
 			channel = (int) i;
 			return;
@@ -293,7 +293,7 @@ detach(void)
 	if (shm_base != NULL && shm_base != MAP_FAILED)
 	{
 		if (channel >= 0)
-			ps_store_release(&ps_channel(shm_base, channel)->claimed, 0);
+			ps_store_release_u64(&ps_channel(shm_base, channel)->claimed, 0);
 		munmap(shm_base, PS_SHM_SIZE);
 	}
 	if (shm_fd >= 0)

@@ -316,6 +316,8 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 {
 	uint32_t idle = 0;
 	uint32_t claimed = 0;
+	uint32_t owned = 0;
+	uint32_t abandoned = 0;
 	uint32_t request = 0;
 	uint32_t done = 0;
 	PsBackpressureMetrics page;
@@ -327,8 +329,14 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 	{
 		PsChannel  *ch = ps_channel(shm, i);
 
-		if (ps_load_acquire(&ch->claimed) != 0)
+		uint64_t claim = ps_load_acquire_u64(&ch->claimed);
+
+		if (claim != 0)
 			claimed++;
+		if (claim != 0 && claim != 2)
+			owned++;
+		else if (claim == 2)
+			abandoned++;
 		switch (ps_load_acquire(&ch->state))
 		{
 			case PS_STATE_IDLE:
@@ -346,7 +354,7 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 		}
 	}
 	read_backpressure_metrics(hdr, &page, &wal, &walidx, &forkmeta);
-	printf("{\"idle\":%u,\"claimed\":%u,\"request\":%u,"
+	printf("{\"idle\":%u,\"claimed\":%u,\"owned\":%u,\"abandoned\":%u,\"request\":%u,"
 		   "\"done\":%u,\"shards\":%u,\"wal_index_pending_bytes\":%llu,"
 		   "\"wal_index_lagging_timelines\":%u,"
 		   "\"page_lag_bytes\":%llu,\"page_high_water_bytes\":%llu,"
@@ -365,7 +373,7 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 		   "\"forkmeta_catchup_bytes\":%llu,\"forkmeta_throttled\":%u,"
 		   "\"forkmeta_throttle_enters\":%llu,\"forkmeta_throttle_exits\":%llu,"
 		   "\"forkmeta_foreground_wait_ns\":%llu}\n",
-		   idle, claimed, request, done, hdr->nshards,
+		   idle, claimed, owned, abandoned, request, done, hdr->nshards,
 		   (unsigned long long) ps_load_acquire_u64(&hdr->wal_index_pending_bytes),
 		   ps_load_acquire(&hdr->wal_index_lagging_timelines),
 		   (unsigned long long) page.lag_bytes,

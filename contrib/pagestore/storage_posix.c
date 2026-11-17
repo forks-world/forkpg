@@ -2899,6 +2899,7 @@ const PsStorage PsStoragePosix = {
 	.sync = posix_sync,
 	.seg_write = posix_seg_write,
 	.seg_read = posix_seg_read,
+	.concurrent_seg_read = 1,
 	.seg_size = posix_seg_size,
 	.seg_change_token = posix_seg_change_token,
 	.seg_remove = posix_seg_remove,

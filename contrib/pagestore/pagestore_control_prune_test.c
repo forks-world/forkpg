@@ -1439,6 +1439,7 @@ test_bounded_control_group_branch_and_twins(void)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-group-branch-XXXXXX";
 	uint64_t before, value = 0;
+	PsStorage no_concurrent_reads = PsStoragePosix;
 	const uint64_t branch_redo = 10000 + 15 * 2000;
 	const uint64_t latest_redo = 10000 + 29 * 2000;
 	int ok;
@@ -1461,8 +1462,18 @@ test_bounded_control_group_branch_and_twins(void)
 	before = ps_test_bounded_prune_published_count();
 	ps_test_set_legacy_record_limit(2);
 	compact_layers = 1;
-	for (int i = 0; i < 50 && ps_test_bounded_prune_published_count() == before; i++)
+	no_concurrent_reads.concurrent_seg_read = 0;
+	ps_storage = &no_concurrent_reads;
+	for (int i = 0; i < 3; i++)
 		(void) ps_core_maintenance();
+	check(ps_test_bounded_prune_published_count() == before,
+		  "provider without concurrent segment reads defers control pruning");
+	ps_storage = &PsStoragePosix;
+	for (int i = 0; i < 100 && ps_test_bounded_prune_published_count() == before; i++)
+	{
+		(void) ps_core_maintenance();
+		usleep(100000); /* allow the normal legacy-budget retry window */
+	}
 	check(ps_test_bounded_prune_published_count() > before,
 		  "bounded control-group compaction publishes with a branch");
 	check(read_control_at(1, PS_CONTROL_IMAGE_BLOCK, UINT64_MAX, &value) && value == branch_redo &&

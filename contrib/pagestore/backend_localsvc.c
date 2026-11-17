@@ -45,6 +45,7 @@
 #include "tcop/utility.h"
 #include "pagestore_ipc.h"
 #include "pagestore_shm.h"
+#include "pagestore_channel_owner.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "utils/guc.h"
@@ -124,6 +125,7 @@ ls_reject_pinned_write(const char *op)
 /* per-backend attachment state */
 static void *ls_shm = NULL;
 static int	ls_shm_fd = -1;
+static pid_t ls_attach_pid = 0;
 static int	ls_channel = -1;
 static uint32	ls_channel_shard = UINT32_MAX;
 static uint32	ls_nchannels = 0;
@@ -139,12 +141,11 @@ static uint64	localsvc_checkpoint_floor[LS_MAX_TIMELINES];
 #define LS_MAX_PAGES_PER_OP		(PS_IO_UNIT / BLCKSZ)
 
 /*
- * claimed states: 0 = free, 1 = owned by a backend, 2 = abandoned after the
- * owner timed out.  An abandoned channel may still receive a late DONE from the
- * daemon, so never hand it to another backend.
+ * claimed states: 0 = free, 1 = legacy owner, 2 = abandoned after a timeout,
+ * otherwise a generation/PID owner token.  A timed-out channel may still
+ * receive a late DONE, so never hand it to another backend until completed.
  */
 #define LS_CLAIMED_FREE		0
-#define LS_CLAIMED_OWNED	1
 #define LS_CLAIMED_ABANDONED	2
 
 static void
@@ -152,17 +153,20 @@ ls_detach(int code, Datum arg)
 {
 	if (ls_shm != NULL)
 	{
-		if (ls_channel >= 0)
+		if (ls_channel >= 0 && ls_attach_pid == getpid())
 		{
 			PsChannel  *ch = ps_channel(ls_shm, ls_channel);
 
 			/* release the channel for reuse by a future backend */
-			ps_store_release(&ch->claimed, LS_CLAIMED_FREE);
+			ps_store_release_u64(&ch->claimed, LS_CLAIMED_FREE);
 			ls_channel = -1;
 			ls_channel_shard = UINT32_MAX;
 		}
+		ls_channel = -1;
+		ls_channel_shard = UINT32_MAX;
 		munmap(ls_shm, PS_SHM_SIZE);
 		ls_shm = NULL;
+		ls_attach_pid = 0;
 	}
 	if (ls_shm_fd >= 0)
 	{
@@ -184,6 +188,8 @@ ls_attach(void)
 	void	   *shm;
 	PsShmHeader *hdr;
 
+	if (ls_shm != NULL && ls_attach_pid != getpid())
+		ls_detach(0, (Datum) 0);
 	if (ls_shm != NULL)
 		return;
 
@@ -287,6 +293,7 @@ ls_attach(void)
 		}
 	}
 	ls_shm = shm;
+	ls_attach_pid = getpid();
 	ls_shm_fd = fd;
 	ls_nchannels = hdr->nchannels;
 	ls_nshards = hdr->nshards ? hdr->nshards : 1;
@@ -321,6 +328,7 @@ ls_claim_channel(uint32_t shard)
 {
 	uint32_t stride;
 	uint32_t target;
+	uint64_t my_claim;
 
 	ls_attach();
 
@@ -331,7 +339,7 @@ ls_claim_channel(uint32_t shard)
 	{
 		PsChannel  *old = ps_channel(ls_shm, ls_channel);
 
-		ps_store_release(&old->claimed, LS_CLAIMED_FREE);
+		ps_store_release_u64(&old->claimed, LS_CLAIMED_FREE);
 		ls_channel = -1;
 		ls_channel_shard = UINT32_MAX;
 	}
@@ -344,12 +352,13 @@ ls_claim_channel(uint32_t shard)
 
 	target = shard % ls_nshards;
 	stride = ls_nshards;
+	my_claim = ps_channel_owner_claim((PsShmHeader *) ls_shm);
 
 	for (uint32_t i = target; i < ls_nchannels; i += stride)
 	{
 		PsChannel  *ch = ps_channel(ls_shm, i);
 
-		if (ps_cas(&ch->claimed, LS_CLAIMED_FREE, LS_CLAIMED_OWNED))
+		if (ps_cas_u64(&ch->claimed, LS_CLAIMED_FREE, my_claim))
 		{
 			ch->shard = target;
 			ls_channel = (int) i;
@@ -373,7 +382,7 @@ ls_claim_channel(uint32_t shard)
 	{
 		PsChannel  *ch = ps_channel(ls_shm, i);
 
-		if (ps_cas(&ch->claimed, LS_CLAIMED_ABANDONED, LS_CLAIMED_OWNED))
+		if (ps_cas_u64(&ch->claimed, LS_CLAIMED_ABANDONED, my_claim))
 		{
 			uint32_t	st = ps_load_acquire(&ch->state);
 
@@ -391,7 +400,19 @@ ls_claim_channel(uint32_t shard)
 				ls_channel_shard = target;
 				return;
 			}
-			ps_store_release(&ch->claimed, LS_CLAIMED_ABANDONED);
+			ps_store_release_u64(&ch->claimed, LS_CLAIMED_ABANDONED);
+		}
+	}
+	for (uint32_t i = target; i < ls_nchannels; i += stride)
+	{
+		PsChannel *ch = ps_channel(ls_shm, i);
+
+		if (ps_channel_reclaim_dead(ch, my_claim))
+		{
+			ch->shard = target;
+			ls_channel = (int) i;
+			ls_channel_shard = target;
+			return;
 		}
 	}
 	ereport(ERROR,
@@ -486,7 +507,7 @@ ls_exec_wait(PsChannel *ch, int timeout_ms)
 	}
 	PG_CATCH();
 	{
-		ps_store_release(&ch->claimed, LS_CLAIMED_ABANDONED);
+		ps_store_release_u64(&ch->claimed, LS_CLAIMED_ABANDONED);
 		ls_channel = -1;
 		ls_channel_shard = UINT32_MAX;
 		PG_RE_THROW();

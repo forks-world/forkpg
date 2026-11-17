@@ -2246,6 +2246,7 @@ static void
 pin_during_control_compaction(void *arg)
 {
 	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_test_set_control_prefetch_hook(NULL, NULL);
 	pin_during_control_coverage(arg);
 }
 
@@ -2255,12 +2256,13 @@ write_during_control_compaction(void *arg)
 	int *written = arg;
 
 	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_test_set_control_prefetch_hook(NULL, NULL);
 	*written = write_control(0, WAL_TOTAL + 27 * 8192, WAL_TOTAL + 26 * 8192) &&
 		write_control_fence(WAL_TOTAL + 27 * 8192, WAL_TOTAL + 26 * 8192);
 }
 
 static void
-test_control_compaction_concurrent_change(int writer)
+test_control_compaction_concurrent_change(int writer, int prefetch)
 {
 	char store[TEST_STORE_PATH_MAX] = "pagestore-control-race-XXXXXX";
 	uint64_t before;
@@ -2280,11 +2282,16 @@ test_control_compaction_concurrent_change(int writer)
 	check(ok && ps_core_open(store) == 0, "prepare control compaction pin race");
 	before = ps_test_bounded_prune_published_count();
 	ps_test_set_legacy_record_limit(2);
-	ps_test_set_compaction_unlocked_hook(writer ? write_during_control_compaction :
-		pin_during_control_compaction, &pinned);
+	if (prefetch)
+		ps_test_set_control_prefetch_hook(writer ? write_during_control_compaction :
+			pin_during_control_compaction, &pinned);
+	else
+		ps_test_set_compaction_unlocked_hook(writer ? write_during_control_compaction :
+			pin_during_control_compaction, &pinned);
 	for (int i = 0; i < 10 && !pinned; i++)
 		(void) ps_core_maintenance();
 	ps_test_set_compaction_unlocked_hook(NULL, NULL);
+	ps_test_set_control_prefetch_hook(NULL, NULL);
 	check(pinned && ps_test_bounded_prune_published_count() == before &&
 		  effective_floor(0, PS_RETENTION_RESOURCE_WAL) == WAL_SEGMENT / 2 &&
 		  segment_count(store, 0) == 3,
@@ -4596,8 +4603,15 @@ main(int argc, char **argv)
 	}
 	if (argc == 2 && strcmp(argv[1], "--control-race") == 0)
 	{
-		test_control_compaction_concurrent_change(0);
-		test_control_compaction_concurrent_change(1);
+		test_control_compaction_concurrent_change(0, 0);
+		test_control_compaction_concurrent_change(1, 0);
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--control-prefetch-race") == 0)
+	{
+		test_control_compaction_concurrent_change(0, 1);
+		test_control_compaction_concurrent_change(1, 1);
 		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 		return failed != 0;
 	}

@@ -864,6 +864,68 @@ test_hold_init_shared_wait_times_out(void)
 	close_fixture(name, fd, hdr);
 }
 
+static void
+test_channel_claim_counts(const char *inspector)
+{
+	char name[128], output[4096];
+	int fd, ready[2], result[2], status;
+	PsShmHeader *hdr;
+	pid_t holder, child;
+	unsigned char byte;
+	ssize_t n;
+
+	if (open_fixture(name, sizeof(name), &fd, &hdr) != 0)
+	{
+		check(0, "create claim count fixture");
+		return;
+	}
+	init_header(hdr, PS_INSPECTION_STATE_IDLE, 0);
+	ps_channel(hdr, 0)->claimed = 1;
+	ps_channel(hdr, 1)->claimed = 2;
+	ps_channel(hdr, 2)->claimed = 2;
+	ps_channel(hdr, 3)->claimed = (UINT64_C(7) << 32) | 123;
+	if (pipe(ready) != 0 || pipe(result) != 0)
+	{
+		check(0, "create claim count pipes");
+		close_fixture(name, fd, hdr);
+		return;
+	}
+	holder = start_lease_holder(name, ready[1]);
+	close(ready[1]);
+	if (holder <= 0 || read(ready[0], &byte, 1) != 1)
+	{
+		check(0, "start claim count lease holder");
+		close(ready[0]);
+		close(result[0]);
+		close(result[1]);
+		if (holder > 0) { kill(holder, SIGKILL); waitpid(holder, &status, 0); }
+		close_fixture(name, fd, hdr);
+		return;
+	}
+	close(ready[0]);
+	child = fork();
+	if (child == 0)
+	{
+		close(result[0]);
+		dup2(result[1], STDOUT_FILENO);
+		close(result[1]);
+		execl(inspector, inspector, "--shm", name, "backpressure", (char *) NULL);
+		_exit(127);
+	}
+	close(result[1]);
+	n = read(result[0], output, sizeof(output) - 1);
+	close(result[0]);
+	if (n < 0) n = 0;
+	output[n] = '\0';
+	check(child > 0 && wait_child(child, 5000, &status) &&
+		  WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+		  strstr(output, "\"claimed\":4,\"owned\":2,\"abandoned\":2") != NULL,
+		  "backpressure distinguishes owned and abandoned channels");
+	kill(holder, SIGKILL);
+	waitpid(holder, &status, 0);
+	close_fixture(name, fd, hdr);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -873,6 +935,7 @@ main(int argc, char **argv)
 		return 2;
 	}
 	test_initialization_lock_exclusion();
+	test_channel_claim_counts(argv[1]);
 	test_lock_busy(argv[1]);
 	test_stale_state(argv[1], PS_INSPECTION_STATE_REQUEST,
 				 "create stale REQUEST fixture");
