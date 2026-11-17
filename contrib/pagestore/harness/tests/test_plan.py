@@ -27,7 +27,7 @@ LINUX_PROCESS_IDENTITY = unittest.skipUnless(
 
 CAPABILITIES = {
     "schema": 1,
-    "inspection_schema": 4,
+    "inspection_schema": 5,
     "storage": ["posix"],
     "shards": [1],
     "compute": ["writer", "reader"],
@@ -1525,8 +1525,8 @@ class PlanValidationTests(unittest.TestCase):
     def test_inspection_schema_is_read_only_and_versioned(self):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
-        self.assertEqual(schema["schema"], 4)
-        self.assertEqual(capabilities["inspection_schema"], 4)
+        self.assertEqual(schema["schema"], 5)
+        self.assertEqual(capabilities["inspection_schema"], 5)
         self.assertEqual(schema["transport"], "private-test-ipc")
         self.assertEqual(schema["mutating_operations"], [])
         self.assertEqual(
@@ -2648,7 +2648,7 @@ class PlanValidationTests(unittest.TestCase):
             "\"wal_index_owners\":0,\"max_generation\":0,"
             "\"retention_poisoned\":false}' ;;\n"
             "backpressure) printf '%s\\n' '"
-            "{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
+            "{\"idle\":128,\"claimed\":0,\"owned\":0,\"abandoned\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0,"
             "\"page_lag_bytes\":0,\"page_high_water_bytes\":0,\"page_catchup_bytes\":0,"
             "\"page_throttled\":0,\"page_throttle_enters\":0,\"page_throttle_exits\":0,"
@@ -2842,7 +2842,7 @@ class PlanValidationTests(unittest.TestCase):
             "\"wal_index_owners\":0,\"max_generation\":0,"
             "\"retention_poisoned\":false}' ;;\n"
             "backpressure) printf '%s\\n' "
-            "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
+            "'{\"idle\":128,\"claimed\":0,\"owned\":0,\"abandoned\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0,"
             "\"page_lag_bytes\":0,\"page_high_water_bytes\":0,"
             "\"page_catchup_bytes\":0,\"page_throttled\":0,"
@@ -2947,7 +2947,7 @@ class PlanValidationTests(unittest.TestCase):
             "\"wal_index_owners\":0,\"max_generation\":0,"
             "\"retention_poisoned\":false}' ;;\n"
             "backpressure) printf '%s\\n' "
-            "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
+            "'{\"idle\":128,\"claimed\":0,\"owned\":0,\"abandoned\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0,"
             "\"page_lag_bytes\":0,\"page_high_water_bytes\":0,"
             "\"page_catchup_bytes\":0,\"page_throttled\":0,"

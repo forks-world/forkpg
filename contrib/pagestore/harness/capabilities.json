@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "inspection_schema": 4,
+  "inspection_schema": 5,
   "inspection_operations": ["health", "timeline", "relation", "manifest", "gc", "owners", "backpressure", "pruning"],
   "runtimes": {
     "daemon_smoke": {
