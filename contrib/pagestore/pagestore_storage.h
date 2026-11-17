@@ -49,6 +49,9 @@ typedef struct PsStorage
 	 * lock, so the lock-free IMMEDSYNC path is safe.
 	 */
 	int			sync_needs_write_lock;
+	/* seg_read can run concurrently with shard writes and segment retirement;
+	 * callers must still validate seg_change_token before using the bytes. */
+	int			concurrent_seg_read;
 
 	/* segment log (page-version data); seg_write creates the segment lazily */
 	int			(*seg_write) (uint32_t shard, int seg, uint64_t off,

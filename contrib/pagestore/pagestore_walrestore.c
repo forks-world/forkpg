@@ -59,6 +59,7 @@
 #include "catalog/pg_control.h"
 #include "pagestore_ipc.h"
 #include "pagestore_shm.h"
+#include "pagestore_channel_owner.h"
 
 static void *shm;
 static volatile sig_atomic_t chan = -1;
@@ -67,8 +68,8 @@ static volatile sig_atomic_t request_in_flight;
 static void
 restore_signal_exit(int signo)
 {
-	if (shm != NULL && chan >= 0)
-		ps_store_release(&ps_channel(shm, chan)->claimed,
+	if (__atomic_always_lock_free(sizeof(uint64_t), 0) && shm != NULL && chan >= 0)
+		ps_store_release_u64(&ps_channel(shm, chan)->claimed,
 						 request_in_flight ? 2 : 0);
 	_exit(128 + signo);
 }
@@ -90,7 +91,7 @@ release_channel(void)
 
 		/* Disarm the signal handler before making the mailbox claimable. */
 		chan = -1;
-		ps_store_release(&ps_channel(shm, release_chan)->claimed,
+		ps_store_release_u64(&ps_channel(shm, release_chan)->claimed,
 						 request_in_flight ? 2 : 0);
 	}
 	sigprocmask(SIG_SETMASK, &oldset, NULL);
@@ -199,13 +200,14 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 		PsKey		key;
 		uint32_t	nshards = hdr->nshards ? hdr->nshards : 1;
 		uint32_t	target;
+		uint64_t	my_claim = ps_channel_owner_claim(hdr);
 
 		memset(&key, 0, sizeof(key));
 		key.klass = PS_KLASS_CONTROL;
 		target = ps_key_shard(&key, nshards);
 
 		for (uint32_t i = target; i < hdr->nchannels; i += nshards)
-			if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
+			if (ps_cas_u64(&ps_channel(shm, i)->claimed, 0, my_claim))
 			{
 				chan = (int) i;
 				ps_channel(shm, chan)->shard = target;
@@ -215,7 +217,7 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 
 		/* Reuse abandoned mailboxes only after no daemon write can still arrive. */
 		for (uint32_t i = target; i < hdr->nchannels; i += nshards)
-			if (ps_cas(&ps_channel(shm, i)->claimed, 2, 1))
+			if (ps_cas_u64(&ps_channel(shm, i)->claimed, 2, my_claim))
 			{
 				uint32_t	state = ps_load_acquire(&ps_channel(shm, i)->state);
 
@@ -226,7 +228,15 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 					sigprocmask(SIG_SETMASK, &oldset, NULL);
 					return;
 				}
-				ps_store_release(&ps_channel(shm, i)->claimed, 2);
+				ps_store_release_u64(&ps_channel(shm, i)->claimed, 2);
+			}
+		for (uint32_t i = target; i < hdr->nchannels; i += nshards)
+			if (ps_channel_reclaim_dead(ps_channel(shm, i), my_claim))
+			{
+				chan = (int) i;
+				ps_channel(shm, chan)->shard = target;
+				sigprocmask(SIG_SETMASK, &oldset, NULL);
+				return;
 			}
 	}
 	sigprocmask(SIG_SETMASK, &oldset, NULL);

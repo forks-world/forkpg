@@ -312,6 +312,14 @@ test('pagestore_inspect_mailbox',
   timeout: 30,
 )
 
+pagestore_channel_owner_test = executable('pagestore_channel_owner_test',
+  files('pagestore_channel_owner_test.c'), install: false)
+test('pagestore_channel_owner', pagestore_channel_owner_test, suite: ['pagestore'])
+pagestore_channel_owner_integration_test = executable('pagestore_channel_owner_integration_test',
+  files('pagestore_channel_owner_integration_test.c'), install: false)
+test('pagestore_channel_owner_integration', pagestore_channel_owner_integration_test,
+  args: [pagestore_import], depends: [pagestore_import], suite: ['pagestore'], timeout: 15)
+
 # Unit test for the immutable image-layer file format (no daemon, no PG).
 pagestore_layer_test = executable('pagestore_layer_test',
   files('pagestore_layer_test.c', 'pagestore_layer.c', 'pagestore_store_owner.c', 'pagestore_layer_store.c',
@@ -485,6 +493,8 @@ test('pagestore_control_group_crash', pagestore_wal_reclaim_core_test,
   args: ['--control-crash'], suite: ['pagestore'], timeout: 45)
 test('pagestore_control_group_race', pagestore_wal_reclaim_core_test,
   args: ['--control-race'], suite: ['pagestore'], timeout: 30)
+test('pagestore_control_prefetch_race', pagestore_wal_reclaim_core_test,
+  args: ['--control-prefetch-race'], suite: ['pagestore'], timeout: 30)
 test('pagestore_archive_progress_authority',
   pagestore_wal_reclaim_core_test,
   args: ['--archive-progress-authority'],

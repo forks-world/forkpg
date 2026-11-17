@@ -6,8 +6,8 @@
  *
  * Included by BOTH the PG-side module (with PG headers) and the standalone
  * daemon (without them), so it uses only plain fixed-width C types and defines
- * an identical layout on both sides.  Synchronization uses __atomic builtins on
- * plain uint32 fields.
+ * an identical layout on both sides. Synchronization uses __atomic builtins on
+ * fixed-width integer fields.
  *
  * Page-size independence: nothing here hardcodes the engine page size.  The
  * channel data buffer is sized in terms of PS_IO_UNIT -- the transfer/IO unit,
@@ -30,7 +30,8 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		56	/* 56: archive progress PREPARE/ACTIVATE split.
+#define PS_SHM_VERSION		57	/* 57: generation-fenced channel ownership.
+								 * 56: archive progress PREPARE/ACTIVATE split.
 								 * 55: archive progress FREEZE request payload.
 								 * 53: compaction conflict and fallback metrics.
 								 * 52: recovery writes carry the active replay
@@ -531,7 +532,7 @@ typedef struct PsWalBaseState
 /* One channel = one backend's mailbox. */
 typedef struct PsChannel
 {
-	uint32_t	claimed;		/* atomic: 0 free, 1 owned */
+	uint64_t	claimed;		/* 0 free, 1 legacy, 2 abandoned; else generation/PID */
 	uint32_t	state;			/* atomic: PS_STATE_* */
 
 	/* request */
@@ -739,6 +740,9 @@ typedef struct PsShmHeader
 	PsInspectionMetrics inspection;
 	PsInspectionRequest inspection_request;
 	PsCompactionMetrics compaction;
+	uint32_t	channel_owner_generation;
+	uint64_t	channel_pidns_dev;
+	uint64_t	channel_pidns_ino;
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)

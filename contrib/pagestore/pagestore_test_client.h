@@ -339,7 +339,7 @@ psc_client_attach(void)
 	hdr = (PsShmHeader *) psc_shm;
 	psc_chan = -1;
 	for (uint32_t i = 0; i < hdr->nchannels; i++)
-		if (ps_cas(&ps_channel(psc_shm, i)->claimed, 0, 1))
+		if (ps_cas_u64(&ps_channel(psc_shm, i)->claimed, 0, 1))
 		{
 			psc_chan = (int) i;
 			break;
@@ -354,7 +354,7 @@ psc_client_detach(void)
 	if (psc_shm != NULL)
 	{
 		if (psc_chan >= 0)
-			ps_store_release(&ps_channel(psc_shm, psc_chan)->claimed, 0);
+			ps_store_release_u64(&ps_channel(psc_shm, psc_chan)->claimed, 0);
 		munmap(psc_shm, PS_SHM_SIZE);
 		psc_shm = NULL;
 		psc_chan = -1;

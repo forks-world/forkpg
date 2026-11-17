@@ -393,8 +393,8 @@ run_test(const char *daemon_path)
 		goto cleanup;
 	hdr = (PsShmHeader *) shm;
 	reader = ps_channel(shm, 0);
-	check(ps_cas(&reader->claimed, 0, 1), "integration claims seed channel");
-	if (ps_load_acquire(&reader->claimed) == 0)
+	check(ps_cas_u64(&reader->claimed, 0, 1), "integration claims seed channel");
+	if (ps_load_acquire_u64(&reader->claimed) == 0)
 		goto cleanup;
 	readback = malloc(page_size);
 	check(readback != NULL, "integration allocates page buffers");
@@ -415,7 +415,7 @@ run_test(const char *daemon_path)
 		submit_and_wait(reader);
 		check(reader->status == PS_STATUS_OK, "integration flushes page mutation");
 	}
-	ps_store_release(&reader->claimed, 0);
+	ps_store_release_u64(&reader->claimed, 0);
 	munmap(shm, PS_SHM_SIZE);
 	shm = MAP_FAILED;
 	close(fd);
@@ -452,10 +452,10 @@ run_test(const char *daemon_path)
 	hdr = (PsShmHeader *) shm;
 	reader = ps_channel(shm, 0);
 	pending = ps_channel(shm, 1);
-	check(ps_cas(&reader->claimed, 0, 1) && ps_cas(&pending->claimed, 0, 1),
+	check(ps_cas_u64(&reader->claimed, 0, 1) && ps_cas_u64(&pending->claimed, 0, 1),
 		  "integration claims two channels on one shard");
-	if (ps_load_acquire(&reader->claimed) == 0 ||
-		ps_load_acquire(&pending->claimed) == 0)
+	if (ps_load_acquire_u64(&reader->claimed) == 0 ||
+		ps_load_acquire_u64(&pending->claimed) == 0)
 		goto cleanup;
 	{
 		uint64_t before = ps_load_acquire_u64(&hdr->inspection_metrics_seq);
@@ -566,8 +566,8 @@ run_test(const char *daemon_path)
 	/* Restart with the old debt fully caught up.  This specifically exercises
 	 * rebuilding gc_next_seg: deleted historical segment ids must not become
 	 * phantom debt when the process starts with a fresh in-memory cursor. */
-	ps_store_release(&pending->claimed, 0);
-	ps_store_release(&reader->claimed, 0);
+	ps_store_release_u64(&pending->claimed, 0);
+	ps_store_release_u64(&reader->claimed, 0);
 	munmap(shm, PS_SHM_SIZE);
 	shm = MAP_FAILED;
 	close(fd);
@@ -614,7 +614,7 @@ run_test(const char *daemon_path)
 		goto cleanup;
 	hdr = (PsShmHeader *) shm;
 	reader = ps_channel(shm, 0);
-	check(ps_cas(&reader->claimed, 0, 1),
+	check(ps_cas_u64(&reader->claimed, 0, 1),
 		  "cursor-restart claims a channel");
 	check(ps_load_acquire_u64(&hdr->page_backpressure.lag_bytes) == 0 &&
 		  ps_load_acquire(&hdr->page_backpressure.throttled) == 0,
@@ -642,7 +642,7 @@ run_test(const char *daemon_path)
 	check(reader->status == PS_STATUS_OK,
 		  "cursor-restart seeds shutdown throttle in one admitted mutation");
 
-	ps_store_release(&reader->claimed, 0);
+	ps_store_release_u64(&reader->claimed, 0);
 	munmap(shm, PS_SHM_SIZE);
 	shm = MAP_FAILED;
 	close(fd);
@@ -706,11 +706,11 @@ run_test(const char *daemon_path)
 	reader = ps_channel(shm, 0);
 	pending = ps_channel(shm, 1);
 	aba = ps_channel(shm, 2);
-	check(ps_cas(&reader->claimed, 0, 1) && ps_cas(&pending->claimed, 0, 1) &&
-		  ps_cas(&aba->claimed, 0, 1), "shutdown phase claims three channels");
-	if (ps_load_acquire(&reader->claimed) == 0 ||
-		ps_load_acquire(&pending->claimed) == 0 ||
-		ps_load_acquire(&aba->claimed) == 0)
+	check(ps_cas_u64(&reader->claimed, 0, 1) && ps_cas_u64(&pending->claimed, 0, 1) &&
+		  ps_cas_u64(&aba->claimed, 0, 1), "shutdown phase claims three channels");
+	if (ps_load_acquire_u64(&reader->claimed) == 0 ||
+		ps_load_acquire_u64(&pending->claimed) == 0 ||
+		ps_load_acquire_u64(&aba->claimed) == 0)
 		goto cleanup;
 	for (int i = 0; i < 500; i++)
 	{
@@ -796,9 +796,9 @@ cleanup:
 	if (ready_pipe[1] >= 0)
 		close(ready_pipe[1]);
 	if (pending != NULL)
-		ps_store_release(&pending->claimed, 0);
+		ps_store_release_u64(&pending->claimed, 0);
 	if (reader != NULL)
-		ps_store_release(&reader->claimed, 0);
+		ps_store_release_u64(&reader->claimed, 0);
 	if (shm != MAP_FAILED)
 		munmap(shm, PS_SHM_SIZE);
 	if (fd >= 0)
@@ -861,10 +861,10 @@ test_forkmeta_request_classification(const char *daemon_path)
 	hdr = (PsShmHeader *) shm;
 	writer = ps_channel(shm, 0);
 	pending = ps_channel(shm, 1);
-	check(ps_cas(&writer->claimed, 0, 1) && ps_cas(&pending->claimed, 0, 1),
+	check(ps_cas_u64(&writer->claimed, 0, 1) && ps_cas_u64(&pending->claimed, 0, 1),
 			"forkmeta classification claims two channels");
-	if (ps_load_acquire(&writer->claimed) == 0 ||
-		ps_load_acquire(&pending->claimed) == 0)
+	if (ps_load_acquire_u64(&writer->claimed) == 0 ||
+		ps_load_acquire_u64(&pending->claimed) == 0)
 		goto cleanup;
 	for (uint32_t i = 0; i < 3; i++)
 	{
@@ -953,9 +953,9 @@ cleanup:
 		}
 	}
 	if (pending != NULL)
-		ps_store_release(&pending->claimed, 0);
+		ps_store_release_u64(&pending->claimed, 0);
 	if (writer != NULL)
-		ps_store_release(&writer->claimed, 0);
+		ps_store_release_u64(&writer->claimed, 0);
 	if (shm != MAP_FAILED)
 		munmap(shm, PS_SHM_SIZE);
 	if (fd >= 0)
@@ -1002,7 +1002,7 @@ test_admission_writer_does_not_block_reads(const char *daemon_path)
 		goto cleanup;
 	writer = ps_channel(shm, 0);
 	reader = ps_channel(shm, 1);
-	marker = ps_cas(&writer->claimed, 0, 1) && ps_cas(&reader->claimed, 0, 1);
+	marker = ps_cas_u64(&writer->claimed, 0, 1) && ps_cas_u64(&reader->claimed, 0, 1);
 	check(marker, "admission test claims two channels");
 	if (!marker)
 		goto cleanup;

@@ -37,6 +37,7 @@
 
 #include "pagestore_ipc.h"
 #include "pagestore_shm.h"
+#include "pagestore_channel_owner.h"
 #include "pagestore_core.h"
 #include "pagestore_pgcache.h"
 #include "pagestore_fault.h"
@@ -1422,7 +1423,7 @@ cancel_deferred_channels(void *shm, uint32_t nchannels)
 			continue;
 		ch = ps_channel(shm, i);
 		generation = slot->request_generation;
-		if (ps_load_acquire(&ch->claimed) == 0 ||
+		if (ps_load_acquire_u64(&ch->claimed) == 0 ||
 			!backpressure_request_matches(slot, ch) ||
 			!ps_cas(&ch->state, PS_STATE_REQUEST, PS_STATE_CANCELLING))
 		{
@@ -1888,6 +1889,7 @@ main(int argc, char **argv)
 	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
+	(void) ps_channel_pid_namespace(&hdr->channel_pidns_dev, &hdr->channel_pidns_ino);
 	hdr->frontend_capabilities = PS_FRONTEND_CAP_RELATION_INSPECTION |
 		PS_FRONTEND_CAP_BRANCH_SEQ | PS_FRONTEND_CAP_ATOMIC_PINS |
 		PS_FRONTEND_CAP_FSM_RESET | PS_FRONTEND_CAP_WAL_BASE |

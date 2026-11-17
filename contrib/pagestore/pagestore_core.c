@@ -737,6 +737,15 @@ static uint64_t ps_test_compaction_pass_count;
 static unsigned segment_gc_compaction_turn;
 static void (*compaction_unlocked_test_hook)(void *);
 static void *compaction_unlocked_test_hook_arg;
+static void (*control_prefetch_test_hook)(void *);
+static void *control_prefetch_test_hook_arg;
+
+void
+ps_test_set_control_prefetch_hook(void (*hook)(void *), void *arg)
+{
+	control_prefetch_test_hook = hook;
+	control_prefetch_test_hook_arg = arg;
+}
 static void (*compaction_fallback_test_hook)(void *);
 static void *compaction_fallback_test_hook_arg;
 
@@ -1028,10 +1037,18 @@ typedef struct PsControlChainPlan
 	int			valid;
 } PsControlChainPlan;
 
+typedef struct ControlRedoPrefetch
+{
+	uint64_t *values;
+	unsigned char *valid;
+	uint32_t count;
+} ControlRedoPrefetch;
+
 static int control_chain_plan(uint32_t timeline, const PsKey *key,
 							  uint32_t block, uint64_t floor,
 							  const PsHistoryFence *fences, uint32_t nfences,
-							  PsControlChainPlan *plan);
+							  PsControlChainPlan *plan,
+							  const ControlRedoPrefetch *prefetch);
 struct PageEnt;
 static PageVer **control_fence_selections(const struct PageEnt *entry,
 												 const PsHistoryFence *fences, uint32_t nfences);
@@ -3885,7 +3902,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 								   order[first].block < PS_CONTROL_PAIRED_BLOCKS ?
 								   PS_CONTROL_IMAGE_BLOCK : order[first].block,
 								   floor, control_fences, ncontrol_fences,
-								   &plan) != 0)
+								   &plan, NULL) != 0)
 			{
 				free(versions);
 				free(keep);
@@ -23868,19 +23885,161 @@ control_note_ptr_cmp(const void *va, const void *vb)
 	return a > b ? -1 : a < b;
 }
 
+/* The map is locked for the lifetime of this index.  Index only layers that
+ * can contain the control note key, then use the prefix maximum end LSN to
+ * discard earlier intervals without losing overlapping or duplicate copies. */
+typedef struct ControlNoteLayer
+{
+	PsLayerDesc desc;
+	uint64_t prefix_end;
+} ControlNoteLayer;
+
+typedef struct ControlNoteLayers
+{
+	ControlNoteLayer *items;
+	uint32_t count;
+	unsigned char *scratch;
+} ControlNoteLayers;
+
+static int
+control_note_layer_cmp(const void *va, const void *vb)
+{
+	const ControlNoteLayer *a = va, *b = vb;
+
+	if (a->desc.lsn_start != b->desc.lsn_start)
+		return a->desc.lsn_start < b->desc.lsn_start ? -1 : 1;
+	return a->desc.layer_id < b->desc.layer_id ? -1 :
+		a->desc.layer_id > b->desc.layer_id;
+}
+
+static int
+control_note_layers_open(uint32_t timeline, const PsKey *key, ControlNoteLayers *index)
+{
+	PsLayerDesc range = {0};
+	uint32_t shard = ps_shard_of(key);
+	uint64_t max_end = 0;
+
+	memset(index, 0, sizeof(*index));
+	range.start_key = range.end_key = *key;
+	range.start_block = range.end_block = PS_CONTROL_NOTE_BLOCK;
+	index->items = calloc(ps_layer_map.nlayers ? ps_layer_map.nlayers : 1,
+						 sizeof(*index->items));
+	index->scratch = malloc(page_size);
+	if (!index->items || !index->scratch)
+	{
+		free(index->items);
+		free(index->scratch);
+		memset(index, 0, sizeof(*index));
+		return -1;
+	}
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->kind == PS_LAYER_IMAGE && d->timeline == timeline &&
+			layer_matches_read_shard(d, shard) && !d->deleting &&
+			!ps_image_layer_ranges_disjoint(d, &range))
+			index->items[index->count++].desc = *d;
+	}
+	qsort(index->items, index->count, sizeof(*index->items), control_note_layer_cmp);
+	for (uint32_t i = 0; i < index->count; i++)
+	{
+		if (index->items[i].desc.lsn_end > max_end)
+			max_end = index->items[i].desc.lsn_end;
+		index->items[i].prefix_end = max_end;
+	}
+	return 0;
+}
+
+static int
+control_note_layers_read(ControlNoteLayers *index, const PsKey *key,
+	const PageVer *v, unsigned char *out)
+{
+	uint32_t lo = 0, hi = index->count;
+	uint64_t best_seq = 0, best_layer = 0;
+	int found = 0;
+
+	while (lo < hi)
+	{
+		uint32_t mid = lo + (hi - lo) / 2;
+		if (index->items[mid].desc.lsn_start <= v->lsn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	while (lo > 0 && index->items[lo - 1].prefix_end >= v->lsn)
+	{
+		PsLayerDesc d = index->items[--lo].desc;
+		uint64_t lsn, seq;
+		bool was_verified = d.data_verified;
+		int rc;
+
+		if (d.lsn_end < v->lsn)
+			continue;
+		if (!was_verified && layer_verified_lookup(&d, 0))
+			d.data_verified = true;
+		rc = ps_image_layer_lookup_exact(&d, key, PS_CONTROL_NOTE_BLOCK,
+			v->lsn, v->admission_seq, index->scratch, page_size, &lsn, &seq);
+		if (!was_verified && d.data_verified)
+			layer_verified_park(&d);
+		if (rc < 0)
+			return -1;
+		if (rc == 1 && (!found || seq > best_seq ||
+			(seq == best_seq && d.layer_id > best_layer)))
+		{
+			if (lsn != v->lsn)
+				continue;
+			best_seq = seq;
+			best_layer = d.layer_id;
+			memcpy(out, index->scratch, page_size);
+			found = 1;
+		}
+	}
+	return found ? 0 : -1;
+}
+
 static int
 control_note_redo_cached(uint32_t timeline, const PsKey *key, const PageEnt *notes,
 	const PageVer *note, unsigned char *tmp, uint64_t *values, unsigned char *valid,
-	uint64_t *redo)
+	uint64_t *redo, ControlNoteLayers *layers, bool prefetch_only)
 {
 	size_t index = (size_t) (note - notes->vers);
 
 	if (values && valid && index < (size_t) notes->nver && valid[index])
 	{
 		*redo = values[index];
+#ifdef PAGESTORE_RELATION_INSPECTION_TEST
+		if (prefetch_only)
+		{
+			uint64_t reference;
+
+			if (control_note_redo(timeline, key, note, tmp, &reference) != 0 ||
+				reference != *redo)
+				return -1;
+		}
+#endif
 		return 0;
 	}
-	if (control_note_redo(timeline, key, note, tmp, redo) != 0)
+	if (prefetch_only)
+		return -1;
+	if (layers && note->seg < 0)
+	{
+		if (control_note_layers_read(layers, key, note, tmp) != 0 ||
+			ps_artifact_trailer_check(tmp, PS_REDO_NOTE_MAGIC, PS_REDO_NOTE_VERSION) != 0)
+			return -1;
+		memcpy(redo, tmp, sizeof(*redo));
+#ifdef PAGESTORE_RELATION_INSPECTION_TEST
+		/* Differentially exercise the existing complete-map reader in the
+		 * real multi-layer pruning tests, including overlapping identities. */
+		{
+			uint64_t reference;
+			if (control_note_redo(timeline, key, note, tmp, &reference) != 0 ||
+				reference != *redo)
+				return -1;
+		}
+#endif
+	}
+	else if (control_note_redo(timeline, key, note, tmp, redo) != 0)
 		return -1;
 	if (values && valid && index < (size_t) notes->nver)
 	{
@@ -23905,7 +24064,8 @@ control_note_redo_cached(uint32_t timeline, const PsKey *key, const PageEnt *not
 static int
 control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 				   uint64_t floor, const PsHistoryFence *fences,
-				   uint32_t nfences, PsControlChainPlan *plan)
+				   uint32_t nfences, PsControlChainPlan *plan,
+				   const ControlRedoPrefetch *prefetch)
 {
 	PageEnt    *e = page_find(timeline, key, block);
 	unsigned char *keep;
@@ -23990,6 +24150,8 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 		PageVer **note_sorted = NULL;
 		uint64_t *redo_values = NULL;
 		unsigned char *redo_valid = NULL;
+		ControlNoteLayers note_layers = {0};
+		ControlNoteLayers *note_layers_ptr = NULL;
 		uint32_t	nkept = plan->nkept;
 
 		if (notes != NULL && tmp == NULL)
@@ -24002,9 +24164,17 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 		}
 		if (notes != NULL && notes->nver > 0)
 		{
+			if (!prefetch && control_note_layers_open(timeline, key, &note_layers) == 0)
+				note_layers_ptr = &note_layers;
 			note_sorted = malloc((size_t) notes->nver * sizeof(*note_sorted));
 			redo_values = calloc((size_t) notes->nver, sizeof(*redo_values));
 			redo_valid = calloc((size_t) notes->nver, 1);
+			if (prefetch && redo_values && redo_valid &&
+				prefetch->count == (uint32_t) notes->nver)
+			{
+				memcpy(redo_values, prefetch->values, (size_t) notes->nver * sizeof(*redo_values));
+				memcpy(redo_valid, prefetch->valid, (size_t) notes->nver);
+			}
 			if (!redo_values || !redo_valid)
 			{
 				free(redo_values);
@@ -24060,8 +24230,10 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * on without it could retire the exact-redo image the note names.
 			 * Fail the plan closed and let a later pass retry. */
 			if (control_note_redo_cached(timeline, key, notes, note, tmp,
-					redo_values, redo_valid, &redo) != 0)
+					redo_values, redo_valid, &redo, note_layers_ptr, prefetch != NULL) != 0)
 			{
+				free(note_layers.items);
+				free(note_layers.scratch);
 				free(note_sorted);
 				free(redo_values);
 				free(redo_valid);
@@ -24123,8 +24295,10 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 			if (note == NULL)
 				continue;
 			if (control_note_redo_cached(timeline, key, notes, note, tmp,
-					redo_values, redo_valid, &redo) != 0)
+					redo_values, redo_valid, &redo, note_layers_ptr, prefetch != NULL) != 0)
 			{
+				free(note_layers.items);
+				free(note_layers.scratch);
 				free(note_selections);
 				free(note_sorted);
 				free(redo_values);
@@ -24155,6 +24329,8 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 		free(note_sorted);
 		free(redo_values);
 		free(redo_valid);
+		free(note_layers.items);
+		free(note_layers.scratch);
 		free(tmp);
 	}
 	plan->valid = 1;
@@ -24487,7 +24663,7 @@ ps_test_control_note_plan(uint32_t timeline, uint64_t *oldest_lsn,
 			&floor, 1, NULL, NULL, NULL, NULL) != 0 || floor == 0 ||
 		control_prune_fences(timeline, &fences, &nfences) != 0 ||
 		control_chain_plan(timeline, &key, PS_CONTROL_IMAGE_BLOCK, floor,
-						   fences, nfences, &plan) != 0 || !plan.valid)
+						   fences, nfences, &plan, NULL) != 0 || !plan.valid)
 		goto done;
 	notes = page_find(timeline, &key, PS_CONTROL_NOTE_BLOCK);
 	if (notes == NULL || notes->nver == 0)
@@ -24642,6 +24818,145 @@ control_layer_id_cmp(const void *va, const void *vb)
 static int oldest_artifact_candidates(uint32_t timeline, uint32_t shard,
 	uint64_t floor, PsImgIndexEnt **out, uint32_t *count);
 
+/* Copy the note identities and pin their immutable layers while locked.  Read
+ * them without the foreground locks, then reject the result unless every
+ * captured page, timeline, retention and layer-map fence still matches. Segment
+ * reads require an explicit concurrency capability and a stable change token;
+ * otherwise the planner defers instead of reading under the shard lock. */
+static int
+control_redo_prefetch_unlocked(uint32_t timeline, uint32_t shard,
+	const PsKey *key, uint64_t floor, ControlRedoPrefetch *prefetch)
+{
+	ControlNoteLayers index = {0};
+	PageEnt *notes = page_find(timeline, key, PS_CONTROL_NOTE_BLOCK);
+	PageVer *versions = NULL;
+	unsigned char *page = NULL;
+	uint64_t *segment_tokens = NULL;
+	PsLayerDesc *map = NULL;
+	uint64_t *pins = NULL;
+	uint64_t page_epoch = g_shards[shard].page_index_epoch;
+	uint64_t admission_epoch, timeline_epoch, retention_epoch, incarnation, current_floor;
+	uint64_t current_retention, current_incarnation;
+	PsTimelineState state;
+	uint32_t map_count = ps_layer_map.nlayers, npins = 0;
+	int rc = -1;
+
+	memset(prefetch, 0, sizeof(*prefetch));
+	if (!notes || notes->nver <= 0 || map_count == 0 || page_epoch == UINT64_MAX ||
+		ps_retention_epoch(&retention_epoch) != 0 ||
+		!ps_timeline_state(timeline, &state, &incarnation) || state != PS_TIMELINE_LIVE)
+		return -1;
+	admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
+	prefetch->count = (uint32_t) notes->nver;
+	if (sizeof(*versions) > SIZE_MAX / (size_t) prefetch->count)
+		return -1;
+	versions = malloc((size_t) prefetch->count * sizeof(*versions));
+	page = malloc(page_size);
+	segment_tokens = calloc(prefetch->count, sizeof(*segment_tokens));
+	prefetch->values = calloc(prefetch->count, sizeof(*prefetch->values));
+	prefetch->valid = calloc(prefetch->count, 1);
+	map = calloc(map_count ? map_count : 1, sizeof(*map));
+	if (!versions || !page || !segment_tokens || !prefetch->values || !prefetch->valid || !map ||
+		control_note_layers_open(timeline, key, &index) != 0)
+		goto done_locked;
+	pins = calloc(index.count ? index.count : 1, sizeof(*pins));
+	if (!pins)
+		goto done_locked;
+	memcpy(versions, notes->vers, (size_t) prefetch->count * sizeof(*versions));
+	memcpy(map, ps_layer_map.layers, (size_t) map_count * sizeof(*map));
+	for (uint32_t i = 0; i < index.count; i++)
+		pins[i] = index.items[i].desc.layer_id;
+	qsort(pins, index.count, sizeof(*pins), cmp_u64);
+	for (uint32_t i = 0; i < map_count; i++)
+		if (bsearch(&ps_layer_map.layers[i].layer_id, pins, index.count,
+				sizeof(*pins), cmp_u64))
+		{
+			__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+			npins++;
+		}
+	if (npins != index.count)
+		goto done_locked;
+	ps_unlock_map();
+	pthread_rwlock_unlock(&page_prune_lock);
+	for (uint32_t s = core_shards(); s > 0; s--)
+		ps_unlock_shard(s - 1);
+	if (control_prefetch_test_hook != NULL)
+		control_prefetch_test_hook(control_prefetch_test_hook_arg);
+	for (uint32_t i = 0; i < prefetch->count; i++)
+	{
+		uint64_t after;
+		int read_rc;
+
+		if (versions[i].seg >= 0)
+		{
+			if (!ps_storage->concurrent_seg_read || !ps_storage->seg_change_token ||
+				ps_storage->seg_change_token(versions[i].shard, versions[i].seg,
+					&segment_tokens[i]) != 0)
+				continue;
+			read_rc = read_version(&versions[i], page);
+			if (read_rc != 0 ||
+				ps_storage->seg_change_token(versions[i].shard, versions[i].seg, &after) != 0 ||
+				after != segment_tokens[i])
+				continue;
+		}
+		else if (control_note_layers_read(&index, key, &versions[i], page) != 0)
+			continue;
+		if (ps_artifact_trailer_check(page, PS_REDO_NOTE_MAGIC,
+									  PS_REDO_NOTE_VERSION) != 0)
+			continue;
+		memcpy(&prefetch->values[i], page, sizeof(prefetch->values[i]));
+		prefetch->valid[i] = 1;
+	}
+	for (uint32_t s = 0; s < core_shards(); s++)
+		ps_lock_shard_wr(s);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	if (page_epoch != g_shards[shard].page_index_epoch ||
+		admission_epoch != __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE) ||
+		timeline_epoch != __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE) ||
+		ps_retention_epoch(&current_retention) != 0 || current_retention != retention_epoch ||
+		!ps_timeline_state(timeline, &state, &current_incarnation) ||
+		state != PS_TIMELINE_LIVE || current_incarnation != incarnation ||
+		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+			&current_floor, 1, NULL, NULL, NULL, NULL) != 0 || current_floor != floor ||
+		ps_layer_map.nlayers != map_count)
+		goto done_locked;
+	for (uint32_t i = 0; i < map_count; i++)
+		if (!ps_image_snapshot_descriptor_equal(&map[i], &ps_layer_map.layers[i]))
+			goto done_locked;
+	for (uint32_t i = 0; i < prefetch->count; i++)
+		if (prefetch->valid[i] && versions[i].seg >= 0)
+		{
+			uint64_t current_token;
+
+			if (ps_storage->seg_change_token(versions[i].shard, versions[i].seg,
+					&current_token) != 0 || current_token != segment_tokens[i])
+				goto done_locked;
+		}
+	rc = 0;
+done_locked:
+	if (npins)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (bsearch(&ps_layer_map.layers[i].layer_id, pins, index.count,
+					sizeof(*pins), cmp_u64))
+				__atomic_sub_fetch(&ps_layer_map.layers[i].cache_readers, 1, __ATOMIC_ACQ_REL);
+	free(index.items);
+	free(index.scratch);
+	free(versions);
+	free(page);
+	free(segment_tokens);
+	free(map);
+	free(pins);
+	if (rc != 0)
+	{
+		free(prefetch->values);
+		free(prefetch->valid);
+		memset(prefetch, 0, sizeof(*prefetch));
+	}
+	return rc;
+}
+
 /* Retire complete, globally obsolete control groups in one durable manifest
  * transaction. Called with all shard locks, prune lock and map write lock;
  * those locks are released during index scanning, staging and verification. */
@@ -24651,6 +24966,7 @@ compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 {
 	PsKey key = {0};
 	PsControlChainPlan global = {0};
+	ControlRedoPrefetch redo_prefetch = {0};
 	PsHistoryFence *fences = NULL;
 	PsLayerDesc *layers = NULL, inputs[PS_IMAGE_MERGE_MAX_INPUTS];
 	PsLayerDesc outputs[PS_CONTROL_PRUNE_MAX_OUTPUTS] = {0};
@@ -24694,11 +25010,27 @@ compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 		goto done;
 	if (!artifact_mode)
 	{
-		if (shard != ps_shard_of(&key) ||
+		if (shard != ps_shard_of(&key))
+			goto done;
+		if (page_find(timeline, &key, PS_CONTROL_NOTE_BLOCK) == NULL)
+			goto done;
+		if (control_redo_prefetch_unlocked(timeline, shard, &key, floor, &redo_prefetch) != 0 ||
 			control_prune_fences(timeline, &fences, &nfences) != 0 ||
 			control_chain_plan(timeline, &key, PS_CONTROL_IMAGE_BLOCK, floor,
-				fences, nfences, &global) != 0 || !global.valid ||
-			control_pair_candidates(timeline, &key, &global, fences, nfences,
+				fences, nfences, &global, &redo_prefetch) != 0 || !global.valid)
+		{
+			if (getenv("PAGESTORE_BENCH_RECOVERY") != NULL)
+			{
+				uint32_t valid = 0;
+				for (uint32_t i = 0; i < redo_prefetch.count; i++)
+					valid += redo_prefetch.valid[i] != 0;
+				fprintf(stderr, "BENCH control_prefetch_deferred timeline=%u valid=%u count=%u\n",
+						timeline, valid, redo_prefetch.count);
+			}
+			*prune_deferred = 1;
+			goto done;
+		}
+		if (control_pair_candidates(timeline, &key, &global, fences, nfences,
 				&candidates, &ncandidates) != 0)
 			goto done;
 	}
@@ -24996,6 +25328,8 @@ compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 	*prune_deferred = 1;
 	rc = 1;
 done:
+	free(redo_prefetch.values);
+	free(redo_prefetch.valid);
 	ps_compaction_relation_plan_close(plan);
 	ps_image_compaction_sources_close(verified_sources);
 	ps_compaction_coverage_close(drop_scan);
@@ -25071,7 +25405,7 @@ control_coverage_preflight(uint32_t timeline, uint32_t selected_limit, bool pair
 		captured.page_floor == 0 ||
 		control_prune_fences(timeline, &fences, &nfences) != 0 ||
 		control_chain_plan(timeline, &key, PS_CONTROL_IMAGE_BLOCK, captured.page_floor,
-			fences, nfences, &plan) != 0 || !plan.valid)
+			fences, nfences, &plan, NULL) != 0 || !plan.valid)
 		goto done;
 	captured.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 	captured.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);

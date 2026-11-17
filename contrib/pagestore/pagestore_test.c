@@ -604,7 +604,7 @@ client_attach(const char *shm_name, uint32_t expect_page_size)
 	{
 		PsChannel  *ch = ps_channel(cl_shm, i);
 
-		if (ps_cas(&ch->claimed, 0, 1))
+		if (ps_cas_u64(&ch->claimed, 0, 1))
 		{
 			cl_chan = (int) i;
 			break;
@@ -623,7 +623,7 @@ client_detach(void)
 	if (cl_shm)
 	{
 		if (cl_chan >= 0)
-			ps_store_release(&ps_channel(cl_shm, cl_chan)->claimed, 0);
+			ps_store_release_u64(&ps_channel(cl_shm, cl_chan)->claimed, 0);
 		munmap(cl_shm, PS_SHM_SIZE);
 		cl_shm = NULL;
 	}
@@ -644,7 +644,7 @@ claim_extra_channel(void)
 		{
 			PsChannel *ch = ps_channel(cl_shm, i);
 
-			if (ps_cas(&ch->claimed, 0, 1))
+			if (ps_cas_u64(&ch->claimed, 0, 1))
 				return ch;
 		}
 	return NULL;
@@ -667,7 +667,7 @@ claim_channel_at(uint32_t idx)
 	if (idx >= hdr->nchannels)
 		return NULL;
 	ch = ps_channel(cl_shm, idx);
-	if (ps_cas(&ch->claimed, 0, 1))
+	if (ps_cas_u64(&ch->claimed, 0, 1))
 		return ch;
 	return NULL;
 }
@@ -3022,7 +3022,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		{
 			PsChannel  *candidate = ps_channel(cl_shm, i);
 
-			if (ps_cas(&candidate->claimed, 0, 1))
+			if (ps_cas_u64(&candidate->claimed, 0, 1))
 			{
 				barrier_ch = candidate;
 				break;
@@ -3070,7 +3070,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		{
 			check(write_ch->req_seq > durable_barrier_seq,
 				  "released same-LSN write is admitted after the barrier");
-			ps_store_release(&barrier_ch->claimed, 0);
+			ps_store_release_u64(&barrier_ch->claimed, 0);
 		}
 	}
 	/* Leave a sub-threshold tail outside the committed watermark and crash. */
@@ -5738,7 +5738,7 @@ run_wal_backpressure_suite(const char *daemon_path, const char *tmpbase)
 		  ps_load_acquire_u64(&hdr->wal_backpressure.throttle_exits) != 0,
 		  "real WAL controller exits after immutable-prefix reclaim");
 	if (pending != NULL)
-		ps_store_release(&pending->claimed, 0);
+		ps_store_release_u64(&pending->claimed, 0);
 	client_detach();
 	stop_daemon(dpid);
 	rm_rf(store);
@@ -6504,7 +6504,7 @@ run_ipc_bounds_suite(const char *daemon_path, const char *tmpbase)
 	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
 		  "refused WAL_READ datalen=PS_IO_UNIT+1 leaves the adjacent channel untouched");
 
-	ps_store_release(&neighbor->claimed, 0);
+	ps_store_release_u64(&neighbor->claimed, 0);
 
 done:
 	client_detach();

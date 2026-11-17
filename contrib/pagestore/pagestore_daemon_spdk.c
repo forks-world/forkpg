@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+#include "pagestore_channel_owner.h"
 #include "pagestore_core.h"
 #include "pagestore_pgcache.h"
 #include "pagestore_retention.h"
@@ -1001,6 +1002,7 @@ main(int argc, char **argv)
 
 	memset(shm, 0, PS_SHM_SIZE);
 	hdr->version = PS_SHM_VERSION;
+	(void) ps_channel_pid_namespace(&hdr->channel_pidns_dev, &hdr->channel_pidns_ino);
 	hdr->page_size = page_size;
 	hdr->io_unit = PS_IO_UNIT;
 	hdr->nchannels = PS_MAX_CHANNELS;
