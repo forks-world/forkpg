@@ -1787,6 +1787,13 @@ image_compaction_snapshot_valid(const PsLayerMap *map,
 				return 0;
 			continue;
 		}
+		/* A live layer outside both ID bounds cannot match an input or an
+		 * output. The older one loses ties to the selected suffix and a newer
+		 * one still wins them after replacement. Skip per-input comparisons
+		 * for these layers, which dominate a large suffix compaction. */
+		if (allow_newer == 1 && !current->deleting && !current->legacy_shard_zero &&
+			(current->layer_id < min_id || current->layer_id > outputs[noutputs - 1].layer_id))
+			continue;
 		for (uint32_t j = 0; j < ninputs; j++)
 			if (current->layer_id == inputs[j].layer_id)
 			{
@@ -1821,13 +1828,6 @@ image_compaction_snapshot_valid(const PsLayerMap *map,
 
 			if (!allow_newer || current->legacy_shard_zero)
 				return 0;
-			if (allow_newer == 1 && current->layer_id > outputs[noutputs - 1].layer_id)
-				continue;
-			/* An omitted older layer already loses every tied identity to
-			 * the selected suffix. Full-coverage verification preserves that
-			 * winner in a replacement newer than all selected sources. */
-			if (allow_newer == 1 && current->layer_id < min_id)
-				continue;
 			for (uint32_t j = 0; j < ninputs && disjoint; j++)
 				disjoint = ps_image_layer_ranges_disjoint(current, &inputs[j]);
 			for (uint32_t j = 0; j < noutputs && disjoint; j++)

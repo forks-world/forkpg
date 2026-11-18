@@ -1125,6 +1125,41 @@ test_legacy_output_budget_fairness(void)
 }
 
 static void
+test_busy_parent_does_not_starve_branch_compaction(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-compaction-fairness-XXXXXX";
+	uint32_t child_layers = 0;
+	int wrote = 1;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  write_relation(0, 0, 1000) && write_relation(0, 1, 1100) &&
+		  create_branch(1, 0, 1500) && write_relation(1, 0, 2100) &&
+		  write_relation(1, 1, 2200), "create due parent and branch compactions");
+	compact_layers = 1;
+	for (uint32_t i = 0; i < 8; i++)
+	{
+		/* Refill the parent before every turn, even after a successful merge. */
+		wrote &= write_relation(0, i + 2, 3000 + i);
+		(void) ps_core_maintenance();
+	}
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		const PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		child_layers += d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == 1;
+	}
+	ps_unlock_map();
+	check(wrote && child_layers == 1 && read_relation_at(9, 3007),
+		  "a busy parent does not starve eligible branch compaction");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_large_newest_suffix_selection(void)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-large-suffix-XXXXXX";
@@ -1276,10 +1311,11 @@ test_large_overlap_suffix_gets_early_turn(void)
 }
 
 static void
-test_rejected_suffix_resumes_large_search(void)
+test_large_suffix_merges_when_pruning_cannot_progress(void)
 {
-	char store[TEST_TEMP_PATH_MAX] = "pagestore-rejected-suffix-XXXXXX";
-	uint64_t before, attempted, materialized;
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-large-retained-suffix-XXXXXX";
+	uint64_t before, materialized;
+	uint32_t live_before = 0, live_after = 0;
 
 	configure_core(1);
 	compact_layers = 2000;
@@ -1291,20 +1327,33 @@ test_rejected_suffix_resumes_large_search(void)
 		check(write_relation(0, 0, 1000 + i), "write overlapping obsolete suffix version");
 	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 10000),
-		  "set a floor that makes an all-version merge ineligible");
+		  "set a floor that makes pruning desirable");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_before++;
+	ps_unlock_map();
 	before = ps_test_bounded_compaction_count();
 	materialized = ps_test_compaction_materialize_count();
 	compact_layers = 1;
 	for (int i = 0; i < 256 && ps_test_bounded_compaction_count() == before; i++)
 		(void) ps_core_maintenance();
-	attempted = ps_test_bounded_compaction_count();
-	check(attempted > before && ps_test_compaction_materialize_count() == materialized,
-		  "ineligible suffix continues unfinished search without full materialization");
-	run_maintenance(3);
-	check(ps_test_bounded_compaction_count() == attempted &&
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_after++;
+	ps_unlock_map();
+	check(ps_test_bounded_compaction_count() > before &&
 		  ps_test_compaction_materialize_count() == materialized &&
-		  read_relation_at(0, 2600),
-		  "unfinished search avoids retrying the same rejected suffix");
+		  live_after + PS_IMAGE_MERGE_MAX_INPUTS / 2 <= live_before,
+		  "overlapping suffix reduces layer count even when safe pruning cannot proceed");
+	check(ps_test_page_prune_due(0, 0) && read_relation_at(0, 1000) &&
+		  read_relation_at(0, 2590) && read_relation_at(0, 2600),
+		  "suffix keeps selected and older versions available for later pruning");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) &&
+		  read_relation_at(0, 2590) && read_relation_at(0, 2600),
+		  "all suffix versions remain readable after restart");
 	close_store();
 	remove_tree(store);
 }
@@ -4749,6 +4798,7 @@ main(int argc, char **argv)
 	test_isolated_search_exhausted_progress();
 	test_legacy_budget_rechecks_new_layer();
 	test_legacy_output_budget_fairness();
+	test_busy_parent_does_not_starve_branch_compaction();
 	test_legacy_budget_retries_small_bounded(0);
 	test_legacy_budget_retries_small_bounded(1);
 	test_large_newest_suffix_selection();
@@ -4756,7 +4806,7 @@ main(int argc, char **argv)
 	test_bounded_overlapping_suffix(1);
 	test_mixed_control_suffix_merge();
 	test_large_overlap_suffix_gets_early_turn();
-	test_rejected_suffix_resumes_large_search();
+	test_large_suffix_merges_when_pruning_cannot_progress();
 	test_isolated_bounded_pruning();
 	test_bounded_control_group_branch_and_twins();
 	test_isolated_pruning_branch_view();
