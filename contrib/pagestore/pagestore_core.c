@@ -4195,8 +4195,6 @@ legacy_budget_defer(uint32_t timeline, uint32_t shard)
 	__atomic_store_n(&legacy_budget_retry_at[timeline][shard],
 		now != 0 && now <= UINT64_MAX - PS_LEGACY_BUDGET_RETRY_NS ?
 		now + PS_LEGACY_BUDGET_RETRY_NS : 1, __ATOMIC_RELAXED);
-	__atomic_store_n(&compaction_selection_cursor, (timeline + 1) % MAX_TIMELINES,
-					 __ATOMIC_RELAXED);
 }
 
 
@@ -5095,6 +5093,7 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	uint64_t timeline_epoch;
 	int result = -1, prepare_rc = 0, ambiguous = 0, eligible = 1, full_set = 1;
 	int isolated_pending = 0;
+	bool large_suffix = false;
 	PsHistoryFence *fences = NULL, *storage_fences = NULL;
 	PsViewFence *views = NULL;
 	uint32_t nfences = 0, nstorage = 0;
@@ -5132,6 +5131,7 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 		{
 			g_shards[shard].isolated_suffix_tried[timeline] = 0;
 			ninputs = bounded_newest_suffix_inputs(&ps_layer_map, timeline, shard, inputs, &bytes);
+			large_suffix = ps_layer_map.nlayers >= PS_LARGE_LAYER_MAP_SUFFIX_THRESHOLD;
 		}
 		else if (ninputs == UINT32_MAX &&
 				 (ps_layer_map.nlayers >= PS_LARGE_LAYER_MAP_SUFFIX_THRESHOLD ||
@@ -5149,6 +5149,7 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 			{
 				isolated_pending = 1;
 				ninputs = suffix;
+				large_suffix = ps_layer_map.nlayers >= PS_LARGE_LAYER_MAP_SUFFIX_THRESHOLD;
 			}
 		}
 	}
@@ -5227,14 +5228,23 @@ compact_timeline_bounded(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 					bounded_all_versions_kept, &eligible, &visited);
 			} while (plan_rc == 1 && eligible);
 		ps_compaction_relation_plan_close(plan);
-		if (plan_rc != 0 || !eligible)
-			eligible = 0;
-		if (eligible)
-		{
+		if (eligible && plan_rc == 0)
 			__atomic_fetch_add(&test_bounded_nonzero_plan_count, 1, __ATOMIC_RELAXED);
-			if (compaction_unlocked_test_hook != NULL)
-				compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
+		else if (!eligible && plan_rc >= 0 && large_suffix &&
+				 bytes <= (uint64_t) (ninputs / 2) * PS_IMAGE_BATCH_MAX_RECORDS * page_size)
+		{
+			/* Overlapping older layers can prevent bounded pruning even when
+			 * the selected versions contain obsolete history. For a large
+			 * backlog, consolidate only if this batch can halve its fanout.
+			 * The coverage proof still verifies every winning version, and
+			 * the caller leaves pruning due. */
+			capacity = ninputs / 2;
+			eligible = 1;
 		}
+		else
+			eligible = 0;
+		if (eligible && compaction_unlocked_test_hook != NULL)
+			compaction_unlocked_test_hook(compaction_unlocked_test_hook_arg);
 	}
 	free(views);
 	if (eligible)
@@ -30763,7 +30773,7 @@ ps_core_maintenance_impl(void)
 				fsh = 0;
 	uint64_t	page_floor = 0;
 	uint64_t selection_now;
-	uint32_t selection_start;
+	uint32_t selection_slot, selection_slots;
 	int			found = 0;
 	int			did = 0;
 	int			skip_segment_gc;
@@ -31188,29 +31198,36 @@ ps_core_maintenance_impl(void)
 	}
 	/*
 	 * Phase 1: scan under map read-lock to pick a timeline+shard whose image
-	 * layers are due for compaction.  A shared lock here lets reads proceed.
+	 * layers are due for compaction. Rotate after every selection so that a
+	 * constantly refilled timeline or shard cannot monopolize maintenance.
 	 */
 	selection_now = inspection_now_ns();
-	selection_start = __atomic_load_n(&compaction_selection_cursor, __ATOMIC_RELAXED);
+	selection_slots = MAX_TIMELINES * ns;
+	selection_slot = __atomic_load_n(&compaction_selection_cursor, __ATOMIC_RELAXED);
 
 	ps_lock_map_rd();
-	for (uint32_t pass = 0; pass < MAX_TIMELINES && !found; pass++)
+	for (uint32_t pass = 0; pass < selection_slots; pass++)
 	{
-		uint32_t tl = (selection_start + pass) % MAX_TIMELINES;
+		uint32_t tl = selection_slot / ns;
+		uint32_t sh = selection_slot % ns;
 
-		for (uint32_t sh = 0; sh < ns; sh++)
-			if ((selection_now == 0 || selection_now >=
-				 __atomic_load_n(&legacy_budget_retry_at[tl][sh], __ATOMIC_RELAXED)) &&
-				ps_timeline_live(tl) &&
-				(count_image_layers(tl, sh) > (uint32_t) compact_layers ||
-				 (__atomic_load_n(&page_prune_due[tl][sh], __ATOMIC_ACQUIRE) != 0 &&
-				  count_image_layers(tl, sh) > 0)))
-			{
-				ftl = tl;
-				fsh = sh;
-				found = 1;
-				break;
-			}
+		if (++selection_slot == selection_slots)
+			selection_slot = 0;
+		if ((selection_now == 0 || selection_now >=
+			 __atomic_load_n(&legacy_budget_retry_at[tl][sh], __ATOMIC_RELAXED)) &&
+			ps_timeline_live(tl))
+		{
+			uint32_t count = count_image_layers(tl, sh);
+
+			if (count <= (uint32_t) compact_layers &&
+				(count == 0 || !__atomic_load_n(&page_prune_due[tl][sh], __ATOMIC_ACQUIRE)))
+				continue;
+			ftl = tl;
+			fsh = sh;
+			found = 1;
+			__atomic_store_n(&compaction_selection_cursor, selection_slot, __ATOMIC_RELAXED);
+			break;
+		}
 	}
 	ps_unlock_map();
 
