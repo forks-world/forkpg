@@ -853,24 +853,46 @@ CREATE INDEX ev_k ON ev(k);
         done = self.writer.datadir / "pg_wal/archive_status" / f"{seg}.done"
         policy = ArchiveRestartpointPolicy()
         next_probe = 0.0
+        next_online_request = 0.0
+        last_online_request = None
 
         def archived() -> bool:
-            nonlocal next_probe
+            nonlocal next_probe, next_online_request, last_online_request, policy
             if done.exists() or not (self.writer.datadir / "pg_wal" / seg).exists():
                 return True
-            # The production supervisor advances a stalled durable watermark
-            # by restarting an idle, healthy worker. This driver owns the
-            # materializer directly, so apply that policy while waiting for
-            # bounded archive shipping as well.
             now = time.monotonic()
             if (getattr(self.args, "materializer_max_lag_mb", 0) > 0 and
                     self.mat.expected_up and now >= next_probe):
-                next_probe = now + 5
+                next_probe = now + 1
+                timeout = self.probe_timeout()
                 progress = self.mat.sql(
-                    "SELECT COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn), "
-                    "COALESCE(pagestore_ext.pagestore_materialized_wal_lsn(), '0/0'::pg_lsn);",
-                    timeout=self.probe_timeout())
-                replay, marker = progress.split("|", 1)
+                    "SELECT replay, marker, replay > marker FROM ("
+                    "SELECT COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn) AS replay, "
+                    "COALESCE(pagestore_ext.pagestore_materialized_wal_lsn(), '0/0'::pg_lsn) "
+                    "AS marker) AS progress;",
+                    timeout=timeout)
+                replay, marker, replay_ahead = progress.split("|")
+                request = (replay, marker)
+                if (marker != "0/0" and replay_ahead == "t" and
+                        request != last_online_request and now >= next_online_request and
+                        self.writer.sql(
+                            "SELECT EXISTS (SELECT FROM pg_stat_activity "
+                            "WHERE backend_type = 'archiver' "
+                            "AND wait_event = 'PageStoreArchiveMaterializer');",
+                            timeout=timeout) == "t"):
+                    last_online_request = request
+                    next_online_request = now + 5
+                    self.mat.sql("CHECKPOINT;", timeout=timeout)
+                    updated_marker = self.mat.sql(
+                        "SELECT pagestore_ext.pagestore_materialized_wal_lsn();",
+                        timeout=timeout)
+                    self.event("archive_online_restartpoint", replay=replay,
+                               marker=marker, updated_marker=updated_marker,
+                               segment=seg, seconds=round(time.monotonic() - now, 3))
+                    if updated_marker not in ("", "0/0", marker):
+                        policy = ArchiveRestartpointPolicy()
+                    return False
+                # Retain the bounded restart fallback for a persistent stall.
                 if marker != "0/0" and policy.should_restart(now, replay, marker):
                     self.event("archive_restartpoint", replay=replay, marker=marker, segment=seg)
                     self.mat.stop("fast")

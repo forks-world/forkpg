@@ -19,6 +19,22 @@ BUILD=$(CDPATH= cd -- "$BUILD" && pwd) || {
 	echo "FAIL - cannot resolve build directory: $BUILD"
 	exit 1
 }
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+archive_defer_supported=0
+if grep -q '^#define HAVE_ARCHIVE_MODULE_DEFER ' \
+		"$SCRIPT_DIR/../../src/include/archive/archive_module.h"; then
+	archive_defer_supported=1
+fi
+expedite_checkpoint_supported=0
+if grep -q '^#define HAVE_EXPEDITE_RUNNING_CHECKPOINT ' \
+		"$SCRIPT_DIR/../../src/include/postmaster/bgwriter.h"; then
+	expedite_checkpoint_supported=1
+fi
+restartpoint_replay_supported=0
+if grep -q '^#define HAVE_RECOVERY_RESTARTPOINT_REPLAYED_HOOK ' \
+		"$SCRIPT_DIR/../../src/include/access/xlog.h"; then
+	restartpoint_replay_supported=1
+fi
 PGCTL=$(find "$BUILD/tmp_install" -path '*/bin/pg_ctl' -type f 2>/dev/null | head -1)
 [ -z "$PGCTL" ] && { echo "FAIL - no tmp_install"; exit 1; }
 BIN=$(dirname "$PGCTL")
@@ -43,7 +59,10 @@ cleanup()
 {
 	"$BIN/pg_ctl" -D "$REDO" -m immediate -w stop >/dev/null 2>&1 || true
 	"$BIN/pg_ctl" -D "$WRITER" -m immediate -w stop >/dev/null 2>&1 || true
-	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
+	if [ -n "${DPID:-}" ]; then
+		kill "$DPID" 2>/dev/null || true
+		wait "$DPID" 2>/dev/null || true
+	fi
 	rm -rf "$TMPROOT"
 	rm -f "/dev/shm$SHM"
 }
@@ -210,6 +229,44 @@ archive_current_wal || fail "first update WAL did not reach pagestore"
 wait_redo_value first || fail "redo worker did not materialize the first value"
 echo "ok   - live redo worker materialized the first archived change"
 
+if grep -q '^#define HAVE_RECOVERY_ARCHIVE_READY_HOOK ' \
+		"$SCRIPT_DIR/../../src/include/access/xlogrecovery.h"; then
+	# A fresh, deliberately long wait leaves enough room to distinguish the
+	# readiness probe from an ordinary retry, even on a loaded runner.
+	echo "wal_retrieve_retry_interval = '10s'" >> "$REDO/postgresql.conf"
+	"$BIN/pg_ctl" -D "$REDO" reload >/dev/null ||
+		fail "could not set the materializer's WAL retry interval"
+	for _ in $(seq 1 100); do
+		[ "$($RP -c 'SHOW wal_retrieve_retry_interval;')" = "10s" ] && break
+		sleep 0.1
+	done
+	[ "$($RP -c 'SHOW wal_retrieve_retry_interval;')" = "10s" ] ||
+		fail "materializer did not reload the WAL retry interval"
+	wait_count=$(grep -c "waiting for WAL to become available" "$REDO/redo.log")
+	for _ in $(seq 1 150); do
+		current_wait_count=$(grep -c "waiting for WAL to become available" "$REDO/redo.log")
+		[ "$current_wait_count" -gt "$wait_count" ] && break
+		sleep 0.1
+	done
+	[ "$current_wait_count" -gt "$wait_count" ] ||
+		fail "materializer did not start a fresh WAL archive wait"
+	sleep 2
+	[ "$(grep -c "waiting for WAL to become available" "$REDO/redo.log")" -eq "$current_wait_count" ] ||
+		fail "archive readiness probes retried restore without new WAL"
+	retrieve_started=$SECONDS
+	retrieve_lsn=$($WP -c "SELECT pg_create_restore_point('archive_ready_probe');") ||
+		fail "could not create the archive readiness restore point"
+	archive_current_wal || fail "readiness probe WAL was not archived"
+	wait_replay_lsn "$retrieve_lsn" || fail "materializer did not replay the readiness probe WAL"
+	retrieve_elapsed=$((SECONDS - retrieve_started))
+	[ "$retrieve_elapsed" -lt 6 ] ||
+		fail "materializer took ${retrieve_elapsed}s to replay WAL during an archive wait"
+	echo "ok   - materializer replayed newly archived WAL in ${retrieve_elapsed}s during a 10s retry wait"
+	echo "wal_retrieve_retry_interval = '5s'" >> "$REDO/postgresql.conf"
+	"$BIN/pg_ctl" -D "$REDO" reload >/dev/null ||
+		fail "could not restore the default WAL retry interval"
+fi
+
 checkpoint_lsn=$($WP -c "UPDATE continuous_redo SET v='second' WHERE id=1;
 	CHECKPOINT;
 	SELECT pg_current_wal_lsn();" | tail -1) ||
@@ -244,11 +301,18 @@ EOF
 	[ "$status_lag" = 0 ] && [ -z "$status_release" ] ||
 	fail "writer materializer status did not report caught-up, unlatch state: $writer_status"
 echo "ok   - writer observes caught-up materializer state without claiming the worker role"
+$RP -v ON_ERROR_STOP=1 -c "CHECKPOINT;" >/dev/null ||
+	fail "online restartpoint request failed on a caught-up materializer"
+[ "$($RP -c "SELECT pagestore_materialized_wal_lsn();")" = "$materialized_lsn" ] ||
+	fail "online restartpoint moved the watermark without a new replayed checkpoint"
+echo "ok   - online restartpoint leaves the caught-up watermark in place"
 
 # Stop recovery, establish a checkpoint, then advance several segments without
 # another checkpoint.  The aligned limiter must finish usable input segments
 # but eventually pause.  A later writer checkpoint moves the guaranteed-safe
 # archive boundary far enough for recovery to reach a real restartpoint.
+archive_failures=$($WP -c "SELECT failed_count FROM pg_stat_archiver;") ||
+	fail "could not read the archiver's initial failure count"
 $WP -c "ALTER SYSTEM SET pagestore.materializer_max_lag_mb = '1';" >/dev/null ||
 	fail "could not configure materializer backpressure"
 writer_started=$($WP -c "SELECT pg_postmaster_start_time();") || fail "writer start time unavailable"
@@ -301,8 +365,36 @@ echo "ok   - stalled materializer applies bounded WAL archive backpressure"
 # Publish a newer completed checkpoint while archiving is paused.  The limiter
 # keeps the earlier release checkpoint latched until the materializer advances,
 # then admits complete segments through this next checkpoint.
-$WP -c "CHECKPOINT;" >/dev/null ||
-	fail "could not publish the backlog release checkpoint"
+if [ "$expedite_checkpoint_supported" -eq 1 ]; then
+	$WP -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET checkpoint_timeout = '30s';" >/dev/null ||
+		fail "could not set the writer checkpoint timeout"
+	$WP -c "SELECT pg_reload_conf();" >/dev/null || fail "writer checkpoint reload failed"
+	for _ in $(seq 1 100); do
+		[ "$($WP -c 'SHOW checkpoint_timeout;')" = "30s" ] && break
+		sleep 0.1
+	done
+	[ "$($WP -c 'SHOW checkpoint_timeout;')" = "30s" ] ||
+		fail "writer did not reload the checkpoint timeout"
+	$WP -v ON_ERROR_STOP=1 -c "CREATE TABLE paced_checkpoint_payload AS
+		SELECT g, repeat(md5(g::text), 32) AS payload
+		FROM generate_series(1, 12000) AS g;" >/dev/null ||
+		fail "could not prepare dirty buffers for the paced checkpoint"
+	paced_checkpoint_starts=$(grep -c "LOG:  checkpoint starting:" "$WRITER/writer.log")
+	paced_started=$SECONDS
+	$WP -v ON_ERROR_STOP=1 -c "CHECKPOINT (MODE SPREAD);" >/dev/null ||
+		fail "could not run the paced writer checkpoint"
+	paced_elapsed=$((SECONDS - paced_started))
+	[ "$paced_elapsed" -lt 12 ] ||
+		fail "paced writer checkpoint took ${paced_elapsed}s under archive backpressure"
+	grep -q "pagestore expedited a writer checkpoint for WAL archiving" "$WRITER/writer.log" ||
+		fail "archive backpressure did not expedite the paced writer checkpoint"
+	$WP -v ON_ERROR_STOP=1 -c "ALTER SYSTEM RESET checkpoint_timeout;" >/dev/null ||
+		fail "could not reset the writer checkpoint timeout"
+	echo "ok   - archive backpressure expedited the paced writer checkpoint in ${paced_elapsed}s"
+else
+	$WP -c "CHECKPOINT;" >/dev/null ||
+		fail "could not publish the backlog release checkpoint"
+fi
 release_lsn=$($WP -c "SELECT pg_switch_wal();") ||
 	fail "could not switch the backlog release checkpoint"
 release_target=$($WP -c "SELECT pg_walfile_name('$release_lsn'::pg_lsn - 1);") ||
@@ -312,6 +404,10 @@ release_target=$($WP -c "SELECT pg_walfile_name('$release_lsn'::pg_lsn - 1);") |
 $WP -c "SELECT pg_reload_conf();" >/dev/null ||
 	fail "could not wake the WAL archiver after checkpoint progress"
 sleep 2
+if [ "$expedite_checkpoint_supported" -eq 1 ]; then
+	[ "$(grep -c "LOG:  checkpoint starting:" "$WRITER/writer.log")" -eq "$((paced_checkpoint_starts + 1))" ] ||
+		fail "archive backpressure queued an extra writer checkpoint"
+fi
 [ -f "$WRITER/pg_wal/archive_status/$release_target.ready" ] ||
 	fail "a later writer checkpoint moved the latched bound before materialization advanced"
 # An operator can temporarily expand the boundary when a replayed checkpoint
@@ -349,12 +445,25 @@ for _ in $(seq 1 300); do
 	[ -f "$WRITER/pg_wal/archive_status/$release_target.ready" ] && break
 	sleep 0.1
 done
-sleep 2
+# Let the archiver finish any failure retries queued by the last WAL switch.
+sleep 5
 [ -f "$WRITER/pg_wal/archive_status/$release_target.ready" ] ||
 	fail "restored materializer limit did not pause the later WAL segment"
 echo "ok   - materializer archive limit expands and tightens without writer restart"
+if [ "$archive_defer_supported" -eq 1 ]; then
+	for _ in $(seq 1 50); do
+		archive_wait_event=$($WP -c "SELECT wait_event FROM pg_stat_activity WHERE backend_type = 'archiver';")
+		[ "$archive_wait_event" = "PageStoreArchiveMaterializer" ] && break
+		sleep 0.1
+	done
+	[ "$archive_wait_event" = "PageStoreArchiveMaterializer" ] ||
+		fail "writer did not expose the materializer archive wait"
+fi
+archive_wait_start=$SECONDS
 "$BIN/pg_ctl" -D "$REDO" -l "$REDO/redo.log" -w start >/dev/null 2>&1 ||
 	fail "materializer did not restart after backpressure"
+redo_started=$($RP -c "SELECT pg_postmaster_start_time();") ||
+	fail "materializer start time unavailable"
 release_replayed=0
 for _ in $(seq 1 400); do
 	release_value=$($RP -c "SELECT max(i) FROM materializer_backpressure_test;" \
@@ -367,12 +476,21 @@ for _ in $(seq 1 400); do
 done
 [ "$release_replayed" -eq 1 ] ||
 	fail "materializer did not reach the latched release checkpoint"
-"$BIN/pg_ctl" -D "$REDO" -m fast -w restart >/dev/null 2>&1 ||
-	fail "materializer did not publish progress at the release checkpoint"
-$WP -c "SELECT pg_reload_conf();" >/dev/null ||
-	fail "could not wake the WAL archiver after materializer progress"
+if [ "$restartpoint_replay_supported" -eq 0 ]; then
+	$RP -v ON_ERROR_STOP=1 -c "CHECKPOINT;" >/dev/null ||
+		fail "materializer did not complete the online restartpoint request"
+fi
+# Keep the writer idle.  Publishing materializer progress must be sufficient
+# for the archiver to retry within a small fraction of its normal 60s timeout.
+archive_wait_attempts=100
+if [ "$archive_defer_supported" -eq 0 ]; then
+	# Release branches without the core deferral API still need a wakeup.
+	$WP -c "SELECT pg_reload_conf();" >/dev/null ||
+		fail "could not wake the WAL archiver after materializer progress"
+	archive_wait_attempts=600
+fi
 archive_drained=0
-for _ in $(seq 1 600); do
+for _ in $(seq 1 "$archive_wait_attempts"); do
 	if [ -f "$WRITER/pg_wal/archive_status/$release_target.done" ]; then
 		archive_drained=1
 		break
@@ -380,7 +498,17 @@ for _ in $(seq 1 600); do
 	sleep 0.1
 done
 [ "$archive_drained" -eq 1 ] ||
-	fail "archive backlog did not drain after materializer restart"
+	fail "archive backlog did not drain after online restartpoint"
+[ "$restartpoint_replay_supported" -eq 0 ] ||
+	grep -q "pagestore requested a fast restartpoint for WAL archiving" "$REDO/redo.log" ||
+	fail "materializer did not request a restartpoint while replaying the release checkpoint"
+[ "$($RP -c "SELECT pg_postmaster_start_time();")" = "$redo_started" ] ||
+	fail "materializer restarted while releasing archive backpressure"
+if [ "$archive_defer_supported" -eq 1 ]; then
+	[ "$($WP -c "SELECT failed_count FROM pg_stat_archiver;")" = "$archive_failures" ] ||
+		fail "archiver counted materializer backpressure as a failure"
+	echo "ok   - idle writer archived pending WAL in $((SECONDS - archive_wait_start))s with an online restartpoint"
+fi
 wait_replay_lsn "$final_checkpoint_lsn" || fail "materializer did not replay the final checkpoint"
 backlog_replayed=0
 for _ in $(seq 1 400); do
@@ -467,4 +595,47 @@ if grep -Eq 'materializer retention advance (was rejected|failed)' "$REDO/redo.l
 	fail "materializer could not advance raw-WAL retention while indexing was enabled"
 fi
 echo "ok   - indexed WAL does not reject materializer retention advancement"
+
+# The materializer watermark is fixed with its role disabled. Hold WAL at
+# that boundary until crash recovery completes a new writer checkpoint.
+checkpoint_before_crash=$($WP -c "SELECT checkpoint_lsn FROM pg_control_checkpoint();") ||
+	fail "could not read the writer checkpoint before the crash"
+crash_boundary_ready=$($WP -c "SELECT coalesce(materialized_wal_lsn >=
+	'$checkpoint_before_crash'::pg_lsn AND release_checkpoint_lsn IS NULL, false)
+	FROM pagestore_materializer_status();")
+[ "$crash_boundary_ready" = "t" ] ||
+	fail "crash checkpoint test did not start beyond the last writer checkpoint"
+for i in 1 2 3 4; do
+	$WP -c "SELECT pg_create_restore_point('crash_checkpoint_$i');" >/dev/null ||
+		fail "could not produce WAL for the crash checkpoint test"
+	crash_switch=$($WP -c "SELECT pg_switch_wal();") || fail "could not seal crash test WAL"
+	crash_target=$($WP -c "SELECT pg_walfile_name('$crash_switch'::pg_lsn - 1);") ||
+		fail "could not identify crash test WAL"
+done
+sleep 2
+[ -f "$WRITER/pg_wal/archive_status/$crash_target.ready" ] ||
+	fail "crash test WAL was not held by the materializer bound"
+$WP -v ON_ERROR_STOP=1 -c "INSERT INTO materializer_backpressure_test VALUES (7);" >/dev/null ||
+	fail "could not leave committed WAL for crash recovery"
+crash_started=$SECONDS
+"$BIN/pg_ctl" -D "$WRITER" -m immediate -w stop >/dev/null 2>&1 ||
+	fail "could not simulate a writer crash"
+"$BIN/pg_ctl" -D "$WRITER" -l "$WRITER/writer.log" -w start >/dev/null 2>&1 ||
+	fail "writer did not recover from the simulated crash"
+crash_checkpoint=$($WP -c "SELECT checkpoint_lsn FROM pg_control_checkpoint();") ||
+	fail "could not read the completed crash recovery checkpoint"
+[ "$crash_checkpoint" != "$checkpoint_before_crash" ] ||
+	fail "writer did not complete a new crash recovery checkpoint"
+for _ in $(seq 1 100); do
+	[ -f "$WRITER/pg_wal/archive_status/$crash_target.done" ] && break
+	sleep 0.1
+done
+[ -f "$WRITER/pg_wal/archive_status/$crash_target.done" ] ||
+	fail "crash recovery checkpoint did not release pending WAL within 10s"
+release_checkpoint=$($WP -c "SELECT release_checkpoint_lsn FROM pagestore_materializer_status();")
+[ "$release_checkpoint" = "$crash_checkpoint" ] ||
+	fail "archive did not use the crash recovery checkpoint as its release checkpoint"
+[ "$($WP -c "SELECT checkpoint_lsn FROM pg_control_checkpoint();")" = "$crash_checkpoint" ] ||
+	fail "archive waited for a subsequent writer checkpoint"
+echo "ok   - crash recovery checkpoint released pending WAL in $((SECONDS - crash_started))s"
 echo "continuous redo demo: PASS"

@@ -87,9 +87,9 @@ class ArchiveLagTests(unittest.TestCase):
         wal = self.root / 'pg_wal'
         (wal / 'archive_status').mkdir(parents=True)
         (wal / 'segment').touch()
-        self.run.writer.sql.side_effect = ['0/200', 'segment']
+        self.run.writer.sql.side_effect = ['0/200', 'segment', 'f', 'f']
         self.run.mat.expected_up = True
-        self.run.mat.sql.return_value = '0/200|0/100'
+        self.run.mat.sql.return_value = '0/200|0/100|t'
         self.run.probe_timeout = Mock(return_value=1)
 
         def wait(what, poll, timeout):
@@ -105,6 +105,36 @@ class ArchiveLagTests(unittest.TestCase):
         self.run.mat.start.assert_called_once()
         self.run.event.assert_called_once_with('archive_restartpoint', replay='0/200',
                                                marker='0/100', segment='segment')
+
+    def test_archive_wait_requests_one_online_restartpoint_under_backpressure(self):
+        wal = self.root / 'pg_wal'
+        (wal / 'archive_status').mkdir(parents=True)
+        (wal / 'segment').touch()
+        self.run.writer.sql.side_effect = ['0/200', 'segment', 'f', 't']
+        self.run.mat.expected_up = True
+        self.run.mat.sql.side_effect = [
+            '0/180|0/100|t', '0/180|0/100|t', '', '0/100', '0/180|0/100|t'
+        ]
+        self.run.probe_timeout = Mock(return_value=1)
+
+        def wait(what, poll, timeout):
+            self.assertFalse(poll())
+            self.assertFalse(poll())
+            self.assertFalse(poll())
+            (wal / 'archive_status' / 'segment.done').touch()
+            self.assertTrue(poll())
+
+        self.run.wait_for.side_effect = wait
+        with patch.object(endurance.time, 'monotonic', side_effect=[0, 1, 1.5, 8]):
+            self.assertEqual(self.run.archive_current_wal(), '0/200')
+        checkpoints = [call for call in self.run.mat.sql.call_args_list
+                       if call.args[0] == 'CHECKPOINT;']
+        self.assertEqual(len(checkpoints), 1)
+        self.run.event.assert_called_once_with('archive_online_restartpoint', replay='0/180',
+                                               marker='0/100', updated_marker='0/100',
+                                               segment='segment', seconds=0.5)
+        self.run.mat.stop.assert_not_called()
+        self.run.mat.start.assert_not_called()
 
     def test_failure_diagnostics_capture_wal_status_before_halt(self):
         self.run.root = self.root
