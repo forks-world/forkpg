@@ -223,6 +223,14 @@ extern bool PromoteIsTriggered(void);
 extern bool CheckPromoteSignal(void);
 extern void WakeupRecovery(void);
 
+/*
+ * Optional advisory probe used while sequential standby recovery waits for
+ * an archive segment.  The normal restore and WAL validation still apply.
+ */
+#define HAVE_RECOVERY_ARCHIVE_READY_HOOK 1
+typedef bool (*recovery_archive_ready_hook_type) (XLogRecPtr segment_end);
+extern PGDLLIMPORT recovery_archive_ready_hook_type recovery_archive_ready_hook;
+
 extern void StartupRequestWalReceiverRestart(void);
 extern void XLogRequestWalReceiverReply(void);
 

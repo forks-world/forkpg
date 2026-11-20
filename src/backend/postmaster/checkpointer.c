@@ -115,6 +115,13 @@ typedef struct
 	FileTag		ftag;			/* file identifier */
 } CheckpointerRequest;
 
+typedef enum CheckpointPacing
+{
+	CHECKPOINT_PACING_INACTIVE,
+	CHECKPOINT_PACING_ACTIVE,
+	CHECKPOINT_PACING_EXPEDITED
+} CheckpointPacing;
+
 typedef struct
 {
 	pid_t		checkpointer_pid;	/* PID (0 if not started) */
@@ -126,6 +133,7 @@ typedef struct
 	int			ckpt_failed;	/* advances when checkpoint fails */
 
 	int			ckpt_flags;		/* checkpoint flags, as defined in xlog.h */
+	pg_atomic_uint32 pacing;	/* write delays of the ongoing checkpoint */
 
 	ConditionVariable start_cv; /* signaled when ckpt_started advances */
 	ConditionVariable done_cv;	/* signaled when ckpt_done advances */
@@ -313,6 +321,7 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 		/* Warn any waiting backends that the checkpoint failed. */
 		if (ckpt_active)
 		{
+			pg_atomic_write_u32(&CheckpointerShmem->pacing, CHECKPOINT_PACING_INACTIVE);
 			SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
 			CheckpointerShmem->ckpt_failed++;
 			CheckpointerShmem->ckpt_done = CheckpointerShmem->ckpt_started;
@@ -499,7 +508,12 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 			 * Do the checkpoint.
 			 */
 			if (!do_restartpoint)
+			{
+				if (!(flags & CHECKPOINT_FAST))
+					pg_atomic_write_u32(&CheckpointerShmem->pacing, CHECKPOINT_PACING_ACTIVE);
 				ckpt_performed = CreateCheckPoint(flags);
+				pg_atomic_write_u32(&CheckpointerShmem->pacing, CHECKPOINT_PACING_INACTIVE);
+			}
 			else
 				ckpt_performed = CreateRestartPoint(flags);
 
@@ -765,9 +779,8 @@ CheckArchiveTimeout(void)
 }
 
 /*
- * Returns true if a fast checkpoint request is pending.  (Note that this does
- * not check the *current* checkpoint's FAST flag, but whether there is one
- * pending behind it.)
+ * Returns true if the running checkpoint was expedited or a fast request is
+ * pending behind it.
  */
 static bool
 FastCheckpointRequested(void)
@@ -778,9 +791,8 @@ FastCheckpointRequested(void)
 	 * We don't need to acquire the ckpt_lck in this case because we're only
 	 * looking at a single flag bit.
 	 */
-	if (cps->ckpt_flags & CHECKPOINT_FAST)
-		return true;
-	return false;
+	return (cps->ckpt_flags & CHECKPOINT_FAST) != 0 ||
+		pg_atomic_read_u32(&cps->pacing) == CHECKPOINT_PACING_EXPEDITED;
 }
 
 /*
@@ -990,6 +1002,7 @@ static void
 CheckpointerShmemInit(void *arg)
 {
 	SpinLockInit(&CheckpointerShmem->ckpt_lck);
+	pg_atomic_init_u32(&CheckpointerShmem->pacing, CHECKPOINT_PACING_INACTIVE);
 	CheckpointerShmem->max_requests = Min(NBuffers, MAX_CHECKPOINT_REQUESTS);
 	CheckpointerShmem->head = CheckpointerShmem->tail = 0;
 	ConditionVariableInit(&CheckpointerShmem->start_cv);
@@ -1193,6 +1206,27 @@ RequestCheckpoint(int flags)
 					(errmsg("checkpoint request failed"),
 					 errhint("Consult recent messages in the server log for details.")));
 	}
+}
+
+/*
+ * Stop pacing the checkpoint already in progress and wake the checkpointer
+ * if it is sleeping between writes.  This never queues a new checkpoint.
+ */
+bool
+ExpediteRunningCheckpoint(void)
+{
+	uint32		expected = CHECKPOINT_PACING_ACTIVE;
+	ProcNumber	checkpointerProc;
+
+	if (!IsUnderPostmaster ||
+		!pg_atomic_compare_exchange_u32(&CheckpointerShmem->pacing, &expected,
+										CHECKPOINT_PACING_EXPEDITED))
+		return false;
+
+	checkpointerProc = ProcGlobal->checkpointerProc;
+	if (checkpointerProc != INVALID_PROC_NUMBER)
+		SetLatch(&GetPGProcByNumber(checkpointerProc)->procLatch);
+	return true;
 }
 
 /*
