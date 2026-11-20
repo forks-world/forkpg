@@ -4816,6 +4816,21 @@ change_gc_layer_set(void *arg)
 	ps_unlock_map();
 }
 
+static void
+reorder_gc_layer_set(void *arg)
+{
+	PsLayerDesc saved;
+	uint32_t last;
+
+	(void) arg;
+	ps_lock_map_wr();
+	last = ps_layer_map.nlayers - 1;
+	saved = ps_layer_map.layers[0];
+	ps_layer_map.layers[0] = ps_layer_map.layers[last];
+	ps_layer_map.layers[last] = saved;
+	ps_unlock_map();
+}
+
 typedef struct GcBatchProbe
 {
 	int calls;
@@ -5016,6 +5031,9 @@ test_page_gc_missing_prefix_preflight(void)
 	segment_gc_enabled = 1;
 	check(ps_test_gc_verified_local(0, 1, NULL, NULL) == 0,
 		  "local GC preflight validates unchanged covered layers");
+	check(ps_test_gc_verified_local(0, 1, reorder_gc_layer_set, NULL) == 0 &&
+		  ps_test_gc_verified_local(0, 1, reorder_gc_layer_set, NULL) == 0,
+		  "local GC matches verified layers by ID across map reordering");
 	{
 		char path[4096] = "";
 		uint32_t covered_layer = UINT32_MAX;
@@ -5086,10 +5104,58 @@ test_page_gc_missing_prefix_preflight(void)
 	remove_tree(store);
 }
 
+static void
+test_page_gc_reopen_with_long_missing_prefix(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-gc-reopen-prefix-XXXXXX";
+	const int first_remaining = 270;
+	unsigned char page[8192];
+
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 1;
+	compact_layers = 1000;
+	if (test_mkdtemp(store, sizeof(store)) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open long missing-prefix GC fixture");
+		return;
+	}
+	for (int i = 0; i <= first_remaining + 1; i++)
+		check(write_timeline_layer(0, (uint32_t) i, 100 + (uint64_t) i) == 0,
+			  "write a covered segment for the restart fixture");
+	check(ps_storage->seg_size(0, first_remaining + 1) > 0,
+		  "fixture has a boundary segment after the first remaining victim");
+	for (int i = 0; i < first_remaining; i++)
+		check(ps_storage->seg_remove(0, i) == 0, "remove covered prefix segment");
+	close_store();
+	if (ps_core_open(store) != 0)
+	{
+		check(0, "reopen after deleting long covered prefix");
+		remove_tree(store);
+		return;
+	}
+	segment_gc_enabled = 1;
+	for (int i = 0; i < 4; i++)
+		(void) ps_core_maintenance();
+	errno = 0;
+	check(ps_storage->seg_size(0, first_remaining) < 0 && errno == ENOENT,
+		  "reopened GC reaches the first live segment within four turns");
+	check(ps_storage->seg_size(0, first_remaining + 1) > 0,
+		  "GC keeps the watermark boundary segment");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  read_test_page(0, 0, page) == 1 && page[100] == 0x5A &&
+		  read_test_page(0, first_remaining, page) == 1 && page[100] == 0x5A,
+		  "pages from the removed prefix and victim survive another reopen");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
 	test_page_gc_missing_prefix_preflight();
+	test_page_gc_reopen_with_long_missing_prefix();
 	test_page_gc_batch(0);
 	test_page_gc_batch(1);
 	test_page_gc_batch(2);

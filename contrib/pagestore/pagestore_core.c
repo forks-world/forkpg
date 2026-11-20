@@ -29966,14 +29966,39 @@ typedef struct GcVerifiedLayer
 /* covers_mask is a uint32_t: one verification pass can safely cover 32
  * segments, while each unlink still yields and revalidates independently. */
 #define PS_GC_BATCH_SEGMENTS 32
+
+typedef struct GcLayerIndex
+{
+	uint64_t layer_id;
+	uint32_t position;
+} GcLayerIndex;
+
 typedef struct GcVerifiedSet
 {
 	GcVerifiedLayer *layers;
+	GcLayerIndex *by_id;
 	uint32_t count;
 	uint32_t first_victim;
 	uint32_t nvictims;
 	bool ready;
 } GcVerifiedSet;
+
+static int
+gc_layer_id_cmp(const void *left, const void *right)
+{
+	const GcLayerIndex *a = left;
+	const GcLayerIndex *b = right;
+
+	return (a->layer_id > b->layer_id) - (a->layer_id < b->layer_id);
+}
+
+static void
+gc_release_verified_set(GcVerifiedSet *set)
+{
+	free(set->by_id);
+	free(set->layers);
+	*set = (GcVerifiedSet) {0};
+}
 
 static void (*gc_batch_test_hook)(void *);
 static void *gc_batch_test_hook_arg;
@@ -30029,17 +30054,21 @@ gc_prepare_local(uint32_t shard, uint32_t victim, uint32_t nvictims,
 			count++;
 	}
 	set->layers = count ? calloc(count, sizeof(*set->layers)) : NULL;
-	if (count && !set->layers)
+	set->by_id = count ? calloc(count, sizeof(*set->by_id)) : NULL;
+	if (count && (!set->layers || !set->by_id))
 	{
 		ps_unlock_map();
-		return false;
+		goto out;
 	}
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 	{
 		PsLayerDesc *d = &ps_layer_map.layers[i];
 		if (ps_timeline_live(d->timeline) && d->kind == PS_LAYER_IMAGE &&
 			!d->deleting && layer_shard_from_id(d->layer_id) == shard)
+		{
+			set->by_id[set->count] = (GcLayerIndex) {d->layer_id, set->count};
 			set->layers[set->count++].desc = *d;
+		}
 	}
 	ps_unlock_map();
 	for (uint32_t i = 0; i < set->count; i++)
@@ -30075,14 +30104,14 @@ gc_prepare_local(uint32_t shard, uint32_t victim, uint32_t nvictims,
 		}
 		close(fd);
 	}
+	/* Build a compact index once outside the locks, for all victims in the
+	 * batch. The live map may have been reordered since the snapshot. */
+	if (set->count > 1)
+		qsort(set->by_id, set->count, sizeof(*set->by_id), gc_layer_id_cmp);
 	set->ready = ok = true;
 out:
 	if (!ok)
-	{
-		free(set->layers);
-		set->layers = NULL;
-		set->count = 0;
-	}
+		gc_release_verified_set(set);
 	return ok;
 }
 
@@ -30101,17 +30130,22 @@ gc_confirm_local(uint32_t shard, uint32_t victim, const GcVerifiedSet *set, int 
 	{
 		PsLayerDesc *d = &ps_layer_map.layers[i];
 		const PsLayerLocation *loc;
-		const GcVerifiedLayer *v = NULL;
+		const GcVerifiedLayer *v;
+		const GcLayerIndex key = {.layer_id = d->layer_id};
+		const GcLayerIndex *match;
 		struct stat now;
 		if (!ps_timeline_live(d->timeline) || d->kind != PS_LAYER_IMAGE ||
 			d->deleting || layer_shard_from_id(d->layer_id) != shard)
 			continue;
-		count++;
-		for (uint32_t j = 0; j < set->count; j++)
-			if (set->layers[j].desc.layer_id == d->layer_id)
-			{ v = &set->layers[j]; break; }
+		if (++count > set->count)
+			return -1;
+		match = bsearch(&key, set->by_id, set->count, sizeof(*set->by_id),
+						gc_layer_id_cmp);
+		if (!match)
+			return -1;
+		v = &set->layers[match->position];
 		loc = tier_local_location(d);
-		if (!v || !loc || d->timeline != v->desc.timeline)
+		if (!loc || d->timeline != v->desc.timeline)
 			return -1;
 		{
 			const PsLayerLocation *old = tier_local_location(&v->desc);
@@ -30150,7 +30184,7 @@ ps_test_gc_verified_local(uint32_t shard, uint32_t victim,
 	ps_lock_map_rd();
 	rc = gc_confirm_local(shard, victim, &set, 1);
 	ps_unlock_map();
-	free(set.layers);
+	gc_release_verified_set(&set);
 	return rc;
 }
 
@@ -30266,8 +30300,41 @@ verify_segment_layers_locked(uint32_t source_shard, uint32_t victim, int need_la
 	return need_layer && !found ? -1 : 0;
 }
 
+/*
+ * With PAGE debt accounting disabled, reopening starts the GC cursor at
+ * zero. Skip already removed IDs in bounded chunks, under shard-wr. Only
+ * confirmed ENOENT below the durable watermark can advance the cursor here.
+ */
+#define PS_GC_MISSING_SEGMENTS_PER_TURN 256
+
+static bool
+gc_skip_missing_segments(Shard *s, uint32_t expected)
+{
+	if (!s->flush_watermark_valid || s->gc_next_seg != expected)
+		return false;
+	for (uint32_t skipped = 0; skipped < PS_GC_MISSING_SEGMENTS_PER_TURN &&
+		 s->gc_next_seg < s->flush_watermark.seg_id; skipped++)
+	{
+		uint32_t victim = s->gc_next_seg;
+
+		errno = 0;
+		if (ps_storage->seg_size(s->id, (int) victim) >= 0)
+			break;
+		if (errno != ENOENT)
+		{
+			s->gc_storage_error = 1;
+			break;
+		}
+		page_gc_debt_settle(s, victim, 0);
+		s->gc_next_seg++;
+	}
+	return s->gc_next_seg != expected;
+}
+
+/* The caller has prepared the current victim and checked the cursor under
+ * shard-wr. A batch proof is revalidated before removing each file. */
 static int
-reclaim_one_segment(Shard *s, int layers_prepared, const GcVerifiedSet *verified)
+reclaim_one_segment(Shard *s, const GcVerifiedSet *verified)
 {
 	uint32_t	victim;
 	uint32_t	ns = core_shards();
@@ -30302,11 +30369,6 @@ reclaim_one_segment(Shard *s, int layers_prepared, const GcVerifiedSet *verified
 	}
 	else
 		seg_bytes = (int64_t) segment_size;
-	/* A missing preflight observation may have become stale before we took
-	 * the shard lock.  Never reclaim a now-present segment without the
-	 * corresponding unlocked layer preparation; retry it next time. */
-	if (!layers_prepared)
-		return 0;
 	refs = segment_has_references(s->id, victim);
 	if ((verified && verified->ready ? gc_confirm_local(s->id, victim, verified, refs) :
 		 verify_segment_layers_locked(s->id, victim, refs)) != 0)
@@ -30777,6 +30839,7 @@ ps_core_maintenance_impl(void)
 	int			found = 0;
 	int			did = 0;
 	int			skip_segment_gc;
+	bool		skipped_missing_segments = false;
 	int			defer_layer_gc = 0;
 	int			forkmeta_gc_scan_incomplete = 0;
 	int			forkmeta_temp_gc_observation_stale = 0;
@@ -31066,22 +31129,26 @@ ps_core_maintenance_impl(void)
 			{
 				int missing = 0;
 
-				/* A deleted prefix is common after restart.  Check it before
-				 * scanning every layer; reclaim_one_segment rechecks under
-				 * shard-wr and settles ambiguous removals exactly as before. */
+				/* Check for a deleted prefix before scanning every layer.
+				 * Recheck under shard-wr before advancing, and prepare a
+				 * present victim on a later turn. */
 				if (ps_storage->seg_size != NULL)
 				{
 					errno = 0;
 					missing = ps_storage->seg_size(sh, (int) victim) < 0 &&
 						errno == ENOENT;
 				}
-				if (!missing)
+				if (missing)
 				{
-					if (!gc_prepare_local(sh, victim, nvictims, &verified[sh]))
-						(void) prepare_segment_layers(sh, victim);
-					prepared_victim[sh] = victim;
-					layers_prepared[sh] = true;
+					ps_lock_shard_wr(sh);
+					skipped_missing_segments |= gc_skip_missing_segments(&g_shards[sh], victim);
+					ps_unlock_shard(sh);
+					continue;
 				}
+				if (!gc_prepare_local(sh, victim, nvictims, &verified[sh]))
+					(void) prepare_segment_layers(sh, victim);
+				prepared_victim[sh] = victim;
+				layers_prepared[sh] = true;
 			}
 		}
 		for (uint32_t sh = 0; sh < ns; sh++)
@@ -31093,9 +31160,9 @@ ps_core_maintenance_impl(void)
 				!g_shards[sh].gc_storage_error &&
 				(!g_shards[sh].gc_debt_unavailable || page_reclaim_high_water_bytes == 0);
 
-			found = reclaim_one_segment(&g_shards[sh],
-				layers_prepared[sh] && prepared_victim[sh] ==
-				g_shards[sh].gc_next_seg, &verified[sh]);
+			if (!layers_prepared[sh] || prepared_victim[sh] != g_shards[sh].gc_next_seg)
+				continue;
+			found = reclaim_one_segment(&g_shards[sh], &verified[sh]);
 			if (found)
 			{
 				reclaimed_shard = sh;
@@ -31127,7 +31194,7 @@ ps_core_maintenance_impl(void)
 				for (uint32_t sh = 0; sh < ns; sh++)
 					stable &= !g_shards[sh].gc_pending_remove;
 				if (stable && g_shards[reclaimed_shard].gc_next_seg == set->first_victim + offset)
-					next_done = reclaim_one_segment(&g_shards[reclaimed_shard], 1, set);
+					next_done = reclaim_one_segment(&g_shards[reclaimed_shard], set);
 				ps_unlock_map();
 				for (uint32_t sh = ns; sh > 0; sh--)
 					ps_unlock_shard(sh - 1);
@@ -31136,7 +31203,7 @@ ps_core_maintenance_impl(void)
 			}
 		}
 		for (uint32_t sh = 0; sh < ns; sh++)
-			free(verified[sh].layers);
+			gc_release_verified_set(&verified[sh]);
 		/* Give compaction a turn before another ordinary segment GC. */
 		if (found)
 		{
@@ -31156,6 +31223,10 @@ ps_core_maintenance_impl(void)
 				__atomic_store_n(&segment_gc_compaction_turn, 1, __ATOMIC_RELEASE);
 			return 1;
 		}
+		/* Walking an already removed prefix needs no layer reads and does
+		 * not spend the compaction turn reserved for a physical reclaim. */
+		if (skipped_missing_segments)
+			return 1;
 	}
 	if (defer_layer_gc && (gc_remote_one() || tier_one_layer()))
 		return 1;
