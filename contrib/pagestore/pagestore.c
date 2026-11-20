@@ -1949,6 +1949,7 @@ pagestore_materializer_archive_ready(XLogRecPtr segment_end)
 
 static XLogRecPtr pagestore_materialized_wal_lsn_internal(void);
 static XLogRecPtr pagestore_materializer_release_checkpoint(XLogRecPtr materialized);
+static uint64 pagestore_wal_segments_after(uint64 lsn, uint64 nsegments);
 static uint64 pagestore_materializer_archive_limit(XLogRecPtr marker,
 												 XLogRecPtr checkpoint,
 												 XLogRecPtr seg_start,
@@ -2551,7 +2552,9 @@ pagestore_materializer_release_checkpoint_read(XLogRecPtr materialized,
 /*
  * The writer already selected this checkpoint to release archive backpressure.
  * Ask the local checkpointer to flush it as soon as the recovery core has
- * accepted and replayed it. The usual restartpoint path publishes durability.
+ * accepted and replayed it and the archive has reached the checkpoint's
+ * release boundary. A branch capture may ship just the checkpoint's segment
+ * and still need to pause replay before taking its own restartpoint.
  */
 static void
 pagestore_materializer_restartpoint_replayed(XLogRecPtr start_lsn,
@@ -2571,8 +2574,11 @@ pagestore_materializer_restartpoint_replayed(XLogRecPtr start_lsn,
 		{
 			PsArchiveProgress progress;
 
-			request_fast = pagestore_materializer_release_checkpoint_read(marker,
-				timeout_ms) == start_lsn ||
+			request_fast =
+				(pagestore_materializer_release_checkpoint_read(marker,
+					timeout_ms) == start_lsn &&
+				 pagestore_localsvc_wal_end_timeout(timeout_ms) >=
+				 pagestore_wal_segments_after(start_lsn, 2)) ||
 				(pagestore_localsvc_archive_progress_snapshot(
 					pagestore_localsvc_timeline(), pagestore_localsvc_expected_incarnation(),
 					&progress, timeout_ms) &&

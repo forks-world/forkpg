@@ -323,6 +323,22 @@ for _ in $(seq 1 100); do
 done
 [ "$( $WP -c "SHOW pagestore.materializer_max_lag_mb;" )" = "1" ] ||
 	fail "materializer backpressure did not reload"
+if [ "$restartpoint_replay_supported" -eq 1 ]; then
+	# Branch preparation ships one fresh writer checkpoint and then pauses
+	# replay for its own restartpoint. Leave that checkpoint available.
+	fast_before=$(grep -c "pagestore requested a fast restartpoint for WAL archiving" "$REDO/redo.log")
+	branch_checkpoint=$($WP -c "CHECKPOINT; SELECT pg_current_wal_lsn();" | tail -1)
+	[ -n "$branch_checkpoint" ] || fail "could not write the branch capture checkpoint"
+	archive_current_wal || fail "could not archive the branch capture checkpoint"
+	wait_replay_lsn "$branch_checkpoint" || fail "could not replay the branch capture checkpoint"
+	sleep 1
+	[ "$(grep -c "pagestore requested a fast restartpoint for WAL archiving" "$REDO/redo.log")" -eq "$fast_before" ] ||
+		fail "archive consumed the branch capture checkpoint before the release boundary"
+	$RP -v ON_ERROR_STOP=1 -c "CHECKPOINT;" >/dev/null ||
+		fail "branch capture checkpoint was no longer available for an online restartpoint"
+	wait_materializer_caught_up || fail "branch capture checkpoint did not advance the watermark"
+	echo "ok   - one archived checkpoint remains available for branch capture"
+fi
 "$BIN/pg_ctl" -D "$REDO" -m fast -w stop >/dev/null 2>&1 ||
 	fail "could not stop the materializer for backpressure testing"
 blocked_target=
