@@ -435,6 +435,26 @@ static uint64_t admission_mutation_epoch;
 static _Thread_local int wal_reclaim_floor_interruptible;
 static _Thread_local uint64_t wal_reclaim_admission_epoch;
 static _Thread_local uint64_t wal_reclaim_next_segment_boundary;
+typedef struct WalRetainNote
+{
+	uint64_t	lsn;
+	uint64_t	seq;
+	uint64_t	redo;
+	uint32_t	timeline;
+	bool		durable;
+} WalRetainNote;
+
+/* Positive result is a verified veto for one segment, never a reclaim floor. */
+#define WAL_RETAIN_SEGMENT_BLOCKED 1
+
+typedef struct ControlRetirementRequest
+{
+	PsControlRetirementStatus status;
+	uint64_t	fence_epoch;
+	uint64_t	attempted_at;
+	uint32_t	artifact_shard;
+} ControlRetirementRequest;
+
 static void (*wal_note_read_test_hook)(void *);
 static void *wal_note_read_test_hook_arg;
 
@@ -517,6 +537,10 @@ static PsBackpressureController wal_backpressure;
 static PsBackpressureController walidx_backpressure;
 static PsBackpressureController forkmeta_backpressure;
 #define MAX_TIMELINES	1024
+
+/* Owned by the maintenance thread, like the WAL reclaim cursor. */
+static ControlRetirementRequest control_retirement_requests[MAX_TIMELINES];
+static uint32_t control_retirement_cursor;
 _Static_assert(MAX_TIMELINES == PS_INSPECTION_MAX_TIMELINES,
 			   "inspection timeline capacity must match core capacity");
 
@@ -1006,8 +1030,22 @@ static int artifact_prune_versions(uint32_t timeline, const PsKey *key,
 	unsigned char *keep, ArtifactPruneCache **cache);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 									uint64_t admission_seq);
+typedef struct ControlFenceSource
+{
+	uint64_t owner_id;
+	uint32_t timeline;
+	uint32_t owner_kind;
+	PsControlRetirementReason reason;
+} ControlFenceSource;
+
+typedef struct ControlFenceSources
+{
+	ControlFenceSource *direct;
+	uint32_t n;
+} ControlFenceSources;
+
 static int control_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
-								uint32_t *nfences_out);
+								uint32_t *nfences_out, ControlFenceSources *sources);
 /* Retention plan for one control block chain.  Blocks 0-2 (image, redo-floor
  * note, admission fence) are written as a same-version group and follow the
  * image block's plan; higher blocks (materializer marker, release and writer
@@ -1048,7 +1086,8 @@ static int control_chain_plan(uint32_t timeline, const PsKey *key,
 							  uint32_t block, uint64_t floor,
 							  const PsHistoryFence *fences, uint32_t nfences,
 							  PsControlChainPlan *plan,
-							  const ControlRedoPrefetch *prefetch);
+							  const ControlRedoPrefetch *prefetch,
+							  PsControlRetirementStatus *blocker);
 struct PageEnt;
 static PageVer **control_fence_selections(const struct PageEnt *entry,
 												 const PsHistoryFence *fences, uint32_t nfences);
@@ -1077,9 +1116,7 @@ static int prune_version_needed(uint32_t timeline, const PsKey *key, uint32_t bl
 static int retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
 											  uint64_t *floor_out, int map_locked,
 											  uint64_t *pin_floor_out,
-											  uint32_t *note_timeline_out,
-											  uint64_t *note_lsn_out,
-											  uint64_t *note_seq_out);
+											  WalRetainNote *note_out);
 static int page_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 							 uint32_t *nfences_out);
 
@@ -3705,7 +3742,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 	if (page_prune_fences(timeline, &fences, &nfences) != 0)
 		return -1;
 	if (page_storage_fences(timeline, fences, nfences, &relation_fences, &nrelation_fences) != 0 ||
-		control_prune_fences(timeline, &control_fences, &ncontrol_fences) != 0)
+		control_prune_fences(timeline, &control_fences, &ncontrol_fences, NULL) != 0)
 	{
 		free(fences);
 		free(relation_fences);
@@ -3902,7 +3939,7 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 								   order[first].block < PS_CONTROL_PAIRED_BLOCKS ?
 								   PS_CONTROL_IMAGE_BLOCK : order[first].block,
 								   floor, control_fences, ncontrol_fences,
-								   &plan, NULL) != 0)
+								   &plan, NULL, NULL) != 0)
 			{
 				free(versions);
 				free(keep);
@@ -4319,7 +4356,8 @@ static uint32_t page_prune_fast_batch_count(uint32_t timeline,
 static uint32_t bounded_isolated_inputs(uint32_t timeline, uint32_t shard,
 	PsLayerDesc *inputs, uint64_t *bytes_out, int pruning);
 static int compact_control_pairs_bounded(uint32_t timeline, uint32_t shard,
-	uint64_t floor, int *prune_deferred);
+	uint64_t floor, int *prune_deferred, PsControlRetirementStatus *blocker,
+	uint64_t artifact_cutoff);
 static int control_prune_provider_supported(void);
 
 static int
@@ -4569,7 +4607,7 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 		!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
 		state != PS_TIMELINE_LIVE ||
 		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-			&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+			&current.page_floor, 1, NULL, NULL) != 0)
 	{
 		if (metrics_header != NULL)
 			ps_fetch_add_u64(&metrics_header->compaction.prune_state_unavailable, 1);
@@ -4688,7 +4726,7 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 				!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
 				state != PS_TIMELINE_LIVE ||
 				retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-					&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+					&current.page_floor, 1, NULL, NULL) != 0)
 				goto done;
 			current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 			current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
@@ -4743,7 +4781,7 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 				!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
 				state != PS_TIMELINE_LIVE ||
 				retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-					&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+					&current.page_floor, 1, NULL, NULL) != 0)
 				goto done;
 			current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 			current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
@@ -4792,7 +4830,7 @@ compact_timeline_pruned_bounded(uint32_t timeline, uint32_t shard, uint64_t floo
 				!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
 				state != PS_TIMELINE_LIVE ||
 				retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-					&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+					&current.page_floor, 1, NULL, NULL) != 0)
 				goto done;
 			current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 			current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
@@ -5488,7 +5526,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	if (!bounded_already_tried && page_floor != 0 && stage_unlocked)
 	{
 		int bounded_prune = control_prune_provider_supported() ?
-			compact_control_pairs_bounded(timeline, shard, page_floor, prune_deferred) : 0;
+				compact_control_pairs_bounded(timeline, shard, page_floor, prune_deferred, NULL, 0) : 0;
 
 		if (bounded_prune == 0)
 			bounded_prune = compact_timeline_pruned_bounded(timeline, shard,
@@ -6164,7 +6202,7 @@ compact_local_first(uint32_t timeline, uint32_t shard, uint64_t floor,
 	*attempted = 1;
 	if (floor != 0 && control_supported)
 	{
-		rc = compact_control_pairs_bounded(timeline, shard, floor, prune_deferred);
+		rc = compact_control_pairs_bounded(timeline, shard, floor, prune_deferred, NULL, 0);
 		if (rc != 0)
 			return rc;
 	}
@@ -8370,7 +8408,7 @@ page_snapshot_lock_valid(uint32_t timeline, const PsKey *key, uint32_t block,
 		!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
 		state != PS_TIMELINE_LIVE ||
 		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-			&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+			&current.page_floor, 1, NULL, NULL) != 0)
 		return 0;
 	current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 	current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
@@ -17742,6 +17780,76 @@ wal_reclaim_preselected(struct timespec *now_out, int honor_retry_at,
 	return 0;
 }
 
+static void
+control_retirement_publish(uint32_t timeline)
+{
+	const PsControlRetirementStatus *status = &control_retirement_requests[timeline].status;
+	PsControlRetirementStatus *published;
+
+	if (metrics_header == NULL)
+		return;
+	published = &metrics_header->control_retirement[timeline];
+	ps_fetch_add_u64(&published->seq, 1);
+	ps_store_release_u64(&published->note_lsn, status->note_lsn);
+	ps_store_release_u64(&published->note_admission_seq, status->note_admission_seq);
+	ps_store_release_u64(&published->redo_lsn, status->redo_lsn);
+	ps_store_release_u64(&published->dependency_lsn, status->dependency_lsn);
+	ps_store_release_u64(&published->owner_id, status->owner_id);
+	ps_store_release(&published->note_timeline, status->note_timeline);
+	ps_store_release(&published->dependency_timeline, status->dependency_timeline);
+	ps_store_release(&published->owner_kind, status->owner_kind);
+	ps_store_release(&published->reason, status->reason);
+	ps_fetch_add_u64(&published->seq, 1);
+}
+
+static void
+control_retirement_clear(uint32_t timeline)
+{
+	ControlRetirementRequest *request = &control_retirement_requests[timeline];
+
+	if (request->status.reason != PS_CONTROL_RETIRE_NONE)
+	{
+		memset(request, 0, sizeof(*request));
+		control_retirement_publish(timeline);
+	}
+}
+
+/* This is a scheduling hint. The compactor must prove eligibility and
+ * source coverage again, under its own snapshot. Deduplicate steady-state
+ * blockers and rate-limit retries after a concurrent publication conflict. */
+static void
+control_retirement_request(uint32_t timeline, const WalRetainNote *note,
+						   uint64_t fence_epoch)
+{
+	ControlRetirementRequest *request = &control_retirement_requests[timeline];
+	PsControlRetirementStatus *status = &request->status;
+	uint64_t now = inspection_now_ns();
+	uint64_t retry_ns = UINT64_C(1000000000);
+	bool same_note = status->note_timeline == note->timeline &&
+		status->note_lsn == note->lsn && status->note_admission_seq == note->seq;
+
+	/* Pin and branch changes invalidate the key immediately. A slower retry
+	 * also covers changes to the image selected at an unchanged fence. */
+	if (status->reason == PS_CONTROL_RETIRE_PIN || status->reason == PS_CONTROL_RETIRE_BRANCH)
+		retry_ns *= 5;
+	if (same_note && request->fence_epoch == fence_epoch &&
+		(status->reason == PS_CONTROL_RETIRE_QUEUED ||
+		 (now >= request->attempted_at &&
+		  now - request->attempted_at < retry_ns)))
+		return;
+	if (!same_note)
+		request->artifact_shard = 0;
+	*status = (PsControlRetirementStatus) {
+		.note_lsn = note->lsn,
+		.note_admission_seq = note->seq,
+		.redo_lsn = note->redo,
+		.note_timeline = note->timeline,
+		.reason = PS_CONTROL_RETIRE_QUEUED
+	};
+	request->fence_epoch = fence_epoch;
+	control_retirement_publish(timeline);
+}
+
 /*
  * R3b-3 conservative core integration.  The caller already owns the
  * lifecycle read side.  A cheap WAL-lock-only preselection keeps the idle
@@ -17786,9 +17894,8 @@ wal_segment_reclaim_one(void)
 		pthread_rwlock_t *wal_lock;
 		uint64_t retention_floor = 0;
 		uint64_t pin_floor = 0;
-		uint32_t note_timeline = 0;
-		uint64_t note_lsn = 0;
-		uint64_t note_seq = 0;
+		WalRetainNote note = {0};
+		bool control_compaction_wanted = false;
 		int		control_flush_wanted = 0;
 		uint64_t progress = 0;
 		uint64_t raw_floor = 0;
@@ -17935,37 +18042,23 @@ wal_segment_reclaim_one(void)
 			next_segment_boundary : 0;
 		rc = rc != 0 ? rc : retention_effective_floor_internal(tl,
 											 PS_RETENTION_RESOURCE_WAL,
-											 &retention_floor, 0, &pin_floor,
-											 &note_timeline, &note_lsn,
-											 &note_seq);
+											 &retention_floor, 0, &pin_floor, &note);
 		wal_reclaim_floor_interruptible = 0;
 		wal_reclaim_next_segment_boundary = 0;
 		if (__atomic_load_n(&admission_mutation_epoch, __ATOMIC_ACQUIRE) !=
 			wal_reclaim_admission_epoch)
 			rc = -1;
-		/* Residual 2 (a superseded control note stuck in the memtable):
-		 * decide here, in this same unlocked interval, since the decision
-		 * needs note I/O (control_checkpoint_cutoff -> control_note_redo,
-		 * whose contract requires the map lock) that must not run while
-		 * holding walidx_prune_lock/publish/wal_lock -- exactly the gates
-		 * released above for the retention-floor scan.  Only the ONE note
-		 * whose redo actually set retention_floor is considered (note_lsn,
-		 * captured by the call above), and only when retention_floor is
-		 * strictly below what pins/branch caps/the operational cutoff alone
-		 * would allow (pin_floor): otherwise a pin or branch cap, not the
-		 * note term, is the real blocker and there is nothing for a flush to
-		 * buy back.  Superseded here matches what compact_timeline actually
-		 * keeps: below the PAGE_HISTORY effective floor (the same floor
-		 * compact_timeline's caller computes) and not the newest note at or
-		 * below any control fence -- not the narrower "below cutoff" test
-		 * the first version of this fix used, which could judge a twin note
-		 * compaction keeps as superseded.  Only carries the two booleans out
-		 * (via control_flush_wanted); the atomic flag stores happen only in
-		 * the NOPROGRESS branch below, and only once per (note identity,
-		 * fence epoch) -- walidx_reclaim_control_request[tl] -- so a request
-		 * already served or pending for this exact note is never repeated. */
-		if (rc == 0 && retention_floor != 0 && retention_floor != 1 &&
-			(pin_floor == 0 || retention_floor < pin_floor) && note_lsn != 0)
+		/* A verified durable blocker can be handed to the bounded planner.
+		 * A pending note still uses the existing flush heuristic: flush
+		 * when it is below the page floor and no fence appears to select it.
+		 * This is advisory; compaction rechecks the complete group and
+		 * every fence before deleting anything. Decide while the WAL gates
+		 * are dropped because the page-floor check can read a control layer. */
+		control_compaction_wanted = rc == 0 && note.durable && note.lsn != 0 &&
+			note.redo < next_segment_boundary &&
+			(pin_floor == 0 || note.redo < pin_floor);
+		if (rc == 0 && !note.durable && retention_floor != 0 && retention_floor != 1 &&
+			(pin_floor == 0 || retention_floor < pin_floor) && note.lsn != 0)
 		{
 			uint64_t	page_history_floor = 0;
 			PsHistoryFence *cfences = NULL;
@@ -17973,13 +18066,13 @@ wal_segment_reclaim_one(void)
 			int			note_rc;
 
 			ps_lock_map_rd();
-			note_rc = retention_effective_floor_internal(note_timeline,
+			note_rc = retention_effective_floor_internal(note.timeline,
 														 PS_RETENTION_RESOURCE_PAGE_HISTORY,
 														 &page_history_floor, 1,
-														 NULL, NULL, NULL, NULL);
+														 NULL, NULL);
 			if (note_rc == 0)
-				note_rc = control_prune_fences(note_timeline, &cfences,
-											   &ncfences);
+				note_rc = control_prune_fences(note.timeline, &cfences,
+											   &ncfences, NULL);
 			ps_unlock_map();
 			/* page_history_floor == 0 means the PAGE_HISTORY floor is not
 			 * yet established by any pin, cap, or durable note (the same
@@ -17993,7 +18086,7 @@ wal_segment_reclaim_one(void)
 			 * compact_timeline re-derives a fresh floor and re-checks both
 			 * tests under its own locks before it prunes. */
 			if (note_rc == 0 &&
-				(page_history_floor == 0 || note_lsn < page_history_floor))
+				(page_history_floor == 0 || note.lsn < page_history_floor))
 			{
 				PsKey		ckey;
 				PageEnt    *notes;
@@ -18001,10 +18094,10 @@ wal_segment_reclaim_one(void)
 
 				memset(&ckey, 0, sizeof(ckey));
 				ckey.klass = PS_KLASS_CONTROL;
-				notes = page_find(note_timeline, &ckey, PS_CONTROL_NOTE_BLOCK);
+				notes = page_find(note.timeline, &ckey, PS_CONTROL_NOTE_BLOCK);
 				for (uint32_t f = 0; f < ncfences && !required; f++)
 				{
-					if (cfences[f].lsn < note_lsn)
+					if (cfences[f].lsn < note.lsn)
 						continue;
 					required = 1;
 					if (notes != NULL)
@@ -18012,28 +18105,11 @@ wal_segment_reclaim_one(void)
 						{
 							const PageVer *v2 = &notes->vers[j];
 
-							if (v2->lsn > note_lsn && v2->lsn <= cfences[f].lsn)
+							if (v2->lsn > note.lsn && v2->lsn <= cfences[f].lsn)
 								required = 0;
 						}
 				}
-				if (!required && notes != NULL)
-				{
-					const PageVer *note_ver = NULL;
-
-					for (int j = 0; j < notes->nver; j++)
-						if (notes->vers[j].lsn == note_lsn &&
-							notes->vers[j].admission_seq == note_seq)
-							note_ver = &notes->vers[j];
-					/* Only the predicate is decided here; the (note identity,
-					 * fence epoch) dedup key is checked and updated at the
-					 * flag-store site below, once this attempt is known to
-					 * survive revalidation -- updating it here would record
-					 * "already requested" for an attempt that retry_timeline
-					 * then discards, permanently suppressing the real
-					 * request that never actually happened. */
-					if (note_ver != NULL && !walidx_base_version_durable(note_ver))
-						control_flush_wanted = 1;
-				}
+				control_flush_wanted = !required && notes != NULL;
 			}
 			free(cfences);
 		}
@@ -18043,6 +18119,11 @@ wal_segment_reclaim_one(void)
 		store = &wal_segment_stores[tl];
 		/* Revalidate the physical store after readers admitted during the floor
 		 * scan have drained.  No writer could pass admission-wr in the interval. */
+		if (rc == WAL_RETAIN_SEGMENT_BLOCKED && ps_timeline_live(tl) &&
+			wal_segment_store_opened[tl] && !store->metadata_fenced &&
+			progress >= next_segment_boundary &&
+			(pin_floor == 0 || pin_floor >= next_segment_boundary))
+			control_retirement_request(tl, &note, fence_epoch);
 		if (!ps_timeline_live(tl) || !wal_segment_store_opened[tl] ||
 			store->metadata_fenced ||
 			!walidx_valid || rc != 0 ||
@@ -18060,6 +18141,11 @@ wal_segment_reclaim_one(void)
 		target = candidate - candidate % store->segment_size;
 		if (target <= store->start_lsn)
 		{
+			/* A raw-index dependency can also hold this segment. Retiring
+			 * the control group lets the next pass request its snapshot. */
+			if (control_compaction_wanted && progress >= next_segment_boundary &&
+				(pin_floor == 0 || pin_floor >= next_segment_boundary))
+				control_retirement_request(tl, &note, fence_epoch);
 			/* A complete segment exists, but the proven floor is still in the
 			 * current boundary.  Avoid repeating the global drain every idle tick;
 			 * the cheap due-time preselection will retry after the bounded delay
@@ -18387,19 +18473,16 @@ wal_segment_reclaim_one(void)
 			 * to have survived revalidation: checking it in the unlocked
 			 * interval would record "already requested" for an attempt
 			 * retry_timeline then discards, permanently suppressing the
-			 * real request that never actually happened.  page_prune_due is
-			 * set only together with the flush request -- a layer-resident
-			 * superseded note gets nothing from the reclaimer, since the
-			 * fence change that superseded it already marked the shard due
-			 * (page_prune_mark_all_due) and the flush's own
-			 * note_flush_pending path re-marks it after landing. */
+			 * real request that never actually happened. The flush also
+			 * marks pruning due, and note_flush_pending re-marks it when
+			 * the note becomes durable. */
 			if (control_flush_wanted)
 			{
 				WalReclaimControlRequest *req = &walidx_reclaim_control_request[tl];
 
 				__atomic_fetch_add(&ps_test_control_flush_wanted_count, 1,
 								   __ATOMIC_RELAXED);
-				if (req->lsn != note_lsn || req->seq != note_seq ||
+				if (req->lsn != note.lsn || req->seq != note.seq ||
 					req->fence_epoch != fence_epoch)
 				{
 					PsKey		ckey;
@@ -18407,8 +18490,8 @@ wal_segment_reclaim_one(void)
 
 					__atomic_fetch_add(&ps_test_control_flush_store_count, 1,
 									   __ATOMIC_RELAXED);
-					req->lsn = note_lsn;
-					req->seq = note_seq;
+					req->lsn = note.lsn;
+					req->seq = note.seq;
 					req->fence_epoch = fence_epoch;
 					memset(&ckey, 0, sizeof(ckey));
 					ckey.klass = PS_KLASS_CONTROL;
@@ -18417,7 +18500,7 @@ wal_segment_reclaim_one(void)
 					{
 						__atomic_store_n(&page_flush_requested[control_shard], 1,
 										 __ATOMIC_RELEASE);
-						__atomic_store_n(&page_prune_due[note_timeline][control_shard],
+						__atomic_store_n(&page_prune_due[note.timeline][control_shard],
 										 1, __ATOMIC_RELEASE);
 					}
 				}
@@ -18435,6 +18518,7 @@ wal_segment_reclaim_one(void)
 		rc = ps_wal_store_reclaim_prefix(store, target);
 		if (rc == 0)
 		{
+			control_retirement_clear(tl);
 			memset(&wal_reclaim_retry_at[tl], 0,
 				   sizeof(wal_reclaim_retry_at[tl]));
 			wal_reclaim_watch_clear(tl);
@@ -20134,7 +20218,7 @@ walidx_plan_bases_build(uint32_t tl)
 	walidx_plan_bases_free();
 	if (retention_effective_floor_internal(tl,
 										   PS_RETENTION_RESOURCE_PAGE_HISTORY,
-										   &floor, 1, NULL, NULL, NULL, NULL) != 0 ||
+										   &floor, 1, NULL, NULL) != 0 ||
 		page_prune_fences(tl, &fences, &nfences) != 0)
 		return -1;
 	{
@@ -23709,8 +23793,7 @@ control_checkpoint_cutoff(uint32_t timeline, uint64_t materializer_lsn,
  * note that set the floor, on this timeline, later. */
 static int
 wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
-					   uint64_t *floor, uint64_t *note_lsn_out,
-					   uint64_t *note_seq_out)
+					   uint64_t *floor, WalRetainNote *note)
 {
 	PsKey		key;
 	PageEnt    *notes;
@@ -23786,7 +23869,8 @@ wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
 								(unsigned long long) redo,
 								(unsigned long long) wal_reclaim_next_segment_boundary,
 								i + 1, notes->nver);
-					return -1;
+					*note = (WalRetainNote) {v->lsn, v->admission_seq, redo, timeline, true};
+					return WAL_RETAIN_SEGMENT_BLOCKED;
 				}
 			}
 			if (redo == 0)
@@ -23797,10 +23881,8 @@ wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
 			if (*floor == 0 || redo < *floor)
 			{
 				*floor = redo;
-				if (note_lsn_out != NULL)
-					*note_lsn_out = v->lsn;
-				if (note_seq_out != NULL)
-					*note_seq_out = v->admission_seq;
+				*note = (WalRetainNote) {v->lsn, v->admission_seq, redo, timeline,
+					walidx_base_version_durable(v) != 0};
 			}
 		}
 	}
@@ -24075,7 +24157,7 @@ static int
 control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 				   uint64_t floor, const PsHistoryFence *fences,
 				   uint32_t nfences, PsControlChainPlan *plan,
-				   const ControlRedoPrefetch *prefetch)
+				   const ControlRedoPrefetch *prefetch, PsControlRetirementStatus *blocker)
 {
 	PageEnt    *e = page_find(timeline, key, block);
 	unsigned char *keep;
@@ -24279,6 +24361,12 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 			}
 			if (have_twin)
 			{
+				if (blocker && blocker->note_lsn == twin.lsn)
+				{
+					blocker->reason = PS_CONTROL_RETIRE_EXACT_REDO;
+					blocker->dependency_lsn = plan->kept[k].lsn;
+					blocker->dependency_timeline = timeline;
+				}
 				plan->kept[plan->nkept] = twin;
 				plan->nkept++;
 			}
@@ -24333,7 +24421,15 @@ control_chain_plan(uint32_t timeline, const PsKey *key, uint32_t block,
 					plan->kept[j].admission_seq == twin->admission_seq)
 					already = true;
 			if (!already)
+			{
+				if (blocker && blocker->note_lsn == twin->lsn)
+				{
+					blocker->reason = PS_CONTROL_RETIRE_EXACT_REDO;
+					blocker->dependency_lsn = note->lsn;
+					blocker->dependency_timeline = timeline;
+				}
 				plan->kept[plan->nkept++] = (PsPruneVersion) {twin->lsn, twin->admission_seq};
+			}
 		}
 		free(note_selections);
 		free(note_sorted);
@@ -24670,10 +24766,10 @@ ps_test_control_note_plan(uint32_t timeline, uint64_t *oldest_lsn,
 	ps_lock_shard_wr(ps_shard_of(&key));
 	ps_lock_map_rd();
 	if (retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-			&floor, 1, NULL, NULL, NULL, NULL) != 0 || floor == 0 ||
-		control_prune_fences(timeline, &fences, &nfences) != 0 ||
+			&floor, 1, NULL, NULL) != 0 || floor == 0 ||
+		control_prune_fences(timeline, &fences, &nfences, NULL) != 0 ||
 		control_chain_plan(timeline, &key, PS_CONTROL_IMAGE_BLOCK, floor,
-						   fences, nfences, &plan, NULL) != 0 || !plan.valid)
+						   fences, nfences, &plan, NULL, NULL) != 0 || !plan.valid)
 		goto done;
 	notes = page_find(timeline, &key, PS_CONTROL_NOTE_BLOCK);
 	if (notes == NULL || notes->nver == 0)
@@ -24740,7 +24836,7 @@ control_pair_candidate_cmp(const void *va, const void *vb)
 static int
 control_pair_candidates(uint32_t timeline, const PsKey *key,
 	const PsControlChainPlan *plan, const PsHistoryFence *fences, uint32_t nfences,
-	PsImgIndexEnt **out, uint32_t *out_count)
+	PsImgIndexEnt **out, uint32_t *out_count, PsControlRetirementStatus *blocker)
 {
 	PageEnt *entries[PS_CONTROL_PAIRED_BLOCKS] = {0};
 	ControlPairCandidate *all = NULL;
@@ -24754,7 +24850,11 @@ control_pair_candidates(uint32_t timeline, const PsKey *key,
 	{
 		entries[block] = page_find(timeline, key, block);
 		if (!entries[block] || entries[block]->nver <= 0)
+		{
+			if (blocker)
+				blocker->reason = PS_CONTROL_RETIRE_INCOMPLETE;
 			return 0; /* no complete group */
+		}
 		if ((uint32_t) entries[block]->nver > UINT32_MAX - total)
 			return -1;
 		total += (uint32_t) entries[block]->nver;
@@ -24779,6 +24879,8 @@ control_pair_candidates(uint32_t timeline, const PsKey *key,
 			PageVer *v = &entry->vers[i];
 			PsPruneVersion version = {v->lsn, v->admission_seq};
 
+			if (blocker && v->lsn != blocker->note_lsn)
+				continue;
 			all[used].identity.key = *key;
 			all[used].identity.block = block;
 			all[used].identity.lsn = v->lsn;
@@ -24801,6 +24903,10 @@ control_pair_candidates(uint32_t timeline, const PsKey *key,
 			keep |= all[end].keep;
 			end++;
 		}
+		if (blocker && blocks != (1u << PS_CONTROL_PAIRED_BLOCKS) - 1)
+			blocker->reason = PS_CONTROL_RETIRE_INCOMPLETE;
+		else if (blocker && keep && blocker->reason == PS_CONTROL_RETIRE_DEFERRED)
+			blocker->reason = PS_CONTROL_RETIRE_CHECKPOINT;
 		if (!keep && blocks == (1u << PS_CONTROL_PAIRED_BLOCKS) - 1)
 			for (uint32_t i = first; i < end; i++)
 				if (i == first || control_pair_candidate_cmp(&all[i - 1], &all[i]) != 0)
@@ -24826,7 +24932,7 @@ control_layer_id_cmp(const void *va, const void *vb)
 }
 
 static int oldest_artifact_candidates(uint32_t timeline, uint32_t shard,
-	uint64_t floor, PsImgIndexEnt **out, uint32_t *count);
+	uint64_t floor, uint64_t cutoff, PsImgIndexEnt **out, uint32_t *count);
 
 /* Copy the note identities and pin their immutable layers while locked.  Read
  * them without the foreground locks, then reject the result unless every
@@ -24929,7 +25035,7 @@ control_redo_prefetch_unlocked(uint32_t timeline, uint32_t shard,
 		!ps_timeline_state(timeline, &state, &current_incarnation) ||
 		state != PS_TIMELINE_LIVE || current_incarnation != incarnation ||
 		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-			&current_floor, 1, NULL, NULL, NULL, NULL) != 0 || current_floor != floor ||
+			&current_floor, 1, NULL, NULL) != 0 || current_floor != floor ||
 		ps_layer_map.nlayers != map_count)
 		goto done_locked;
 	for (uint32_t i = 0; i < map_count; i++)
@@ -24970,12 +25076,67 @@ done_locked:
 /* Retire complete, globally obsolete control groups in one durable manifest
  * transaction. Called with all shard locks, prune lock and map write lock;
  * those locks are released during index scanning, staging and verification. */
+/* Identify a direct dependency using the same admissibility and durable
+ * image order as the planner. An exact-redo dependency is reported by the
+ * planner itself because it reads the retained note's payload. */
+static void
+control_retirement_describe_fence(uint32_t timeline, const PsControlChainPlan *plan,
+	const PsHistoryFence *fences, uint32_t nfences, const ControlFenceSources *sources,
+	PsControlRetirementStatus *blocker)
+{
+	bool inherited;
+	uint64_t branch_lsn = timeline_inherited_below(timeline, &inherited);
+
+	for (uint32_t f = 0; f < nfences; f++)
+	{
+		PsAdmitCap cap = {fences[f].lsn, fences[f].seq, fences[f].admission_seq};
+		uint32_t lo = 0, hi = plan->nchain;
+
+		if (cap.lsn < blocker->note_lsn)
+			continue;
+		while (lo < hi)
+		{
+			uint32_t mid = lo + (hi - lo) / 2;
+
+			if (plan->chain[mid].lsn <= cap.lsn)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		while (lo > 0)
+		{
+			const PsPruneVersion *v = &plan->chain[--lo];
+			bool minimum = lo == 0 || plan->chain[lo - 1].lsn != v->lsn;
+
+			if (v->lsn < blocker->note_lsn)
+				break;
+			if (!ps_version_admissible(v->lsn, v->admission_seq, minimum, &cap,
+									   branch_lsn, inherited))
+				continue;
+			if (v->lsn == blocker->note_lsn)
+			{
+				ControlFenceSource source = f < sources->n ? sources->direct[f] :
+					(ControlFenceSource) {.timeline = timeline, .reason = PS_CONTROL_RETIRE_ARTIFACT};
+
+				blocker->reason = source.reason;
+				blocker->dependency_lsn = cap.lsn;
+				blocker->dependency_timeline = source.timeline;
+				blocker->owner_id = source.owner_id;
+				blocker->owner_kind = source.owner_kind;
+				return;
+			}
+			break;
+		}
+	}
+}
+
 static int
 compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
-	int *prune_deferred)
+	int *prune_deferred, PsControlRetirementStatus *blocker, uint64_t artifact_cutoff)
 {
 	PsKey key = {0};
 	PsControlChainPlan global = {0};
+	ControlFenceSources sources = {0};
 	ControlRedoPrefetch redo_prefetch = {0};
 	PsHistoryFence *fences = NULL;
 	PsLayerDesc *layers = NULL, inputs[PS_IMAGE_MERGE_MAX_INPUTS];
@@ -25011,12 +25172,12 @@ compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 		!ps_timeline_state(timeline, &state, &captured.timeline_incarnation) ||
 		state != PS_TIMELINE_LIVE ||
 		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-			&captured.page_floor, 1, NULL, NULL, NULL, NULL) != 0 ||
+			&captured.page_floor, 1, NULL, NULL) != 0 ||
 		captured.page_floor != floor)
 		goto done;
-	artifact_mode = oldest_artifact_candidates(timeline, shard, floor,
-		&candidates, &ncandidates);
-	if (artifact_mode < 0)
+	artifact_mode = blocker ? 0 : oldest_artifact_candidates(timeline, shard, floor,
+		artifact_cutoff, &candidates, &ncandidates);
+	if (artifact_mode < 0 || (artifact_cutoff != 0 && !artifact_mode))
 		goto done;
 	if (!artifact_mode)
 	{
@@ -25025,9 +25186,9 @@ compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 		if (page_find(timeline, &key, PS_CONTROL_NOTE_BLOCK) == NULL)
 			goto done;
 		if (control_redo_prefetch_unlocked(timeline, shard, &key, floor, &redo_prefetch) != 0 ||
-			control_prune_fences(timeline, &fences, &nfences) != 0 ||
+			control_prune_fences(timeline, &fences, &nfences, blocker ? &sources : NULL) != 0 ||
 			control_chain_plan(timeline, &key, PS_CONTROL_IMAGE_BLOCK, floor,
-				fences, nfences, &global, &redo_prefetch) != 0 || !global.valid)
+				fences, nfences, &global, &redo_prefetch, blocker) != 0 || !global.valid)
 		{
 			if (getenv("PAGESTORE_BENCH_RECOVERY") != NULL)
 			{
@@ -25041,8 +25202,13 @@ compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 			goto done;
 		}
 		if (control_pair_candidates(timeline, &key, &global, fences, nfences,
-				&candidates, &ncandidates) != 0)
+				&candidates, &ncandidates, blocker) != 0)
 			goto done;
+		if (blocker && ncandidates == 0 &&
+			(blocker->reason == PS_CONTROL_RETIRE_CHECKPOINT ||
+			 blocker->reason == PS_CONTROL_RETIRE_EXACT_REDO))
+			control_retirement_describe_fence(timeline, &global, fences, nfences,
+											 &sources, blocker);
 	}
 	if (getenv("PAGESTORE_BENCH_RECOVERY") != NULL)
 	{
@@ -25105,6 +25271,10 @@ compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 	}
 	if (ncandidates == 0)
 		goto done;
+	/* A targeted pass already tried this timeline on this turn. If its
+	 * snapshot changes, yield before trying a different publication. */
+	if (blocker || artifact_cutoff != 0)
+		*prune_deferred = 1;
 	while (nfirst < ncandidates && candidates[nfirst].lsn == candidates[0].lsn)
 		nfirst++;
 	if (nfirst > PS_BOUNDED_PRUNE_MAX_DROPPED)
@@ -25282,7 +25452,7 @@ compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 		!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
 		state != PS_TIMELINE_LIVE ||
 		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-			&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+			&current.page_floor, 1, NULL, NULL) != 0)
 		goto done;
 	current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 	current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
@@ -25321,6 +25491,8 @@ compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 	 * non-crash probe fails, still reconcile the live in-memory index. */
 	(void) ps_fault_probe(PS_FAULT_POINT_PAGE_GC_AFTER_MARK_DELETE);
 	page_remove_compacted_versions(timeline, dropped_recs, ndrop);
+	if (!artifact_mode)
+		wal_reclaim_proof_changed();
 	if (metrics_header != NULL)
 	{
 		ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
@@ -25338,6 +25510,7 @@ compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 	*prune_deferred = 1;
 	rc = 1;
 done:
+	free(sources.direct);
 	free(redo_prefetch.values);
 	free(redo_prefetch.valid);
 	ps_compaction_relation_plan_close(plan);
@@ -25411,11 +25584,11 @@ control_coverage_preflight(uint32_t timeline, uint32_t selected_limit, bool pair
 		!ps_timeline_state(timeline, &state, &captured.timeline_incarnation) ||
 		state != PS_TIMELINE_LIVE ||
 		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-			&captured.page_floor, 1, NULL, NULL, NULL, NULL) != 0 ||
+			&captured.page_floor, 1, NULL, NULL) != 0 ||
 		captured.page_floor == 0 ||
-		control_prune_fences(timeline, &fences, &nfences) != 0 ||
+		control_prune_fences(timeline, &fences, &nfences, NULL) != 0 ||
 		control_chain_plan(timeline, &key, PS_CONTROL_IMAGE_BLOCK, captured.page_floor,
-			fences, nfences, &plan, NULL) != 0 || !plan.valid)
+			fences, nfences, &plan, NULL, NULL) != 0 || !plan.valid)
 		goto done;
 	captured.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 	captured.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
@@ -25426,7 +25599,7 @@ control_coverage_preflight(uint32_t timeline, uint32_t selected_limit, bool pair
 	if (paired)
 	{
 		if (control_pair_candidates(timeline, &key, &plan, fences, nfences,
-									&identities, &n) != 0)
+									&identities, &n, NULL) != 0)
 			goto done;
 	}
 	else
@@ -25500,7 +25673,7 @@ control_coverage_preflight(uint32_t timeline, uint32_t selected_limit, bool pair
 		!ps_timeline_state(timeline, &state, &current.timeline_incarnation) ||
 		state != PS_TIMELINE_LIVE ||
 		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-			&current.page_floor, 1, NULL, NULL, NULL, NULL) != 0)
+			&current.page_floor, 1, NULL, NULL) != 0)
 		goto done;
 	current.timeline_epoch = __atomic_load_n(&page_view_timeline_epoch, __ATOMIC_ACQUIRE);
 	current.admission_epoch = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
@@ -25965,6 +26138,8 @@ artifact_fence_forget_versions(uint32_t timeline, uint64_t lsn,
 					 * reclaimable; the current pass already snapshotted the
 					 * fence, so make sure a later pass looks again */
 					page_prune_mark_all_due_locked();
+					walidx_reclaim_fence_changed();
+					wal_reclaim_proof_changed();
 				}
 				break;
 			}
@@ -26127,7 +26302,7 @@ artifact_fence_snapshot(uint32_t timeline, uint64_t **lsns_out,
  * page-prune and map locks. Pending or unprovable objects fail closed. */
 static int
 oldest_artifact_candidates(uint32_t timeline, uint32_t shard, uint64_t floor,
-	PsImgIndexEnt **out, uint32_t *count)
+	uint64_t cutoff, PsImgIndexEnt **out, uint32_t *count)
 {
 	uint64_t oldest = UINT64_MAX;
 	uint32_t pending = 0;
@@ -26144,6 +26319,7 @@ oldest_artifact_candidates(uint32_t timeline, uint32_t shard, uint64_t floor,
 	}
 	for (uint32_t i = 0; i < nartifact_fences; i++)
 		if (artifact_fences[i].timeline == timeline &&
+			(cutoff == 0 || artifact_fences[i].lsn == cutoff) &&
 			(artifact_fences[i].versions || artifact_fences[i].pending) &&
 			artifact_fences[i].lsn < oldest)
 		{
@@ -26502,7 +26678,7 @@ page_view_registered(uint32_t timeline, const ViewCap *cap)
  */
 static int
 control_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
-					 uint32_t *nfences_out)
+					 uint32_t *nfences_out, ControlFenceSources *sources)
 {
 	PsRetentionPin *pins = NULL;
 	uint32_t npins = 0;
@@ -26517,6 +26693,16 @@ control_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 		free(pins);
 		return -1;
 	}
+	if (sources != NULL)
+	{
+		sources->direct = calloc((size_t) npins + MAX_TIMELINES, sizeof(*sources->direct));
+		if (sources->direct == NULL)
+		{
+			free(fences);
+			free(pins);
+			return -1;
+		}
+	}
 	for (uint32_t i = 0; i < npins; i++)
 		if ((pins[i].resources & (PS_RETENTION_RESOURCE_PAGE_HISTORY |
 								  PS_RETENTION_RESOURCE_WAL)) != 0)
@@ -26528,6 +26714,11 @@ control_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 			if (retention_project_cap(pins[i].timeline, timeline, &cap))
 			{
 				fences[nfences] = (PsHistoryFence) {cap.lsn, cap.strict_seq, cap.seq};
+				if (sources != NULL)
+					sources->direct[nfences] = (ControlFenceSource) {
+						pins[i].owner_id, pins[i].timeline, pins[i].owner_kind,
+						PS_CONTROL_RETIRE_PIN
+					};
 				nfences++;
 			}
 		}
@@ -26542,10 +26733,16 @@ control_prune_fences(uint32_t timeline, PsHistoryFence **fences_out,
 			retention_project_cap(candidate, timeline, &cap))
 		{
 			fences[nfences] = (PsHistoryFence) {cap.lsn, cap.strict_seq, cap.seq};
+			if (sources != NULL)
+				sources->direct[nfences] = (ControlFenceSource) {
+					.timeline = candidate, .reason = PS_CONTROL_RETIRE_BRANCH
+				};
 			nfences++;
 		}
 	}
 	free(pins);
+	if (sources != NULL)
+		sources->n = nfences;
 	/* SLRU seed snapshots and exact-R reader artifacts are reader-artifact
 	 * authority that no dedicated protocol reclaims yet.  Seeding replays from
 	 * such a base and resolves the control state (for example the commit-ts
@@ -26616,7 +26813,7 @@ control_view_registered(uint32_t timeline, const ViewCap *cap)
 	if (page_view_registered(timeline, cap) || artifact_cap_registered(timeline, cap))
 		return 1;
 	if (timeline_meta_poisoned_load() ||
-		control_prune_fences(timeline, &fences, &nfences) != 0)
+		control_prune_fences(timeline, &fences, &nfences, NULL) != 0)
 		return 0;
 	for (uint32_t i = 0; i < nfences; i++)
 		if (fences[i].lsn == cap->lsn && fences[i].seq == cap->seq &&
@@ -26820,9 +27017,7 @@ walidx_view_fences(uint32_t timeline, PsHistoryFence **fences_out,
 static int
 retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
 							   uint64_t *floor_out, int map_locked,
-							   uint64_t *pin_floor_out,
-							   uint32_t *note_timeline_out,
-							   uint64_t *note_lsn_out, uint64_t *note_seq_out)
+							   uint64_t *pin_floor_out, WalRetainNote *note_out)
 {
 	typedef struct RetentionControlProjection
 	{
@@ -26951,61 +27146,23 @@ retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
 	if (resource == PS_RETENTION_RESOURCE_WAL)
 	{
 		unsigned char *tmp = malloc(page_size);
-		uint32_t	note_timeline = 0;
-		uint64_t	note_lsn = 0;
-		uint64_t	note_seq = 0;
+		WalRetainNote note = {0};
+		int rc = 0;
 
 		if (!tmp)
 			return -1;
-		for (uint32_t i = 0; i < ncontrols && floor != 1; i++)
-		{
-			uint64_t	before = floor;
-			uint64_t	lsn = 0,
-						seq = 0;
-
-			if (wal_retain_floor_level(controls[i].timeline,
-								   controls[i].cap, tmp, &floor, &lsn,
-								   &seq) != 0)
-			{
-				free(tmp);
-				return -1;
-			}
-			if (floor != before && floor != 1 && lsn != 0)
-			{
-				note_timeline = controls[i].timeline;
-				note_lsn = lsn;
-				note_seq = seq;
-			}
-		}
-		for (uint32_t i = 0; i < nancestors && floor != 1; i++)
-		{
-			uint64_t	before = floor;
-			uint64_t	lsn = 0,
-						seq = 0;
-
-			if (wal_retain_floor_level(ancestors[i].tl, ancestors[i].lsn,
-								   tmp, &floor, &lsn, &seq) != 0)
-			{
-				free(tmp);
-				return -1;
-			}
-			if (floor != before && floor != 1 && lsn != 0)
-			{
-				note_timeline = ancestors[i].tl;
-				note_lsn = lsn;
-				note_seq = seq;
-			}
-		}
+		for (uint32_t i = 0; i < ncontrols && floor != 1 && rc == 0; i++)
+			rc = wal_retain_floor_level(controls[i].timeline,
+										controls[i].cap, tmp, &floor, &note);
+		for (uint32_t i = 0; i < nancestors && floor != 1 && rc == 0; i++)
+			rc = wal_retain_floor_level(ancestors[i].tl,
+										ancestors[i].lsn, tmp, &floor, &note);
 		free(tmp);
-		if (floor != 0 && floor != 1)
-		{
-			if (note_timeline_out != NULL)
-				*note_timeline_out = note_timeline;
-			if (note_lsn_out != NULL)
-				*note_lsn_out = note_lsn;
-			if (note_seq_out != NULL)
-				*note_seq_out = note_seq;
-		}
+		if (note_out != NULL && (rc == WAL_RETAIN_SEGMENT_BLOCKED ||
+								(rc == 0 && floor != 0 && floor != 1)))
+			*note_out = note;
+		if (rc != 0)
+			return rc;
 	}
 	*floor_out = floor;
 	return 0;
@@ -27016,7 +27173,7 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 						  uint64_t *floor_out)
 {
 	return retention_effective_floor_internal(timeline, resource, floor_out, 0,
-											  NULL, NULL, NULL, NULL);
+											  NULL, NULL);
 }
 
 /* Return only immutable WAL bytes which the existing R3b proof would permit
@@ -30798,7 +30955,7 @@ compact_budget_retry_now(uint32_t timeline, uint32_t shard, uint32_t nshards)
 		(prune_abandon_local_only() || control_prune_provider_supported()) &&
 		count_image_layers(timeline, shard) != 0 &&
 		retention_effective_floor_internal(timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-			&floor, 1, NULL, NULL, NULL, NULL) == 0)
+			&floor, 1, NULL, NULL) == 0)
 	{
 		was_due = __atomic_exchange_n(&page_prune_due[timeline][shard], 0, __ATOMIC_ACQ_REL);
 		bounded = compact_local_first(timeline, shard, floor, &deferred, &attempted, 1);
@@ -30818,6 +30975,85 @@ compact_budget_retry_now(uint32_t timeline, uint32_t shard, uint32_t nshards)
 		return 1;
 	}
 	return 0;
+}
+
+/* Run one WAL-blocking control group ahead of ordinary layer maintenance. */
+static int
+control_retirement_maintenance(uint32_t nshards)
+{
+	PsKey key = {.klass = PS_KLASS_CONTROL};
+	uint32_t shard;
+	uint32_t wal_timeline;
+	ControlRetirementRequest *request = NULL;
+	PsControlRetirementStatus *status;
+	uint64_t floor = 0;
+	int deferred = 0;
+	int rc = 0;
+
+	for (uint32_t pass = 0; pass < MAX_TIMELINES; pass++)
+	{
+		wal_timeline = (control_retirement_cursor + pass) % MAX_TIMELINES;
+		if (control_retirement_requests[wal_timeline].status.reason == PS_CONTROL_RETIRE_QUEUED)
+		{
+			request = &control_retirement_requests[wal_timeline];
+			break;
+		}
+	}
+	if (request == NULL)
+		return 0;
+	control_retirement_cursor = (wal_timeline + 1) % MAX_TIMELINES;
+	status = &request->status;
+	status->reason = PS_CONTROL_RETIRE_DEFERRED;
+	if (!control_prune_provider_supported())
+	{
+		request->attempted_at = inspection_now_ns();
+		control_retirement_publish(wal_timeline);
+		return 0;
+	}
+	shard = ps_shard_of(&key);
+
+	for (uint32_t sh = 0; sh < nshards; sh++)
+		ps_lock_shard_wr(sh);
+	pthread_rwlock_rdlock(&page_prune_lock);
+	ps_lock_map_wr();
+	if (ps_timeline_live(wal_timeline) && ps_timeline_live(status->note_timeline) &&
+		retention_effective_floor_internal(status->note_timeline, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+			&floor, 1, NULL, NULL) == 0)
+	{
+		PageEnt *notes = page_find(status->note_timeline, &key, PS_CONTROL_NOTE_BLOCK);
+		bool present = false;
+
+		for (int i = 0; notes && i < notes->nver && !present; i++)
+			present = notes->vers[i].lsn == status->note_lsn &&
+				notes->vers[i].admission_seq == status->note_admission_seq;
+		if (!present)
+			status->reason = PS_CONTROL_RETIRE_RETIRED;
+		else
+			rc = compact_control_pairs_bounded(status->note_timeline, shard, floor,
+											   &deferred, status, 0);
+		if (rc > 0)
+		{
+			status->reason = PS_CONTROL_RETIRE_RETIRED;
+			__atomic_fetch_add(&ps_test_compaction_pass_count, 1, __ATOMIC_RELAXED);
+		}
+		else if (rc == 0 && status->reason == PS_CONTROL_RETIRE_ARTIFACT)
+		{
+			/* The control key and its artifact can live on different shards.
+			 * Try one shard per turn, with the same whole-object proof. */
+			rc = compact_control_pairs_bounded(status->note_timeline,
+					request->artifact_shard, floor, &deferred, NULL, status->dependency_lsn);
+			request->artifact_shard = (request->artifact_shard + 1) % nshards;
+			if (rc > 0)
+				__atomic_fetch_add(&ps_test_compaction_pass_count, 1, __ATOMIC_RELAXED);
+		}
+	}
+	ps_unlock_map();
+	pthread_rwlock_unlock(&page_prune_lock);
+	for (uint32_t sh = nshards; sh > 0; sh--)
+		ps_unlock_shard(sh - 1);
+	request->attempted_at = inspection_now_ns();
+	control_retirement_publish(wal_timeline);
+	return rc != 0 || deferred;
 }
 
 /*
@@ -31074,6 +31310,8 @@ ps_core_maintenance_impl(void)
 	/* WAL reclaim is finite, one-timeline work.  Schedule it before potentially
 	 * continuous tier/remote-GC streams so those classes cannot starve it. */
 	if (wal_segment_reclaim_one())
+		return 1;
+	if (control_retirement_maintenance(ns))
 		return 1;
 	/* A failed post-unlink directory sync leaves counted segment debt until
 	 * absence is confirmed. Do that before draining a queue of layer GC. */
@@ -31338,7 +31576,7 @@ ps_core_maintenance_impl(void)
 				count_image_layers(ftl, fsh) != 0 &&
 				(retry_budget || count_image_layers(ftl, fsh) > PS_IMAGE_MERGE_MAX_INPUTS) &&
 				retention_effective_floor_internal(ftl, PS_RETENTION_RESOURCE_PAGE_HISTORY,
-														   &page_floor, 1, NULL, NULL, NULL, NULL) == 0)
+														   &page_floor, 1, NULL, NULL) == 0)
 			{
 				int deferred = 0;
 				int was_due = __atomic_exchange_n(&page_prune_due[ftl][fsh], 0, __ATOMIC_ACQ_REL);
@@ -31389,7 +31627,7 @@ ps_core_maintenance_impl(void)
 				  count_image_layers(ftl, fsh) > 0)) &&
 				retention_effective_floor_internal(ftl,
 					PS_RETENTION_RESOURCE_PAGE_HISTORY, &page_floor, 1,
-					NULL, NULL, NULL, NULL) == 0)
+					NULL, NULL) == 0)
 			{
 				int		prune_deferred = 0;
 				int		compact_rc;
@@ -31824,6 +32062,8 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 		   sizeof(walidx_snapshot_cleanup_retry_at));
 	memset(wal_reclaim_retry_at, 0, sizeof(wal_reclaim_retry_at));
 	wal_reclaim_cursor = 0;
+	memset(control_retirement_requests, 0, sizeof(control_retirement_requests));
+	control_retirement_cursor = 0;
 	__atomic_store_n(&wal_reclaim_proof_epoch, 0, __ATOMIC_RELEASE);
 	memset(wal_reclaim_backoff_epoch, 0, sizeof(wal_reclaim_backoff_epoch));
 	memset(wal_reclaim_armed_at, 0, sizeof(wal_reclaim_armed_at));

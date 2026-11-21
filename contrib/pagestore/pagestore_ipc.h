@@ -30,7 +30,8 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		57	/* 57: generation-fenced channel ownership.
+#define PS_SHM_VERSION		58	/* 58: WAL control-retirement diagnostics.
+								 * 57: generation-fenced channel ownership.
 								 * 56: archive progress PREPARE/ACTIVATE split.
 								 * 55: archive progress FREEZE request payload.
 								 * 53: compaction conflict and fallback metrics.
@@ -706,6 +707,36 @@ typedef struct PsCompactionMetrics
 	uint64_t locked_fallback_active_shard;
 } PsCompactionMetrics;
 
+typedef enum PsControlRetirementReason
+{
+	PS_CONTROL_RETIRE_NONE = 0,
+	PS_CONTROL_RETIRE_QUEUED,
+	PS_CONTROL_RETIRE_DEFERRED,
+	PS_CONTROL_RETIRE_INCOMPLETE,
+	PS_CONTROL_RETIRE_CHECKPOINT,
+	PS_CONTROL_RETIRE_EXACT_REDO,
+	PS_CONTROL_RETIRE_PIN,
+	PS_CONTROL_RETIRE_BRANCH,
+	PS_CONTROL_RETIRE_ARTIFACT,
+	PS_CONTROL_RETIRE_RETIRED
+} PsControlRetirementReason;
+
+/* A sampled, verified blocker for one WAL timeline.  A short-circuited
+ * proof identifies one blocking note; it does not compute the full floor. */
+typedef struct PsControlRetirementStatus
+{
+	uint64_t	seq;
+	uint64_t	note_lsn;
+	uint64_t	note_admission_seq;
+	uint64_t	redo_lsn;
+	uint64_t	dependency_lsn;
+	uint64_t	owner_id;
+	uint32_t	note_timeline;
+	uint32_t	dependency_timeline;
+	uint32_t	owner_kind;
+	uint32_t	reason;
+} PsControlRetirementStatus;
+
 typedef struct PsShmHeader
 {
 	uint32_t	magic;
@@ -743,6 +774,7 @@ typedef struct PsShmHeader
 	uint32_t	channel_owner_generation;
 	uint64_t	channel_pidns_dev;
 	uint64_t	channel_pidns_ino;
+	PsControlRetirementStatus control_retirement[PS_INSPECTION_MAX_TIMELINES];
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)

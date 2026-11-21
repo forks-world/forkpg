@@ -2393,6 +2393,95 @@ test_control_pair_crash(const char *fault)
 }
 
 static void
+test_prioritized_control_retirement(int with_seed)
+{
+	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-control-retirement-XXXXXX";
+	const uint64_t old_redo = WAL_SEGMENT / 2;
+	const uint64_t owner = 313;
+	const uint64_t seed_cutoff = WAL_TOTAL + 12 * 8192;
+	const uint64_t end = WAL_TOTAL + 25 * 8192;
+	PsKey seed = {.relNumber = 7, .klass = PS_KLASS_SLRU};
+	PsShmHeader metrics = {0};
+	PsControlRetirementStatus *status = &metrics.control_retirement[0];
+	int ok;
+
+	configure_core();
+	compact_layers = 1000;
+	ok = prepare_store(store, old_redo, 0, 0, 1) &&
+		write_control_fence(WAL_TOTAL, old_redo);
+	for (uint32_t i = 1; i <= 24 && ok; i++)
+	{
+		uint64_t version = WAL_TOTAL + (uint64_t) i * 8192;
+
+		ok = write_control(0, version, version) && write_control_fence(version, version);
+	}
+	ok = ok && append_wal_bytes(0, WAL_TOTAL, 25 * 8192) &&
+		wal_index_progress(0, WAL_TOTAL, end) &&
+		reserve_pin(0, PS_RETENTION_OWNER_READER, owner, 1,
+					PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL, WAL_TOTAL);
+	if (with_seed && ok)
+	{
+		unsigned char page[8192] = {0};
+		uint32_t shard = ps_shard_of(&seed);
+
+		ok = reserve_pin(0, PS_RETENTION_OWNER_READER, owner + 1, 1,
+						PS_RETENTION_RESOURCE_PAGE_HISTORY | PS_RETENTION_RESOURCE_WAL, seed_cutoff);
+		ps_lock_shard_wr(shard);
+		ok = ok && append_page(0, &seed, 0, page, WAL_TOTAL, NULL) == 0 &&
+			append_page(0, &seed, 0, page, seed_cutoff, NULL) == 0;
+		ps_unlock_shard(shard);
+	}
+	close_store();
+	check(ok && ps_core_open(store) == 0, "reopen the complete control groups in immutable layers");
+	ps_core_set_metrics_header(&metrics);
+
+	for (int i = 0; i < 12 && status->reason != PS_CONTROL_RETIRE_PIN; i++)
+		(void) ps_core_maintenance();
+	check(status->reason == PS_CONTROL_RETIRE_PIN && status->note_lsn == WAL_TOTAL &&
+		  status->redo_lsn == old_redo && status->dependency_lsn == WAL_TOTAL &&
+		  status->owner_kind == PS_RETENTION_OWNER_READER && status->owner_id == owner,
+		  "the sampled WAL blocker identifies the owner keeping the old group");
+	check(segment_count(store, 0) == 3 &&
+		  effective_floor(0, PS_RETENTION_RESOURCE_WAL) == old_redo,
+		  "the pinned group and its WAL remain eligible for recovery");
+
+	check(drop_wal_pin(0, owner, 1), "release the group's explicit reader dependency");
+	if (with_seed)
+	{
+		for (int i = 0; i < 100 && status->reason != PS_CONTROL_RETIRE_ARTIFACT; i++)
+		{
+			(void) ps_core_maintenance();
+			usleep(2000);
+		}
+		check(status->reason == PS_CONTROL_RETIRE_ARTIFACT &&
+			  status->dependency_lsn == WAL_TOTAL &&
+			  ps_test_page_version_count(0, &seed, 0) == 1 &&
+			  effective_floor(0, PS_RETENTION_RESOURCE_WAL) == old_redo,
+			  "retire the obsolete seed before retiring the checkpoint it kept");
+	}
+	for (int i = 0; i < 100 && status->reason != PS_CONTROL_RETIRE_RETIRED; i++)
+	{
+		(void) ps_core_maintenance();
+		usleep(2000);
+	}
+	check(status->reason == PS_CONTROL_RETIRE_RETIRED &&
+		  effective_floor(0, PS_RETENTION_RESOURCE_WAL) > old_redo,
+		  "the prioritized pass durably retires the old group");
+	/* Poll only the WAL reclaimer. With the one-second backoff still armed,
+	 * the control publication itself must have changed its proof epoch. */
+	for (int i = 0; i < 100 && segment_count(store, 0) == 3; i++)
+	{
+		(void) ps_test_wal_reclaim_maintenance();
+		usleep(2000);
+	}
+	check(segment_count(store, 0) < 3 && status->reason == PS_CONTROL_RETIRE_NONE,
+		  "control publication wakes WAL GC within its short rearm window");
+	ps_core_set_metrics_header(NULL);
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_many_control_layers_release_wal(int pinned, int generic_provider)
 {
 	char store[TEST_STORE_PATH_MAX] = "pagestore-wal-many-control-XXXXXX";
@@ -4590,6 +4679,13 @@ main(int argc, char **argv)
 	if (argc == 2 && strcmp(argv[1], "--control-coverage") == 0)
 	{
 		test_control_coverage_preflight();
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--prioritized-control-retirement") == 0)
+	{
+		test_prioritized_control_retirement(0);
+		test_prioritized_control_retirement(1);
 		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 		return failed != 0;
 	}

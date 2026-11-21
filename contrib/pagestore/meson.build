@@ -485,6 +485,8 @@ test('pagestore_wal_reclaim_core',
 )
 test('pagestore_control_group_reclaim', pagestore_wal_reclaim_core_test,
   args: ['--many-control-layers'], suite: ['pagestore'], timeout: 45)
+test('pagestore_control_retirement', pagestore_wal_reclaim_core_test,
+  args: ['--prioritized-control-retirement'], suite: ['pagestore'], timeout: 30)
 test('pagestore_control_group_pinned', pagestore_wal_reclaim_core_test,
   args: ['--many-control-layers-pinned'], suite: ['pagestore'], timeout: 45)
 test('pagestore_control_group_provider', pagestore_wal_reclaim_core_test,
