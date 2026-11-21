@@ -4678,6 +4678,7 @@ control_file_flush_hook_type control_file_flush_hook = NULL;
 recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook = NULL;
 recovery_restartpoint_pre_control_hook_type recovery_restartpoint_pre_control_hook = NULL;
 recovery_restartpoint_rejected_hook_type recovery_restartpoint_rejected_hook = NULL;
+recovery_restartpoint_replayed_hook_type recovery_restartpoint_replayed_hook = NULL;
 recovery_start_hook_type recovery_start_hook = NULL;
 recovery_consistency_hook_type recovery_consistency_hook = NULL;
 
@@ -8365,6 +8366,20 @@ RecoveryRestartPoint(const CheckPoint *checkPoint, XLogReaderState *record)
 	XLogCtl->lastCheckPointEndPtr = record->EndRecPtr;
 	XLogCtl->lastCheckPoint = *checkPoint;
 	SpinLockRelease(&XLogCtl->info_lck);
+}
+
+void
+ReportRecoveryRestartPointReplay(XLogRecPtr start_lsn, XLogRecPtr end_lsn,
+								TimeLineID tli)
+{
+	bool		accepted;
+
+	Assert(recovery_restartpoint_replayed_hook != NULL);
+	SpinLockAcquire(&XLogCtl->info_lck);
+	accepted = XLogCtl->lastCheckPointEndPtr == end_lsn;
+	SpinLockRelease(&XLogCtl->info_lck);
+	if (accepted)
+		(*recovery_restartpoint_replayed_hook) (start_lsn, end_lsn, tli);
 }
 
 /*

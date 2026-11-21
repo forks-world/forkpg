@@ -473,6 +473,7 @@ class Supervisor:
         self.stop_requested = False
         self.last_replay: int | None = None
         self.replay_changed_at = time.monotonic()
+        self.last_online_restartpoint: tuple[int, int] | None = None
         self.restart_baseline: int | None = None
         self.restart_deadline = 0.0
         self.retry_not_before = 0.0
@@ -715,6 +716,18 @@ class Supervisor:
             timeout=max(self.config.command_timeout_seconds, 60),
         )
 
+    def request_restartpoint(self, progress: Progress) -> None:
+        self.last_online_restartpoint = (progress.replay_int, progress.materialized_int)
+        self.publish("restartpoint", reason="requesting an online restartpoint")
+        try:
+            self.psql("CHECKPOINT;")
+        except (subprocess.SubprocessError, OSError):
+            # A timed-out client can leave the checkpointer running. Observe
+            # the watermark before falling back to a worker restart.
+            self.publish("awaiting_restartpoint", reason="online request did not complete")
+        self.restart_baseline = progress.materialized_int
+        self.restart_deadline = time.monotonic() + self.config.progress_timeout_ms / 1000
+
     def restart_for_progress(self) -> None:
         assert self.progress is not None
         baseline = self.progress.materialized_int
@@ -806,7 +819,11 @@ class Supervisor:
         if (now - self.replay_changed_at >= self.config.replay_idle_ms / 1000 or
                 now - self.lag_started_at >= self.config.replay_idle_ms / 1000):
             try:
-                self.restart_for_progress()
+                request = (replay, progress.materialized_int)
+                if request != self.last_online_restartpoint:
+                    self.request_restartpoint(progress)
+                else:
+                    self.restart_for_progress()
             except (subprocess.SubprocessError, OSError, RuntimeError) as error:
                 return self.record_failure(error)
         else:

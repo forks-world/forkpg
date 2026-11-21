@@ -147,6 +147,13 @@ typedef bool (*ArchiveFileCB) (ArchiveModuleState *state, const char *file, cons
     path of the WAL file (including the file name).
    </para>
 
+   <para>
+    If the callback is waiting for progress elsewhere, it can return
+    <literal>ArchiveModuleDefer(wait_event_info)</literal>. The file stays pending, and the
+    archiver waits up to one second before retrying, without counting an
+    archive failure. Pass zero to use the default archiver wait event.
+   </para>
+
    <note>
     <para>
      The <function>archive_file_cb</function> callback is called in a

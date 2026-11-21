@@ -48,6 +48,7 @@
 #include "miscadmin.h"
 #include "nodes/miscnodes.h"
 #include "pgstat.h"
+#include "portability/instr_time.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/startup.h"
 #include "replication/slot.h"
@@ -96,6 +97,7 @@ TimestampTz recoveryTargetTime;
 const char *recoveryTargetName;
 XLogRecPtr	recoveryTargetLSN;
 int			recovery_min_apply_delay = 0;
+recovery_archive_ready_hook_type recovery_archive_ready_hook = NULL;
 
 /* options formerly taken from recovery.conf for XLOG streaming */
 char	   *PrimaryConnInfo = NULL;
@@ -2036,6 +2038,14 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	/* Allow read-only connections if we're consistent now */
 	CheckRecoveryConsistency();
 
+	if (recovery_restartpoint_replayed_hook && StandbyMode && reachedConsistency &&
+		!ignore_invalid_pages &&
+		record->xl_rmid == RM_XLOG_ID &&
+		((record->xl_info & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_ONLINE ||
+		 (record->xl_info & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_SHUTDOWN))
+		ReportRecoveryRestartPointReplay(xlogreader->ReadRecPtr,
+									   xlogreader->EndRecPtr, *replayTLI);
+
 	/* Is this a timeline switch? */
 	if (switchedTLI)
 	{
@@ -3524,6 +3534,67 @@ next_record_is_invalid:
 }
 
 /*
+ * Wait for the normal retry interval or for evidence that a complete archive
+ * segment is available.  Give each segment one early attempt so an archive
+ * command failure cannot turn an advisory positive into a retry loop.
+ */
+static void
+WaitForArchiveRetry(XLogRecPtr recptr, TimeLineID tli, bool randAccess,
+					long wait_time)
+{
+	static XLogRecPtr last_early_retry_end = InvalidXLogRecPtr;
+	static TimeLineID last_early_retry_tli = 0;
+	const long	probe_interval = 1000L;
+	XLogRecPtr	segment_end = InvalidXLogRecPtr;
+	bool		probe = false;
+	instr_time	start;
+	long		remaining = wait_time;
+
+	if (recovery_archive_ready_hook && reachedConsistency && !randAccess &&
+		wait_time > probe_interval && XLogRecPtrIsValid(recptr))
+	{
+		XLogSegNo	segno;
+
+		/* recptr is the exclusive end of the bytes requested by the reader. */
+		XLByteToPrevSeg(recptr, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno + 1, 0, wal_segment_size, segment_end);
+		probe = XLogRecPtrIsValid(segment_end) &&
+			(tli != last_early_retry_tli || segment_end > last_early_retry_end);
+	}
+	if (probe)
+		INSTR_TIME_SET_CURRENT(start);
+
+	while (probe)
+	{
+		instr_time	elapsed;
+
+		if (recovery_archive_ready_hook(segment_end))
+		{
+			last_early_retry_end = segment_end;
+			last_early_retry_tli = tli;
+			return;
+		}
+
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, start);
+		remaining = wait_time - (long) INSTR_TIME_GET_MILLISEC(elapsed);
+		if (remaining <= probe_interval)
+			break;
+
+		if (WaitLatch(&XLogRecoveryCtl->recoveryWakeupLatch,
+					  WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					  probe_interval, WAIT_EVENT_RECOVERY_RETRIEVE_RETRY_INTERVAL) &
+			WL_LATCH_SET)
+			return;
+	}
+
+	if (remaining > 0)
+		(void) WaitLatch(&XLogRecoveryCtl->recoveryWakeupLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 remaining, WAIT_EVENT_RECOVERY_RETRIEVE_RETRY_INTERVAL);
+}
+
+/*
  * Open the WAL segment containing WAL location 'RecPtr'.
  *
  * The segment can be fetched via restore_command, or via walreceiver having
@@ -3743,11 +3814,7 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 						/* Do background tasks that might benefit us later. */
 						KnownAssignedTransactionIdsIdleMaintenance();
 
-						(void) WaitLatch(&XLogRecoveryCtl->recoveryWakeupLatch,
-										 WL_LATCH_SET | WL_TIMEOUT |
-										 WL_EXIT_ON_PM_DEATH,
-										 wait_time,
-										 WAIT_EVENT_RECOVERY_RETRIEVE_RETRY_INTERVAL);
+						WaitForArchiveRetry(RecPtr, replayTLI, randAccess, wait_time);
 						ResetLatch(&XLogRecoveryCtl->recoveryWakeupLatch);
 						now = GetCurrentTimestamp();
 
