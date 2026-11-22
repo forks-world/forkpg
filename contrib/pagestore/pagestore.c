@@ -260,6 +260,9 @@ static bool pagestore_portable_install_faults_owned = false;
 #define PS_MATERIALIZER_MARKER_TIMEOUT_MS \
 	PS_FAULT_MATERIALIZER_MARKER_TIMEOUT_MS
 #define PS_MATERIALIZER_PROGRESS_TIMEOUT_MS 1000
+/* The post-restartpoint pin update takes the daemon's admission and metadata
+ * locks and syncs its retention log. Allow for contention and I/O latency. */
+#define PS_MATERIALIZER_RETENTION_ADVANCE_TIMEOUT_MS 30000
 /* Recovery consumes the contiguous raw WAL stream, not per-page index views.
  * A WAL_INDEX pin would require admitting each restartpoint as a new historical
  * page view, which can already be behind the index compaction frontier.  The
@@ -2409,7 +2412,7 @@ pagestore_materializer_retention_advance(XLogRecPtr replay_lsn)
 			pagestore_retention_owner_generation,
 			PS_MATERIALIZER_RETENTION_RESOURCES, (uint64) replay_lsn,
 			&admission_seq,
-			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+			PS_MATERIALIZER_RETENTION_ADVANCE_TIMEOUT_MS);
 	}
 	PG_CATCH();
 	{

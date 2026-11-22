@@ -528,6 +528,8 @@ test('pagestore_control_prune',
 test('pagestore_artifact_bounded_crash', pagestore_control_prune_test,
   args: ['--artifact-crash'],
   suite: 'pagestore')
+test('pagestore_retention_timeout', pagestore_control_prune_test,
+  args: ['--retention-timeout'], suite: ['pagestore'], timeout: 30)
 
 pagestore_artifact_lifecycle_test = executable('pagestore_artifact_lifecycle_test',
   files('pagestore_artifact_lifecycle_test.c', 'pagestore_core.c',

@@ -5416,8 +5416,17 @@ done:
 }
 
 static int
+compact_layer_id_cmp(const void *va, const void *vb)
+{
+	const PsLayerDesc *a = va, *b = vb;
+
+	return a->layer_id < b->layer_id ? -1 : a->layer_id > b->layer_id;
+}
+
+static int
 compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
-				 int *prune_deferred, int bounded_already_tried)
+				 int *prune_deferred, int bounded_already_tried,
+				 uint64_t materialized_records)
 {
 	PsLayerDesc *old;
 	uint32_t	nold = count_image_layers(timeline, shard);
@@ -5437,6 +5446,12 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 	uint64_t	frontier_seq;
 	uint64_t	retention_epoch = 0, timeline_epoch = 0, admission_epoch = 0;
 	int			stage_unlocked = g_shards[shard].staged_compaction_retries < 2;
+	bool		local_native = prune_abandon_local_only();
+	bool		native_inputs = true;
+	bool		verified_inputs = true;
+	bool		require_unlocked_gather;
+	bool		retry_legacy_unlocked = false;
+	uint64_t	locked_bytes_left = (uint64_t) PS_IMAGE_BATCH_MAX_RECORDS * page_size;
 	int			gather_unlocked = 0, gather_ok = 1;
 	int			rc = -1;
 	uint64_t	locked_start = 0;
@@ -5475,37 +5490,48 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 			!d->deleting &&
 			d->timeline == timeline &&
 			layer_shard_from_id(d->layer_id) == shard)
+		{
+			const PsLayerLocation *loc = tier_local_location(d);
+
+			/* A pinned input precludes the full legacy pass. Check while
+			 * collecting the inputs, before sorting or doing any I/O. */
+			if (__atomic_load_n(&d->cache_readers, __ATOMIC_ACQUIRE) != 0)
+			{
+				free(old);
+				return 0;
+			}
+			native_inputs &= !d->remote_durable && !d->legacy_shard_zero && loc != NULL;
+			verified_inputs &= d->data_verified;
+			if (loc == NULL || loc->size >= locked_bytes_left)
+				locked_bytes_left = 0;
+			else
+				locked_bytes_left -= loc->size;
 			old[nold++] = *d;
+		}
 	}
 	/* Read the sources in layer-id order.  A lookup resolves two copies of
 	 * one identity by the highest layer id, and legacy records carry no
 	 * admission sequence, so the compaction input must be ordered the same
 	 * way for its own tie-break to select the copy a read would serve. */
-	for (uint32_t i = 1; i < nold; i++)
-	{
-		PsLayerDesc entry = old[i];
-		uint32_t	j = i;
+	qsort(old, nold, sizeof(*old), compact_layer_id_cmp);
 
-		while (j > 0 && old[j - 1].layer_id > entry.layer_id)
-		{
-			old[j] = old[j - 1];
-			j--;
-		}
-		old[j] = entry;
+	/* A foreground pin update needs the map and page-prune locks even if
+	 * the compaction is for a different timeline. Limit lock-held local
+	 * retries to one batch of input records and bound the source count. */
+	local_native &= native_inputs;
+	require_unlocked_gather = local_native &&
+		(nold > PS_IMAGE_MERGE_MAX_INPUTS || locked_bytes_left == 0 ||
+		 materialized_records > PS_IMAGE_BATCH_MAX_RECORDS);
+	if (require_unlocked_gather && !stage_unlocked)
+	{
+		g_shards[shard].staged_compaction_retries = 0;
+		stage_unlocked = 1;
+		/* A bounded merge can exhaust its output capacity on a layer
+		 * with shared payload. Retry the legacy pass unlocked without
+		 * going through the same bounded rejection on every turn. */
+		retry_legacy_unlocked = true;
+		bounded_already_tried = 1;
 	}
-	/* A read snapshots and pins the complete timeline layer set before doing
-	 * remote I/O.  Do not publish a partial compaction while any source is
-	 * pinned: that leaves the source count above the threshold and makes idle
-	 * maintenance repeatedly create larger overlapping replacements. */
-	for (uint32_t k = 0; k < nold; k++)
-		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-			if (ps_layer_map.layers[i].layer_id == old[k].layer_id &&
-				__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
-								__ATOMIC_ACQUIRE) != 0)
-			{
-				free(old);
-				return 0;
-			}
 
 	/* The retry fallback keeps the caller's shard and map locks throughout
 	 * this pass. Start after the input pin check and record until cleanup. */
@@ -5607,13 +5633,16 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 
 	/* Snapshot and pin verified local inputs so index I/O and record allocation
 	 * do not block writers. The pruning decision still runs under the locks. */
+	if (require_unlocked_gather && !verified_inputs)
+	{
+		/* A source added after materialization can still need verification. */
+		*prune_deferred = 1;
+		rc = 0;
+		goto cleanup;
+	}
 	if (stage_unlocked && nold > 0)
 	{
-		gather_unlocked = 1;
-		for (uint32_t k = 0; k < nold; k++)
-			if (old[k].remote_durable || old[k].legacy_shard_zero ||
-				!old[k].data_verified || tier_local_location(&old[k]) == NULL)
-				gather_unlocked = 0;
+		gather_unlocked = native_inputs && verified_inputs;
 		if (gather_unlocked && ps_retention_epoch(&retention_epoch) != 0)
 			goto cleanup;
 		if (gather_unlocked)
@@ -5638,6 +5667,18 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor,
 
 		if (read_image_index_refreshing(&old[k], &idx, &n) != 0)
 			goto gather_done;
+		/* Packed layers can contain more identities than their payload
+		 * size suggests. Bound the lock-held gather and rewrite by the
+		 * actual index count too. */
+		if (local_native && !gather_unlocked &&
+			n > PS_IMAGE_BATCH_MAX_RECORDS - nrec)
+		{
+			free(idx);
+			g_shards[shard].staged_compaction_retries = 0;
+			*prune_deferred = 1;
+			rc = 0;
+			goto cleanup;
+		}
 		/* materialize_compaction_inputs() verified this copy before the pass.
 		 * The map lock or the gather pin prevents eviction while it is read. */
 		if (!old[k].data_verified && verify_image_layer_refreshing(&old[k]) != 0)
@@ -5785,7 +5826,7 @@ gather_complete:
 	}
 	/* The legacy planner may prune opportunistically even without a due flag.
 	 * Use the bounded merge only after it proves no versions were dropped. */
-	if (ndropped == 0 && stage_unlocked)
+	if (ndropped == 0 && stage_unlocked && !retry_legacy_unlocked)
 	{
 		int bounded = compact_timeline_bounded(timeline, shard, 0, NULL, NULL, 0);
 
@@ -6069,7 +6110,7 @@ cleanup:
 }
 
 static int
-materialize_compaction_inputs(uint32_t timeline, uint32_t shard)
+materialize_compaction_inputs(uint32_t timeline, uint32_t shard, uint64_t *records_out)
 {
 	PsLayerDesc *layers = NULL;
 	uint32_t	nlayers = 0;
@@ -6137,6 +6178,7 @@ materialize_compaction_inputs(uint32_t timeline, uint32_t shard)
 		}
 		free(idx);
 	}
+	*records_out = total_records;
 	rc = 0;
 
 out:
@@ -24923,14 +24965,6 @@ done:
 	return rc;
 }
 
-static int
-control_layer_id_cmp(const void *va, const void *vb)
-{
-	const PsLayerDesc *a = va, *b = vb;
-
-	return a->layer_id < b->layer_id ? -1 : a->layer_id > b->layer_id;
-}
-
 static int oldest_artifact_candidates(uint32_t timeline, uint32_t shard,
 	uint64_t floor, uint64_t cutoff, PsImgIndexEnt **out, uint32_t *count);
 
@@ -25316,7 +25350,7 @@ compact_control_pairs_bounded(uint32_t timeline, uint32_t shard, uint64_t floor,
 		layers[npinned] = *d;
 		pin_ids[npinned++] = d->layer_id;
 	}
-	qsort(layers, nlayers, sizeof(*layers), control_layer_id_cmp);
+	qsort(layers, nlayers, sizeof(*layers), compact_layer_id_cmp);
 	for (uint32_t i = 0; i < PS_CONTROL_PRUNE_MAX_OUTPUTS; i++)
 	{
 		output_ids[i] = alloc_layer_id(&g_shards[shard]);
@@ -31552,6 +31586,7 @@ ps_core_maintenance_impl(void)
 		int large_local = 0;
 		int retry_budget = __atomic_load_n(&legacy_budget_retry_at[ftl][fsh], __ATOMIC_RELAXED) != 0;
 		int materialized;
+		uint64_t materialized_records = 0;
 
 		/* Large local timelines and budget-deferred retries can select and
 		 * verify bounded inputs before legacy all-layer materialization. */
@@ -31596,7 +31631,8 @@ ps_core_maintenance_impl(void)
 			for (uint32_t sh = ns; sh > 0; sh--)
 				ps_unlock_shard(sh - 1);
 		}
-		materialized = bounded_finished ? 1 : materialize_compaction_inputs(ftl, fsh);
+		materialized = bounded_finished ? 1 :
+			materialize_compaction_inputs(ftl, fsh, &materialized_records);
 
 		if (materialized == -2)
 		{
@@ -31641,7 +31677,8 @@ ps_core_maintenance_impl(void)
 				 * durable) is a fresh mark for the next pass, not one this
 				 * pass clears on its way out.  Zero disables pruning but
 				 * still permits a safe layer merge. */
-				compact_rc = compact_timeline(ftl, fsh, page_floor, &prune_deferred, bounded_attempted);
+				compact_rc = compact_timeline(ftl, fsh, page_floor, &prune_deferred,
+											  bounded_attempted, materialized_records);
 
 				did = compact_rc > 0;
 				if (compact_rc == -2)

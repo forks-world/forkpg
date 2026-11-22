@@ -3236,6 +3236,81 @@ observe_active_fallback(void *arg)
 }
 
 static void
+reserve_root_pin_during_branch_gather(void *arg)
+{
+	int *reserved = arg;
+
+	ps_test_set_compaction_gather_hook(NULL, NULL);
+	*reserved = reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 55, 1,
+						   PS_RETENTION_RESOURCE_WAL, 5000);
+}
+
+static void
+test_large_branch_fallback_allows_retention(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-large-branch-fallback-XXXXXX";
+	const uint32_t records = 2 * (PS_IMAGE_BATCH_MAX_RECORDS + 1);
+	PsShmHeader *metrics = calloc(1, sizeof(*metrics));
+	int reserved = 0, ok;
+
+	if (metrics == NULL)
+	{
+		check(0, "allocate fallback inspection metrics");
+		return;
+	}
+	configure_core(0);
+	segment_size = 64 * 1024 * 1024;
+	flush_pages = PS_IMAGE_BATCH_MAX_RECORDS + 1;
+	compact_layers = 1000;
+	segment_gc_enabled = 0;
+	ok = test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		create_branch(1, 0, 2000);
+	for (uint32_t i = 0; i < records && ok; i++)
+		ok = write_relation(1, i, 6000 + i);
+	check(ok, "create two large branch layers below the legacy space budget");
+	if (ok)
+	{
+		uint32_t live = 0;
+
+		ps_core_set_metrics_header(metrics);
+		ps_test_force_legacy_compaction(0);
+		ps_test_set_compaction_gather_hook(reserve_root_pin_during_branch_gather, &reserved);
+		compact_layers = 1;
+		for (int i = 0; i < 16 && !reserved; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_compaction_gather_hook(NULL, NULL);
+		check(reserved && metrics->compaction.locked_fallback_attempts == 0 &&
+			  metrics->compaction.legacy_gather_conflicts > 0,
+			  "root retention reserve succeeds during the unlocked branch retry");
+		run_maintenance(16);
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].timeline == 1 &&
+				ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting)
+				live++;
+		ps_unlock_map();
+		check(metrics->compaction.locked_fallback_attempts == 0 &&
+			  live == 1 &&
+			  read_isolated_branch_page(1, UINT64_MAX, 6000) &&
+			  ps_test_page_version_count(1, &(PsKey) {1, 1, 1, 0, PS_KLASS_RELATION},
+										 records - 1) == 1,
+			  "repeated large retries preserve branch data without a locked fallback");
+		ps_core_set_metrics_header(NULL);
+	}
+	free(metrics);
+	close_store();
+	if (ok)
+	{
+		check(ps_core_open(store) == 0 &&
+			  read_isolated_branch_page(1, UINT64_MAX, 6000),
+			  "the retried branch remains readable after recovery");
+		close_store();
+	}
+	remove_tree(store);
+}
+
+static void
 test_bounded_prune_conflict(int mode)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-conflict-XXXXXX";
@@ -4762,6 +4837,12 @@ test_compaction_source_read_batch(void)
 int
 main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "--retention-timeout") == 0)
+	{
+		test_large_branch_fallback_allows_retention();
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--artifact-crash") == 0)
 	{
 		test_bounded_artifact_crash("page_prune.after_frontier");
