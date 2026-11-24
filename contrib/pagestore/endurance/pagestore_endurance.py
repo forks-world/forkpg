@@ -33,6 +33,9 @@ from typing import Any
 import pagestore_resources
 
 
+DEFAULT_DAEMON_START_TIMEOUT = 600
+
+
 def compute_resources_alive(pg, handle) -> bool:
     # stop() clears expected_up before closing its pidfd. Check on both sides
     # of select so a reused/closed descriptor cannot be sampled as the old root.
@@ -661,23 +664,37 @@ class Run:
         # pass before the new daemon re-initializes it (finding E-8).  The
         # previous daemon has exited, so the stale object can go.
         unlink_shm(self.shm)
-        log = open(self.root / "daemon.log", "a")
-        self.daemon = subprocess.Popen(
-            [str(self.daemon_bin), "--shm", self.shm, "--store", str(self.store), *self.args.daemon_arg],
-            stdout=log, stderr=subprocess.STDOUT, env=self.env)
-        deadline = time.time() + 300
-        while time.time() < deadline:
-            if self.daemon.poll() is not None:
-                raise Failure("daemon_start", f"daemon exited with {self.daemon.returncode} during recovery")
+        log_path = self.root / "daemon.log"
+        started = time.monotonic()
+        deadline = started + self.args.daemon_start_timeout
+        with log_path.open("a") as log:
+            log_start = log.tell()
+            self.daemon = subprocess.Popen(
+                [str(self.daemon_bin), "--shm", self.shm, "--store", str(self.store), *self.args.daemon_arg],
+                stdout=log, stderr=subprocess.STDOUT, env=self.env)
+        detail = f"daemon did not become ready in {self.args.daemon_start_timeout:g} s"
+        while (remaining := deadline - time.monotonic()) > 0:
+            rc = self.daemon.poll()
+            if rc is not None:
+                detail = f"daemon exited with {rc} during recovery"
+                break
             try:
                 if subprocess.run([str(self.inspect_bin), "--shm", self.shm, "health"],
-                                  capture_output=True, env=self.env, timeout=10).returncode == 0:
+                                  capture_output=True, env=self.env, timeout=min(10, remaining)).returncode == 0:
                     self.daemon_expected_up = True
+                    self.event("daemon_ready", seconds=round(time.monotonic() - started, 3))
                     return
             except subprocess.TimeoutExpired:
                 pass
-            time.sleep(0.1)
-        raise Failure("daemon_start", "daemon did not become ready in 300 s")
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        with log_path.open("rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(log_start, log.tell() - 2048))
+            last_line = next((line for line in reversed(log.read(2048).decode(errors="replace").splitlines())
+                              if line.strip()), "")
+        if last_line:
+            detail += f"; last daemon message: {last_line}"
+        raise Failure("daemon_start", detail)
 
     def stop_daemon(self, sig: int = signal.SIGTERM) -> None:
         self.daemon_expected_up = False
@@ -1741,6 +1758,8 @@ def main() -> int:
     p.add_argument("--branch-probability", type=float, default=0.25)
     p.add_argument("--max-branches", type=int, default=2)
     p.add_argument("--sync-timeout", type=float, default=1800)
+    p.add_argument("--daemon-start-timeout", type=float, default=DEFAULT_DAEMON_START_TIMEOUT,
+                   help="seconds to wait for PageStore startup and recovery")
     p.add_argument("--sample-interval", type=float, default=15)
     p.add_argument("--max-rss-mb", type=int, default=0,
                    help="stop above summed RSS MiB across daemon/compute process trees; zero disables")
@@ -1761,7 +1780,8 @@ def main() -> int:
     p.add_argument("--daemon-arg", action="append", default=[],
                    help="extra pagestore_daemon argument; repeat for each word (experiments)")
     args = p.parse_args()
-    for name in ("max_run_gb", "max_store_gb", "min_free_gb", "sample_interval"):
+    for name in ("max_run_gb", "max_store_gb", "min_free_gb", "sample_interval",
+                 "daemon_start_timeout"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
             p.error(f"--{name.replace('_', '-')} must be finite and greater than zero")

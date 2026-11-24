@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 
-from pagestore_endurance import Failure, Run, WORKLOAD, quoted
+from pagestore_endurance import DEFAULT_DAEMON_START_TIMEOUT, Failure, Run, WORKLOAD, quoted
 
 
 GIB = 1024 ** 3
@@ -258,6 +258,8 @@ def main():
     p.add_argument("--clients", type=int, default=2)
     p.add_argument("--transactions-per-client", type=int, default=15000)
     p.add_argument("--sync-timeout", type=float, default=600)
+    p.add_argument("--daemon-start-timeout", type=float, default=DEFAULT_DAEMON_START_TIMEOUT,
+                   help="seconds to wait for PageStore startup and recovery")
     p.add_argument("--sample-interval", type=float, default=5)
     p.add_argument("--max-run-gb", type=float, default=20)
     p.add_argument("--max-store-gb", type=float, default=15)
@@ -266,7 +268,8 @@ def main():
     p.add_argument("--max-fds", type=int, default=8192)
     p.add_argument("--daemon-arg", action="append", default=[])
     args = p.parse_args()
-    for name in ("scale", "clients", "transactions_per_client", "sync_timeout", "sample_interval",
+    for name in ("scale", "clients", "transactions_per_client", "sync_timeout",
+                 "daemon_start_timeout", "sample_interval",
                  "max_run_gb", "max_store_gb", "min_free_gb", "max_rss_mb", "max_fds"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:

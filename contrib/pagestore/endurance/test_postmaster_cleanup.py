@@ -512,6 +512,37 @@ class BurstDeadlineTests(unittest.TestCase):
         stop.wait.assert_called_once_with(0.3)
 
 
+class DaemonStartupTests(unittest.TestCase):
+    def test_recovery_timeout_preserves_current_phase(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            (root / 'daemon.log').write_text('phase from previous startup\n')
+            run = SimpleNamespace(root=root, store=root / 'store', shm='/ps-test',
+                                  daemon_bin='daemon', inspect_bin='inspect', env={},
+                                  args=SimpleNamespace(daemon_start_timeout=2, daemon_arg=[]),
+                                  daemon_expected_up=False, event=Mock())
+
+            def launch(*args, stdout, **kwargs):
+                stdout.write('startup phase=page_replay elapsed_ms=1500\n')
+                return Mock(poll=Mock(return_value=None))
+
+            with patch.object(endurance, 'unlink_shm'), \
+                 patch.object(endurance.subprocess, 'Popen', side_effect=launch), \
+                 patch.object(endurance.subprocess, 'run',
+                              side_effect=subprocess.TimeoutExpired('inspect', 1.5)) as inspect, \
+                 patch.object(endurance.time, 'monotonic', side_effect=[10, 10.5, 12, 12]), \
+                 patch.object(endurance.time, 'sleep'):
+                with self.assertRaises(endurance.Failure) as raised:
+                    endurance.Run.start_daemon(run)
+            self.assertEqual(raised.exception.kind, 'daemon_start')
+            self.assertIn('did not become ready in 2 s', raised.exception.detail)
+            self.assertIn('phase=page_replay', raised.exception.detail)
+            self.assertNotIn('previous startup', raised.exception.detail)
+            self.assertEqual(inspect.call_args.kwargs['timeout'], 1.5)
+            self.assertFalse(run.daemon_expected_up)
+            run.event.assert_not_called()
+
+
 class RetentionLogTests(unittest.TestCase):
     def test_rejected_retention_progress_is_a_finding(self):
         with tempfile.TemporaryDirectory() as root:

@@ -230,6 +230,68 @@ test_atomic_source_retirement(void)
 	ps_test_remove_tree(dir);
 }
 
+static void
+test_layer_replay_with_churn(void)
+{
+	char dir[PS_TEST_TEMP_PATH_MAX] = "psmanifestchurnXXXXXX";
+	uint64_t expected[160];
+	uint32_t count = 0;
+	PsLayerDesc reused = make_slru_layer(5);
+
+	if (!ps_test_mkdtemp(dir, sizeof(dir)))
+	{
+		check(0, "create manifest churn fixture");
+		return;
+	}
+	check(ps_manifest_open(dir) == 0, "open churn manifest");
+	for (int i = 0; i < 256; i++)
+	{
+		check(ps_manifest_add_layer(&reused) == 0, "reuse one layer ID");
+		check(ps_manifest_remove_layer(reused.layer_id) == 0, "retire the reused ID");
+	}
+	for (uint64_t i = 1; i <= 96; i++)
+	{
+		PsLayerDesc layer = make_slru_layer((i % 4 << 48) | i);
+
+		check(ps_manifest_add_layer(&layer) == 0, "add original layer");
+		if (i % 8 == 0)
+			expected[count++] = layer.layer_id;
+	}
+	for (uint64_t i = 1; i <= 96; i++)
+		if (i % 8 != 0)
+			check(ps_manifest_remove_layer((i % 4 << 48) | i) == 0,
+				  "remove original layer");
+	for (uint64_t i = 1; i <= 144; i++)
+		if (i > 96 || i % 8 != 0)
+		{
+			PsLayerDesc layer = make_slru_layer((i % 4 << 48) | i);
+
+			check(ps_manifest_add_layer(&layer) == 0, "append or re-add a layer");
+			expected[count++] = layer.layer_id;
+			if (i % 8 == 1)
+				check(ps_manifest_mark_delete(layer.layer_id) == 0,
+					  "mark a new or re-added layer for deletion");
+		}
+	check(ps_manifest_remove_layer(expected[0]) == 0,
+		  "remove a surviving original layer");
+	ps_manifest_close();
+
+	check(ps_manifest_open(dir) == 0 && ps_manifest_replay(&ps_layer_map) == 0,
+		  "replay overlapping layer IDs across index growth");
+	check(ps_layer_map.nlayers == count - 1, "replay packs all removed layers");
+	check(ps_layer_map.capacity <= 256, "replay does not retain space for repeated IDs");
+	for (uint32_t i = 0; i < ps_layer_map.nlayers && i + 1 < count; i++)
+	{
+		const PsLayerDesc *layer = &ps_layer_map.layers[i];
+
+		check(layer->layer_id == expected[i + 1], "replay preserves live layer order");
+		check(layer->deleting == (expected[i + 1] % 8 == 1),
+			  "replay applies deletion to the live descriptor");
+	}
+	ps_manifest_close();
+	ps_test_remove_tree(dir);
+}
+
 int
 main(void)
 {
@@ -244,6 +306,7 @@ main(void)
 	PsLayerLocation remote;
 
 	test_atomic_source_retirement();
+	test_layer_replay_with_churn();
 
 	if (!ps_test_mkdtemp(dir, sizeof(dir)))
 	{
