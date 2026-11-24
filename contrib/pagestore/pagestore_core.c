@@ -31920,10 +31920,20 @@ ps_core_open(const char *store_dir)
 	return rc;
 }
 
+static void
+recovery_phase(uint64_t started, const char *phase)
+{
+	uint64_t now = inspection_now_ns();
+
+	fprintf(stderr, "pagestore_core: startup phase=%s elapsed_ms=%llu\n", phase,
+			(unsigned long long) (started && now >= started ? (now - started) / 1000000 : 0));
+}
+
 static int
 ps_core_open_impl(const char *store_dir, int *storage_opened)
 {
 	uint32_t	ns = core_shards();
+	uint64_t	recovery_started = inspection_now_ns();
 	int			publish_shard_count = 0;
 	int			path_len;
 	char		runtime_store_root[PATH_MAX];
@@ -32150,9 +32160,11 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	errno = 0;
 	if (ps_manifest_open(runtime_store_dir) != 0)
 		return OPEN_STEP("manifest open");
+	recovery_phase(recovery_started, "manifest_replay");
 	errno = 0;
 	if (ps_manifest_replay(&ps_layer_map) != 0)
 		return OPEN_STEP("manifest replay");
+	recovery_phase(recovery_started, "layer_directory");
 	errno = 0;
 	if (validate_store_shard_count(runtime_store_dir,
 							   &publish_shard_count) != 0)
@@ -32259,6 +32271,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	ps_pgcache_init((uint32_t) cache_pages, page_size);
 	fprintf(stderr, "pagestore_core: %u image layer(s) in map after manifest replay\n",
 			ps_layer_map.nlayers);
+	recovery_phase(recovery_started, "metadata");
 
 	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
@@ -32427,6 +32440,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	if (load_fork_meta() != 0)
 		return OPEN_STEP("load fork metadata");
 
+	recovery_phase(recovery_started, "page_replay");
 	for (uint32_t sh = 0; sh < ns; sh++)
 	{
 		errno = 0;
@@ -32476,6 +32490,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	}
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */
+	recovery_phase(recovery_started, "wal_and_index");
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 		if (tl == 0 || timelines[tl].defined || timeline_is_used(tl))
 		{
@@ -32533,6 +32548,7 @@ ps_core_open_impl(const char *store_dir, int *storage_opened)
 	if (forkmeta_reclaim_high_water_bytes != 0 &&
 		fork_meta_reclaim_baseline_init() != 0)
 		return OPEN_STEP("initialize forkmeta reclaim baseline");
+	recovery_phase(recovery_started, "activate_views");
 	if (artifact_caps_recover() != 0 || timeline_activate_view_caps() != 0 ||
 		timeline_activate_index_bases() != 0)
 		return OPEN_STEP("activate finite view caps");

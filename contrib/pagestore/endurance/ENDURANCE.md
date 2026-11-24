@@ -372,6 +372,12 @@ One run is one topology lifetime: provisioning, then rounds for
 seed+1, ... each from a fresh `initdb` and import, so the bootstrap paths are
 exercised as often as the steady state.
 
+Initial PageStore startup and each daemon restart have a separate deadline
+of 600 seconds by default. Set `--daemon-start-timeout` to adjust it for
+endurance or fixed replay. The `daemon_ready` event records startup time,
+and a startup failure includes the latest message from that launch's
+`daemon.log`. The daemon logs when it enters each recovery phase.
+
 ## Repeated branch reclamation
 
 `--branch-reclaim-cycles 3 --branch-reclaim-slack-mb 64` runs fixed-parent
