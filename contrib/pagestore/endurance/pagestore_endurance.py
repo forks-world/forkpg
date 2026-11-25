@@ -118,14 +118,44 @@ def preserve_success_logs(root: Path, keep: Path) -> None:
             (keep / (src.name + ".warnings")).write_bytes(b"".join(warnings))
 
 
+def reclaimed_store_files(path: Path, store: Path, before: tuple, lines: list[str]) -> bool:
+    """Accept only vanished PageStore files under the same measured directories."""
+    pattern = re.compile(r"^du: cannot access '" + re.escape(str(store)) +
+                         r"/(layer_[0-9]+_[0-9a-f]{16}|seg_[0-9]{8,10})': No such file or directory$")
+    matches = [pattern.fullmatch(line) for line in lines]
+    if not all(matches):
+        return False
+    try:
+        after = (path.lstat(), store.lstat())
+        if any(not stat.S_ISDIR(old.st_mode) or not stat.S_ISDIR(new.st_mode) or
+               (old.st_dev, old.st_ino) != (new.st_dev, new.st_ino)
+               for old, new in zip(before, after)):
+            return False
+        for match in matches:
+            try:
+                (store / match.group(1)).lstat()
+            except FileNotFoundError:
+                continue
+            return False
+    except OSError:
+        return False
+    return True
+
+
 def directory_kb(path: Path) -> int:
     """Allocated bytes, including hidden files; never follow external symlinks."""
-    # Compaction can remove a layer between du's directory read and stat.
-    # Retry the whole scan instead of accepting du's incomplete total.  Any
-    # other error, or repeated races, still fails closed.
+    # Prefer an error-free scan. Under sustained reclamation, accept the
+    # last total only when the reported PageStore files are still absent.
     env = os.environ.copy()
     env["LC_ALL"] = "C"
+    store = path if path.name == "store" else path / "store"
+    before = None
     for attempt in range(3):
+        if attempt == 2:
+            try:
+                before = (path.lstat(), store.lstat())
+            except OSError:
+                pass
         result = subprocess.run(["du", "-sk", "--", str(path)],
                                 capture_output=True, text=True, timeout=120, env=env)
         if result.returncode == 0:
@@ -134,6 +164,12 @@ def directory_kb(path: Path) -> int:
         vanished = lines and all(line.startswith("du: cannot access ") and
                                  line.endswith(": No such file or directory")
                                  for line in lines)
+        if attempt == 2 and vanished and before and reclaimed_store_files(path, store, before, lines):
+            output = result.stdout.splitlines()
+            if len(output) == 1:
+                count, separator, target = output[0].partition("\t")
+                if separator and count.isascii() and count.isdecimal() and target == str(path):
+                    return int(count)
         if not vanished or attempt == 2:
             raise ValueError(f"du {path.name}: {result.stderr.strip()[:200]}")
     raise AssertionError("unreachable")
