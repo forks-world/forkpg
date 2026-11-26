@@ -3,10 +3,14 @@
 Status: **experimental partial implementation; not a general deadlock fix**.
 The current worktree implements the v4 durable progress record and localsvc
 START, SAFE, FREEZE, PREPARE, ACTIVATE, and authorized-SNAPSHOT operations.
-It can extend the writer's archive boundary only for a fixed, CRC-verified
-completed checkpoint whose containing segment fits the per-timeline cap. A
-standalone writer background worker can seal that already prepared candidate
-without blocking in the archive callback. It does not create a checkpoint or
+It can extend the writer's archive boundary for a fixed, CRC-verified
+completed checkpoint whose containing segment fits the per-timeline cap. When
+the latest completed checkpoint has moved beyond that frozen cap, it can also
+consume the cap itself as the grant boundary, as long as the cap advances past
+the materializer's SAFE replay point; this bounded fallback lets recovery reach
+an earlier safe checkpoint instead of deadlocking. A standalone writer
+background worker can seal that already prepared candidate without blocking in
+the archive callback. It does not create a checkpoint, raise the frozen cap, or
 advance an arbitrary WAL gap.
 
 ## Failure addressed
@@ -19,6 +23,11 @@ archive. This progress path is intended to cover the bounded case where
 recovery has since passed PostgreSQL's consistency and invalid-page checks and
 the writer has a suitable completed checkpoint within the frozen extension
 cap.
+
+The 2026-11-26 round-428 failure showed a second variant: the latest completed
+writer checkpoint can outrun the frozen cap while the materializer is still
+missing the single next WAL segment. The fallback below consumes the already
+frozen cap as the shipping boundary in that case.
 
 ## Current protocol
 
@@ -63,6 +72,14 @@ SAFE, frozen budget, WAL timeline, and active grant. Repeated polls cannot
 ratchet the target or budget. The archive callback itself does not wait for a
 checkpoint or switch.
 
+If `pg_control`'s completed checkpoint lies in a segment beyond
+`original_limit + max_extra`, PREPARE clamps the candidate to the frozen cap:
+`target_end` becomes the cap and `target` is one byte past SAFE. The cap is not
+raised and the grant remains bounded by the FREEZE decision; recovery may
+replay to the cap and establish an earlier restartpoint, but the clamped
+boundary itself is not a restartpoint. If the cap does not advance past SAFE,
+the writer keeps the blocked diagnostic and remains fail-closed.
+
 Progress records use format v4. v1/v2/v3 and unknown/corrupt records are
 rejected fail-closed; there is no automatic migration. The daemon emits a
 rate-limited diagnostic for rejected operations and unsupported stored
@@ -86,17 +103,20 @@ closed. Only the POSIX provider has been exercised for this progress state.
   deployment with multiple timelines can therefore reserve/ship the sum of
 their individual caps. Global admission/backpressure is required before
 claiming the design's cumulative-space bound.
-* PREPARE only selects the current completed checkpoint. If no suitable
-  checkpoint exists, the candidate is beyond the frozen cap, the candidate
-  belongs to another WAL timeline, or the worker cannot prove and seal its
-  segment, the writer remains fail-closed with a blocked/deferred diagnostic.
-  It does not request a checkpoint, and it does not keep issuing switches from
-  an archive retry loop.
+* PREPARE selects the current completed checkpoint. If no suitable checkpoint
+  exists, the candidate belongs to another WAL timeline, or the worker cannot
+  prove and seal its segment, the writer remains fail-closed with a
+  blocked/deferred diagnostic. An over-cap candidate is clamped to the frozen
+  cap only when that cap advances past SAFE; otherwise it remains blocked. It
+  does not request a checkpoint, and it does not keep issuing switches from an
+  archive retry loop.
 * The segment check and conditional switch prevent the observed stale-pointer
   race from sealing a later segment. A finite cap still cannot guarantee
-  progress through an arbitrarily large WAL gap. There is no upstream write
-  backpressure policy here; over-cap candidates remain blocked and require
-  operator/supervisor action or a separately designed controller.
+  progress through an arbitrarily large gap: the clamp consumes exactly the
+  already-frozen allowance and does not follow a checkpoint that is farther
+  ahead. There is no upstream write backpressure policy here; when the cap
+  cannot cover the materializer's next needed WAL, operator/supervisor action
+  or a separately designed controller is still required.
 * A progress grant is not a restartpoint, retention receipt, marker update, or
   permission to reclaim WAL. Those remain governed by PostgreSQL's completed
   and synchronously durable restartpoint path.
