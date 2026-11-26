@@ -18,6 +18,7 @@ main(void)
 	const uint64_t segment = 16 * 1024 * 1024;
 	const uint64_t original = 256 * 1024 * 1024;
 	uint64_t bound;
+	uint64_t target, target_end;
 
 	CHECK(!ps_materializer_rejection_matches(&hint, 3, marker, checkpoint));
 	hint.magic = PS_MATERIALIZER_REJECTED_MAGIC;
@@ -44,6 +45,22 @@ main(void)
 	CHECK(ps_materializer_rejection_limit(original, segment, 4) == original + 4 * segment);
 	CHECK(ps_materializer_rejection_limit(UINT64_MAX - 5, segment, 2) == UINT64_MAX);
 	CHECK(ps_materializer_rejection_limit(1, UINT64_MAX, 2) == UINT64_MAX);
+
+	/* Over-cap checkpoints consume the frozen cap instead of failing closed. */
+	CHECK(ps_materializer_progress_clamp(256, 180, 100, &target, &target_end) == 0);
+	CHECK(target == 181 && target_end == 256);
+	CHECK(ps_materializer_progress_clamp(181, 180, 100, &target, &target_end) != 0);
+	CHECK(ps_materializer_progress_clamp(182, 180, 100, &target, &target_end) == 0);
+	CHECK(target == 181 && target_end == 182);
+	CHECK(ps_materializer_progress_clamp(256, 100, 100, &target, &target_end) != 0);
+	CHECK(ps_materializer_progress_clamp(256, 180, 180, &target, &target_end) != 0);
+	CHECK(ps_materializer_progress_clamp(256, UINT64_MAX - 1, 100,
+										 &target, &target_end) != 0);
+	CHECK(ps_materializer_progress_clamp(UINT64_MAX, UINT64_MAX - 2, 100,
+										 &target, &target_end) == 0);
+	CHECK(target == UINT64_MAX - 1 && target_end == UINT64_MAX);
+	CHECK(ps_materializer_progress_clamp(256, 180, 100, NULL, &target_end) != 0);
+	CHECK(ps_materializer_progress_clamp(256, 180, 100, &target, NULL) != 0);
 	puts("archive policy tests passed");
 	return 0;
 }

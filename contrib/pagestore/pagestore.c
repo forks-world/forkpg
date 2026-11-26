@@ -2792,6 +2792,27 @@ pagestore_materializer_archive_progress_notice(const char *message,
 	return false;
 }
 
+/* The clamped fallback consumes the frozen cap instead of failing closed. */
+static void
+pagestore_materializer_archive_progress_clamped(XLogRecPtr checkpoint,
+												 uint64 cap)
+{
+	static time_t last_notice = 0;
+	time_t now = time(NULL);
+
+	if (last_notice == 0 || now < last_notice || now - last_notice >= 30)
+	{
+		last_notice = now;
+		ereport(LOG,
+				(errmsg("pagestore materializer archive progress clamped to the frozen grant cap"),
+				 errdetail("Latest completed checkpoint %X/%08X is beyond cap %X/%08X; "
+						   "shipping through the cap so recovery can reach an earlier "
+						   "safe checkpoint.",
+						   (uint32) (checkpoint >> 32), (uint32) checkpoint,
+						   (uint32) (cap >> 32), (uint32) cap)));
+	}
+}
+
 static bool
 pagestore_materializer_prepare_completed_checkpoint(TimeLineID archive_tli,
 											PsArchiveProgress *progress)
@@ -2855,9 +2876,29 @@ pagestore_materializer_prepare_completed_checkpoint(TimeLineID archive_tli,
 		return false;
 	segment_end = ((uint64) checkpoint_segno + 1) * (uint64) wal_segment_size;
 	if (segment_end > progress->original_limit + progress->max_extra)
-		return pagestore_materializer_archive_progress_notice(
-			"latest completed checkpoint exceeds the immutable progress budget",
-			checkpoint_end, progress->original_limit + progress->max_extra);
+	{
+		uint64	cap = progress->original_limit + progress->max_extra;
+		uint64	target;
+		uint64	target_end;
+
+		/*
+		 * The latest completed checkpoint is beyond the frozen per-marker
+		 * cap.  The cap itself is still the fixed amount FREEZE authorized,
+		 * so ship through it: recovery can replay the intervening WAL and
+		 * reach an earlier safe checkpoint even though this newer checkpoint
+		 * cannot be used as a restartpoint.  Fail closed only when the cap
+		 * cannot advance past SAFE.
+		 */
+		if (ps_materializer_progress_clamp(cap, (uint64) progress->safe_lsn,
+										   (uint64) progress->marker,
+										   &target, &target_end) != 0)
+			return pagestore_materializer_archive_progress_notice(
+				"latest completed checkpoint exceeds the immutable progress budget",
+				checkpoint_end, cap);
+		pagestore_materializer_archive_progress_clamped(checkpoint_end, cap);
+		checkpoint_end = (XLogRecPtr) target;
+		segment_end = target_end;
+	}
 	if (!pagestore_localsvc_archive_progress_prepare(pagestore_localsvc_timeline(),
 			progress->incarnation, progress->attempt, progress->marker,
 			(uint64) checkpoint_end, segment_end, archive_tli, &pinned,
