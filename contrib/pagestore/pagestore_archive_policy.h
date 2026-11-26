@@ -57,4 +57,42 @@ ps_materializer_progress_clamp(uint64_t cap, uint64_t safe_lsn,
 	*target_end = cap;
 	return 0;
 }
+
+/*
+ * Select the PREPARE boundary for a completed checkpoint under the frozen
+ * cap.  Returns 1 when the checkpoint itself fits, 2 when the cap fallback is
+ * used, 0 when neither boundary can advance past SAFE (the caller keeps the
+ * blocked diagnostic), and -1 for impossible inputs.
+ */
+static inline int
+ps_materializer_progress_boundary(uint64_t cap, uint64_t safe_lsn,
+								  uint64_t marker, uint64_t checkpoint_end,
+								  uint64_t segment_end, uint64_t *target,
+								  uint64_t *target_end)
+{
+	if (target == NULL || target_end == NULL || checkpoint_end == 0 ||
+		segment_end < checkpoint_end)
+		return -1;
+	if (segment_end <= cap)
+	{
+		uint64_t target_lsn = checkpoint_end;
+
+		/*
+		 * A record end exactly on a segment boundary is valid and leaves no
+		 * byte between the target and the containing segment's end.  Keep
+		 * grant_end at the boundary and put the strict target just below it.
+		 */
+		if (target_lsn == segment_end)
+			target_lsn = segment_end - 1;
+		if (target_lsn <= safe_lsn || target_lsn >= segment_end)
+			return -1;
+		*target = target_lsn;
+		*target_end = segment_end;
+		return 1;
+	}
+	if (ps_materializer_progress_clamp(cap, safe_lsn, marker,
+									   target, target_end) != 0)
+		return 0;
+	return 2;
+}
 #endif
