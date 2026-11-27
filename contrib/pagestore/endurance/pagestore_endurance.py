@@ -933,9 +933,9 @@ CREATE INDEX ev_k ON ev(k);
                             "WHERE backend_type = 'archiver' "
                             "AND wait_event = 'PageStoreArchiveMaterializer');",
                             timeout=timeout) == "t"):
-                    last_online_request = request
                     next_online_request = now + 5
                     self.mat.sql("CHECKPOINT;", timeout=timeout)
+                    last_online_request = request
                     updated_marker = self.mat.sql(
                         "SELECT pagestore_ext.pagestore_materialized_wal_lsn();",
                         timeout=timeout)
@@ -952,7 +952,21 @@ CREATE INDEX ev_k ON ev(k);
                     self.mat.start()
             return False
 
-        self.wait_for(f"archive of {seg}", archived, self.args.sync_timeout)
+        try:
+            self.wait_for(f"archive of {seg}", archived, self.args.sync_timeout)
+        except Failure as failure:
+            if failure.kind == "timeout":
+                # Put the limiter state in the run log before teardown stops
+                # the computes and makes their live wait events unavailable.
+                try:
+                    status = self.writer.sql(
+                        "SELECT shipped_wal_lsn, materialized_wal_lsn, release_checkpoint_lsn, "
+                        "(SELECT wait_event FROM pg_stat_activity WHERE backend_type = 'archiver') "
+                        "FROM pagestore_ext.pagestore_materializer_status();", timeout=5)
+                except (SqlError, subprocess.TimeoutExpired) as error:
+                    status = str(error)[:180]
+                self.event("archive_timeout_status", segment=seg, writer_status=status)
+            raise
         return switch
 
     def sync_materializer(self) -> str:
