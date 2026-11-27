@@ -145,7 +145,12 @@ PostgreSQL can reject it while invalid-page references remain unresolved; if
 their resolving WAL and the next safe checkpoint are beyond the archive limit,
 the worker and archiver can stall even after a restart. The timeout preserves
 that failure and its diagnostics; increasing the timeout alone cannot make
-progress. The current limiter has no automatic bounded escape for this case.
+progress. When recovery has published SAFE and the latest completed checkpoint
+is beyond the frozen progress budget, PageStore can grant shipping through
+that cap. Recovery must still find a usable restartpoint to advance the
+durable marker. If progress stops at the cap, the driver records the shipped
+WAL position, durable marker, release checkpoint and archiver wait event in
+`archive_timeout_status`.
 `pagestore.materializer_max_lag_mb` can be changed with `ALTER SYSTEM` followed
 by `pg_reload_conf()` without restarting the writer. An operator can temporarily
 raise the limit to let the materializer reach a later safe checkpoint, then
