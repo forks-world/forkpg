@@ -62,8 +62,10 @@ int main(void)
 		CHECK(ps_archive_progress_safe(&t, 0, 1, 1, marker, safe) == 0);
 		CHECK(ps_archive_progress_freeze_budget(&t, 0, 1, 1, marker,
 												original, extra) == 0);
-		CHECK(ps_materializer_progress_clamp(original + extra, safe, marker,
-											 &target, &target_end) == 0);
+		CHECK(ps_materializer_progress_boundary(original + extra, safe, marker,
+												UINT64_C(0x765C3538),
+												UINT64_C(0x77000000),
+												&target, &target_end) == 2);
 		CHECK(target == safe + 1 && target_end == original + extra);
 		CHECK(ps_archive_progress_prepare(&t, 0, 1, 1, marker, 1,
 										  target, target_end) == 0);

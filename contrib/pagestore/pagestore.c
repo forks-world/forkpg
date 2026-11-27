@@ -2875,27 +2875,33 @@ pagestore_materializer_prepare_completed_checkpoint(TimeLineID archive_tli,
 	if (checkpoint_segno >= UINT64_MAX / (uint64) wal_segment_size)
 		return false;
 	segment_end = ((uint64) checkpoint_segno + 1) * (uint64) wal_segment_size;
-	if (segment_end > progress->original_limit + progress->max_extra)
 	{
 		uint64	cap = progress->original_limit + progress->max_extra;
 		uint64	target;
 		uint64	target_end;
+		int		plan;
 
 		/*
-		 * The latest completed checkpoint is beyond the frozen per-marker
+		 * The latest completed checkpoint may be beyond the frozen per-marker
 		 * cap.  The cap itself is still the fixed amount FREEZE authorized,
-		 * so ship through it: recovery can replay the intervening WAL and
-		 * reach an earlier safe checkpoint even though this newer checkpoint
-		 * cannot be used as a restartpoint.  Fail closed only when the cap
-		 * cannot advance past SAFE.
+		 * so consume it to let recovery replay the intervening WAL and reach
+		 * an earlier safe checkpoint.  Fail closed only when the cap cannot
+		 * advance past SAFE.
 		 */
-		if (ps_materializer_progress_clamp(cap, (uint64) progress->safe_lsn,
-										   (uint64) progress->marker,
-										   &target, &target_end) != 0)
+		plan = ps_materializer_progress_boundary(cap,
+												 (uint64) progress->safe_lsn,
+												 (uint64) progress->marker,
+												 (uint64) checkpoint_end,
+												 segment_end,
+												 &target, &target_end);
+		if (plan < 0)
+			return false;
+		if (plan == 0)
 			return pagestore_materializer_archive_progress_notice(
 				"latest completed checkpoint exceeds the immutable progress budget",
 				checkpoint_end, cap);
-		pagestore_materializer_archive_progress_clamped(checkpoint_end, cap);
+		if (plan == 2)
+			pagestore_materializer_archive_progress_clamped(checkpoint_end, cap);
 		checkpoint_end = (XLogRecPtr) target;
 		segment_end = target_end;
 	}

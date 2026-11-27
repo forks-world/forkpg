@@ -61,6 +61,34 @@ main(void)
 	CHECK(target == UINT64_MAX - 1 && target_end == UINT64_MAX);
 	CHECK(ps_materializer_progress_clamp(256, 180, 100, NULL, &target_end) != 0);
 	CHECK(ps_materializer_progress_clamp(256, 180, 100, &target, NULL) != 0);
+
+	/* Boundary selection: fit, clamp, blocked, impossible. */
+	CHECK(ps_materializer_progress_boundary(256, 180, 100, 200, 256,
+											&target, &target_end) == 1);
+	CHECK(target == 200 && target_end == 256);
+	CHECK(ps_materializer_progress_boundary(192, 180, 100, 200, 256,
+											&target, &target_end) == 2);
+	CHECK(target == 181 && target_end == 192);
+	CHECK(ps_materializer_progress_boundary(181, 180, 100, 200, 256,
+											&target, &target_end) == 0);
+	/* A segment-aligned checkpoint end is valid, not an impossible input. */
+	CHECK(ps_materializer_progress_boundary(256, 180, 100, 256, 256,
+											&target, &target_end) == 1);
+	CHECK(target == 255 && target_end == 256);
+	CHECK(ps_materializer_progress_boundary(192, 180, 100, 192, 192,
+											&target, &target_end) == 1);
+	CHECK(target == 191 && target_end == 192);
+	CHECK(ps_materializer_progress_boundary(191, 180, 100, 192, 192,
+											&target, &target_end) == 2);
+	CHECK(target == 181 && target_end == 191);
+	CHECK(ps_materializer_progress_boundary(181, 180, 100, 192, 192,
+											&target, &target_end) == 0);
+	CHECK(ps_materializer_progress_boundary(256, 180, 100, 200, 199,
+											&target, &target_end) == -1);
+	CHECK(ps_materializer_progress_boundary(256, 180, 100, 200, 256,
+											NULL, &target_end) == -1);
+	CHECK(ps_materializer_progress_boundary(256, 180, 100, 200, 256,
+											&target, NULL) == -1);
 	puts("archive policy tests passed");
 	return 0;
 }
