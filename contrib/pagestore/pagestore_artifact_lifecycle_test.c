@@ -664,10 +664,72 @@ test_io_failure_still_poisons(const char *store)
 	key.relNumber = saved_rel;
 }
 
+static void
+test_bounded_reader_generations(void)
+{
+	char store[PS_TEST_TEMP_PATH_MAX] = "pagestore-reader-generations-XXXXXX";
+	PsChannel pin = {.opcode = PS_OP_RETENTION_PIN_RESERVE, .timeline = 0,
+		.blocknum = PS_RETENTION_OWNER_READER, .parent_timeline = PS_RETENTION_RESOURCE_ALL,
+		.old_nblocks = 1, .req_seq = 100, .req_lsn = 100};
+	uint32_t before;
+	uint64_t published;
+
+	key = (PsKey) {.klass = PS_KLASS_READER_SNAPSHOT, .relNumber = 91};
+	compact_layers = 1000;
+	segment_gc_enabled = 0;
+	check(ps_test_mkdtemp(store, sizeof(store)) && ps_core_open(store) == 0,
+		  "open bounded reader generation fixture");
+	meta(&pin);
+	for (uint32_t i = 0; i < 25; i++)
+	{
+		uint64_t lsn = 100 + (uint64_t) i * 10;
+		uint64_t token = begin(lsn);
+
+		check(write_page(lsn, token, 0, (int) (i + 1)) == 0 &&
+			  commit(lsn, token, 1) == 0, "publish reader generation");
+	}
+	pin = (PsChannel) {.opcode = PS_OP_RETENTION_PIN_RESERVE, .timeline = 0,
+		.blocknum = PS_RETENTION_OWNER_MATERIALIZER, .parent_timeline = PS_RETENTION_RESOURCE_ALL,
+		.old_nblocks = 1, .req_seq = 101, .req_lsn = 1000};
+	meta(&pin);
+	before = ps_test_artifact_fence_count(0);
+	ps_test_set_legacy_record_limit(2);
+	compact_layers = 1;
+	maintain();
+	check(read_value(0, 100, 0, 1) && ps_test_artifact_fence_count(0) == before,
+		  "active reader retains its exact generation");
+	pin = (PsChannel) {.opcode = PS_OP_RETENTION_PIN_DROP, .timeline = 0,
+		.blocknum = PS_RETENTION_OWNER_READER, .old_nblocks = 1, .req_seq = 100};
+	meta(&pin);
+	published = ps_test_bounded_prune_published_count();
+	for (int i = 0; i < 100 && ps_test_artifact_fence_count(0) == before; i++)
+		(void) ps_core_maintenance();
+	check(ps_test_bounded_prune_published_count() > published &&
+		  ps_test_artifact_fence_count(0) < before && read_value(0, 1000, 0, 25),
+		  "bounded lifecycle pruning removes an unpinned generation and preserves the newest");
+	ps_test_set_legacy_record_limit(0);
+	ps_core_close();
+	if (ps_storage->close)
+		ps_storage->close();
+	check(ps_core_open(store) == 0 && read_value(0, 1000, 0, 25) &&
+		  ps_test_artifact_fence_count(0) < before,
+		  "bounded lifecycle pruning survives restart");
+	ps_core_close();
+	if (ps_storage->close)
+		ps_storage->close();
+	ps_test_remove_tree(store);
+}
+
 int
 main(int argc, char **argv)
 {
 	configure();
+	if (argc == 2 && strcmp(argv[1], "--bounded-reader") == 0)
+	{
+		test_bounded_reader_generations();
+		fprintf(stderr, "%d checks, %d failures\n", checks, failures);
+		return failures != 0;
+	}
 	if (argc == 3)
 	{
 		if (strncmp(argv[1], "sync-fail-", 10) == 0)

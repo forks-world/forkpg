@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -397,6 +398,45 @@ class SupervisorTests(unittest.TestCase):
             supervisor.restart_deadline = 0
             keep_running = supervisor.observe_progress(float(failure))
             self.assertTrue(keep_running)
+        self.assertEqual(supervisor.failures, 0)
+
+    def test_online_restartpoint_advances_watermark_without_worker_restart(self):
+        config = MODULE.Config.load(self.write_config())
+        supervisor = MODULE.Supervisor(config)
+        supervisor.read_progress = mock.Mock(side_effect=[
+            MODULE.Progress("0/2", "0/2", "0/1", 1),
+            MODULE.Progress("0/2", "0/2", "0/1", 1),
+            MODULE.Progress("0/2", "0/2", "0/2", 0),
+        ])
+        supervisor.psql = mock.Mock()
+        supervisor.restart_for_progress = mock.Mock()
+
+        with mock.patch.object(MODULE.time, "monotonic", return_value=4):
+            self.assertTrue(supervisor.observe_progress(0))
+            self.assertTrue(supervisor.observe_progress(4))
+            self.assertTrue(supervisor.observe_progress(5))
+
+        supervisor.psql.assert_called_once_with("CHECKPOINT;")
+        supervisor.restart_for_progress.assert_not_called()
+        self.assertIsNone(supervisor.restart_baseline)
+
+    def test_timed_out_online_restartpoint_waits_before_falling_back(self):
+        config = MODULE.Config.load(self.write_config())
+        supervisor = MODULE.Supervisor(config)
+        supervisor.read_progress = mock.Mock(return_value=MODULE.Progress("0/2", "0/2", "0/1", 1))
+        supervisor.psql = mock.Mock(side_effect=subprocess.TimeoutExpired("psql", 15))
+        supervisor.restart_for_progress = mock.Mock()
+
+        with mock.patch.object(MODULE.time, "monotonic", return_value=4):
+            self.assertTrue(supervisor.observe_progress(0))
+            self.assertTrue(supervisor.observe_progress(4))
+
+        self.assertTrue(supervisor.observe_progress(33))
+        self.assertTrue(supervisor.observe_progress(34))
+        supervisor.restart_for_progress.assert_not_called()
+        self.assertTrue(supervisor.observe_progress(37))
+        supervisor.psql.assert_called_once_with("CHECKPOINT;")
+        supervisor.restart_for_progress.assert_called_once()
         self.assertEqual(supervisor.failures, 0)
 
     def test_missing_progress_api_reaches_the_configured_bound(self):

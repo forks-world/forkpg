@@ -34,6 +34,7 @@
 #include "pagestore_test_temp.h"
 #include "pagestore_artifact_format.h"
 #include "pagestore_ipc.h"
+#include "pagestore_archive_progress_format.h"
 #include "pagestore_shm.h"
 
 /* ===================== tiny test framework ============================= */
@@ -603,7 +604,7 @@ client_attach(const char *shm_name, uint32_t expect_page_size)
 	{
 		PsChannel  *ch = ps_channel(cl_shm, i);
 
-		if (ps_cas(&ch->claimed, 0, 1))
+		if (ps_cas_u64(&ch->claimed, 0, 1))
 		{
 			cl_chan = (int) i;
 			break;
@@ -622,7 +623,7 @@ client_detach(void)
 	if (cl_shm)
 	{
 		if (cl_chan >= 0)
-			ps_store_release(&ps_channel(cl_shm, cl_chan)->claimed, 0);
+			ps_store_release_u64(&ps_channel(cl_shm, cl_chan)->claimed, 0);
 		munmap(cl_shm, PS_SHM_SIZE);
 		cl_shm = NULL;
 	}
@@ -643,7 +644,7 @@ claim_extra_channel(void)
 		{
 			PsChannel *ch = ps_channel(cl_shm, i);
 
-			if (ps_cas(&ch->claimed, 0, 1))
+			if (ps_cas_u64(&ch->claimed, 0, 1))
 				return ch;
 		}
 	return NULL;
@@ -666,7 +667,7 @@ claim_channel_at(uint32_t idx)
 	if (idx >= hdr->nchannels)
 		return NULL;
 	ch = ps_channel(cl_shm, idx);
-	if (ps_cas(&ch->claimed, 0, 1))
+	if (ps_cas_u64(&ch->claimed, 0, 1))
 		return ch;
 	return NULL;
 }
@@ -3021,7 +3022,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		{
 			PsChannel  *candidate = ps_channel(cl_shm, i);
 
-			if (ps_cas(&candidate->claimed, 0, 1))
+			if (ps_cas_u64(&candidate->claimed, 0, 1))
 			{
 				barrier_ch = candidate;
 				break;
@@ -3069,7 +3070,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		{
 			check(write_ch->req_seq > durable_barrier_seq,
 				  "released same-LSN write is admitted after the barrier");
-			ps_store_release(&barrier_ch->claimed, 0);
+			ps_store_release_u64(&barrier_ch->claimed, 0);
 		}
 	}
 	/* Leave a sub-threshold tail outside the committed watermark and crash. */
@@ -5065,6 +5066,16 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 			   PS_FRONTEND_CAP_BRANCH_REDO_READ) != 0,
 			  "daemon advertises finite-branch recovery reads");
 		memset(rb, 0, ps);
+		cl_setkey(ch, REL_B, 1);
+		ch->timeline = 1;
+		ch->opcode = PS_OP_READV;
+		ch->blocknum = 0;
+		ch->nblocks = 1;
+		ch->req_lsn = 1600;
+		ch->is_redo = PS_READ_BRANCH_REDO;
+		check(cl_exec()->status == PS_STATUS_OK && memcmp(ch->data, rb, ps) == 0,
+			  "branch WAL recovery rebuilds inherited WAL-less FSM hints");
+		ch->is_redo = 0;
 		for (int rewrite = 0; rewrite < 2; rewrite++)
 		{
 			if (rewrite)
@@ -5727,7 +5738,7 @@ run_wal_backpressure_suite(const char *daemon_path, const char *tmpbase)
 		  ps_load_acquire_u64(&hdr->wal_backpressure.throttle_exits) != 0,
 		  "real WAL controller exits after immutable-prefix reclaim");
 	if (pending != NULL)
-		ps_store_release(&pending->claimed, 0);
+		ps_store_release_u64(&pending->claimed, 0);
 	client_detach();
 	stop_daemon(dpid);
 	rm_rf(store);
@@ -6493,7 +6504,7 @@ run_ipc_bounds_suite(const char *daemon_path, const char *tmpbase)
 	check(memcmp_all(neighbor->data, 0xa5, PS_IO_UNIT),
 		  "refused WAL_READ datalen=PS_IO_UNIT+1 leaves the adjacent channel untouched");
 
-	ps_store_release(&neighbor->claimed, 0);
+	ps_store_release_u64(&neighbor->claimed, 0);
 
 done:
 	client_detach();
@@ -7004,6 +7015,161 @@ main(int argc, char **argv)
 	{
 		perror("mkdtemp");
 		return 2;
+	}
+	if (getenv("PAGESTORE_TEST_ARCHIVE_PROGRESS_ONLY"))
+	{
+		char shm[64], store[256];
+		PsChannel *ch;
+		PsArchiveProgress progress;
+		PsArchiveProgressStartRequest start_request = {0, 0xA11CE, 0x55,
+			100, 1};
+		PsArchiveProgressSafeRequest safe_request = {1, 1, 100, 180};
+		PsArchiveProgressFreezeRequest freeze_request = {1, 1, 100, 192, 64};
+		PsArchiveProgressPrepareRequest pin_request = {1, 1, 100, 200, 256, 1, 0};
+		PsMaterializerMarkerFormat marker = {PS_MATERIALIZER_MARKER_MAGIC,
+			PS_MATERIALIZER_MARKER_VERSION, 0, 0, 100, ~UINT64_C(100)};
+		unsigned char marker_page[PS_DEFAULT_PAGE_SIZE] = {0};
+		pid_t pid;
+
+		snprintf(shm, sizeof(shm), "/pstest_progress_%d", (int) getpid());
+		snprintf(store, sizeof(store), "%s/archive_progress", tmpbase);
+		ps_shm_unlink(shm);
+		pid = spawn_daemon(daemon_path, shm, store, 8192, test_nshards);
+		(void) wait_ready(shm, 8192);
+		client_attach(shm, 8192);
+		check((((PsShmHeader *) cl_shm)->frontend_capabilities &
+			   (PS_FRONTEND_CAP_ARCHIVE_PROGRESS_SNAPSHOT |
+				PS_FRONTEND_CAP_ARCHIVE_PROGRESS_COORDINATION)) ==
+			  (PS_FRONTEND_CAP_ARCHIVE_PROGRESS_SNAPSHOT |
+			   PS_FRONTEND_CAP_ARCHIVE_PROGRESS_COORDINATION),
+			  "daemon advertises archive progress operations");
+		ch = ps_channel(cl_shm, cl_chan);
+		cl_setkey(ch, 0, 0);
+		memset(&ch->key, 0, sizeof(ch->key));
+		ch->key.klass = PS_KLASS_CONTROL;
+		ch->timeline = 0;
+		ch->incarnation = 1;
+		ch->opcode = PS_OP_ARCHIVE_PROGRESS_SNAPSHOT;
+		ch = cl_exec();
+		check(ch->status == PS_STATUS_OK && ch->result == 0 &&
+			  ch->datalen == PS_ARCHIVE_PROGRESS_FORMAT_BYTES &&
+			  ps_archive_progress_decode(&progress, ch->data, ch->datalen) == 0 &&
+			  progress.attempt == 0,
+			  "snapshot reads an empty archive progress authority");
+		memcpy(marker_page, &marker, sizeof(marker));
+		ch->opcode = PS_OP_WRITEV;
+		ch->blocknum = PS_MATERIALIZER_MARKER_BLOCK;
+		ch->nblocks = 1;
+		ch->datalen = PS_DEFAULT_PAGE_SIZE;
+		memcpy(ch->data, marker_page, sizeof(marker_page));
+		ch = cl_exec();
+		check(ch->status == PS_STATUS_OK, "publish materializer marker page");
+		ch->opcode = PS_OP_IMMEDSYNC;
+		ch->datalen = 0;
+		ch = cl_exec();
+		check(ch->status == PS_STATUS_OK, "sync marker before START");
+		ch->opcode = PS_OP_ARCHIVE_PROGRESS_START;
+		ch->datalen = sizeof(start_request);
+		memcpy(ch->data, &start_request, sizeof(start_request));
+		ch = cl_exec();
+		check(ch->status == PS_STATUS_OK && ch->result == 0 &&
+			  ps_archive_progress_decode(&progress, ch->data, ch->datalen) == 0 &&
+			  progress.attempt == 1 && progress.marker == 100 && progress.incarnation == 1,
+			  "START validates the real durable marker and timeline incarnation");
+		ch->opcode = PS_OP_ARCHIVE_PROGRESS_SAFE;
+		ch->datalen = sizeof(safe_request);
+		memcpy(ch->data, &safe_request, sizeof(safe_request));
+		ch = cl_exec();
+		check(ch->status == PS_STATUS_OK &&
+			  ps_archive_progress_decode(&progress, ch->data, ch->datalen) == 0 &&
+			  progress.safe_lsn == 180,
+			  "SAFE persists one recovery progress value under the marker lease");
+		ch->opcode = PS_OP_ARCHIVE_PROGRESS_FREEZE;
+		ch->datalen = sizeof(freeze_request);
+		memcpy(ch->data, &freeze_request, sizeof(freeze_request));
+		ch = cl_exec();
+		check(ch->status == PS_STATUS_OK &&
+			  ps_archive_progress_decode(&progress, ch->data, ch->datalen) == 0 &&
+			  progress.budget_frozen && progress.original_limit == 192 &&
+			  progress.max_extra == 64,
+			  "writer freezes its original limit and cap under marker lease");
+		ch->opcode = PS_OP_ARCHIVE_PROGRESS_PREPARE;
+		ch->datalen = sizeof(pin_request);
+		memcpy(ch->data, &pin_request, sizeof(pin_request));
+		ch = cl_exec();
+		check(ch->status == PS_STATUS_OK &&
+			  ps_archive_progress_decode(&progress, ch->data, ch->datalen) == 0 &&
+			  progress.target == 200 && progress.grant_end == 256 &&
+			  !progress.grant_active && progress.candidate_wal_tli == 1,
+			  "PREPARE stores one fixed bounded candidate without granting archive");
+		ch->opcode = PS_OP_ARCHIVE_PROGRESS_ACTIVATE;
+		ch->datalen = sizeof(pin_request);
+		memcpy(ch->data, &pin_request, sizeof(pin_request));
+		ch = cl_exec();
+		check(ch->status == PS_STATUS_OK &&
+			  ps_archive_progress_decode(&progress, ch->data, ch->datalen) == 0 &&
+			  progress.grant_active && progress.target == 200,
+			  "ACTIVATE grants only the exact prepared checkpoint after flush proof");
+		ch->opcode = PS_OP_ARCHIVE_PROGRESS_START;
+		ch->datalen = sizeof(start_request) - 1;
+		memcpy(ch->data, &start_request, sizeof(start_request));
+		ch = cl_exec();
+		check(ch->status != PS_STATUS_OK, "START rejects truncated request payload");
+		marker.materialized_lsn = 200;
+		marker.materialized_lsn_complement = ~UINT64_C(200);
+		memset(marker_page, 0, sizeof(marker_page));
+		memcpy(marker_page, &marker, sizeof(marker));
+		ch->opcode = PS_OP_WRITEV;
+		ch->blocknum = PS_MATERIALIZER_MARKER_BLOCK;
+		ch->nblocks = 1;
+		ch->datalen = PS_DEFAULT_PAGE_SIZE;
+		memcpy(ch->data, marker_page, sizeof(marker_page));
+		ch = cl_exec();
+		ch->opcode = PS_OP_IMMEDSYNC;
+		ch->datalen = 0;
+		ch = cl_exec();
+		ch->opcode = PS_OP_ARCHIVE_PROGRESS_SAFE;
+		ch->datalen = sizeof(safe_request);
+		memcpy(ch->data, &safe_request, sizeof(safe_request));
+		ch = cl_exec();
+		check(ch->status != PS_STATUS_OK, "SAFE rejects marker advanced after startup");
+		ch->opcode = PS_OP_ARCHIVE_PROGRESS_FREEZE;
+		ch->datalen = sizeof(freeze_request);
+		memcpy(ch->data, &freeze_request, sizeof(freeze_request));
+		ch = cl_exec();
+		check(ch->status != PS_STATUS_OK, "FREEZE rejects marker advanced after startup");
+		ch->opcode = PS_OP_ARCHIVE_PROGRESS_SNAPSHOT;
+		ch->datalen = 0;
+		ch = cl_exec();
+		check(ch->status == PS_STATUS_OK && ch->datalen == PS_ARCHIVE_PROGRESS_FORMAT_BYTES &&
+			  ps_archive_progress_decode(&progress, ch->data, ch->datalen) == 0 &&
+			  progress.attempt == 1 && progress.target == 200 && progress.grant_end == 256 &&
+			  progress.grant_active,
+			  "snapshot preserves the pinned grant after stale SAFE refusal");
+		client_detach();
+		stop_daemon(pid);
+		pid = spawn_daemon(daemon_path, shm, store, 8192, test_nshards);
+		(void) wait_ready(shm, 8192);
+		client_attach(shm, 8192);
+		ch = ps_channel(cl_shm, cl_chan);
+		cl_setkey(ch, 0, 0);
+		memset(&ch->key, 0, sizeof(ch->key));
+		ch->key.klass = PS_KLASS_CONTROL;
+		ch->incarnation = 1;
+		ch->opcode = PS_OP_ARCHIVE_PROGRESS_SNAPSHOT;
+		ch = cl_exec();
+		check(ch->status == PS_STATUS_OK &&
+			  ps_archive_progress_decode(&progress, ch->data, ch->datalen) == 0 &&
+			  progress.attempt == 1 && progress.budget_frozen &&
+			  progress.original_limit == 192 && progress.max_extra == 64 &&
+			  progress.target == 200 && progress.grant_end == 256,
+			  "fixed grant survives daemon process restart");
+		client_detach();
+		stop_daemon(pid);
+		ps_shm_unlink(shm);
+		rm_rf(tmpbase);
+		fprintf(stderr, "%d checks, %d failed\n", tests_run, tests_failed);
+		return tests_failed ? 1 : 0;
 	}
 	if (getenv("PAGESTORE_TEST_RECOVERY_PROOF_REASON_ONLY"))
 	{

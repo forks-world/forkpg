@@ -39,6 +39,7 @@
 
 #include "pagestore_ipc.h"
 #include "pagestore_shm.h"
+#include "pagestore_channel_owner.h"
 
 /* Physical tablespace OIDs (stable PostgreSQL constants). */
 #define DEFAULTTABLESPACE_OID	1663
@@ -50,13 +51,28 @@ static uint32_t page_size = PS_DEFAULT_PAGE_SIZE;
 
 /* shared-memory client state */
 static void *shm;
-static int	chan;
+static int	chan = -1;
+
+static void
+client_release(void)
+{
+	if (shm && chan >= 0)
+	{
+		PsChannel *ch = ps_channel(shm, chan);
+		uint32_t state = ps_load_acquire(&ch->state);
+
+		ps_store_release_u64(&ch->claimed,
+			(state == PS_STATE_IDLE || state == PS_STATE_DONE) ? 0 : 2);
+		chan = -1;
+	}
+}
 
 static void
 client_attach(const char *shm_name)
 {
 	int			fd = ps_shm_open(shm_name, O_RDWR, 0600);
 	PsShmHeader *hdr;
+	uint64_t my_claim;
 
 	if (fd < 0)
 	{
@@ -110,8 +126,16 @@ client_attach(const char *shm_name)
 		}
 	}
 	close(fd);
+	my_claim = ps_channel_owner_claim(hdr);
+	atexit(client_release);
 	for (uint32_t i = 0; i < hdr->nchannels; i++)
-		if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
+		if (ps_cas_u64(&ps_channel(shm, i)->claimed, 0, my_claim))
+		{
+			chan = (int) i;
+			return;
+		}
+	for (uint32_t i = 0; i < hdr->nchannels; i++)
+		if (ps_channel_reclaim_dead(ps_channel(shm, i), my_claim))
 		{
 			chan = (int) i;
 			return;

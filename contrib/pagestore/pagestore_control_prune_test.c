@@ -1125,6 +1125,41 @@ test_legacy_output_budget_fairness(void)
 }
 
 static void
+test_busy_parent_does_not_starve_branch_compaction(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-compaction-fairness-XXXXXX";
+	uint32_t child_layers = 0;
+	int wrote = 1;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 100;
+	check(test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		  write_relation(0, 0, 1000) && write_relation(0, 1, 1100) &&
+		  create_branch(1, 0, 1500) && write_relation(1, 0, 2100) &&
+		  write_relation(1, 1, 2200), "create due parent and branch compactions");
+	compact_layers = 1;
+	for (uint32_t i = 0; i < 8; i++)
+	{
+		/* Refill the parent before every turn, even after a successful merge. */
+		wrote &= write_relation(0, i + 2, 3000 + i);
+		(void) ps_core_maintenance();
+	}
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		const PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		child_layers += d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == 1;
+	}
+	ps_unlock_map();
+	check(wrote && child_layers == 1 && read_relation_at(9, 3007),
+		  "a busy parent does not starve eligible branch compaction");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_large_newest_suffix_selection(void)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-large-suffix-XXXXXX";
@@ -1276,10 +1311,11 @@ test_large_overlap_suffix_gets_early_turn(void)
 }
 
 static void
-test_rejected_suffix_resumes_large_search(void)
+test_large_suffix_merges_when_pruning_cannot_progress(void)
 {
-	char store[TEST_TEMP_PATH_MAX] = "pagestore-rejected-suffix-XXXXXX";
-	uint64_t before, attempted, materialized;
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-large-retained-suffix-XXXXXX";
+	uint64_t before, materialized;
+	uint32_t live_before = 0, live_after = 0;
 
 	configure_core(1);
 	compact_layers = 2000;
@@ -1291,20 +1327,33 @@ test_rejected_suffix_resumes_large_search(void)
 		check(write_relation(0, 0, 1000 + i), "write overlapping obsolete suffix version");
 	check(reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
 					  PS_RETENTION_RESOURCE_PAGE_HISTORY, 10000),
-		  "set a floor that makes an all-version merge ineligible");
+		  "set a floor that makes pruning desirable");
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_before++;
+	ps_unlock_map();
 	before = ps_test_bounded_compaction_count();
 	materialized = ps_test_compaction_materialize_count();
 	compact_layers = 1;
 	for (int i = 0; i < 256 && ps_test_bounded_compaction_count() == before; i++)
 		(void) ps_core_maintenance();
-	attempted = ps_test_bounded_compaction_count();
-	check(attempted > before && ps_test_compaction_materialize_count() == materialized,
-		  "ineligible suffix continues unfinished search without full materialization");
-	run_maintenance(3);
-	check(ps_test_bounded_compaction_count() == attempted &&
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE && !ps_layer_map.layers[i].deleting)
+			live_after++;
+	ps_unlock_map();
+	check(ps_test_bounded_compaction_count() > before &&
 		  ps_test_compaction_materialize_count() == materialized &&
-		  read_relation_at(0, 2600),
-		  "unfinished search avoids retrying the same rejected suffix");
+		  live_after + PS_IMAGE_MERGE_MAX_INPUTS / 2 <= live_before,
+		  "overlapping suffix reduces layer count even when safe pruning cannot proceed");
+	check(ps_test_page_prune_due(0, 0) && read_relation_at(0, 1000) &&
+		  read_relation_at(0, 2590) && read_relation_at(0, 2600),
+		  "suffix keeps selected and older versions available for later pruning");
+	close_store();
+	check(ps_core_open(store) == 0 && read_relation_at(0, 1000) &&
+		  read_relation_at(0, 2590) && read_relation_at(0, 2600),
+		  "all suffix versions remain readable after restart");
 	close_store();
 	remove_tree(store);
 }
@@ -1432,6 +1481,65 @@ read_isolated_branch_page(uint32_t timeline, uint64_t lsn, uint64_t expected)
 	memcpy(&hi, page, sizeof(hi));
 	memcpy(&lo, page + sizeof(hi), sizeof(lo));
 	return (((uint64_t) hi << 32) | lo) == expected;
+}
+
+static void
+test_bounded_control_group_branch_and_twins(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-group-branch-XXXXXX";
+	uint64_t before, value = 0;
+	PsStorage no_concurrent_reads = PsStoragePosix;
+	const uint64_t branch_redo = 10000 + 15 * 2000;
+	const uint64_t latest_redo = 10000 + 29 * 2000;
+	int ok;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 1000;
+	ok = test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0;
+	for (uint32_t i = 0; i < 30 && ok; i++)
+	{
+		uint64_t redo = 10000 + (uint64_t) i * 2000;
+
+		ok = write_checkpoint(0, redo, redo + 1000);
+		if (i == 15 && ok)
+			ok = create_branch(1, 0, branch_redo);
+	}
+	ok = ok && reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+		PS_RETENTION_RESOURCE_WAL | PS_RETENTION_RESOURCE_WAL_INDEX, latest_redo + 2000);
+	check(ok, "prepare many exact-redo checkpoints with a branch horizon");
+	before = ps_test_bounded_prune_published_count();
+	ps_test_set_legacy_record_limit(2);
+	compact_layers = 1;
+	no_concurrent_reads.concurrent_seg_read = 0;
+	ps_storage = &no_concurrent_reads;
+	for (int i = 0; i < 3; i++)
+		(void) ps_core_maintenance();
+	check(ps_test_bounded_prune_published_count() == before,
+		  "provider without concurrent segment reads defers control pruning");
+	ps_storage = &PsStoragePosix;
+	for (int i = 0; i < 100 && ps_test_bounded_prune_published_count() == before; i++)
+	{
+		(void) ps_core_maintenance();
+		usleep(100000); /* allow the normal legacy-budget retry window */
+	}
+	check(ps_test_bounded_prune_published_count() > before,
+		  "bounded control-group compaction publishes with a branch");
+	check(read_control_at(1, PS_CONTROL_IMAGE_BLOCK, UINT64_MAX, &value) && value == branch_redo &&
+		  read_control_at(0, PS_CONTROL_IMAGE_BLOCK, latest_redo, &value) && value == latest_redo &&
+		  read_control_at(0, PS_CONTROL_IMAGE_BLOCK, latest_redo + 1000, &value) &&
+		  value == latest_redo + 1000,
+		  "branch checkpoint and newest exact-redo twin remain readable");
+	ps_test_set_legacy_record_limit(0);
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  read_control_at(1, PS_CONTROL_IMAGE_BLOCK, UINT64_MAX, &value) && value == branch_redo &&
+		  read_control_at(0, PS_CONTROL_IMAGE_BLOCK, latest_redo, &value) && value == latest_redo &&
+		  read_control_at(0, PS_CONTROL_IMAGE_BLOCK, latest_redo + 1000, &value) &&
+		  value == latest_redo + 1000,
+		  "branch checkpoint and exact-redo twin survive restart");
+	close_store();
+	remove_tree(store);
 }
 
 static void
@@ -3128,6 +3236,81 @@ observe_active_fallback(void *arg)
 }
 
 static void
+reserve_root_pin_during_branch_gather(void *arg)
+{
+	int *reserved = arg;
+
+	ps_test_set_compaction_gather_hook(NULL, NULL);
+	*reserved = reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 55, 1,
+						   PS_RETENTION_RESOURCE_WAL, 5000);
+}
+
+static void
+test_large_branch_fallback_allows_retention(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-large-branch-fallback-XXXXXX";
+	const uint32_t records = 2 * (PS_IMAGE_BATCH_MAX_RECORDS + 1);
+	PsShmHeader *metrics = calloc(1, sizeof(*metrics));
+	int reserved = 0, ok;
+
+	if (metrics == NULL)
+	{
+		check(0, "allocate fallback inspection metrics");
+		return;
+	}
+	configure_core(0);
+	segment_size = 64 * 1024 * 1024;
+	flush_pages = PS_IMAGE_BATCH_MAX_RECORDS + 1;
+	compact_layers = 1000;
+	segment_gc_enabled = 0;
+	ok = test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		create_branch(1, 0, 2000);
+	for (uint32_t i = 0; i < records && ok; i++)
+		ok = write_relation(1, i, 6000 + i);
+	check(ok, "create two large branch layers below the legacy space budget");
+	if (ok)
+	{
+		uint32_t live = 0;
+
+		ps_core_set_metrics_header(metrics);
+		ps_test_force_legacy_compaction(0);
+		ps_test_set_compaction_gather_hook(reserve_root_pin_during_branch_gather, &reserved);
+		compact_layers = 1;
+		for (int i = 0; i < 16 && !reserved; i++)
+			(void) ps_core_maintenance();
+		ps_test_set_compaction_gather_hook(NULL, NULL);
+		check(reserved && metrics->compaction.locked_fallback_attempts == 0 &&
+			  metrics->compaction.legacy_gather_conflicts > 0,
+			  "root retention reserve succeeds during the unlocked branch retry");
+		run_maintenance(16);
+		ps_lock_map_rd();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].timeline == 1 &&
+				ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting)
+				live++;
+		ps_unlock_map();
+		check(metrics->compaction.locked_fallback_attempts == 0 &&
+			  live == 1 &&
+			  read_isolated_branch_page(1, UINT64_MAX, 6000) &&
+			  ps_test_page_version_count(1, &(PsKey) {1, 1, 1, 0, PS_KLASS_RELATION},
+										 records - 1) == 1,
+			  "repeated large retries preserve branch data without a locked fallback");
+		ps_core_set_metrics_header(NULL);
+	}
+	free(metrics);
+	close_store();
+	if (ok)
+	{
+		check(ps_core_open(store) == 0 &&
+			  read_isolated_branch_page(1, UINT64_MAX, 6000),
+			  "the retried branch remains readable after recovery");
+		close_store();
+	}
+	remove_tree(store);
+}
+
+static void
 test_bounded_prune_conflict(int mode)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-bounded-prune-conflict-XXXXXX";
@@ -4203,6 +4386,133 @@ object_version_at(uint32_t timeline, uint32_t klass, uint32_t object,
  * retired artifact also releases the control era it fenced, and a dropped pin
  * retires the artifacts only it protected. */
 static void
+test_bounded_reader_artifact_reclaim(void)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-reader-artifact-bounded-XXXXXX";
+	uint64_t before;
+	int ok;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 1000;
+	ok = test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+			PS_RETENTION_RESOURCE_WAL | PS_RETENTION_RESOURCE_WAL_INDEX, 500) &&
+		write_checkpoint(0, 800, 1000) && write_checkpoint(0, 1800, 2000) &&
+		write_checkpoint(0, 2800, 3000) &&
+		reserve_pin(0, PS_RETENTION_OWNER_READER, 9, 1, PS_RETENTION_RESOURCE_ALL, 1500) &&
+		write_object(0, PS_KLASS_SLRU, 7, 0, 1500, 0x71) &&
+		write_object(0, PS_KLASS_SLRU, 7, 1, 1500, 0x72) &&
+		write_object(0, PS_KLASS_SLRU, 7, 0, 2500, 0x74) &&
+		write_object(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 1500, 0x73) &&
+		write_object(0, PS_KLASS_READER_SNAPSHOT, 10, 0, 1500, 0x77) &&
+		write_object(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 2500, 0x76) &&
+		create_branch(1, 0, 2500) &&
+		reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+			PS_RETENTION_RESOURCE_WAL | PS_RETENTION_RESOURCE_WAL_INDEX, 3400);
+	for (uint32_t block = 1; block <= 70 && ok; block++)
+		ok = write_relation(0, block, 3500 + block);
+	check(ok, "prepare old reader artifacts and a retained branch");
+	before = ps_test_bounded_prune_published_count();
+	ps_test_set_legacy_record_limit(2);
+	compact_layers = 1;
+	for (int i = 0; i < 8; i++)
+		(void) ps_core_maintenance();
+	check(object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 1500) == 1500 &&
+		  object_version_at(0, PS_KLASS_SLRU, 7, 0, 1500) == 1500 &&
+		  ps_test_artifact_fence_count(0) == 2,
+		  "bounded maintenance retains an artifact protected by a reader pin");
+	check(drop_pin(0, PS_RETENTION_OWNER_READER, 9, 1), "release old reader pin");
+	for (int i = 0; i < 50 && ps_test_artifact_fence_count(0) > 1; i++)
+		(void) ps_core_maintenance();
+	check(ps_test_bounded_prune_published_count() > before &&
+		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 1500) == 0 &&
+		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 10, 0, 1500) == 0 &&
+		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 2500) == 2500 &&
+		  object_version_at(0, PS_KLASS_SLRU, 7, 0, 1500) == 0 &&
+		  object_version_at(0, PS_KLASS_SLRU, 7, 1, 1500) == 0 &&
+		  object_version_at(0, PS_KLASS_SLRU, 7, 0, 2500) == 2500 &&
+		  ps_test_artifact_fence_count(0) == 1,
+		  "bounded maintenance releases the oldest reader-artifact fence");
+	ps_test_set_legacy_record_limit(0);
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 1500) == 0 &&
+		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 2500) == 2500 &&
+		  object_version_at(0, PS_KLASS_SLRU, 7, 1, 1500) == 0 &&
+		  object_version_at(0, PS_KLASS_SLRU, 7, 0, 2500) == 2500 &&
+		  ps_test_artifact_fence_count(0) == 1,
+		  "reader-artifact pruning and branch retention survive restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_bounded_artifact_crash(const char *fault)
+{
+	char store[TEST_TEMP_PATH_MAX] = "pagestore-artifact-crash-XXXXXX";
+	char control[TEST_TEMP_PATH_MAX] = "pagestore-artifact-fault-XXXXXX";
+	char arm[TEST_TEMP_PATH_MAX + 16];
+	FILE *file;
+	pid_t child;
+	int status = 0, ok;
+	int retired = strcmp(fault, "page_gc.after_mark_delete") == 0;
+
+	configure_core(1);
+	segment_gc_enabled = 0;
+	compact_layers = 1000;
+	ok = test_mkdtemp(store, sizeof(store)) != NULL && ps_core_open(store) == 0 &&
+		reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+			PS_RETENTION_RESOURCE_WAL | PS_RETENTION_RESOURCE_WAL_INDEX, 500) &&
+		write_checkpoint(0, 800, 1000) && write_checkpoint(0, 1800, 2000) &&
+		write_checkpoint(0, 2800, 3000) &&
+		reserve_pin(0, PS_RETENTION_OWNER_READER, 9, 1, PS_RETENTION_RESOURCE_ALL, 1500) &&
+		write_object(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 1500, 0x73) &&
+		write_object(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 2500, 0x76) &&
+		create_branch(1, 0, 2500) &&
+		reserve_pin(0, PS_RETENTION_OWNER_MATERIALIZER, 1, 1,
+			PS_RETENTION_RESOURCE_WAL | PS_RETENTION_RESOURCE_WAL_INDEX, 3400) &&
+		drop_pin(0, PS_RETENTION_OWNER_READER, 9, 1);
+	for (uint32_t block = 1; block <= 70 && ok; block++)
+		ok = write_relation(0, block, 3500 + block);
+	close_store();
+	if (!test_mkdtemp(control, sizeof(control)) ||
+		snprintf(arm, sizeof(arm), "%s/arm", control) >= (int) sizeof(arm) ||
+		(file = fopen(arm, "w")) == NULL)
+	{
+		check(0, "prepare artifact crash fault");
+		remove_tree(store);
+		return;
+	}
+	fclose(file);
+	child = fork();
+	if (child == 0)
+	{
+		if (!ok || setenv("PAGESTORE_TEST_FAULT_NAME", fault, 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) != 0 ||
+			setenv("PAGESTORE_TEST_FAULT_DIR", control, 1) != 0 ||
+			ps_fault_init(store) != 0 || ps_core_open(store) != 0)
+			_exit(91);
+		ps_test_set_legacy_record_limit(2);
+		compact_layers = 1;
+		run_maintenance(100);
+		_exit(92);
+	}
+	check(child > 0 && waitpid(child, &status, 0) == child &&
+		  WIFEXITED(status) && WEXITSTATUS(status) == PS_FAULT_CRASH_EXIT,
+		  "artifact pruning reaches the requested crash boundary");
+	check(ps_core_open(store) == 0 &&
+		  object_version_at(0, PS_KLASS_READER_SNAPSHOT, 9, 0, 2500) == 2500 &&
+		  object_version_at(1, PS_KLASS_READER_SNAPSHOT, 9, 0, UINT64_MAX) == 2500 &&
+		  ps_test_artifact_fence_count(0) == (retired ? 1u : 2u),
+		  "artifact crash replays a complete source set and keeps the branch view");
+	close_store();
+	remove_tree(store);
+	remove_tree(control);
+}
+
+static void
 test_stale_artifacts_are_retired(void)
 {
 	char store[TEST_TEMP_PATH_MAX] = "pagestore-control-prune-artifact-XXXXXX";
@@ -4525,8 +4835,22 @@ test_compaction_source_read_batch(void)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "--retention-timeout") == 0)
+	{
+		test_large_branch_fallback_allows_retention();
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--artifact-crash") == 0)
+	{
+		test_bounded_artifact_crash("page_prune.after_frontier");
+		test_bounded_artifact_crash("page_compaction.after_publish");
+		test_bounded_artifact_crash("page_gc.after_mark_delete");
+		fprintf(stderr, "%d checks, %d failures\n", checks, failed);
+		return failed != 0;
+	}
 	test_parallel_recovery_rejects_corrupt_layer();
 	test_nonzero_floor_bounded_plan(0);
 	test_nonzero_floor_bounded_plan(1);
@@ -4555,6 +4879,7 @@ main(void)
 	test_isolated_search_exhausted_progress();
 	test_legacy_budget_rechecks_new_layer();
 	test_legacy_output_budget_fairness();
+	test_busy_parent_does_not_starve_branch_compaction();
 	test_legacy_budget_retries_small_bounded(0);
 	test_legacy_budget_retries_small_bounded(1);
 	test_large_newest_suffix_selection();
@@ -4562,8 +4887,9 @@ main(void)
 	test_bounded_overlapping_suffix(1);
 	test_mixed_control_suffix_merge();
 	test_large_overlap_suffix_gets_early_turn();
-	test_rejected_suffix_resumes_large_search();
+	test_large_suffix_merges_when_pruning_cannot_progress();
 	test_isolated_bounded_pruning();
+	test_bounded_control_group_branch_and_twins();
 	test_isolated_pruning_branch_view();
 	test_isolated_pruning_concurrent_change(0);
 	test_isolated_pruning_concurrent_change(1);
@@ -4609,6 +4935,8 @@ main(void)
 	test_staged_compaction_makes_progress_after_conflicts();
 	test_compaction_source_read_batch();
 	check(ps_test_control_fence_selections() == 0, "cached control fence selections match the original planner");
+	check(ps_test_control_note_decisions(28209) == 0,
+		  "large control-note snapshot matches global retention decisions and retains unknown versions");
 	test_floor_retires_older_checkpoints();
 	test_note_identity_trailer();
 	test_reader_pin_retains_its_checkpoint();
@@ -4623,6 +4951,7 @@ main(void)
 	test_materializer_pin_is_the_page_cutoff();
 	test_checkpoint_note_is_the_page_cutoff();
 	test_stale_artifacts_are_retired();
+	test_bounded_reader_artifact_reclaim();
 	test_live_slru_mirror_follows_page_history();
 	test_same_version_twin_supersedes_pre_checkpoint_image();
 	test_independent_blocks_keep_their_newest();

@@ -30,6 +30,7 @@
 #include "storage/smgr.h"
 
 #include "pagestore_ipc.h"		/* PsWalRec */
+#include "pagestore_archive_progress.h"
 
 /*
  * Upstream renamed the replication-origin-id typedef from RepOriginId to
@@ -251,6 +252,31 @@ extern bool pagestore_localsvc_timeline_state_known(uint32 timeline,
 extern int	pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn,
 										uint32 len, void *out);
 extern uint32 pagestore_localsvc_timeline(void);
+extern bool pagestore_localsvc_archive_progress_snapshot(uint32 timeline,
+	uint64 incarnation, PsArchiveProgress *result, int timeout_ms);
+extern bool pagestore_localsvc_archive_progress_authorized_snapshot(
+	uint32 timeline, uint64 incarnation, PsArchiveProgress *result,
+	int timeout_ms);
+extern bool pagestore_localsvc_archive_progress_start(uint32 timeline,
+	uint64 incarnation, uint64 expected_attempt, uint64 nonce_hi,
+	uint64 nonce_lo, uint64 marker, uint64 original_limit,
+	uint64 max_extra, PsArchiveProgress *result, bool *replayed,
+	int timeout_ms);
+extern bool pagestore_localsvc_archive_progress_safe(uint32 timeline,
+	uint64 incarnation, uint64 attempt, uint64 marker, uint64 safe_lsn,
+	PsArchiveProgress *result, int timeout_ms);
+extern bool pagestore_localsvc_archive_progress_freeze(uint32 timeline,
+	uint64 incarnation, uint64 attempt, uint64 marker,
+	uint64 original_limit, uint64 max_extra, PsArchiveProgress *result,
+	int timeout_ms);
+extern bool pagestore_localsvc_archive_progress_prepare(uint32 timeline,
+	uint64 incarnation, uint64 attempt, uint64 marker, uint64 target,
+	uint64 target_end, uint32 candidate_wal_tli,
+	PsArchiveProgress *result, int timeout_ms);
+extern bool pagestore_localsvc_archive_progress_activate(uint32 timeline,
+	uint64 incarnation, uint64 attempt, uint64 marker, uint64 target,
+	uint64 target_end, uint32 candidate_wal_tli,
+	PsArchiveProgress *result, int timeout_ms);
 extern uint64 pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key,
 											  uint64 lsn);
 extern bool pagestore_localsvc_block_death_asof(const PageStoreRelKey *key,

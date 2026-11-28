@@ -6,8 +6,8 @@
  *
  * Included by BOTH the PG-side module (with PG headers) and the standalone
  * daemon (without them), so it uses only plain fixed-width C types and defines
- * an identical layout on both sides.  Synchronization uses __atomic builtins on
- * plain uint32 fields.
+ * an identical layout on both sides. Synchronization uses __atomic builtins on
+ * fixed-width integer fields.
  *
  * Page-size independence: nothing here hardcodes the engine page size.  The
  * channel data buffer is sized in terms of PS_IO_UNIT -- the transfer/IO unit,
@@ -30,7 +30,11 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		53	/* 53: compaction conflict and fallback metrics.
+#define PS_SHM_VERSION		58	/* 58: WAL control-retirement diagnostics.
+								 * 57: generation-fenced channel ownership.
+								 * 56: archive progress PREPARE/ACTIVATE split.
+								 * 55: archive progress FREEZE request payload.
+								 * 53: compaction conflict and fallback metrics.
 								 * 52: recovery writes carry the active replay
 								 * position in req_lsn, enabling safe stale-page
 								 * suppression; mixed versions must not attach.
@@ -189,6 +193,13 @@ typedef enum PsOpcode
 	PS_OP_READV_FSM,
 	PS_OP_WAL_BASE_READ,		/* retained index-view base; no PAGE read grant */
 	PS_OP_WAL_BASE_STATE,		/* base and lifecycle at the same index view */
+	PS_OP_ARCHIVE_PROGRESS_SNAPSHOT, /* read-only; capability negotiated */
+	PS_OP_ARCHIVE_PROGRESS_START, /* fenced, durable materializer attempt */
+	PS_OP_ARCHIVE_PROGRESS_SAFE, /* consistency-checked replay feedback */
+	PS_OP_ARCHIVE_PROGRESS_PREPARE, /* persist one fixed, not-yet-active candidate */
+	PS_OP_ARCHIVE_PROGRESS_AUTHORIZED_SNAPSHOT, /* marker-checked current state */
+	PS_OP_ARCHIVE_PROGRESS_FREEZE, /* writer-frozen original bound and cap */
+	PS_OP_ARCHIVE_PROGRESS_ACTIVATE, /* activate only after segment flush proof */
 } PsOpcode;
 
 typedef enum PsTimelineState
@@ -366,6 +377,48 @@ typedef struct PsWalIndexEntry
 #define PS_FRONTEND_CAP_WAL_BASE (UINT32_C(1) << 4)
 #define PS_FRONTEND_CAP_WAL_BASE_STATE (UINT32_C(1) << 5)
 #define PS_FRONTEND_CAP_BRANCH_REDO_READ (UINT32_C(1) << 6)
+#define PS_FRONTEND_CAP_ARCHIVE_PROGRESS_SNAPSHOT (UINT32_C(1) << 7)
+#define PS_FRONTEND_CAP_ARCHIVE_PROGRESS_COORDINATION (UINT32_C(1) << 8)
+
+/* Fixed payloads for the optional archive-progress mutation operations. */
+typedef struct PsArchiveProgressStartRequest
+{
+	uint64_t expected_attempt;
+	uint64_t nonce_hi;
+	uint64_t nonce_lo;
+	uint64_t marker;
+	uint64_t incarnation;
+} PsArchiveProgressStartRequest;
+
+typedef struct PsArchiveProgressSafeRequest
+{
+	uint64_t incarnation;
+	uint64_t attempt;
+	uint64_t marker;
+	uint64_t safe_lsn;
+} PsArchiveProgressSafeRequest;
+
+typedef struct PsArchiveProgressFreezeRequest
+{
+	uint64_t incarnation;
+	uint64_t attempt;
+	uint64_t marker;
+	uint64_t original_limit;
+	uint64_t max_extra;
+} PsArchiveProgressFreezeRequest;
+
+typedef struct PsArchiveProgressPrepareRequest
+{
+	uint64_t incarnation;
+	uint64_t attempt;
+	uint64_t marker;
+	uint64_t target;
+	uint64_t target_end;
+	uint32_t candidate_wal_tli;
+	uint32_t reserved;
+} PsArchiveProgressPrepareRequest;
+
+#define PS_ARCHIVE_PROGRESS_START_REPLAYED 1u
 /* READV only: a startup-process page read during branch crash recovery. */
 #define PS_READ_BRANCH_REDO UINT32_C(0x42525244)
 #define PS_WAL_BASE_VIEW_UNREGISTERED 1u
@@ -480,7 +533,7 @@ typedef struct PsWalBaseState
 /* One channel = one backend's mailbox. */
 typedef struct PsChannel
 {
-	uint32_t	claimed;		/* atomic: 0 free, 1 owned */
+	uint64_t	claimed;		/* 0 free, 1 legacy, 2 abandoned; else generation/PID */
 	uint32_t	state;			/* atomic: PS_STATE_* */
 
 	/* request */
@@ -654,6 +707,36 @@ typedef struct PsCompactionMetrics
 	uint64_t locked_fallback_active_shard;
 } PsCompactionMetrics;
 
+typedef enum PsControlRetirementReason
+{
+	PS_CONTROL_RETIRE_NONE = 0,
+	PS_CONTROL_RETIRE_QUEUED,
+	PS_CONTROL_RETIRE_DEFERRED,
+	PS_CONTROL_RETIRE_INCOMPLETE,
+	PS_CONTROL_RETIRE_CHECKPOINT,
+	PS_CONTROL_RETIRE_EXACT_REDO,
+	PS_CONTROL_RETIRE_PIN,
+	PS_CONTROL_RETIRE_BRANCH,
+	PS_CONTROL_RETIRE_ARTIFACT,
+	PS_CONTROL_RETIRE_RETIRED
+} PsControlRetirementReason;
+
+/* A sampled, verified blocker for one WAL timeline.  A short-circuited
+ * proof identifies one blocking note; it does not compute the full floor. */
+typedef struct PsControlRetirementStatus
+{
+	uint64_t	seq;
+	uint64_t	note_lsn;
+	uint64_t	note_admission_seq;
+	uint64_t	redo_lsn;
+	uint64_t	dependency_lsn;
+	uint64_t	owner_id;
+	uint32_t	note_timeline;
+	uint32_t	dependency_timeline;
+	uint32_t	owner_kind;
+	uint32_t	reason;
+} PsControlRetirementStatus;
+
 typedef struct PsShmHeader
 {
 	uint32_t	magic;
@@ -688,6 +771,10 @@ typedef struct PsShmHeader
 	PsInspectionMetrics inspection;
 	PsInspectionRequest inspection_request;
 	PsCompactionMetrics compaction;
+	uint32_t	channel_owner_generation;
+	uint64_t	channel_pidns_dev;
+	uint64_t	channel_pidns_ino;
+	PsControlRetirementStatus control_retirement[PS_INSPECTION_MAX_TIMELINES];
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)

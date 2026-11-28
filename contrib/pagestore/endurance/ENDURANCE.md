@@ -145,7 +145,12 @@ PostgreSQL can reject it while invalid-page references remain unresolved; if
 their resolving WAL and the next safe checkpoint are beyond the archive limit,
 the worker and archiver can stall even after a restart. The timeout preserves
 that failure and its diagnostics; increasing the timeout alone cannot make
-progress. The current limiter has no automatic bounded escape for this case.
+progress. When recovery has published SAFE and the latest completed checkpoint
+is beyond the frozen progress budget, PageStore can grant shipping through
+that cap. Recovery must still find a usable restartpoint to advance the
+durable marker. If progress stops at the cap, the driver records the shipped
+WAL position, durable marker, release checkpoint and archiver wait event in
+`archive_timeout_status`.
 `pagestore.materializer_max_lag_mb` can be changed with `ALTER SYSTEM` followed
 by `pg_reload_conf()` without restarting the writer. An operator can temporarily
 raise the limit to let the materializer reach a later safe checkpoint, then
@@ -371,6 +376,12 @@ One run is one topology lifetime: provisioning, then rounds for
 `--duration` seconds (at least one).  `--forever` runs seed,
 seed+1, ... each from a fresh `initdb` and import, so the bootstrap paths are
 exercised as often as the steady state.
+
+Initial PageStore startup and each daemon restart have a separate deadline
+of 600 seconds by default. Set `--daemon-start-timeout` to adjust it for
+endurance or fixed replay. The `daemon_ready` event records startup time,
+and a startup failure includes the latest message from that launch's
+`daemon.log`. The daemon logs when it enters each recovery phase.
 
 ## Repeated branch reclamation
 

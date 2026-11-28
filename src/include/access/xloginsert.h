@@ -44,6 +44,10 @@
 extern void XLogBeginInsert(void);
 extern void XLogSetRecordFlags(uint8 flags);
 extern XLogRecPtr XLogInsert(RmgrId rmid, uint8 info);
+/* Insert an XLOG_SWITCH only if the current insertion position is still in
+ * expected_segno; the check is atomic with WAL insertion-lock acquisition. */
+extern XLogRecPtr XLogInsertIfSegment(RmgrId rmid, uint8 info,
+									  XLogSegNo expected_segno);
 extern XLogRecPtr XLogSimpleInsertInt64(RmgrId rmid, uint8 info, int64 value);
 extern void XLogEnsureRecordSpace(int max_block_id, int ndatas);
 extern void XLogRegisterData(const void *data, uint32 len);

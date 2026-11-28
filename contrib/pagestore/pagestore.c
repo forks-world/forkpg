@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "access/clog.h"
@@ -71,10 +72,12 @@
 #include "pagestore_fault.h"
 #include "pagestore_ipc.h"
 #include "pagestore_artifact_format.h"
+#include "pagestore_archive_policy.h"
 #include "pagestore_materializer_marker.h"
 #include "port/pg_iovec.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/bgwriter.h"
+#include "portability/instr_time.h"
 #include "postmaster/interrupt.h"
 #include "storage/aio.h"
 #include "storage/bufpage.h"
@@ -189,6 +192,7 @@ PGDLLEXPORT void pagestore_reader_snapshot_worker_main(Datum main_arg);
 PGDLLEXPORT void pagestore_reader_artifact_launcher_main(Datum main_arg);
 PGDLLEXPORT void pagestore_reader_artifact_database_main(Datum main_arg);
 PGDLLEXPORT void pagestore_wal_index_worker_main(Datum main_arg);
+PGDLLEXPORT void pagestore_archive_progress_worker_main(Datum main_arg);
 
 /* GUC state */
 static bool pagestore_route_all = false;
@@ -207,6 +211,8 @@ static char *pagestore_retention_owner_generation_str = NULL;
 static uint64 pagestore_retention_owner_id = 0;
 static uint32 pagestore_retention_owner_generation = 0;
 static int pagestore_materializer_max_lag_mb = 0;
+static int pagestore_materializer_recovery_extra_segments = 2;
+static int pagestore_materializer_progress_extra_segments = 8;
 static int pagestore_wal_index_max_lag_mb = 0;
 /* Per-request bound for explicit, potentially large SLRU snapshots. */
 static int pagestore_slru_snapshot_timeout_ms = 60000;
@@ -222,6 +228,26 @@ static ExecutorRun_hook_type prev_executor_run_hook = NULL;
 static recovery_start_hook_type prev_recovery_start_hook = NULL;
 static recovery_restartpoint_pre_control_hook_type prev_restartpoint_pre_control_hook = NULL;
 static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL;
+static recovery_restartpoint_rejected_hook_type prev_restartpoint_rejected_hook = NULL;
+#ifdef HAVE_RECOVERY_RESTARTPOINT_REPLAYED_HOOK
+static recovery_restartpoint_replayed_hook_type prev_restartpoint_replayed_hook = NULL;
+#endif
+static recovery_consistency_hook_type prev_recovery_consistency_hook = NULL;
+#ifdef HAVE_RECOVERY_ARCHIVE_READY_HOOK
+static recovery_archive_ready_hook_type prev_recovery_archive_ready_hook = NULL;
+#endif
+static PsArchiveProgress materializer_archive_progress;
+static bool materializer_archive_progress_valid = false;
+static bool materializer_progress_start_pending = false;
+static bool materializer_progress_start_identity_ready = false;
+static XLogRecPtr materializer_progress_start_marker = InvalidXLogRecPtr;
+static XLogRecPtr materializer_progress_start_redo = InvalidXLogRecPtr;
+static uint64 materializer_progress_start_incarnation = 0;
+static uint64 materializer_progress_start_expected_attempt = UINT64_MAX;
+static uint64 materializer_progress_start_nonce[2] = {0, 0};
+static XLogRecPtr ps_checkpoint_record_end(XLogRecPtr checkpoint_lsn,
+										  const CheckPoint *checkpoint,
+										  uint8 *info_out);
 
 /* Fault probes below are scoped to the portable bootstrap installer.  Legacy
  * branch installs and reader installs must keep their existing fault surface. */
@@ -233,6 +259,10 @@ static bool pagestore_portable_install_faults_owned = false;
  * stay byte-identical to the format structs there. */
 #define PS_MATERIALIZER_MARKER_TIMEOUT_MS \
 	PS_FAULT_MATERIALIZER_MARKER_TIMEOUT_MS
+#define PS_MATERIALIZER_PROGRESS_TIMEOUT_MS 1000
+/* The post-restartpoint pin update takes the daemon's admission and metadata
+ * locks and syncs its retention log. Allow for contention and I/O latency. */
+#define PS_MATERIALIZER_RETENTION_ADVANCE_TIMEOUT_MS 30000
 /* Recovery consumes the contiguous raw WAL stream, not per-page index views.
  * A WAL_INDEX pin would require admitting each restartpoint as a new historical
  * page view, which can already be behind the index compaction frontier.  The
@@ -1879,7 +1909,131 @@ pagestore_materializer_shipped_lsn(int timeout_ms)
 	return (XLogRecPtr) shipped;
 }
 
+#ifdef HAVE_RECOVERY_ARCHIVE_READY_HOOK
+/*
+ * The local WAL end is a cheap advisory check for a complete archive segment.
+ * A positive result schedules a restore attempt; it grants no replay authority.
+ */
+static bool
+pagestore_materializer_archive_ready(XLogRecPtr segment_end)
+{
+	MemoryContext callercontext = CurrentMemoryContext;
+	volatile bool ready = false;
+
+	if (prev_recovery_archive_ready_hook &&
+		(*prev_recovery_archive_ready_hook) (segment_end))
+		return true;
+
+	PG_TRY();
+	{
+		ready = pagestore_localsvc_wal_end_timeout(100) >= segment_end;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(callercontext);
+		edata = CopyErrorData();
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		ereport(DEBUG1,
+				(errmsg("pagestore archive readiness check failed: %s", edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	return ready;
+}
+#endif
+
 static XLogRecPtr pagestore_materialized_wal_lsn_internal(void);
+static XLogRecPtr pagestore_materializer_release_checkpoint(XLogRecPtr materialized);
+static uint64 pagestore_wal_segments_after(uint64 lsn, uint64 nsegments);
+static uint64 pagestore_materializer_archive_limit(XLogRecPtr marker,
+												 XLogRecPtr checkpoint,
+												 XLogRecPtr seg_start,
+												 uint64 shipped_end,
+												 bool *rejected);
+
+/* This hint grants only a fixed shipping allowance.  Failure to publish it
+ * must not turn an otherwise valid recovery into a startup failure. */
+static void
+pagestore_materializer_restartpoint_rejected(XLogRecPtr checkpoint)
+{
+	MemoryContext callercontext = CurrentMemoryContext;
+
+	if (prev_restartpoint_rejected_hook)
+		(*prev_restartpoint_rejected_hook) (checkpoint);
+
+	PG_TRY();
+	{
+		PageStoreRelKey key = {0};
+		PsMaterializerRejectedFormat hint = {0};
+		XLogRecPtr marker = pagestore_materialized_wal_lsn_internal();
+		char page[BLCKSZ];
+
+		if (XLogRecPtrIsValid(marker) && checkpoint > marker)
+		{
+			hint.magic = PS_MATERIALIZER_REJECTED_MAGIC;
+			hint.version = PS_MATERIALIZER_REJECTED_VERSION;
+			hint.timeline = pagestore_localsvc_timeline();
+			hint.materialized_lsn = marker;
+			hint.materialized_lsn_complement = ~hint.materialized_lsn;
+			hint.checkpoint_lsn = checkpoint;
+			hint.checkpoint_lsn_complement = ~hint.checkpoint_lsn;
+			memset(page, 0, sizeof(page));
+			memcpy(page, &hint, sizeof(hint));
+			pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key,
+				PS_MATERIALIZER_REJECTED_BLOCK, page, (uint64) checkpoint,
+				PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+			pagestore_localsvc_store_sync_timeout(PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+			ereport(LOG,
+					(errmsg("pagestore materializer rejected restartpoint at %X/%08X",
+							(uint32) (checkpoint >> 32), (uint32) checkpoint),
+					 errdetail("The durable materializer watermark remains %X/%08X.",
+							   (uint32) (marker >> 32), (uint32) marker)));
+		}
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		MemoryContextSwitchTo(callercontext);
+		edata = CopyErrorData();
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		ereport(WARNING, (errmsg("pagestore could not publish rejected restartpoint: %s",
+							 edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+}
+
+static bool
+pagestore_materializer_rejected_checkpoint(XLogRecPtr marker, XLogRecPtr checkpoint)
+{
+	PageStoreRelKey key = {0};
+	PsMaterializerRejectedFormat hint;
+	char page[BLCKSZ];
+
+	if (XLogRecPtrIsInvalid(marker) || XLogRecPtrIsInvalid(checkpoint) ||
+		!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_CONTROL, &key,
+			PS_MATERIALIZER_REJECTED_BLOCK, UINT64_MAX, page, NULL,
+			PS_MATERIALIZER_MARKER_TIMEOUT_MS))
+		return false;
+	memcpy(&hint, page, sizeof(hint));
+	return ps_materializer_rejection_matches(&hint, pagestore_localsvc_timeline(),
+												marker, checkpoint);
+}
 
 /* Publish a restartpoint marker after relation pages are durable. */
 static void
@@ -1931,6 +2085,188 @@ pagestore_materializer_publish_marker(XLogRecPtr replay_lsn,
 
 /* Fence this recovery process before it can consume the first WAL record. */
 static void
+pagestore_materializer_progress_start_try(XLogRecPtr redo_lsn)
+{
+	PsArchiveProgress previous;
+	PsArchiveProgress started;
+	PsArchiveProgress verified;
+	uint32 timeline = pagestore_localsvc_timeline();
+	bool replayed = false;
+
+	if (!materializer_progress_start_pending)
+		return;
+	if (!materializer_progress_start_identity_ready)
+	{
+		XLogRecPtr marker = pagestore_materialized_wal_lsn_internal();
+		uint64 incarnation = pagestore_localsvc_expected_incarnation();
+
+		if (!XLogRecPtrIsValid(marker) || incarnation == 0 ||
+			!pg_strong_random(materializer_progress_start_nonce,
+								 sizeof(materializer_progress_start_nonce)) ||
+			(materializer_progress_start_nonce[0] == 0 &&
+			 materializer_progress_start_nonce[1] == 0))
+		{
+			ereport(DEBUG1,
+					(errmsg("pagestore materializer archive progress identity is pending")));
+			return;
+		}
+		materializer_archive_progress_valid = false;
+		materializer_progress_start_redo = redo_lsn;
+		materializer_progress_start_marker = marker;
+		materializer_progress_start_incarnation = incarnation;
+		materializer_progress_start_identity_ready = true;
+	}
+
+	/* This snapshot only supplies an optimistic attempt CAS value. START itself
+	 * verifies the requested marker under the daemon's marker-authority lease. */
+	if (!pagestore_localsvc_archive_progress_snapshot(timeline,
+			materializer_progress_start_incarnation, &previous,
+			PS_MATERIALIZER_PROGRESS_TIMEOUT_MS))
+	{
+		ereport(DEBUG1,
+				(errmsg("pagestore materializer archive progress START is pending")));
+		return;
+	}
+	if (materializer_progress_start_expected_attempt == UINT64_MAX)
+		materializer_progress_start_expected_attempt = previous.attempt;
+	{
+		XLogRecPtr current_marker = pagestore_materialized_wal_lsn_internal();
+
+		/* Reconcile a possibly committed START receipt before comparing marker
+		 * values. This also handles the case where the first retry already
+		 * updated its local marker but the prior nonce still names an old receipt. */
+		if (materializer_progress_start_expected_attempt != UINT64_MAX &&
+			previous.attempt == materializer_progress_start_expected_attempt + 1 &&
+			previous.start_nonce_hi == materializer_progress_start_nonce[0] &&
+			previous.start_nonce_lo == materializer_progress_start_nonce[1])
+		{
+			if (XLogRecPtrIsValid(current_marker) &&
+				previous.marker != (uint64) current_marker)
+			{
+				uint64 refreshed_nonce[2];
+
+				if (!pg_strong_random(refreshed_nonce, sizeof(refreshed_nonce)) ||
+					(refreshed_nonce[0] == 0 && refreshed_nonce[1] == 0))
+				{
+					ereport(DEBUG1,
+							(errmsg("pagestore materializer archive progress marker refresh is pending")));
+					return;
+				}
+				materializer_progress_start_expected_attempt = previous.attempt;
+				materializer_progress_start_nonce[0] = refreshed_nonce[0];
+				materializer_progress_start_nonce[1] = refreshed_nonce[1];
+			}
+		}
+		else if (previous.attempt != materializer_progress_start_expected_attempt)
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("pagestore materializer archive progress startup was fenced"),
+					 errdetail("A different recovery attempt committed while the durable marker advanced."),
+					 errhint("Restart the materializer under a fresh retention-owner generation.")));
+
+		if (XLogRecPtrIsValid(current_marker) &&
+			current_marker != materializer_progress_start_marker)
+		{
+			/* Rebind to the authority's current marker. The attempt/nonce check
+			 * above distinguishes a lost local reply from a competing START. */
+			materializer_progress_start_marker = current_marker;
+			ereport(DEBUG1,
+					(errmsg("pagestore materializer archive progress START refreshed after durable marker advancement")));
+		}
+	}
+	if (previous.attempt > materializer_progress_start_expected_attempt &&
+		(materializer_progress_start_expected_attempt == UINT64_MAX ||
+		 previous.attempt != materializer_progress_start_expected_attempt + 1 ||
+		 previous.start_nonce_hi != materializer_progress_start_nonce[0] ||
+		 previous.start_nonce_lo != materializer_progress_start_nonce[1]))
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore materializer archive progress startup was fenced"),
+				 errdetail("A different recovery attempt committed after this process read its attempt number."),
+				 errhint("Restart the materializer under a fresh retention-owner generation.")));
+	if (!pagestore_localsvc_archive_progress_start(timeline,
+												  materializer_progress_start_incarnation,
+												  materializer_progress_start_expected_attempt,
+												  materializer_progress_start_nonce[0],
+												  materializer_progress_start_nonce[1],
+												  (uint64) materializer_progress_start_marker,
+												  0, 0,
+												  &started, &replayed,
+												  PS_MATERIALIZER_PROGRESS_TIMEOUT_MS) ||
+		started.marker != (uint64) materializer_progress_start_marker ||
+		started.incarnation != materializer_progress_start_incarnation ||
+		started.attempt != materializer_progress_start_expected_attempt + 1 ||
+		started.start_nonce_hi != materializer_progress_start_nonce[0] ||
+		started.start_nonce_lo != materializer_progress_start_nonce[1] ||
+		(replayed && previous.attempt != started.attempt))
+	{
+		ereport(DEBUG1,
+				(errmsg("pagestore materializer archive progress START is pending")));
+		return;
+	}
+	if (!pagestore_localsvc_archive_progress_authorized_snapshot(timeline,
+			materializer_progress_start_incarnation, &verified,
+			PS_MATERIALIZER_PROGRESS_TIMEOUT_MS) ||
+		verified.marker != started.marker ||
+		verified.incarnation != started.incarnation ||
+		verified.attempt != started.attempt ||
+		verified.start_nonce_hi != started.start_nonce_hi ||
+		verified.start_nonce_lo != started.start_nonce_lo)
+		return;
+	materializer_archive_progress = started;
+	materializer_archive_progress_valid = true;
+	materializer_progress_start_pending = false;
+}
+
+static void
+pagestore_materializer_progress_start(XLogRecPtr redo_lsn)
+{
+	static time_t last_start_try = 0;
+	static unsigned int retry_delay = 1;
+	MemoryContext callercontext = CurrentMemoryContext;
+	time_t now = time(NULL);
+
+	if (last_start_try != 0 && now >= last_start_try &&
+		now - last_start_try < retry_delay)
+		return;
+	last_start_try = now;
+	if (!materializer_progress_start_pending &&
+		!materializer_archive_progress_valid)
+	{
+		materializer_progress_start_pending = true;
+		materializer_progress_start_redo = redo_lsn;
+	}
+	PG_TRY();
+	{
+		pagestore_materializer_progress_start_try(redo_lsn);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(callercontext);
+		edata = CopyErrorData();
+
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		ereport(DEBUG1,
+				(errmsg("pagestore materializer archive progress START will retry: %s",
+						edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	if (materializer_progress_start_pending)
+		retry_delay = Min(retry_delay * 2, 30U);
+	else
+		retry_delay = 1;
+}
+
+static void
 pagestore_materializer_recovery_start(XLogRecPtr redo_lsn)
 {
 	uint8		status;
@@ -1972,10 +2308,89 @@ pagestore_materializer_recovery_start(XLogRecPtr redo_lsn)
 		if (status != PS_STATUS_OK)
 			ereport(FATAL,
 					(errmsg("pagestore materializer could not register its retention owner")));
+
+		/* This attempt only authorizes later progress feedback. It does not
+		 * advance the materialized marker or retention floor. */
+		pagestore_materializer_progress_start(redo_lsn);
 	}
 
 	if (prev_recovery_start_hook)
 		(*prev_recovery_start_hook) (redo_lsn);
+}
+
+static bool
+pagestore_materializer_recovery_consistent(XLogRecPtr replay_lsn)
+{
+	static time_t last_safe_try = 0;
+	static XLogRecPtr pending_safe_lsn = InvalidXLogRecPtr;
+	static unsigned int retry_delay = 1;
+	MemoryContext callercontext = CurrentMemoryContext;
+	uint32 timeline = pagestore_localsvc_timeline();
+	PsArchiveProgress safe;
+	time_t now = time(NULL);
+	volatile bool ok = false;
+
+	if (prev_recovery_consistency_hook)
+		if (!(*prev_recovery_consistency_hook) (replay_lsn))
+			return false;
+	if (!pagestore_materializer)
+		return true;
+	if (materializer_progress_start_pending &&
+		!materializer_archive_progress_valid)
+		pagestore_materializer_progress_start(materializer_progress_start_redo);
+	if (materializer_progress_start_pending)
+		return false;
+	if (!materializer_archive_progress_valid ||
+		!XLogRecPtrIsValid(replay_lsn) ||
+		replay_lsn <= materializer_archive_progress.marker)
+		return true;
+	if (!XLogRecPtrIsValid(pending_safe_lsn))
+		pending_safe_lsn = replay_lsn;
+	/* CheckRecoveryConsistency runs for every replayed record. */
+	if (last_safe_try != 0 && now >= last_safe_try &&
+		now - last_safe_try < retry_delay)
+		return false;
+	last_safe_try = now;
+	PG_TRY();
+	{
+		ok = pagestore_localsvc_archive_progress_safe(timeline,
+				materializer_archive_progress.incarnation,
+				materializer_archive_progress.attempt,
+				materializer_archive_progress.marker,
+				(uint64) pending_safe_lsn, &safe,
+				PS_MATERIALIZER_PROGRESS_TIMEOUT_MS);
+		if (ok)
+			materializer_archive_progress = safe;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(callercontext);
+		edata = CopyErrorData();
+
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		ereport(WARNING,
+				(errmsg("pagestore materializer recovery progress feedback failed: %s",
+						edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	if (!ok)
+	{
+		retry_delay = Min(retry_delay * 2, 30U);
+		ereport(DEBUG1,
+				(errmsg("pagestore materializer checked recovery progress is pending")));
+	}
+	else
+		retry_delay = 1;
+	return ok;
 }
 
 /* The durable marker may move first; a failed pin update simply retains the
@@ -1997,7 +2412,7 @@ pagestore_materializer_retention_advance(XLogRecPtr replay_lsn)
 			pagestore_retention_owner_generation,
 			PS_MATERIALIZER_RETENTION_RESOURCES, (uint64) replay_lsn,
 			&admission_seq,
-			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+			PS_MATERIALIZER_RETENTION_ADVANCE_TIMEOUT_MS);
 	}
 	PG_CATCH();
 	{
@@ -2078,7 +2493,7 @@ pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn,
 }
 
 static XLogRecPtr
-pagestore_materialized_wal_lsn_internal(void)
+pagestore_materialized_wal_lsn_timeout(int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	PsMaterializerMarker marker;
@@ -2087,7 +2502,7 @@ pagestore_materialized_wal_lsn_internal(void)
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_CONTROL, &key,
 													PS_MATERIALIZER_MARKER_BLOCK,
 													UINT64_MAX, page, NULL,
-													PS_MATERIALIZER_MARKER_TIMEOUT_MS))
+													timeout_ms))
 		return InvalidXLogRecPtr;
 	memcpy(&marker, page, sizeof(marker));
 	if (marker.magic != PS_MATERIALIZER_MARKER_MAGIC ||
@@ -2098,9 +2513,16 @@ pagestore_materialized_wal_lsn_internal(void)
 	return (XLogRecPtr) marker.materialized_lsn;
 }
 
+static XLogRecPtr
+pagestore_materialized_wal_lsn_internal(void)
+{
+	return pagestore_materialized_wal_lsn_timeout(PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+}
+
 /* Read the durable release checkpoint only when it matches this marker. */
 static XLogRecPtr
-pagestore_materializer_release_checkpoint_read(XLogRecPtr materialized)
+pagestore_materializer_release_checkpoint_read(XLogRecPtr materialized,
+											   int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	PsMaterializerRelease release;
@@ -2113,7 +2535,7 @@ pagestore_materializer_release_checkpoint_read(XLogRecPtr materialized)
 
 	if (pagestore_localsvc_obj_read_at_timeout(
 			PS_KLASS_CONTROL, &key, PS_MATERIALIZER_RELEASE_BLOCK,
-			UINT64_MAX, page, NULL, PS_MATERIALIZER_MARKER_TIMEOUT_MS))
+			UINT64_MAX, page, NULL, timeout_ms))
 	{
 		memcpy(&release, page, sizeof(release));
 		if (release.magic == PS_MATERIALIZER_RELEASE_MAGIC &&
@@ -2128,6 +2550,74 @@ pagestore_materializer_release_checkpoint_read(XLogRecPtr materialized)
 	}
 	return InvalidXLogRecPtr;
 }
+
+#ifdef HAVE_RECOVERY_RESTARTPOINT_REPLAYED_HOOK
+/*
+ * The writer already selected this checkpoint to release archive backpressure.
+ * Ask the local checkpointer to flush it as soon as the recovery core has
+ * accepted and replayed it and the archive has reached the checkpoint's
+ * release boundary. A branch capture may ship just the checkpoint's segment
+ * and still need to pause replay before taking its own restartpoint.
+ */
+static void
+pagestore_materializer_restartpoint_replayed(XLogRecPtr start_lsn,
+											 XLogRecPtr end_lsn, TimeLineID tli)
+{
+	const int	timeout_ms = 100;
+	MemoryContext callercontext = CurrentMemoryContext;
+	volatile bool request_fast = false;
+
+	if (prev_restartpoint_replayed_hook)
+		(*prev_restartpoint_replayed_hook) (start_lsn, end_lsn, tli);
+	PG_TRY();
+	{
+		XLogRecPtr marker = pagestore_materialized_wal_lsn_timeout(timeout_ms);
+
+		if (XLogRecPtrIsValid(marker) && start_lsn > marker)
+		{
+			PsArchiveProgress progress;
+
+			request_fast =
+				(pagestore_materializer_release_checkpoint_read(marker,
+					timeout_ms) == start_lsn &&
+				 pagestore_localsvc_wal_end_timeout(timeout_ms) >=
+				 pagestore_wal_segments_after(start_lsn, 2)) ||
+				(pagestore_localsvc_archive_progress_snapshot(
+					pagestore_localsvc_timeline(), pagestore_localsvc_expected_incarnation(),
+					&progress, timeout_ms) &&
+				 progress.marker == marker && progress.grant_active &&
+				 progress.target == end_lsn && progress.candidate_wal_tli == tli);
+		}
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(callercontext);
+		edata = CopyErrorData();
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		ereport(DEBUG1,
+				(errmsg("pagestore restartpoint priority check failed: %s", edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+
+	if (request_fast)
+	{
+		RequestCheckpoint(CHECKPOINT_FAST);
+		ereport(LOG,
+				(errmsg("pagestore requested a fast restartpoint for WAL archiving"),
+				 errdetail("Replayed the archive release checkpoint at %X/%08X.",
+						   LSN_FORMAT_ARGS(start_lsn))));
+	}
+}
+#endif
 
 /*
  * Pin the first completed checkpoint observed for one materialized watermark.
@@ -2149,7 +2639,8 @@ pagestore_materializer_release_checkpoint(XLogRecPtr materialized)
 	if (XLogRecPtrIsInvalid(materialized))
 		return InvalidXLogRecPtr;
 	marker = (uint64) materialized;
-	latched = pagestore_materializer_release_checkpoint_read(materialized);
+	latched = pagestore_materializer_release_checkpoint_read(materialized,
+		PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 	if (XLogRecPtrIsValid(latched))
 		return latched;
 
@@ -2173,6 +2664,37 @@ pagestore_materializer_release_checkpoint(XLogRecPtr materialized)
 		(uint64) checkpoint, PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 	pagestore_localsvc_store_sync_timeout(PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 	return checkpoint;
+}
+
+/* Diagnostics must never turn a bounded pause into a failed archive call. */
+static XLogRecPtr
+pagestore_materializer_latest_checkpoint_for_log(void)
+{
+	volatile XLogRecPtr latest = InvalidXLogRecPtr;
+	MemoryContext callercontext = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		latest = pagestore_control_writer_checkpoint_lsn_timeout(
+			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		MemoryContextSwitchTo(callercontext);
+		edata = CopyErrorData();
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	return latest;
 }
 
 static uint64
@@ -2210,7 +2732,8 @@ static uint64
 pagestore_materializer_archive_limit(XLogRecPtr marker,
 									 XLogRecPtr checkpoint,
 									 XLogRecPtr seg_start,
-									 uint64 shipped_end)
+									 uint64 shipped_end,
+									 bool *rejected)
 {
 	uint64		limit = 0;
 
@@ -2236,9 +2759,370 @@ pagestore_materializer_archive_limit(XLogRecPtr marker,
 	if (!XLogRecPtrIsInvalid(checkpoint))
 		limit = Max(limit,
 					pagestore_wal_segments_after((uint64) checkpoint, 2));
+	/* A rejected checkpoint needs later WAL.  Add one fixed, non-ratcheting
+	 * allowance to the original limit for this marker, never to shipped_end. */
+	*rejected = pagestore_materializer_rejected_checkpoint(marker, checkpoint);
+	if (*rejected)
+		limit = ps_materializer_rejection_limit(limit, (uint64) wal_segment_size,
+			(uint64) pagestore_materializer_recovery_extra_segments);
 	if (shipped_end % wal_segment_size != 0)
 		limit = Max(limit, pagestore_wal_align_up(shipped_end));
 	return limit;
+}
+
+/* A progress grant may be installed only from a checkpoint record verified
+ * against the writer's CRC-checked pg_control and sealed in its local WAL. */
+static bool
+pagestore_materializer_archive_progress_notice(const char *message,
+												 XLogRecPtr target,
+												 uint64 cap)
+{
+	static time_t last_notice = 0;
+	time_t now = time(NULL);
+
+	if (last_notice == 0 || now < last_notice || now - last_notice >= 30)
+	{
+		last_notice = now;
+		ereport(WARNING,
+				(errmsg("pagestore materializer archive progress blocked: %s", message),
+				 errdetail("candidate checkpoint %X/%08X, fixed grant cap %X/%08X.",
+						   (uint32) (target >> 32), (uint32) target,
+						   (uint32) (cap >> 32), (uint32) cap)));
+	}
+	return false;
+}
+
+/* The clamped fallback consumes the frozen cap instead of failing closed. */
+static void
+pagestore_materializer_archive_progress_clamped(XLogRecPtr checkpoint,
+												 uint64 cap)
+{
+	static time_t last_notice = 0;
+	time_t now = time(NULL);
+
+	if (last_notice == 0 || now < last_notice || now - last_notice >= 30)
+	{
+		last_notice = now;
+		ereport(LOG,
+				(errmsg("pagestore materializer archive progress clamped to the frozen grant cap"),
+				 errdetail("Latest completed checkpoint %X/%08X is beyond cap %X/%08X; "
+						   "shipping through the cap so recovery can reach an earlier "
+						   "safe checkpoint.",
+						   (uint32) (checkpoint >> 32), (uint32) checkpoint,
+						   (uint32) (cap >> 32), (uint32) cap)));
+	}
+}
+
+static bool
+pagestore_materializer_prepare_completed_checkpoint(TimeLineID archive_tli,
+											PsArchiveProgress *progress)
+{
+	ControlFileData *control;
+	XLogRecPtr	checkpoint_end;
+	XLogSegNo	checkpoint_segno;
+	TimeLineID	checkpoint_tli;
+	uint64		segment_end;
+	uint8		info = 0;
+	bool		crc_ok = false;
+	PsArchiveProgress pinned;
+	MemoryContext callercontext = CurrentMemoryContext;
+	volatile bool checkpoint_read_ok = false;
+
+	if (progress->target != 0 || progress->safe_lsn <= progress->marker ||
+		pagestore_redo_wal_from_store)
+		return progress->target != 0;
+	control = get_controlfile(DataDir, &crc_ok);
+	if (control == NULL || !crc_ok)
+	{
+		if (control)
+			pfree(control);
+		return false;
+	}
+	checkpoint_tli = control->checkPointCopy.ThisTimeLineID;
+	PG_TRY();
+	{
+		checkpoint_end = ps_checkpoint_record_end(control->checkPoint,
+												&control->checkPointCopy, &info);
+		checkpoint_read_ok = true;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(callercontext);
+		edata = CopyErrorData();
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	pfree(control);
+	if (!checkpoint_read_ok)
+		return false;
+	if (info != XLOG_CHECKPOINT_ONLINE && info != XLOG_CHECKPOINT_SHUTDOWN)
+		return pagestore_materializer_archive_progress_notice(
+			"pg_control does not name a completed checkpoint record",
+			checkpoint_end, progress->original_limit + progress->max_extra);
+	if ((uint64) checkpoint_end <= progress->safe_lsn || checkpoint_end == 0 ||
+		checkpoint_tli != archive_tli)
+		return false;
+	XLByteToPrevSeg(checkpoint_end, checkpoint_segno, wal_segment_size);
+	if (checkpoint_segno >= UINT64_MAX / (uint64) wal_segment_size)
+		return false;
+	segment_end = ((uint64) checkpoint_segno + 1) * (uint64) wal_segment_size;
+	{
+		uint64	cap = progress->original_limit + progress->max_extra;
+		uint64	target;
+		uint64	target_end;
+		int		plan;
+
+		/*
+		 * The latest completed checkpoint may be beyond the frozen per-marker
+		 * cap.  The cap itself is still the fixed amount FREEZE authorized,
+		 * so consume it to let recovery replay the intervening WAL and reach
+		 * an earlier safe checkpoint.  Fail closed only when the cap cannot
+		 * advance past SAFE.
+		 */
+		plan = ps_materializer_progress_boundary(cap,
+												 (uint64) progress->safe_lsn,
+												 (uint64) progress->marker,
+												 (uint64) checkpoint_end,
+												 segment_end,
+												 &target, &target_end);
+		if (plan < 0)
+			return false;
+		if (plan == 0)
+			return pagestore_materializer_archive_progress_notice(
+				"latest completed checkpoint exceeds the immutable progress budget",
+				checkpoint_end, cap);
+		if (plan == 2)
+			pagestore_materializer_archive_progress_clamped(checkpoint_end, cap);
+		checkpoint_end = (XLogRecPtr) target;
+		segment_end = target_end;
+	}
+	if (!pagestore_localsvc_archive_progress_prepare(pagestore_localsvc_timeline(),
+			progress->incarnation, progress->attempt, progress->marker,
+			(uint64) checkpoint_end, segment_end, archive_tli, &pinned,
+			PS_MATERIALIZER_MARKER_TIMEOUT_MS))
+		return false;
+	*progress = pinned;
+	return pinned.target == (uint64) checkpoint_end &&
+		pinned.grant_end == segment_end;
+}
+
+static void
+pagestore_materializer_authorize_archive_progress(XLogRecPtr materialized,
+											 TimeLineID archive_tli,
+											 uint64 *limit)
+{
+	PsArchiveProgress candidate;
+	PsArchiveProgress progress;
+	uint64 incarnation = pagestore_localsvc_expected_incarnation();
+	uint64 max_extra;
+
+	if (*limit == 0 || incarnation == 0 ||
+		pagestore_materializer_progress_extra_segments <= 0 ||
+		!pagestore_localsvc_archive_progress_snapshot(
+			pagestore_localsvc_timeline(), incarnation, &candidate,
+			PS_MATERIALIZER_MARKER_TIMEOUT_MS) ||
+		candidate.attempt == 0 ||
+		candidate.marker != (uint64) materialized ||
+		candidate.incarnation != incarnation || candidate.safe_lsn == 0)
+		return;
+	if (!pagestore_localsvc_archive_progress_authorized_snapshot(
+			pagestore_localsvc_timeline(), incarnation, &progress,
+			PS_MATERIALIZER_MARKER_TIMEOUT_MS) ||
+		progress.attempt != candidate.attempt ||
+		progress.marker != candidate.marker ||
+		progress.incarnation != candidate.incarnation ||
+		progress.safe_lsn != candidate.safe_lsn)
+		return;
+	if (!progress.budget_frozen)
+	{
+		if ((uint64) pagestore_materializer_progress_extra_segments >
+			UINT64_MAX / (uint64) wal_segment_size)
+			return;
+		max_extra =
+			(uint64) pagestore_materializer_progress_extra_segments *
+			(uint64) wal_segment_size;
+		if (!pagestore_localsvc_archive_progress_freeze(
+				pagestore_localsvc_timeline(), incarnation, progress.attempt,
+				progress.marker, *limit, max_extra, &progress,
+				PS_MATERIALIZER_PROGRESS_TIMEOUT_MS))
+			return;
+	}
+	if (!progress.budget_frozen ||
+		progress.original_limit > UINT64_MAX - progress.max_extra)
+		return;
+	if (progress.target == 0 &&
+		!pagestore_materializer_prepare_completed_checkpoint(archive_tli, &progress))
+		return;
+	if (pagestore_materializer_progress_extra_segments > 0 &&
+		progress.grant_active && progress.target != 0 &&
+		progress.candidate_wal_tli == archive_tli &&
+		progress.grant_end > *limit)
+		*limit = progress.grant_end;
+}
+
+/* Drive only a candidate already durably PREPAREd by the archiver. This
+ * worker is independent of archive_file_cb so a segment switch cannot wait on
+ * the archive operation that it is meant to unblock. */
+static void
+pagestore_archive_progress_drive_once(void)
+{
+	PsArchiveProgress progress;
+	uint32 timeline = pagestore_localsvc_timeline();
+	uint64 incarnation = pagestore_localsvc_expected_incarnation();
+	XLogRecPtr flush_lsn;
+	XLogRecPtr insert_lsn;
+	XLogSegNo candidate_segno;
+	XLogSegNo insert_segno;
+	TimeLineID flush_tli;
+	TimeLineID insert_tli;
+	TimeLineID archive_tli;
+	uint64 grant_end;
+	PsArchiveProgress candidate;
+
+	if (pagestore_materializer || pagestore_materializer_max_lag_mb <= 0 ||
+		pagestore_materializer_progress_extra_segments <= 0 ||
+		pagestore_redo_wal_from_store || !XLogArchivingActive() ||
+		RecoveryInProgress() || incarnation == 0 ||
+		!pagestore_localsvc_archive_progress_snapshot(timeline,
+			incarnation, &candidate, PS_MATERIALIZER_PROGRESS_TIMEOUT_MS) ||
+		candidate.attempt == 0 || candidate.marker == 0 ||
+		!candidate.safe_lsn || !candidate.budget_frozen ||
+		!candidate.target || !candidate.grant_end || candidate.grant_active)
+		return;
+
+	grant_end = candidate.grant_end;
+	archive_tli = GetWALInsertionTimeLine();
+	if (archive_tli == 0 || archive_tli != candidate.candidate_wal_tli)
+		return;
+	flush_lsn = GetFlushRecPtr(&flush_tli);
+	if (flush_tli != archive_tli)
+		return;
+	if (flush_lsn < (XLogRecPtr) grant_end)
+	{
+		insert_lsn = GetXLogInsertRecPtr();
+		insert_tli = GetWALInsertionTimeLine();
+		if (insert_tli != archive_tli ||
+			insert_lsn < (XLogRecPtr) candidate.target)
+			return;
+		if (insert_lsn < (XLogRecPtr) grant_end)
+		{
+			XLByteToPrevSeg((XLogRecPtr) grant_end, candidate_segno,
+							wal_segment_size);
+			XLByteToSeg(insert_lsn, insert_segno, wal_segment_size);
+			/* Never generate intervening WAL segments just to reach a future
+			 * candidate. A switch is bounded to the segment holding it. */
+			if (insert_segno != candidate_segno)
+				return;
+		}
+	}
+	/* The inexpensive snapshot above is only a filter. Recheck the durable
+	 * marker and current attempt before any switch or grant activation. */
+	if (!pagestore_localsvc_archive_progress_authorized_snapshot(timeline,
+			incarnation, &progress, PS_MATERIALIZER_PROGRESS_TIMEOUT_MS) ||
+		progress.attempt != candidate.attempt ||
+		progress.marker != candidate.marker ||
+		progress.incarnation != incarnation ||
+		progress.safe_lsn != candidate.safe_lsn ||
+		progress.target != candidate.target ||
+		progress.grant_end != candidate.grant_end ||
+		progress.candidate_wal_tli != candidate.candidate_wal_tli ||
+		!progress.budget_frozen || progress.grant_active)
+		return;
+	flush_lsn = GetFlushRecPtr(&flush_tli);
+	if (flush_tli != archive_tli)
+		return;
+	if (flush_lsn < (XLogRecPtr) grant_end)
+	{
+		insert_lsn = GetXLogInsertRecPtr();
+		insert_tli = GetWALInsertionTimeLine();
+		if (insert_tli != archive_tli ||
+			insert_lsn < (XLogRecPtr) progress.target)
+			return;
+		if (insert_lsn >= (XLogRecPtr) grant_end)
+			XLogFlush((XLogRecPtr) grant_end);
+		else
+		{
+			XLByteToPrevSeg((XLogRecPtr) grant_end, candidate_segno,
+							wal_segment_size);
+			XLByteToSeg(insert_lsn, insert_segno, wal_segment_size);
+			if (insert_segno != candidate_segno || !XLogInsertAllowed())
+				return;
+			(void) RequestXLogSwitchIfSegment(candidate_segno);
+		}
+		flush_lsn = GetFlushRecPtr(&flush_tli);
+	}
+	if (flush_tli != archive_tli || flush_lsn < (XLogRecPtr) grant_end)
+		return;
+
+	/* PREPARE is only a candidate. ACTIVATE is the durable archive grant and
+	 * rechecks the current marker/attempt under the daemon's marker lease. */
+	(void) pagestore_localsvc_archive_progress_activate(timeline, incarnation,
+		progress.attempt, progress.marker, progress.target, progress.grant_end,
+		progress.candidate_wal_tli,
+		&progress, PS_MATERIALIZER_PROGRESS_TIMEOUT_MS);
+}
+
+void
+pagestore_archive_progress_worker_main(Datum main_arg)
+{
+	MemoryContext work_context;
+
+	(void) main_arg;
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	BackgroundWorkerUnblockSignals();
+	work_context = AllocSetContextCreate(TopMemoryContext,
+										  "pagestore archive progress worker",
+									  ALLOCSET_DEFAULT_SIZES);
+	while (!ShutdownRequestPending)
+	{
+		MemoryContext old_context = MemoryContextSwitchTo(work_context);
+		PG_TRY();
+		{
+			if (ConfigReloadPending)
+			{
+				ConfigReloadPending = false;
+				ProcessConfigFile(PGC_SIGHUP);
+			}
+			pagestore_archive_progress_drive_once();
+		}
+		PG_CATCH();
+		{
+			ErrorData *edata;
+
+			MemoryContextSwitchTo(old_context);
+			edata = CopyErrorData();
+			if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+				edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			{
+				FreeErrorData(edata);
+				PG_RE_THROW();
+			}
+			FlushErrorState();
+			ereport(WARNING,
+					(errmsg("pagestore archive progress worker deferred candidate: %s",
+							edata->message)));
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
+		MemoryContextSwitchTo(old_context);
+		MemoryContextReset(work_context);
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 1000L, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	proc_exit(0);
 }
 
 static void
@@ -2371,7 +3255,8 @@ pagestore_materializer_status(PG_FUNCTION_ARGS)
 
 	/* Sample marker first so concurrent progress can only overstate the lag. */
 	materialized = pagestore_materialized_wal_lsn_internal();
-	release = pagestore_materializer_release_checkpoint_read(materialized);
+	release = pagestore_materializer_release_checkpoint_read(materialized,
+		PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 	shipped = pagestore_materializer_shipped_lsn(
 		PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 
@@ -2405,6 +3290,67 @@ pagestore_materializer_status(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
 
+#ifdef HAVE_EXPEDITE_RUNNING_CHECKPOINT
+/*
+ * A completed writer checkpoint can move the materializer's release boundary.
+ * Give replay a chance to catch up before expediting an existing checkpoint,
+ * and only do it once for the same blocked WAL position and durable marker.
+ */
+static void
+pagestore_expedite_checkpoint_for_archive(TimeLineID tli, XLogRecPtr current,
+										 XLogRecPtr materialized)
+{
+	static TimeLineID blocked_tli;
+	static XLogRecPtr blocked_lsn;
+	static XLogRecPtr blocked_marker;
+	static instr_time blocked_since;
+	static bool expedited;
+	instr_time	now;
+
+	if (XLogRecPtrIsInvalid(materialized))
+		return;
+	INSTR_TIME_SET_CURRENT(now);
+	if (blocked_tli != tli || blocked_lsn != current ||
+		blocked_marker != materialized)
+	{
+		blocked_tli = tli;
+		blocked_lsn = current;
+		blocked_marker = materialized;
+		blocked_since = now;
+		expedited = false;
+		return;
+	}
+	if (expedited)
+		return;
+
+	INSTR_TIME_SUBTRACT(now, blocked_since);
+	if (INSTR_TIME_GET_MILLISEC(now) >= 2000 && ExpediteRunningCheckpoint())
+	{
+		expedited = true;
+		ereport(LOG,
+				(errmsg("pagestore expedited a writer checkpoint for WAL archiving"),
+				 errdetail("Archive blocked at %X/%08X with materializer watermark %X/%08X.",
+						   LSN_FORMAT_ARGS(current), LSN_FORMAT_ARGS(materialized))));
+	}
+}
+#endif
+
+static bool
+pagestore_archive_defer(bool materializer)
+{
+#ifdef HAVE_ARCHIVE_MODULE_DEFER
+	static uint32 materializer_wait_event;
+
+	if (!materializer)
+		return ArchiveModuleDefer(0);
+	if (materializer_wait_event == 0)
+		materializer_wait_event = WaitEventExtensionNew("PageStoreArchiveMaterializer");
+	return ArchiveModuleDefer(materializer_wait_event);
+#else
+	return false;
+#endif
+}
+
 static bool
 pagestore_archive_file(ArchiveModuleState *state, const char *file,
 					   const char *path)
@@ -2422,6 +3368,7 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	XLogRecPtr	materialized = InvalidXLogRecPtr;
 	XLogRecPtr	checkpoint = InvalidXLogRecPtr;
 	uint64		materializer_limit = 0;
+	bool		materializer_rejected = false;
 	uint64		max_record_wal_span;
 
 	/*
@@ -2447,7 +3394,7 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 		materialized = pagestore_materialized_wal_lsn_internal();
 		checkpoint = pagestore_materializer_release_checkpoint(materialized);
 		materializer_limit = pagestore_materializer_archive_limit(
-			materialized, checkpoint, seg_start, shipped_end);
+			materialized, checkpoint, seg_start, shipped_end, &materializer_rejected);
 	}
 	if (pagestore_wal_index_max_lag_mb > 0)
 	{
@@ -2497,9 +3444,15 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 			materialized = pagestore_materialized_wal_lsn_internal();
 			checkpoint = pagestore_materializer_release_checkpoint(materialized);
 			materializer_limit = pagestore_materializer_archive_limit(
-				materialized, checkpoint, seg_start, shipped_end);
+				materialized, checkpoint, seg_start, shipped_end, &materializer_rejected);
+			pagestore_materializer_authorize_archive_progress(materialized,
+														 tli, &materializer_limit);
 			if (current >= materializer_limit)
 			{
+				XLogRecPtr latest = InvalidXLogRecPtr;
+
+				if (materializer_rejected)
+					latest = pagestore_materializer_latest_checkpoint_for_log();
 				pfree(buf);
 				close(fd);
 				if (XLogRecPtrIsInvalid(materialized))
@@ -2507,12 +3460,34 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 							(errmsg("pagestore archive paused: materializer watermark is unavailable"),
 							 errhint("Start or repair the declared pagestore materializer, "
 									 "or disable pagestore.materializer_max_lag_mb.")));
+				else if (materializer_rejected && XLogRecPtrIsValid(latest) &&
+						 (uint64) latest > materializer_limit)
+					ereport(WARNING,
+							(errmsg("pagestore archive paused: materializer is %llu bytes behind",
+									(unsigned long long) (current - (uint64) materialized)),
+							 errdetail("A rejected checkpoint has used its %d-segment recovery allowance. "
+									   "The latest completed writer checkpoint starts %llu bytes beyond the archive boundary; "
+									   "it is not necessarily a safe restartpoint.",
+									   pagestore_materializer_recovery_extra_segments,
+									   (unsigned long long) ((uint64) latest - materializer_limit)),
+							 errhint("Restore materializer progress or increase pagestore.materializer_recovery_extra_segments.")));
+				else if (materializer_rejected)
+					ereport(WARNING,
+							(errmsg("pagestore archive paused: materializer is %llu bytes behind",
+									(unsigned long long) (current - (uint64) materialized)),
+							 errdetail("A rejected checkpoint has used its %d-segment recovery allowance; "
+									   "no completed writer checkpoint beyond the boundary could be confirmed.",
+									   pagestore_materializer_recovery_extra_segments),
+							 errhint("Restore materializer progress or increase pagestore.materializer_recovery_extra_segments.")));
 				else
 					ereport(WARNING,
 							(errmsg("pagestore archive paused: materializer is %llu bytes behind",
 									(unsigned long long) (current - (uint64) materialized)),
 							 errhint("Increase pagestore.materializer_max_lag_mb or restore materializer progress.")));
-				return false;
+#ifdef HAVE_EXPEDITE_RUNNING_CHECKPOINT
+				pagestore_expedite_checkpoint_for_archive(tli, current, materialized);
+#endif
+				return pagestore_archive_defer(true);
 			}
 		}
 
@@ -2536,7 +3511,7 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 							(errmsg("pagestore archive paused: WAL index is %llu bytes behind",
 									(unsigned long long) (seg_start + off - indexed_end)),
 							 errhint("Increase pagestore.wal_index_max_lag_mb or restore WAL indexing progress.")));
-					return false;
+					return pagestore_archive_defer(false);
 				}
 			}
 		}
@@ -3993,43 +4968,60 @@ static XLogRecPtr
 ps_checkpoint_record_end(XLogRecPtr checkpoint_lsn,
 						 const CheckPoint *expected, uint8 *info_out)
 {
-	ReadLocalXLogPageNoWaitPrivate *pd = palloc0(sizeof(*pd));
-	XLogReaderState *reader;
+	MemoryContext callercontext = CurrentMemoryContext;
+	ReadLocalXLogPageNoWaitPrivate *pd = NULL;
+	XLogReaderState *reader = NULL;
 	char	   *errm = NULL;
 	XLogRecPtr	end = InvalidXLogRecPtr;
 	bool		matches = false;
 
-	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
-										   .segment_open = &wal_segment_open,
-										   .segment_close = &wal_segment_close),
-								pd);
-	if (reader == NULL)
-		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
-
-	XLogBeginRead(reader, checkpoint_lsn);
-	if (XLogReadRecord(reader, &errm) != NULL &&
-		reader->ReadRecPtr == checkpoint_lsn &&
-		XLogRecGetRmid(reader) == RM_XLOG_ID &&
-		((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_ONLINE ||
-		 (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_SHUTDOWN) &&
-		XLogRecGetDataLen(reader) == sizeof(CheckPoint) &&
-		ps_checkpoint_matches_control(
-			(const CheckPoint *) XLogRecGetData(reader), expected))
+	PG_TRY();
 	{
-		end = reader->EndRecPtr;
-		if (info_out != NULL)
-			*info_out = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
-		matches = true;
-	}
+		pd = palloc0(sizeof(*pd));
+		reader = XLogReaderAllocate(wal_segment_size, NULL,
+									XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
+											   .segment_open = &wal_segment_open,
+											   .segment_close = &wal_segment_close),
+									pd);
+		if (reader == NULL)
+			ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
 
-	XLogReaderFree(reader);
-	pfree(pd);
-	if (!matches)
-		ereport(ERROR,
-				(errmsg("mirrored control image has no matching readable checkpoint record"),
-				 errdetail("Expected checkpoint record at %X/%08X.",
+		XLogBeginRead(reader, checkpoint_lsn);
+		if (XLogReadRecord(reader, &errm) != NULL &&
+			reader->ReadRecPtr == checkpoint_lsn &&
+			XLogRecGetRmid(reader) == RM_XLOG_ID &&
+			((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_ONLINE ||
+			 (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_SHUTDOWN) &&
+			XLogRecGetDataLen(reader) == sizeof(CheckPoint) &&
+			ps_checkpoint_matches_control(
+				(const CheckPoint *) XLogRecGetData(reader), expected))
+		{
+			end = reader->EndRecPtr;
+			if (info_out != NULL)
+				*info_out = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+			matches = true;
+		}
+
+		XLogReaderFree(reader);
+		reader = NULL;
+		pfree(pd);
+		pd = NULL;
+		if (!matches)
+			ereport(ERROR,
+					(errmsg("mirrored control image has no matching readable checkpoint record"),
+					 errdetail("Expected checkpoint record at %X/%08X.",
 							   LSN_FORMAT_ARGS(checkpoint_lsn))));
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(callercontext);
+		if (reader)
+			XLogReaderFree(reader);
+		if (pd)
+			pfree(pd);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	return end;
 }
 
@@ -14898,6 +15890,23 @@ _PG_init(void)
 							PGC_SIGHUP,
 							0,
 							NULL, NULL, NULL);
+	DefineCustomIntVariable("pagestore.materializer_recovery_extra_segments",
+							"Bound extra archived WAL after recovery rejects a checkpoint.",
+							"The fixed allowance applies once per durable materializer watermark; "
+							"zero disables the allowance. It may be changed by configuration reload.",
+							&pagestore_materializer_recovery_extra_segments,
+							2, 0, INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("pagestore.materializer_progress_extra_segments",
+							"Bound additional WAL enabled by checked recovery progress.",
+							"The writer freezes this cap once per durable marker and does not add it again to the existing rejected-checkpoint allowance. Zero disables progress-based extension.",
+							&pagestore_materializer_progress_extra_segments,
+													 8, 0, INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
 	DefineCustomIntVariable("pagestore.wal_index_max_lag_mb",
 							"Pause WAL archiving when durable WAL indexing falls too far behind.",
 							"Zero disables the limit. Headroom for one maximum-size WAL record "
@@ -15014,6 +16023,19 @@ _PG_init(void)
 		prev_restartpoint_flush_hook = recovery_restartpoint_flush_hook;
 		recovery_restartpoint_flush_hook =
 			pagestore_materializer_restartpoint_flush;
+		prev_restartpoint_rejected_hook = recovery_restartpoint_rejected_hook;
+		recovery_restartpoint_rejected_hook =
+			pagestore_materializer_restartpoint_rejected;
+#ifdef HAVE_RECOVERY_RESTARTPOINT_REPLAYED_HOOK
+		prev_restartpoint_replayed_hook = recovery_restartpoint_replayed_hook;
+		recovery_restartpoint_replayed_hook = pagestore_materializer_restartpoint_replayed;
+#endif
+		prev_recovery_consistency_hook = recovery_consistency_hook;
+		recovery_consistency_hook = pagestore_materializer_recovery_consistent;
+#ifdef HAVE_RECOVERY_ARCHIVE_READY_HOOK
+		prev_recovery_archive_ready_hook = recovery_archive_ready_hook;
+		recovery_archive_ready_hook = pagestore_materializer_archive_ready;
+#endif
 	}
 	if (pagestore_backend_name != NULL &&
 		strcmp(pagestore_backend_name, "localsvc") == 0 &&
@@ -15071,6 +16093,28 @@ _PG_init(void)
 				 "pagestore_wal_index_worker_main");
 		snprintf(worker.bgw_name, BGW_MAXLEN, "pagestore WAL index worker");
 		snprintf(worker.bgw_type, BGW_MAXLEN, "pagestore WAL index worker");
+		RegisterBackgroundWorker(&worker);
+	}
+	/* Keep candidate sealing independent from the archiver retry path and the
+	 * optional WAL-index worker. It is cheap when progress is disabled and can
+	 * discover a persisted PREPARE after either process restarts. */
+	if (!pagestore_materializer && pagestore_backend_name != NULL &&
+		strcmp(pagestore_backend_name, "localsvc") == 0 &&
+		pagestore_localsvc_read_lsn() == 0)
+	{
+		BackgroundWorker worker;
+
+		memset(&worker, 0, sizeof(worker));
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		worker.bgw_restart_time = 10;
+		snprintf(worker.bgw_library_name, BGW_MAXLEN, "pagestore");
+		snprintf(worker.bgw_function_name, BGW_MAXLEN,
+				 "pagestore_archive_progress_worker_main");
+		snprintf(worker.bgw_name, BGW_MAXLEN,
+				 "pagestore archive progress worker");
+		snprintf(worker.bgw_type, BGW_MAXLEN,
+				 "pagestore archive progress worker");
 		RegisterBackgroundWorker(&worker);
 	}
 }

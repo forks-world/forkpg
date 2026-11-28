@@ -63,6 +63,7 @@
  */
 #define PGARCH_AUTOWAKE_INTERVAL 60 /* How often to force a poll of the
 									 * archive status directory; in seconds. */
+#define PGARCH_DEFERRED_RETRY_INTERVAL_MS 1000L
 #define PGARCH_RESTART_INTERVAL 10	/* How often to attempt to restart a
 									 * failed archiver; in seconds. */
 
@@ -82,6 +83,13 @@
  * Maximum number of .ready files to gather per directory scan.
  */
 #define NUM_FILES_PER_DIRECTORY_SCAN 64
+
+typedef enum ArchiveResult
+{
+	ARCHIVE_OK,
+	ARCHIVE_FAILED,
+	ARCHIVE_DEFERRED
+} ArchiveResult;
 
 /* Shared memory area for archiver process */
 typedef struct PgArchData
@@ -107,6 +115,7 @@ static PgArchData *PgArch = NULL;
 static const ArchiveModuleCallbacks *ArchiveCallbacks;
 static ArchiveModuleState *archive_module_state;
 static MemoryContext archive_context;
+static uint32 archive_defer_wait_event;
 
 
 /*
@@ -145,8 +154,8 @@ static volatile sig_atomic_t ready_to_stop = false;
  */
 static void pgarch_waken_stop(SIGNAL_ARGS);
 static void pgarch_MainLoop(void);
-static void pgarch_ArchiverCopyLoop(void);
-static bool pgarch_archiveXlog(char *xlog);
+static bool pgarch_ArchiverCopyLoop(void);
+static ArchiveResult pgarch_archiveXlog(char *xlog);
 static bool pgarch_readyXlog(char *xlog);
 static void pgarch_archiveDone(char *xlog);
 static void pgarch_die(int code, Datum arg);
@@ -294,6 +303,16 @@ PgArchWakeup(void)
 		SetLatch(&GetPGProcByNumber(arch_pgprocno)->procLatch);
 }
 
+/*
+ * Let the current archive callback defer the file without reporting failure.
+ */
+bool
+ArchiveModuleDefer(uint32 wait_event_info)
+{
+	archive_defer_wait_event = wait_event_info != 0 ?
+		wait_event_info : WAIT_EVENT_ARCHIVER_MAIN;
+	return false;
+}
 
 /* SIGUSR2 signal handler for archiver process */
 static void
@@ -321,6 +340,8 @@ pgarch_MainLoop(void)
 	 */
 	do
 	{
+		bool		deferred;
+
 		ResetLatch(MyLatch);
 
 		/* When we get SIGUSR2, we do one more archive cycle, then exit */
@@ -349,20 +370,22 @@ pgarch_MainLoop(void)
 		}
 
 		/* Do what we're here for */
-		pgarch_ArchiverCopyLoop();
+		deferred = pgarch_ArchiverCopyLoop();
 
 		/*
 		 * Sleep until a signal is received, or until a poll is forced by
-		 * PGARCH_AUTOWAKE_INTERVAL, or until postmaster dies.
+		 * the retry interval, or until postmaster dies.
 		 */
 		if (!time_to_stop)		/* Don't wait during last iteration */
 		{
+			long		wait_ms = deferred ? PGARCH_DEFERRED_RETRY_INTERVAL_MS :
+				PGARCH_AUTOWAKE_INTERVAL * 1000L;
 			int			rc;
 
 			rc = WaitLatch(MyLatch,
 						   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-						   PGARCH_AUTOWAKE_INTERVAL * 1000L,
-						   WAIT_EVENT_ARCHIVER_MAIN);
+						   wait_ms,
+						   deferred ? archive_defer_wait_event : WAIT_EVENT_ARCHIVER_MAIN);
 			if (rc & WL_POSTMASTER_DEATH)
 				time_to_stop = true;
 		}
@@ -378,9 +401,10 @@ pgarch_MainLoop(void)
 /*
  * pgarch_ArchiverCopyLoop
  *
- * Archives all outstanding xlogs then returns
+ * Archives outstanding WAL, returning true when the module requests an early
+ * retry of the oldest pending file.
  */
-static void
+static bool
 pgarch_ArchiverCopyLoop(void)
 {
 	char		xlog[MAX_XFN_CHARS + 1];
@@ -403,6 +427,7 @@ pgarch_ArchiverCopyLoop(void)
 		{
 			struct stat stat_buf;
 			char		pathname[MAXPGPATH];
+			ArchiveResult result;
 
 			/*
 			 * Do not initiate any more archive commands after receiving
@@ -412,7 +437,7 @@ pgarch_ArchiverCopyLoop(void)
 			 * archiver spawned by a newer postmaster.
 			 */
 			if (ShutdownRequestPending || !PostmasterIsAlive())
-				return;
+				return false;
 
 			/*
 			 * Check for barrier events and config update.  This is so that
@@ -432,7 +457,7 @@ pgarch_ArchiverCopyLoop(void)
 						(errmsg("\"archive_mode\" enabled, yet archiving is not configured"),
 						 arch_module_check_errdetail_string ?
 						 errdetail_internal("%s", arch_module_check_errdetail_string) : 0));
-				return;
+				return false;
 			}
 
 			/*
@@ -467,7 +492,7 @@ pgarch_ArchiverCopyLoop(void)
 									xlogready)));
 
 					/* give up cleanup of orphan status files */
-					return;
+					return false;
 				}
 
 				/* wait a bit before retrying */
@@ -475,7 +500,8 @@ pgarch_ArchiverCopyLoop(void)
 				continue;
 			}
 
-			if (pgarch_archiveXlog(xlog))
+			result = pgarch_archiveXlog(xlog);
+			if (result == ARCHIVE_OK)
 			{
 				/* successful */
 				pgarch_archiveDone(xlog);
@@ -488,6 +514,8 @@ pgarch_ArchiverCopyLoop(void)
 
 				break;			/* out of inner retry loop */
 			}
+			else if (result == ARCHIVE_DEFERRED)
+				return true;
 			else
 			{
 				/*
@@ -501,12 +529,13 @@ pgarch_ArchiverCopyLoop(void)
 					ereport(WARNING,
 							(errmsg("archiving write-ahead log file \"%s\" failed too many times, will try again later",
 									xlog)));
-					return;		/* give up archiving for now */
+					return false;	/* give up archiving for now */
 				}
 				pg_usleep(1000000L);	/* wait a bit before retrying */
 			}
 		}
 	}
+	return false;
 }
 
 /*
@@ -514,16 +543,16 @@ pgarch_ArchiverCopyLoop(void)
  *
  * Invokes archive_file_cb to copy one archive file to wherever it should go
  *
- * Returns true if successful
+ * Reports success, failure, or a retryable deferral.
  */
-static bool
+static ArchiveResult
 pgarch_archiveXlog(char *xlog)
 {
 	sigjmp_buf	local_sigjmp_buf;
 	MemoryContext oldcontext;
 	char		pathname[MAXPGPATH];
 	char		activitymsg[MAXFNAMELEN + 16];
-	bool		ret;
+	ArchiveResult result;
 
 	snprintf(pathname, MAXPGPATH, XLOGDIR "/%s", xlog);
 
@@ -594,7 +623,7 @@ pgarch_archiveXlog(char *xlog)
 		RESUME_INTERRUPTS();
 
 		/* Report failure so that the archiver retries this file */
-		ret = false;
+		result = ARCHIVE_FAILED;
 	}
 	else
 	{
@@ -602,8 +631,14 @@ pgarch_archiveXlog(char *xlog)
 		PG_exception_stack = &local_sigjmp_buf;
 
 		/* Archive the file! */
-		ret = ArchiveCallbacks->archive_file_cb(archive_module_state,
-												xlog, pathname);
+		archive_defer_wait_event = 0;
+		if (ArchiveCallbacks->archive_file_cb(archive_module_state,
+											 xlog, pathname))
+			result = ARCHIVE_OK;
+		else if (archive_defer_wait_event != 0)
+			result = ARCHIVE_DEFERRED;
+		else
+			result = ARCHIVE_FAILED;
 
 		/* Remove our exception handler */
 		PG_exception_stack = NULL;
@@ -613,13 +648,15 @@ pgarch_archiveXlog(char *xlog)
 		MemoryContextReset(archive_context);
 	}
 
-	if (ret)
+	if (result == ARCHIVE_OK)
 		snprintf(activitymsg, sizeof(activitymsg), "last was %s", xlog);
+	else if (result == ARCHIVE_DEFERRED)
+		snprintf(activitymsg, sizeof(activitymsg), "deferred on %s", xlog);
 	else
 		snprintf(activitymsg, sizeof(activitymsg), "failed on %s", xlog);
 	set_ps_display(activitymsg);
 
-	return ret;
+	return result;
 }
 
 /*

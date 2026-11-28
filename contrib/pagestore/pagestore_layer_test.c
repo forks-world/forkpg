@@ -149,6 +149,12 @@ legacy_index_visitor_test(void)
 			  ps_image_index_cursor_next(pull, &entry) == -1,
 			  "unsorted legacy input fails closed and stays failed");
 		ps_image_index_cursor_close(pull);
+		pull = NULL;
+		check(ps_image_index_cursor_open_staged(&layer, &pull) == 0 &&
+			  ps_image_index_cursor_next(pull, &entry) == 1 &&
+			  ps_image_index_cursor_next(pull, &entry) == -1,
+			  "staged cursor rejects unsorted legacy input");
+		ps_image_index_cursor_close(pull);
 		layer.kind = PS_LAYER_IMAGE;
 		layer.layer_id = 1;
 		check(ps_image_index_merge_open(&layer, 1, &merge) == 0 &&
@@ -169,6 +175,8 @@ static uint64_t prepare_fail_write_id;
 static uint64_t prepare_fail_delete_id;
 static int prepare_corrupt_source;
 static uint32_t visitor_read_max;
+static uint64_t visitor_read_bytes;
+static uint32_t visitor_read_calls;
 static int visitor_corrupt;
 static int visitor_first_chunk_reads;
 
@@ -176,6 +184,8 @@ static int
 visitor_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_t len)
 {
 	int rc = PsLayerStoreLocal.read_layer_block(layer, off, buf, len);
+	visitor_read_bytes += len;
+	visitor_read_calls++;
 	if (len > visitor_read_max)
 		visitor_read_max = len;
 	if (off == (uint64_t) 4096 * PSZ)
@@ -651,6 +661,44 @@ streaming_layer_test(void)
 		check(cursor_rc == 0 && count == 4096 && visitor_read_max <= 64 * 1024,
 			  "cursor yields ordered records with bounded reads and final validation");
 		ps_image_index_cursor_close(cursor);
+		cursor = NULL;
+		visitor_read_calls = 0;
+		visitor_read_bytes = 0;
+		check(ps_image_index_cursor_open_staged(&layer, &cursor) == 0 &&
+			  visitor_read_calls == 1 && visitor_read_bytes == sizeof(PsImgFooter),
+			  "staged cursor open reads only its footer");
+		check(ps_image_index_cursor_next(cursor, &entry) == 1 &&
+			  visitor_read_calls == 2 && visitor_read_bytes <= sizeof(PsImgFooter) + 64 * 1024,
+			  "first staged cursor step reads at most one index chunk");
+		ps_image_index_cursor_close(cursor);
+		{
+			PsCompactionCoverage *scan = NULL;
+			unsigned char selected = 1, result = 42;
+
+			visitor_read_calls = 0;
+			visitor_read_bytes = 0;
+			check(ps_compaction_coverage_open(&layer, 1, &selected, &entry, 1, &scan) == 0 &&
+				  ps_compaction_coverage_step(scan, 1) == 1 && visitor_read_calls == 1 &&
+				  visitor_read_bytes == sizeof(PsImgFooter) &&
+				  ps_compaction_coverage_results(scan, &result, 1) == -1 && result == 42,
+				  "coverage open step reads only the footer and exposes no result");
+			check(ps_compaction_coverage_step(scan, 1) == 1 && visitor_read_calls == 2 &&
+				  visitor_read_bytes <= sizeof(PsImgFooter) + 64 * 1024,
+				  "coverage record step reads at most one index chunk");
+			ps_compaction_coverage_close(scan);
+		}
+		cursor = NULL;
+		visitor_corrupt = 1;
+		visitor_first_chunk_reads = 0;
+		cursor_rc = -1;
+		if (ps_image_index_cursor_open_staged(&layer, &cursor) == 0)
+			while ((cursor_rc = ps_image_index_cursor_next(cursor, &entry)) == 1)
+				;
+		check(cursor != NULL && cursor_rc == -1 &&
+			  ps_image_index_cursor_next(cursor, &entry) == -1,
+			  "staged cursor detects corruption at completion and stays failed");
+		ps_image_index_cursor_close(cursor);
+		visitor_corrupt = 0;
 		visitor_corrupt = 1;
 		visitor_first_chunk_reads = 0;
 		count = 0;
@@ -903,6 +951,346 @@ stage_pruned_bad_read(const PsLayerDesc *layer, uint64_t off, void *buf, uint32_
 }
 
 static void
+control_identity_coverage_test(void)
+{
+	PsKey key = {0, 0, 0, 0, PS_KLASS_CONTROL};
+	unsigned char page[PSZ] = {0};
+	PsImgRec rec = {0};
+	PsLayerDesc layers[3], duplicate[3];
+	PsImgIndexEnt identity = {0};
+	unsigned char selected[3] = {1, 0, 0};
+	int ok;
+
+	rec.key = key;
+	rec.block = 1;
+	rec.lsn = 100;
+	rec.admission_seq = 7;
+	rec.page = page;
+	ok = ps_image_layer_write(32100, 0, &rec, 1, PSZ, &layers[0]) == 0 &&
+		ps_image_layer_write(32101, 0, &rec, 1, PSZ, &layers[1]) == 0;
+	rec.admission_seq = 8;
+	ok = ok && ps_image_layer_write(32102, 0, &rec, 1, PSZ, &layers[2]) == 0;
+	check(ok, "write overlapping control identity layers");
+	if (!ok)
+		return;
+	identity.key = key;
+	identity.block = 1;
+	identity.lsn = 100;
+	identity.admission_seq = 7;
+	check(ps_compaction_identity_covered(layers, 3, selected, &identity) == 0,
+		  "excluded duplicate prevents declaring the identity fully covered");
+	{
+		PsCompactionCoverage *scan = NULL;
+		PsImageGroupEntry chosen = {.entry = identity, .layer_id = layers[0].layer_id};
+		int rc;
+
+		check(ps_compaction_coverage_open(layers, 3, selected, &identity, 1, &scan) == 0,
+			  "prepare cross-layer winner proof");
+		do { rc = ps_compaction_coverage_step(scan, 2); } while (rc == 1);
+		check(rc == 0 && !ps_compaction_coverage_selected_winners_valid(scan, &chosen, 1),
+			  "a newer excluded duplicate forbids promotion of the older copy");
+		ps_compaction_coverage_close(scan);
+		scan = NULL;
+		selected[1] = 1;
+		chosen.layer_id = layers[1].layer_id;
+		check(ps_compaction_coverage_open(layers, 3, selected, &identity, 1, &scan) == 0,
+			  "prepare selected newest-copy proof");
+		do { rc = ps_compaction_coverage_step(scan, 2); } while (rc == 1);
+		check(rc == 0 && ps_compaction_coverage_selected_winners_valid(scan, &chosen, 1),
+			  "selecting the existing newest copy allows promotion");
+		chosen.layer_id = layers[0].layer_id;
+		check(!ps_compaction_coverage_selected_winners_valid(scan, &chosen, 1),
+			  "claiming the wrong selected source fails closed");
+		ps_compaction_coverage_close(scan);
+	}
+	selected[1] = 1;
+	check(ps_compaction_identity_covered(layers, 3, selected, &identity) == 1,
+		  "all duplicate copies selected while same-LSN retry remains excluded");
+	identity.admission_seq = 8;
+	check(ps_compaction_identity_covered(layers, 3, selected, &identity) == 0,
+		  "same-LSN identity with a different admission sequence remains excluded");
+	identity.admission_seq = 9;
+	check(ps_compaction_identity_covered(layers, 3, selected, &identity) == 0,
+		  "unknown identity cannot be declared covered");
+	identity.admission_seq = 7;
+	{
+		PsCompactionRelationPlan *plan = NULL;
+		RelationPlanProbe probe = {0};
+		uint32_t visited = 0;
+
+		check(ps_compaction_control_plan_open(layers, 2, 1, &identity, 1, &plan) == 0 &&
+			  ps_compaction_relation_plan_step(plan, 1, visit_relation_plan, &probe, &visited) == -2 &&
+			  visited == 0,
+			  "duplicate identity never splits across control-plan chunks");
+		ps_compaction_relation_plan_close(plan);
+	}
+	memcpy(duplicate, layers, sizeof(layers));
+	duplicate[2] = duplicate[1];
+	check(ps_compaction_identity_covered(duplicate, 3, selected, &identity) == -1,
+		  "duplicate layer descriptors invalidate the snapshot");
+	memcpy(duplicate, layers, sizeof(layers));
+	duplicate[2].timeline++;
+	check(ps_compaction_identity_covered(duplicate, 3, selected, &identity) == -1,
+		  "mixed timeline snapshot fails closed");
+	memcpy(duplicate, layers, sizeof(layers));
+	duplicate[2].kind = PS_LAYER_DELTA;
+	check(ps_compaction_identity_covered(duplicate, 3, selected, &identity) == -1,
+		  "unsupported layer kind fails closed");
+	selected[2] = 2;
+	check(ps_compaction_identity_covered(layers, 3, selected, &identity) == -1,
+		  "invalid input selection fails closed");
+	selected[2] = 0;
+	{
+		PsLayerMap map;
+		PsCompactionCoverage *scan = NULL;
+		PsCompactionPruneFence fence = {11, 12, 13, 14, 15}, changed;
+		PsLayerDesc extra = layers[2];
+		int rc;
+
+		ps_layer_map_init(&map);
+		for (uint32_t i = 0; i < 3; i++)
+		{
+			layers[i].cache_readers = 1;
+			ps_layer_map_add(&map, &layers[i]);
+		}
+		check(ps_compaction_coverage_open(layers, 3, selected, &identity, 1, &scan) == 0 &&
+			  ps_compaction_coverage_bind_snapshot(scan, &map, &fence) == 0 &&
+			  !ps_compaction_coverage_snapshot_valid(scan, &map, &fence),
+			  "bind a pinned snapshot but reject validation before scan completion");
+		layers[0].location_count = 0; /* caller storage is not the scan snapshot */
+		do { rc = ps_compaction_coverage_step(scan, 2); } while (rc == 1);
+		check(rc == 0 && ps_compaction_coverage_snapshot_valid(scan, &map, &fence),
+			  "completed scan validates its copied layer snapshot");
+		layers[0] = map.layers[0];
+		{
+			PsLayerDesc output = layers[2];
+
+			output.layer_id = 32103;
+			check(ps_compaction_coverage_inputs_match(scan, layers, 2) &&
+				  ps_compaction_coverage_publication_valid(scan, &map, &fence, &output, 1, 0),
+				  "bound sources and an absent reserved output validate");
+			ps_layer_map_add(&map, &output);
+			check(ps_compaction_coverage_publication_valid(scan, &map, &fence, &output, 1, 1) &&
+				  !ps_compaction_coverage_publication_valid(scan, &map, &fence, &output, 1, 0),
+				  "published output prefix is checked against the complete layer snapshot");
+			map.nlayers--;
+		}
+		changed = fence;
+		changed.admission_epoch++;
+		check(!ps_compaction_coverage_snapshot_valid(scan, &map, &changed),
+			  "concurrent admission invalidates coverage");
+		changed = fence;
+		changed.retention_epoch++;
+		check(!ps_compaction_coverage_snapshot_valid(scan, &map, &changed),
+			  "changed history pin invalidates coverage");
+		changed = fence;
+		changed.timeline_epoch++;
+		check(!ps_compaction_coverage_snapshot_valid(scan, &map, &changed),
+			  "changed branch state invalidates coverage");
+		changed = fence;
+		changed.timeline_incarnation++;
+		check(!ps_compaction_coverage_snapshot_valid(scan, &map, &changed),
+			  "recreated timeline invalidates coverage");
+		changed = fence;
+		changed.page_floor++;
+		check(!ps_compaction_coverage_snapshot_valid(scan, &map, &changed),
+			  "changed page floor invalidates coverage");
+		map.layers[1].locations[0].generation++;
+		check(!ps_compaction_coverage_snapshot_valid(scan, &map, &fence),
+			  "replaced layer location invalidates coverage");
+		map.layers[1].locations[0].generation--;
+		map.layers[1].cache_readers = 0;
+		check(!ps_compaction_coverage_snapshot_valid(scan, &map, &fence),
+			  "lost layer pin invalidates coverage");
+		map.layers[1].cache_readers = 1;
+		map.layers[1].deleting = true;
+		check(!ps_compaction_coverage_snapshot_valid(scan, &map, &fence),
+			  "retiring a source invalidates coverage");
+		map.layers[1].deleting = false;
+		map.layers[1].legacy_shard_zero = true;
+		check(!ps_compaction_coverage_snapshot_valid(scan, &map, &fence),
+			  "legacy cross-shard layer invalidates coverage");
+		map.layers[1].legacy_shard_zero = false;
+		extra.layer_id = 32103;
+		ps_layer_map_add(&map, &extra);
+		check(!ps_compaction_coverage_snapshot_valid(scan, &map, &fence),
+			  "new overlapping layer invalidates coverage");
+		map.nlayers--;
+		map.nlayers--;
+		check(!ps_compaction_coverage_snapshot_valid(scan, &map, &fence),
+			  "missing layer invalidates coverage");
+		ps_compaction_coverage_close(scan);
+		ps_layer_map_free(&map);
+	}
+	{
+		PsImgIndexEnt candidates[3] = {identity, identity, identity};
+		PsCompactionCoverage *scan = NULL;
+		unsigned char result[3] = {42, 42, 42};
+		int rc, steps = 0;
+
+		candidates[0].admission_seq = 9;
+		candidates[1].admission_seq = 7;
+		candidates[2].admission_seq = 8;
+		check(ps_compaction_coverage_open(layers, 3, selected, candidates, 3, &scan) == 0,
+			  "open batched coverage scan with unordered candidates");
+		check(ps_compaction_coverage_results(scan, result, 3) == -1 && result[0] == 42,
+			  "partial coverage results are unavailable");
+		do {
+			rc = ps_compaction_coverage_step(scan, 1);
+			steps++;
+		} while (rc == 1 && steps < 30);
+		check(rc == 0 && steps == 9 &&
+			  ps_compaction_coverage_results(scan, result, 3) == 0 &&
+			  result[0] == 0 && result[1] == 1 && result[2] == 0,
+			  "resumable batch produces ordered results in one scan");
+		ps_compaction_coverage_close(scan);
+		scan = NULL;
+		candidates[0] = candidates[1];
+		check(ps_compaction_coverage_open(layers, 3, selected, candidates, 3, &scan) == -1 &&
+			  scan == NULL, "duplicate candidates are rejected");
+		check(ps_compaction_coverage_open(layers, 3, selected, &identity, 1, &scan) == 0 &&
+			  ps_compaction_coverage_step(scan, 0) == -1 &&
+			  ps_compaction_coverage_step(scan, 1) == -1,
+			  "invalid step budget permanently fails the scan");
+		ps_compaction_coverage_close(scan);
+	}
+	{
+		PsImgIndexEnt candidates[3] = {identity, identity, identity};
+		PsCompactionCoverage *scan = NULL;
+		unsigned char result[3] = {42, 42, 42};
+		int rc;
+
+		check(ps_compaction_coverage_open(layers, 3, selected, candidates, 1, &scan) == 0 &&
+			  ps_compaction_coverage_require_control_groups(scan) == 0,
+			  "enable strict control group coverage");
+		do { rc = ps_compaction_coverage_step(scan, 2); } while (rc == 1);
+		check(rc == -1 && ps_compaction_coverage_results(scan, result, 1) == -1 &&
+			  result[0] == 42 && ps_compaction_coverage_step(scan, 1) == -1,
+			  "unknown version in an excluded layer invalidates all results");
+		ps_compaction_coverage_close(scan);
+		scan = NULL;
+		selected[2] = 1;
+		check(ps_compaction_coverage_open(layers, 3, selected, candidates, 1, &scan) == 0 &&
+			  ps_compaction_coverage_require_control_groups(scan) == 0,
+			  "prepare unknown version in a selected layer");
+		do { rc = ps_compaction_coverage_step(scan, 2); } while (rc == 1);
+		check(rc == -1, "unknown version in a selected layer invalidates the scan");
+		ps_compaction_coverage_close(scan);
+		scan = NULL;
+		candidates[1].admission_seq = 8;
+		candidates[2].lsn = 101;
+		check(ps_compaction_coverage_open(layers, 3, selected, candidates, 3, &scan) == 0 &&
+			  ps_compaction_coverage_require_control_groups(scan) == 0,
+			  "prepare strict scan with all same-LSN versions and an absent LSN");
+		do { rc = ps_compaction_coverage_step(scan, 2); } while (rc == 1);
+		check(rc == 0 && ps_compaction_coverage_results(scan, result, 3) == 0 &&
+			  result[0] == 1 && result[1] == 1 && result[2] == 0,
+			  "known versions pass while an absent identity remains uncovered");
+		ps_compaction_coverage_close(scan);
+		{
+			PsLayerDesc extended[4];
+			unsigned char all_selected[4] = {1, 1, 1, 1};
+
+			memcpy(extended, layers, sizeof(layers));
+			rec.block = 2;
+			rec.admission_seq = 17;
+			check(ps_image_layer_write(32104, 0, &rec, 1, PSZ, &extended[3]) == 0,
+				  "write a control fence in a separate layer");
+			scan = NULL;
+			check(ps_compaction_coverage_open(extended, 4, all_selected, candidates, 2, &scan) == 0 &&
+				  ps_compaction_coverage_require_control_groups(scan) == 0,
+				  "prepare strict scan missing the fence identity");
+			do { rc = ps_compaction_coverage_step(scan, 2); } while (rc == 1);
+			check(rc == -1, "unknown control block at a candidate LSN rejects the scan");
+			ps_compaction_coverage_close(scan);
+			scan = NULL;
+			candidates[2] = identity;
+			candidates[2].block = 2;
+			candidates[2].admission_seq = 17;
+			check(ps_compaction_coverage_open(extended, 4, all_selected, candidates, 3, &scan) == 0 &&
+				  ps_compaction_coverage_require_control_groups(scan) == 0,
+				  "prepare strict scan with the fence identity");
+			do { rc = ps_compaction_coverage_step(scan, 2); } while (rc == 1);
+			check(rc == 0 && ps_compaction_coverage_results(scan, result, 3) == 0 &&
+				  result[0] && result[1] && result[2],
+				  "complete cross-block identity set passes strict coverage");
+			ps_compaction_coverage_close(scan);
+			rec.block = 3;
+			check(ps_image_layer_write(32105, 0, &rec, 1, PSZ, &extended[3]) == 0,
+				  "write unrelated control marker layer");
+			{
+				int fd = open(extended[3].locations[0].uri, O_RDWR);
+				unsigned char saved = 0, bad;
+				int changed = fd >= 0 && pread(fd, &saved, 1, PSZ) == 1;
+
+				bad = saved ^ 1;
+				changed = changed && pwrite(fd, &bad, 1, PSZ) == 1;
+				scan = NULL;
+				check(changed && ps_compaction_coverage_open(extended, 4, all_selected,
+						candidates, 2, &scan) == 0 &&
+					  ps_compaction_coverage_require_control_groups(scan) == 0,
+					  "prepare strict scan with a corrupt disjoint marker");
+				do { rc = ps_compaction_coverage_step(scan, 2); } while (rc == 1);
+				check(rc == 0 && ps_compaction_coverage_results(scan, result, 2) == 0 &&
+					  result[0] && result[1],
+					  "strict scan skips index of a range-disjoint marker");
+				ps_compaction_coverage_close(scan);
+				if (changed)
+					check(pwrite(fd, &saved, 1, PSZ) == 1, "restore marker test layer");
+				if (fd >= 0)
+					close(fd);
+			}
+		}
+		selected[2] = 0;
+	}
+	{
+		PsImgIndexEnt candidates[2] = {identity, identity};
+		unsigned char none[3] = {0, 0, 0}, sources[3] = {42, 42, 42};
+		PsCompactionCoverage *scan = NULL;
+		int rc;
+
+		candidates[1].admission_seq = 8;
+		check(ps_compaction_coverage_open(layers, 3, none, candidates, 2, &scan) == 0 &&
+			  ps_compaction_coverage_require_control_groups(scan) == 0,
+			  "open source discovery for a complete control group");
+		do { rc = ps_compaction_coverage_step(scan, 2); } while (rc == 1);
+		check(rc == 0 && ps_compaction_coverage_select_found_sources(scan, 2, 2,
+				sources, 3) == 0 && sources[0] == 42,
+			  "over-limit source discovery leaves the selection unchanged");
+		check(ps_compaction_coverage_select_found_sources(scan, 2, 3, sources, 3) == 3 &&
+			  sources[0] && sources[1] && sources[2] &&
+			  ps_compaction_coverage_inputs_match(scan, layers, 3),
+			  "source discovery selects every physical copy");
+		ps_compaction_coverage_close(scan);
+	}
+	{
+		int fd = open(layers[2].locations[0].uri, O_RDWR);
+		unsigned char saved = 0, bad;
+		unsigned char result = 42;
+		PsCompactionCoverage *scan = NULL;
+		int rc = ps_compaction_coverage_open(layers, 3, selected, &identity, 1, &scan);
+		int changed = fd >= 0 && pread(fd, &saved, 1, PSZ) == 1;
+
+		check(rc == 0 && ps_compaction_coverage_step(scan, 6) == 1,
+			  "pause after scanning the first two layer indexes");
+		bad = saved ^ 1;
+		changed = changed && pwrite(fd, &bad, 1, PSZ) == 1;
+		check(changed && ps_compaction_coverage_step(scan, 10) == -1 &&
+			  ps_compaction_coverage_results(scan, &result, 1) == -1 && result == 42 &&
+			  ps_compaction_coverage_step(scan, 1) == -1,
+			  "late corruption invalidates all staged batch results permanently");
+		ps_compaction_coverage_close(scan);
+		check(changed && ps_compaction_identity_covered(layers, 3, selected,
+				&identity) == -1,
+			  "corrupt excluded layer invalidates the full coverage scan");
+		if (changed)
+			check(pwrite(fd, &saved, 1, PSZ) == 1, "restore test layer index");
+		if (fd >= 0)
+			close(fd);
+	}
+}
+
+static void
 stage_pruned_batch_test(void)
 {
 	PsKey key = {1, 1, 31415, 0, PS_KLASS_RELATION};
@@ -959,6 +1347,25 @@ stage_pruned_batch_test(void)
 	check(ps_image_compaction_verify_selected_batch(layers, 2, selected, 2,
 			&output, PSZ) == 0,
 		  "independent verification matches selected sources and output bytes");
+	{
+		PsImageVerifiedSources *verified = NULL;
+		PsLayerStore injected = PsLayerStoreLocal;
+		const PsLayerStore *saved = ps_layer_store;
+
+		check(ps_image_compaction_sources_open(layers, 2, PSZ, &verified) == 0 &&
+			  ps_image_compaction_verify_verified_batch(verified, selected, 2, &output) == 0,
+			  "verified source snapshot supports output verification");
+		injected.read_layer_block = stage_pruned_bad_read;
+		ps_layer_store = &injected;
+		check(ps_image_compaction_sources_revalidate(verified) == -1,
+			  "source corruption invalidates the shared verification snapshot");
+		ps_layer_store = saved;
+		uncertain = 123;
+		check(ps_image_compaction_stage_verified_batch(verified, selected, 2, 32161,
+				&ignored, &uncertain) == -1 && uncertain == 0,
+			  "invalidated source snapshot cannot stage further outputs");
+		ps_image_compaction_sources_close(verified);
+	}
 	bad[0] = selected[0];
 	bad[1] = selected[1];
 	bad[0].entry.growth_lsn++;
@@ -1046,6 +1453,140 @@ stage_pruned_batch_test(void)
 done:
 	free(index0);
 	free(index1);
+}
+
+typedef struct ControlLongProbe
+{
+	uint32_t kept, dropped, groups;
+} ControlLongProbe;
+
+static int
+visit_control_long(const PsImageGroupEntry *entries, uint32_t count,
+	const unsigned char *keep, const unsigned char *closure, void *arg)
+{
+	ControlLongProbe *probe = arg;
+
+	(void) closure;
+	probe->groups++;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		if ((keep[i] == 0) != (entries[i].entry.lsn == 500))
+			return -1;
+		if (keep[i])
+			probe->kept++;
+		else
+			probe->dropped++;
+	}
+	return 0;
+}
+
+static void
+control_long_chain_test(void)
+{
+	PsKey key = {0, 0, 0, 0, PS_KLASS_CONTROL};
+	unsigned char page[PSZ] = {0};
+	PsImgRec *records = calloc(1100, sizeof(*records));
+	PsImgIndexEnt drop = {0};
+	PsLayerDesc input;
+	PsCompactionRelationPlan *plan = NULL;
+	ControlLongProbe probe = {0};
+	uint32_t visited = 0;
+	int rc;
+
+	check(records != NULL, "allocate long control history");
+	if (!records)
+		return;
+	for (uint32_t i = 0; i < 1100; i++)
+	{
+		records[i].key = key;
+		records[i].block = 1;
+		records[i].lsn = i + 1;
+		records[i].admission_seq = i + 1;
+		records[i].page = page;
+	}
+	drop.key = key;
+	drop.block = 1;
+	drop.lsn = 500;
+	drop.admission_seq = 500;
+	check(ps_image_layer_write(32160, 0, records, 1100, PSZ, &input) == 0 &&
+		  ps_compaction_control_plan_open(&input, 1, 128, &drop, 1, &plan) == 0,
+		  "open bounded control plan for more than one page group limit");
+	do {
+		rc = plan ? ps_compaction_relation_plan_step(plan, 1, visit_control_long,
+														 &probe, &visited) : -1;
+	} while (rc == 1);
+	check(rc == 0 && probe.kept == 1099 && probe.dropped == 1 && probe.groups > 1,
+		  "long control history is processed in complete-identity chunks");
+	ps_compaction_relation_plan_close(plan);
+	free(records);
+}
+
+static void
+verify_control_output_plan_test(void)
+{
+	PsKey control = {0, 0, 0, 0, PS_KLASS_CONTROL};
+	PsKey relation = {1, 1, 32150, 0, PS_KLASS_RELATION};
+	unsigned char pages[7][PSZ];
+	PsImgRec records[7] = {0}, expected[4], missing[3], extra[5], bad[4];
+	PsImgIndexEnt drop[4] = {0};
+	PsLayerDesc input, output, missing_output, extra_output, bad_output;
+	GroupProbe staged = {0};
+	uint64_t kept = 0, dropped = 0;
+	int ok;
+
+	for (uint32_t i = 0; i < 6; i++)
+	{
+		memset(pages[i], (int) (i + 10), PSZ);
+		records[i].key = control;
+		records[i].block = i % 3;
+		records[i].lsn = i < 3 ? 100 : 200;
+		records[i].admission_seq = i + 1;
+		records[i].page = pages[i];
+		if (i < 3)
+		{
+			drop[i].key = control;
+			drop[i].block = i;
+			drop[i].lsn = 100;
+			drop[i].admission_seq = i + 1;
+		}
+	}
+	memset(pages[6], 42, PSZ);
+	records[6].key = relation;
+	records[6].lsn = 50;
+	records[6].admission_seq = 7;
+	records[6].page = pages[6];
+	memcpy(expected, records + 3, sizeof(expected));
+	memcpy(missing, expected, sizeof(missing));
+	memcpy(extra, expected, sizeof(expected));
+	extra[4] = records[0];
+	memcpy(bad, expected, sizeof(expected));
+	bad[0].page = pages[0];
+	ok = ps_image_layer_write(32150, 0, records, 7, PSZ, &input) == 0 &&
+		ps_image_layer_write(32151, 0, expected, 4, PSZ, &output) == 0 &&
+		ps_image_layer_write(32152, 0, missing, 3, PSZ, &missing_output) == 0 &&
+		ps_image_layer_write(32153, 0, extra, 5, PSZ, &extra_output) == 0 &&
+		ps_image_layer_write(32154, 0, bad, 4, PSZ, &bad_output) == 0;
+	check(ok, "create paired control output verification fixture");
+	if (!ok)
+		return;
+	check(ps_compaction_verify_control_plan(&input, 1, &output, 1, PSZ, 10,
+			drop, 3, visit_group, &staged, &kept, &dropped) == 0 &&
+		  kept == 4 && dropped == 3 && staged.entries == 3,
+		  "verify paired drops while retaining unrelated relation data");
+	check(ps_compaction_verify_control_plan(&input, 1, &missing_output, 1, PSZ, 10,
+			drop, 3, visit_group, &staged, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "missing unrelated data rejects the control output");
+	check(ps_compaction_verify_control_plan(&input, 1, &extra_output, 1, PSZ, 10,
+			drop, 3, visit_group, &staged, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "extra dropped control record rejects the output");
+	check(ps_compaction_verify_control_plan(&input, 1, &bad_output, 1, PSZ, 10,
+			drop, 3, visit_group, &staged, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "validly checksummed incorrect page bytes reject the output");
+	drop[3] = drop[0];
+	drop[3].lsn++;
+	check(ps_compaction_verify_control_plan(&input, 1, &output, 1, PSZ, 10,
+			drop, 4, visit_group, &staged, &kept, &dropped) == -1 && kept == 0 && dropped == 0,
+		  "missing named drop invalidates the staged plan");
 }
 
 static void
@@ -1789,6 +2330,9 @@ main(void)
 	resumable_relation_plan_test();
 	relation_group_selection_test();
 	stage_pruned_batch_test();
+	verify_control_output_plan_test();
+	control_long_chain_test();
+	control_identity_coverage_test();
 	verify_pruned_plan_test();
 	verify_pruned_plan_duplicate_test();
 	bounded_merge_test();

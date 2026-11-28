@@ -592,7 +592,7 @@ INSPECTION_RESPONSES = {
         "admission_fence_epoch", "admission_pending_epoch", "admission_pending_lsn",
     },
     "backpressure": {
-        "idle", "claimed", "request", "done", "shards",
+        "idle", "claimed", "owned", "abandoned", "request", "done", "shards",
         "wal_index_pending_bytes", "wal_index_lagging_timelines",
         "page_lag_bytes", "page_high_water_bytes", "page_catchup_bytes",
         "page_throttled", "page_throttle_enters", "page_throttle_exits",
@@ -643,7 +643,7 @@ INSPECTION_COUNTER_FIELDS = (
     set().union(*INSPECTION_RESPONSES.values())
     - INSPECTION_BOOLEAN_FIELDS - INSPECTION_SIGNED_FIELDS
 )
-INSPECTION_SCHEMA_VERSION = 4
+INSPECTION_SCHEMA_VERSION = 5
 INSPECTION_TRANSPORT = "private-test-ipc"
 PG_CONTROL_FILE_SIZE = 8192
 
@@ -5239,6 +5239,8 @@ def run_writer_smoke(
     install = pg_bin.parent
     env["LD_LIBRARY_PATH"] = f"{install / 'lib'}:{install / 'lib64'}"
     dproc = None
+    # Cleanup runs even when early daemon/runtime validation fails.
+    reader_data_dirs: dict[str, Path] = {}
     try:
         events.emit("run_start", scenario=plan.header["scenario"], seed=plan.header["seed"],
                     shm=shm, postgres_major=postgres_major)
@@ -5293,7 +5295,6 @@ def run_writer_smoke(
         prepared_readers: dict[str, Path] = {}
         reader_seeds: dict[str, Path] = {}
         reader_clients: dict[str, tuple[Path, int]] = {}
-        reader_data_dirs: dict[str, Path] = {}
         reader_lsns: dict[str, str] = {}
         reader_owner_ids: dict[str, int] = {}
         for action in plan.actions:

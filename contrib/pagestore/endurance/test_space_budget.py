@@ -76,6 +76,27 @@ class SpaceBudgetTests(unittest.TestCase):
                 endurance.directory_kb(self.store)
             self.assertEqual(scan.call_count, 3)
 
+    def test_repeated_reclaimed_page_segment_uses_verified_total(self):
+        for path in (self.store, self.root):
+            with self.subTest(path=path):
+                removed = self.store / "seg_00007266"
+                result = SimpleNamespace(
+                    returncode=1, stdout=f"42\t{path}\n",
+                    stderr=f"du: cannot access '{removed}': No such file or directory\n")
+                with patch.object(endurance.subprocess, "run", return_value=result) as scan:
+                    self.assertEqual(endurance.directory_kb(path), 42)
+                    self.assertEqual(scan.call_count, 3)
+
+    def test_reappearing_page_segment_rejects_total(self):
+        segment = self.store / "seg_00007266"
+        segment.touch()
+        result = SimpleNamespace(
+            returncode=1, stdout=f"42\t{self.store}\n",
+            stderr=f"du: cannot access '{segment}': No such file or directory\n")
+        with patch.object(endurance.subprocess, "run", return_value=result):
+            with self.assertRaises(ValueError):
+                endurance.directory_kb(self.store)
+
     def test_mixed_du_errors_are_not_retried(self):
         result = SimpleNamespace(returncode=1, stdout="", stderr=
                                  "du: cannot access 'gone': No such file or directory\n"

@@ -36,6 +36,12 @@
     "version": 1
   },
   {
+    "family": "control",
+    "artifact": "control object block 6 rejected restartpoint",
+    "magic": "0x5053524a",
+    "version": 1
+  },
+  {
     "family": "forkmeta",
     "artifact": "forkmeta record",
     "magic": "0x344d4b46",

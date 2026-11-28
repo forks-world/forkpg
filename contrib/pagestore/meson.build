@@ -29,6 +29,44 @@ pagestore = shared_module('pagestore',
 )
 contrib_targets += pagestore
 
+pagestore_archive_policy_test = executable('pagestore_archive_policy_test',
+  files('pagestore_archive_policy_test.c'),
+  install: false,
+)
+test('pagestore_archive_policy', pagestore_archive_policy_test,
+  suite: ['pagestore'], timeout: 30)
+
+pagestore_archive_progress_test = executable('pagestore_archive_progress_test',
+  files('pagestore_archive_progress_test.c'),
+  install: false,
+)
+test('pagestore_archive_progress', pagestore_archive_progress_test,
+  suite: ['pagestore'], timeout: 30)
+
+pagestore_archive_progress_txn_test = executable('pagestore_archive_progress_txn_test',
+  files('pagestore_archive_progress_txn.c', 'pagestore_archive_progress_txn_test.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_archive_progress_txn', pagestore_archive_progress_txn_test,
+  suite: ['pagestore'], timeout: 30)
+
+pagestore_archive_progress_format_test = executable('pagestore_archive_progress_format_test',
+  files('pagestore_archive_progress_format_test.c'),
+  install: false,
+)
+test('pagestore_archive_progress_format', pagestore_archive_progress_format_test,
+  suite: ['pagestore'], timeout: 30)
+
+storage_archive_progress_test = executable('storage_archive_progress_test',
+  files('storage_archive_progress_test.c', 'storage_posix.c', 'pagestore_store_owner.c',
+        'pagestore_archive_progress_txn.c', 'pagestore_archive_progress_store.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('storage_archive_progress', storage_archive_progress_test,
+  suite: ['pagestore'], timeout: 30)
+
 # Backend-only fault tests use private copies of the real mirror drains.
 pagestore_mirror_error_test = shared_module('pagestore_mirror_error_test',
   files('pagestore_control_error_test.c', 'pagestore_slru_error_test.c',
@@ -111,6 +149,8 @@ endif
 # includes only pagestore_ipc.h and libc, no PostgreSQL libraries.
 pagestore_daemon = executable('pagestore_daemon',
   files('pagestore_daemon.c', 'pagestore_core.c', 'storage_posix.c',
+		'pagestore_archive_progress_store.c', 'pagestore_archive_progress_txn.c',
+		'pagestore_archive_progress_authority.c',
         'pagestore_fault.c',
         'pagestore_layer.c', 'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
         'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c', 'pagestore_compaction_prune.c',
@@ -249,6 +289,14 @@ test('pagestore_standalone',
   suite: ['pagestore'],
   timeout: 120,
 )
+test('pagestore_archive_progress_daemon_snapshot',
+  pagestore_test,
+  args: [pagestore_daemon, pagestore_inspect],
+  env: ['PAGESTORE_TEST_ARCHIVE_PROGRESS_ONLY=1'],
+  depends: [pagestore_daemon, pagestore_inspect],
+  suite: ['pagestore'],
+  timeout: 30,
+)
 
 # Focused POSIX mailbox lifecycle coverage.  It drives only the inspector and
 # forked lock/lease holders; no pagestore daemon or SPDK frontend runs.
@@ -263,6 +311,14 @@ test('pagestore_inspect_mailbox',
   suite: ['pagestore'],
   timeout: 30,
 )
+
+pagestore_channel_owner_test = executable('pagestore_channel_owner_test',
+  files('pagestore_channel_owner_test.c'), install: false)
+test('pagestore_channel_owner', pagestore_channel_owner_test, suite: ['pagestore'])
+pagestore_channel_owner_integration_test = executable('pagestore_channel_owner_integration_test',
+  files('pagestore_channel_owner_integration_test.c'), install: false)
+test('pagestore_channel_owner_integration', pagestore_channel_owner_integration_test,
+  args: [pagestore_import], depends: [pagestore_import], suite: ['pagestore'], timeout: 15)
 
 # Unit test for the immutable image-layer file format (no daemon, no PG).
 pagestore_layer_test = executable('pagestore_layer_test',
@@ -410,6 +466,8 @@ test('pagestore_viewcap',
 pagestore_wal_reclaim_core_test = executable('pagestore_wal_reclaim_core_test',
   files('pagestore_wal_reclaim_core_test.c', 'pagestore_core.c',
         'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_archive_progress_authority.c',
+        'pagestore_archive_progress_store.c', 'pagestore_archive_progress_txn.c',
         'pagestore_store_owner.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
         'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c', 'pagestore_compaction_prune.c',
         'pagestore_retention.c', 'pagestore_wal_store.c',
@@ -424,6 +482,26 @@ test('pagestore_wal_reclaim_core',
   pagestore_wal_reclaim_core_test,
   suite: ['pagestore'],
   timeout: 60,
+)
+test('pagestore_control_group_reclaim', pagestore_wal_reclaim_core_test,
+  args: ['--many-control-layers'], suite: ['pagestore'], timeout: 45)
+test('pagestore_control_retirement', pagestore_wal_reclaim_core_test,
+  args: ['--prioritized-control-retirement'], suite: ['pagestore'], timeout: 30)
+test('pagestore_control_group_pinned', pagestore_wal_reclaim_core_test,
+  args: ['--many-control-layers-pinned'], suite: ['pagestore'], timeout: 45)
+test('pagestore_control_group_provider', pagestore_wal_reclaim_core_test,
+  args: ['--control-provider'], suite: ['pagestore'], timeout: 45)
+test('pagestore_control_group_crash', pagestore_wal_reclaim_core_test,
+  args: ['--control-crash'], suite: ['pagestore'], timeout: 45)
+test('pagestore_control_group_race', pagestore_wal_reclaim_core_test,
+  args: ['--control-race'], suite: ['pagestore'], timeout: 30)
+test('pagestore_control_prefetch_race', pagestore_wal_reclaim_core_test,
+  args: ['--control-prefetch-race'], suite: ['pagestore'], timeout: 30)
+test('pagestore_archive_progress_authority',
+  pagestore_wal_reclaim_core_test,
+  args: ['--archive-progress-authority'],
+  suite: ['pagestore'],
+  timeout: 30,
 )
 
 # Control-object retention during image compaction: the newest pg_control
@@ -447,6 +525,11 @@ test('pagestore_control_prune',
   suite: ['pagestore'],
   timeout: 60,
 )
+test('pagestore_artifact_bounded_crash', pagestore_control_prune_test,
+  args: ['--artifact-crash'],
+  suite: 'pagestore')
+test('pagestore_retention_timeout', pagestore_control_prune_test,
+  args: ['--retention-timeout'], suite: ['pagestore'], timeout: 30)
 
 pagestore_artifact_lifecycle_test = executable('pagestore_artifact_lifecycle_test',
   files('pagestore_artifact_lifecycle_test.c', 'pagestore_core.c',
@@ -473,6 +556,8 @@ test('pagestore_artifact_lifecycle_reader',
   suite: ['pagestore'],
   timeout: 60,
 )
+test('pagestore_artifact_bounded_reader', pagestore_artifact_lifecycle_test,
+  args: ['--bounded-reader'], suite: ['pagestore'], timeout: 60)
 
 # Bounded fork-lifecycle history: invalidated page versions leave image
 # layers, and forkmeta compaction keeps only base, fence, and growth per
