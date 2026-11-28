@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -25,6 +26,9 @@
 #define PS_MANIFEST_MAGIC	0x504d414e	/* "PMAN" */
 #define PS_MANIFEST_VERSION 3	/* 3: per-record CRC (over the header + payload) */
 #define PS_MANIFEST_FNV_INIT	2166136261u
+/* Old readers reject this valid v3 record rather than truncate a later event. */
+#define PS_MANIFEST_BATCH_GUARD_SEG UINT32_C(0x50534247)
+#define PS_MANIFEST_BATCH_GUARD_OFF UINT64_C(0x4354524c42415443)
 
 typedef enum PsManifestEventType
 {
@@ -36,6 +40,7 @@ typedef enum PsManifestEventType
 	PS_MANIFEST_SET_FLUSH_WATERMARK = 6,
 	PS_MANIFEST_SET_REMOTE_LOCATION = 7,
 	PS_MANIFEST_REBASE_FLUSH_WATERMARK = 8,
+	PS_MANIFEST_MARK_DELETE_BATCH = 9,
 } PsManifestEventType;
 
 typedef struct PsManifestRecord
@@ -52,6 +57,14 @@ typedef struct PsManifestLayerIdEvent
 	uint64_t	layer_id;
 	uint64_t	value;
 } PsManifestLayerIdEvent;
+
+/* One checksummed record is the commit point for an inseparable source set. */
+typedef struct PsManifestDeleteBatchEvent
+{
+	uint32_t count;
+	uint32_t reserved;
+	uint64_t layer_ids[PS_IMAGE_MERGE_MAX_INPUTS];
+} PsManifestDeleteBatchEvent;
 
 typedef struct PsManifestKeyDisk
 {
@@ -290,6 +303,8 @@ manifest_type_payload_len(uint32_t type)
 			return (int) sizeof(PsManifestLayerIdEvent);
 		case PS_MANIFEST_SET_REMOTE_LOCATION:
 			return (int) sizeof(PsManifestRemoteLocationEvent);
+		case PS_MANIFEST_MARK_DELETE_BATCH:
+			return (int) sizeof(PsManifestDeleteBatchEvent);
 		case PS_MANIFEST_SET_FLUSH_WATERMARK:
 		case PS_MANIFEST_REBASE_FLUSH_WATERMARK:
 			return (int) sizeof(PsFlushWatermark);
@@ -512,6 +527,163 @@ manifest_remove_from_map(PsLayerMap *map, uint64_t layer_id)
 	}
 }
 
+/* Replay can see many more events than live layers. Index the live IDs and
+ * leave removed descriptors in place until a stable compaction of the array.
+ * Slots store descriptor indices plus one so reallocating the map is safe. */
+typedef struct ManifestReplayIndex
+{
+	uint32_t *slots;
+	size_t capacity;
+	size_t occupied;
+	uint32_t live;
+} ManifestReplayIndex;
+
+#define MANIFEST_REPLAY_DELETED UINT32_MAX
+
+static size_t
+manifest_replay_slot(const ManifestReplayIndex *index, const PsLayerMap *map,
+					 uint64_t layer_id)
+{
+	size_t mask = index->capacity - 1;
+	uint64_t hash = layer_id;
+	size_t pos;
+	size_t deleted = index->capacity;
+
+	/* Mix the high bits too: layer IDs encode the shard in those bits. */
+	hash ^= hash >> 30;
+	hash *= UINT64_C(0xbf58476d1ce4e5b9);
+	hash ^= hash >> 27;
+	hash *= UINT64_C(0x94d049bb133111eb);
+	hash ^= hash >> 31;
+	pos = (size_t) hash & mask;
+	for (;;)
+	{
+		uint32_t slot = index->slots[pos];
+
+		if (slot == 0)
+			return deleted == index->capacity ? pos : deleted;
+		if (slot == MANIFEST_REPLAY_DELETED)
+		{
+			if (deleted == index->capacity)
+				deleted = pos;
+		}
+		else if (map->layers[slot - 1].layer_id == layer_id)
+			return pos;
+		pos = (pos + 1) & mask;
+	}
+}
+
+static uint32_t
+manifest_replay_lookup(const ManifestReplayIndex *index, const PsLayerMap *map,
+					   uint64_t layer_id)
+{
+	uint32_t slot = index->slots[manifest_replay_slot(index, map, layer_id)];
+
+	return slot == MANIFEST_REPLAY_DELETED ? 0 : slot;
+}
+
+static PsLayerDesc *
+manifest_replay_find(const ManifestReplayIndex *index, PsLayerMap *map,
+					 uint64_t layer_id)
+{
+	uint32_t slot = manifest_replay_lookup(index, map, layer_id);
+
+	return slot == 0 ? NULL : &map->layers[slot - 1];
+}
+
+static void
+manifest_replay_insert(ManifestReplayIndex *index, const PsLayerMap *map, uint32_t slot)
+{
+	size_t pos = manifest_replay_slot(index, map, map->layers[slot - 1].layer_id);
+
+	index->occupied += index->slots[pos] == 0;
+	index->slots[pos] = slot;
+	index->live++;
+}
+
+static void
+manifest_replay_pack(ManifestReplayIndex *index, PsLayerMap *map)
+{
+	uint32_t count = 0;
+
+	if (index->live == map->nlayers)
+		return;
+	for (uint32_t i = 0; i < map->nlayers; i++)
+	{
+		size_t pos = manifest_replay_slot(index, map, map->layers[i].layer_id);
+
+		if (index->slots[pos] == i + 1)
+		{
+			map->layers[count] = map->layers[i];
+			index->slots[pos] = ++count;
+		}
+	}
+	map->nlayers = count;
+}
+
+/* Reclaim array holes periodically, keeping live descriptors in ADD order.
+ * An ID can be removed and added again, so compare the exact array position. */
+static int
+manifest_replay_rebuild(ManifestReplayIndex *index, PsLayerMap *map, size_t capacity)
+{
+	ManifestReplayIndex next = {0};
+
+	if (capacity > SIZE_MAX / sizeof(*next.slots) ||
+		(next.slots = calloc(capacity, sizeof(*next.slots))) == NULL)
+		return -1;
+	next.capacity = capacity;
+	manifest_replay_pack(index, map);
+	for (uint32_t i = 0; i < map->nlayers; i++)
+		manifest_replay_insert(&next, map, i + 1);
+	free(index->slots);
+	*index = next;
+	return 0;
+}
+
+static int
+manifest_replay_add(ManifestReplayIndex *index, PsLayerMap *map,
+					const PsLayerDesc *desc)
+{
+	if (manifest_replay_lookup(index, map, desc->layer_id) != 0)
+		return 0;
+	if (index->occupied >= index->capacity / 2)
+	{
+		size_t capacity = index->capacity;
+
+		if (index->live >= capacity / 4)
+		{
+			if (capacity > SIZE_MAX / 2)
+				return -1;
+			capacity *= 2;
+		}
+		if (manifest_replay_rebuild(index, map, capacity) != 0)
+			return -1;
+	}
+	/* Reusing the same IDs can keep the hash occupancy flat while leaving
+	 * holes in the descriptor array. Pack before growing a mostly empty map. */
+	if (map->nlayers == map->capacity && index->live < map->nlayers / 2)
+		manifest_replay_pack(index, map);
+	if (map->nlayers >= (uint32_t) INT32_MAX - 1 ||
+		ps_layer_map_add(map, desc) != 0)
+		return -1;
+	manifest_replay_insert(index, map, map->nlayers);
+	return 0;
+}
+
+static void
+manifest_replay_remove(ManifestReplayIndex *index, const PsLayerMap *map,
+					   uint64_t layer_id)
+{
+	size_t pos = manifest_replay_slot(index, map, layer_id);
+
+	if (index->slots[pos] != 0 && index->slots[pos] != MANIFEST_REPLAY_DELETED)
+	{
+		index->slots[pos] = MANIFEST_REPLAY_DELETED;
+		index->live--;
+	}
+}
+
+
 int
 ps_manifest_open(const char *store_dir)
 {
@@ -705,8 +877,11 @@ ps_manifest_replay(PsLayerMap *map)
 	off_t		good_off = 0;
 	int			truncate_tail = 0;
 	int			file_v2;
+	int			batch_guard_seen = 0;
 	off_t		file_size;
 	struct stat st;
+	ManifestReplayIndex index = {0};
+	size_t index_capacity = 64;
 
 	if (ps_store_owner_require_current(manifest_owner) != 0)
 		return -1;
@@ -765,6 +940,28 @@ ps_manifest_replay(PsLayerMap *map)
 			file_v2 = 0;		/* ambiguous/torn/corrupt -> the v3 loop drops it */
 	}
 
+	while (map->nlayers >= index_capacity / 2)
+	{
+		if (index_capacity > SIZE_MAX / 2)
+			goto fail;
+		index_capacity *= 2;
+	}
+	if (map->nlayers >= (uint32_t) INT32_MAX - 1 ||
+		index_capacity > SIZE_MAX / sizeof(*index.slots) ||
+		(index.slots = calloc(index_capacity, sizeof(*index.slots))) == NULL)
+		goto fail;
+	index.capacity = index_capacity;
+	for (uint32_t i = 0; i < map->nlayers; i++)
+	{
+		if (manifest_replay_lookup(&index, map, map->layers[i].layer_id) != 0)
+		{
+			free(index.slots);
+			close(fd);
+			return -1;
+		}
+		manifest_replay_insert(&index, map, i + 1);
+	}
+
 	while (good_off < file_size)
 	{
 		PsManifestRecord rec;
@@ -773,6 +970,7 @@ ps_manifest_replay(PsLayerMap *map)
 			unsigned char bytes[sizeof(PsManifestLayerDisk)];
 			PsManifestLayerDisk layer;
 			PsManifestLayerIdEvent ev;
+			PsManifestDeleteBatchEvent delete_batch;
 			PsManifestRemoteLocationEvent remote_location;
 			PsFlushWatermark watermark;
 		}			payload;
@@ -820,10 +1018,7 @@ ps_manifest_replay(PsLayerMap *map)
 				}
 			}
 			if (interior)
-			{
-				close(fd);
-				return -1;
-			}
+				goto fail;
 			truncate_tail = 1;
 			good_off = rec_off;
 			break;
@@ -836,10 +1031,7 @@ ps_manifest_replay(PsLayerMap *map)
 					PsLayerDesc desc;
 
 					if (manifest_decode_layer(&desc, &payload.layer) != 0)
-					{
-						close(fd);
-						return -1;
-					}
+						goto fail;
 					/* A compacted pre-location manifest can encode durability only in
 					 * ADD_LAYER.  Do not claim an unlocatable remote copy is safe. */
 					if (desc.remote_durable && !manifest_has_remote_location(&desc))
@@ -847,18 +1039,14 @@ ps_manifest_replay(PsLayerMap *map)
 						desc.remote_durable = false;
 						desc.remote_uploaded_lsn = 0;
 					}
-					if ((!manifest_layer_exists(map, desc.layer_id) &&
-						 ps_layer_map_add(map, &desc) != 0))
-					{
-						close(fd);
-						return -1;
-					}
+					if (manifest_replay_add(&index, map, &desc) != 0)
+						goto fail;
 					break;
 				}
 
 			case PS_MANIFEST_SET_REMOTE_DURABLE:
 				{
-					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
+					PsLayerDesc *layer = manifest_replay_find(&index, map, payload.ev.layer_id);
 
 					/* Old writers could append this record before discovering that
 					 * its layer no longer existed; their replay ignored it. */
@@ -883,20 +1071,49 @@ ps_manifest_replay(PsLayerMap *map)
 
 			case PS_MANIFEST_MARK_DELETE:
 				{
-					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
+					PsLayerDesc *layer = manifest_replay_find(&index, map, payload.ev.layer_id);
 
 					if (layer != NULL)
 						layer->deleting = true;
 					break;
 				}
 
+			case PS_MANIFEST_MARK_DELETE_BATCH:
+				{
+					PsManifestDeleteBatchEvent *batch = &payload.delete_batch;
+					PsLayerDesc *layers[PS_IMAGE_MERGE_MAX_INPUTS];
+
+					if (!batch_guard_seen || file_v2 || batch->count == 0 ||
+						batch->count > PS_IMAGE_MERGE_MAX_INPUTS ||
+						batch->reserved != 0)
+						goto fail;
+					for (uint32_t i = 0; i < batch->count; i++)
+					{
+						PsLayerDesc *layer = manifest_replay_find(&index, map, batch->layer_ids[i]);
+
+						if (!layer || layer->deleting || layer->kind != PS_LAYER_IMAGE ||
+							layer->remote_durable)
+							goto fail;
+						for (uint32_t j = 0; j < i; j++)
+							if (batch->layer_ids[j] == batch->layer_ids[i])
+								goto fail;
+						layers[i] = layer;
+					}
+					for (uint32_t i = batch->count; i < PS_IMAGE_MERGE_MAX_INPUTS; i++)
+						if (batch->layer_ids[i] != 0)
+							goto fail;
+					for (uint32_t i = 0; i < batch->count; i++)
+						layers[i]->deleting = true;
+					break;
+				}
+
 			case PS_MANIFEST_REMOVE_LAYER:
-				manifest_remove_from_map(map, payload.ev.layer_id);
+				manifest_replay_remove(&index, map, payload.ev.layer_id);
 				break;
 
 			case PS_MANIFEST_SET_REMOTE_LOCATION:
 				{
-					PsLayerDesc *layer = manifest_find_layer(map,
+					PsLayerDesc *layer = manifest_replay_find(&index, map,
 													payload.remote_location.layer_id);
 					PsLayerLocation location;
 
@@ -914,17 +1131,14 @@ ps_manifest_replay(PsLayerMap *map)
 						!manifest_remote_location_valid(&location) ||
 						layer->location_count >= PS_LAYER_MAX_LOCATIONS ||
 						manifest_has_remote_location(layer))
-					{
-						close(fd);
-						return -1;
-					}
+						goto fail;
 					layer->locations[layer->location_count++] = location;
 					break;
 				}
 
 			case PS_MANIFEST_DROP_LOCAL:
 				{
-					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
+					PsLayerDesc *layer = manifest_replay_find(&index, map, payload.ev.layer_id);
 
 					if (layer != NULL)
 						for (uint32_t i = 0; i < layer->location_count; i++)
@@ -943,49 +1157,47 @@ ps_manifest_replay(PsLayerMap *map)
 					   flush_watermarks[payload.watermark.shard].seg_id &&
 					   payload.watermark.seg_off <
 					   flush_watermarks[payload.watermark.shard].seg_off))))
-				{
-					close(fd);
-					return -1;
-				}
+					goto fail;
 				flush_watermarks[payload.watermark.shard] = payload.watermark;
 				flush_watermark_valid[payload.watermark.shard] = 1;
 				break;
 
 			case PS_MANIFEST_REBASE_FLUSH_WATERMARK:
+				if (payload.watermark.shard == UINT32_MAX &&
+					payload.watermark.seg_id == PS_MANIFEST_BATCH_GUARD_SEG &&
+					payload.watermark.seg_off == PS_MANIFEST_BATCH_GUARD_OFF)
+				{
+					if (file_v2)
+						goto fail;
+					batch_guard_seen = 1;
+					break;
+				}
 				if (payload.watermark.shard >= PS_MAX_CHANNELS ||
 					!flush_watermark_valid[payload.watermark.shard] ||
 					payload.watermark.seg_id !=
 					flush_watermarks[payload.watermark.shard].seg_id ||
 					payload.watermark.seg_off >
 					flush_watermarks[payload.watermark.shard].seg_off)
-				{
-					close(fd);
-					return -1;
-				}
+					goto fail;
 				flush_watermarks[payload.watermark.shard] = payload.watermark;
 				break;
 
 			default:
-				close(fd);
-				return -1;
+				goto fail;
 		}
 		good_off = rec_off + rec_size;
 		manifest_nrecords++;
 	}
 
 	if (truncate_tail && manifest_install_repair_marker() != 0)
-	{
-		close(fd);
-		return -1;
-	}
+		goto fail;
 	if (truncate_tail &&
 		(ftruncate(fd, good_off) != 0 || fsync(fd) != 0))
-	{
-		close(fd);
-		return -1;
-	}
+		goto fail;
 	if (truncate_tail)
 		manifest_replay_repaired = 1;
+	manifest_replay_pack(&index, map);
+	free(index.slots);
 	close(fd);
 
 	/*
@@ -999,6 +1211,14 @@ ps_manifest_replay(PsLayerMap *map)
 		return -1;
 
 	return 0;
+
+fail:
+	/* Leave the prefix in the same dense shape as ordinary replay. */
+	if (index.slots != NULL && index.live != map->nlayers)
+		manifest_replay_pack(&index, map);
+	free(index.slots);
+	close(fd);
+	return -1;
 }
 
 int
@@ -1076,6 +1296,80 @@ ps_manifest_retire_image_source_newer(const PsLayerDesc *inputs, uint32_t ninput
 			outputs, noutputs, source_index))
 		return -1;
 	return ps_manifest_mark_delete(inputs[source_index].layer_id);
+}
+
+static int
+manifest_retire_image_sources_atomic(const PsLayerDesc *inputs, uint32_t ninputs)
+{
+	PsManifestDeleteBatchEvent batch = {0};
+	PsFlushWatermark guard = {UINT32_MAX, PS_MANIFEST_BATCH_GUARD_SEG,
+		PS_MANIFEST_BATCH_GUARD_OFF};
+
+	batch.count = ninputs;
+	for (uint32_t i = 0; i < ninputs; i++)
+		batch.layer_ids[i] = inputs[i].layer_id;
+	/* The old-reader guard must reach stable storage before the new event. */
+	if (manifest_append(PS_MANIFEST_REBASE_FLUSH_WATERMARK, &guard, sizeof(guard)) != 0)
+		return -1;
+	if (manifest_append(PS_MANIFEST_MARK_DELETE_BATCH, &batch, sizeof(batch)) != 0)
+		return -1;
+	for (uint32_t i = 0; i < ninputs; i++)
+	{
+		PsLayerDesc *layer = manifest_find_layer(&ps_layer_map, inputs[i].layer_id);
+
+		/* Validation ran under the caller's map lock before the append. */
+		if (!layer)
+			return -1;
+		layer->deleting = true;
+	}
+	return 0;
+}
+
+int
+ps_manifest_retire_image_sources_atomic_newer(const PsLayerDesc *inputs,
+	uint32_t ninputs, const PsLayerDesc *outputs, uint32_t noutputs)
+{
+	if (!ps_image_compaction_retirement_valid_newer(&ps_layer_map, inputs, ninputs,
+			outputs, noutputs, 0))
+		return -1;
+	return manifest_retire_image_sources_atomic(inputs, ninputs);
+}
+
+int
+ps_manifest_retire_image_sources_atomic(const PsLayerDesc *inputs, uint32_t ninputs,
+	const PsLayerDesc *outputs, uint32_t noutputs)
+{
+	if (!inputs || !outputs || ninputs == 0 || ninputs > PS_IMAGE_MERGE_MAX_INPUTS ||
+		noutputs == 0 || noutputs > PS_IMAGE_PREPARE_MAX_OUTPUTS)
+		return -1;
+	for (uint32_t i = 0; i < ninputs; i++)
+	{
+		PsLayerDesc *current = manifest_find_layer(&ps_layer_map, inputs[i].layer_id);
+
+		if (!current || inputs[i].kind != PS_LAYER_IMAGE || inputs[i].deleting ||
+			inputs[i].remote_durable || inputs[i].legacy_shard_zero ||
+			!ps_image_snapshot_descriptor_equal(current, &inputs[i]) ||
+			__atomic_load_n(&current->cache_readers, __ATOMIC_ACQUIRE) == 0)
+			return -1;
+		for (uint32_t j = 0; j < i; j++)
+			if (inputs[i].layer_id == inputs[j].layer_id)
+				return -1;
+	}
+	for (uint32_t i = 0; i < noutputs; i++)
+	{
+		PsLayerDesc *current = manifest_find_layer(&ps_layer_map, outputs[i].layer_id);
+
+		if (!current || outputs[i].kind != PS_LAYER_IMAGE || outputs[i].deleting ||
+			!ps_image_snapshot_descriptor_equal(current, &outputs[i]))
+			return -1;
+		for (uint32_t j = 0; j < ninputs; j++)
+			if (outputs[i].layer_id == inputs[j].layer_id)
+				return -1;
+		for (uint32_t j = 0; j < i; j++)
+			if (outputs[i].layer_id == outputs[j].layer_id)
+				return -1;
+	}
+	return manifest_retire_image_sources_atomic(inputs, ninputs);
 }
 
 int

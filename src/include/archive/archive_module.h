@@ -56,6 +56,15 @@ typedef const ArchiveModuleCallbacks *(*ArchiveModuleInit) (void);
 
 extern PGDLLEXPORT const ArchiveModuleCallbacks *_PG_archive_module_init(void);
 
+/*
+ * An archive_file_cb can return ArchiveModuleDefer() when it is waiting for
+ * progress elsewhere.  The file stays pending and the archiver retries
+ * promptly without counting an archive failure.  Pass 0 for the default
+ * archiver wait event.
+ */
+#define HAVE_ARCHIVE_MODULE_DEFER 1
+extern bool ArchiveModuleDefer(uint32 wait_event_info);
+
 /* Support for messages reported from archive module callbacks. */
 
 extern PGDLLIMPORT char *arch_module_check_errdetail_string;

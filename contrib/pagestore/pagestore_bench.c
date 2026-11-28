@@ -74,7 +74,7 @@ claim_channel(void)
 	PsShmHeader *h = g_shm;
 
 	for (uint32_t c = 0; c < h->nchannels; c++)
-		if (ps_cas(&ps_channel(g_shm, c)->claimed, 0, 1))
+		if (ps_cas_u64(&ps_channel(g_shm, c)->claimed, 0, 1))
 			return (int) c;
 	return -1;
 }
@@ -107,7 +107,7 @@ read_range(const uint32_t *starts, uint32_t from, uint32_t to,
 		c->nblocks = k;
 		exec_on(chan);
 	}
-	ps_store_release(&ps_channel(g_shm, chan)->claimed, 0);
+	ps_store_release_u64(&ps_channel(g_shm, chan)->claimed, 0);
 }
 
 static double
@@ -153,7 +153,7 @@ attach(const char *shm)
 			{
 				g_shm = h;
 				for (uint32_t c = 0; c < h->nchannels; c++)
-					if (ps_cas(&ps_channel(g_shm, c)->claimed, 0, 1))
+					if (ps_cas_u64(&ps_channel(g_shm, c)->claimed, 0, 1))
 					{
 						g_chan = (int) c;
 						return;
@@ -304,7 +304,7 @@ main(int argc, char **argv)
 	printf("  read : %.3fs  %.0f MiB/s  %.0f Kpages/s\n",
 		   rsec, total_mib / rsec, npages / rsec / 1000.0);
 
-	ps_store_release(&chp()->claimed, 0);
+	ps_store_release_u64(&chp()->claimed, 0);
 	munmap(g_shm, PS_SHM_SIZE);
 	kill(pid, SIGTERM);
 	waitpid(pid, NULL, 0);

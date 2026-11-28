@@ -33,6 +33,9 @@ from typing import Any
 import pagestore_resources
 
 
+DEFAULT_DAEMON_START_TIMEOUT = 600
+
+
 def compute_resources_alive(pg, handle) -> bool:
     # stop() clears expected_up before closing its pidfd. Check on both sides
     # of select so a reused/closed descriptor cannot be sampled as the old root.
@@ -115,14 +118,44 @@ def preserve_success_logs(root: Path, keep: Path) -> None:
             (keep / (src.name + ".warnings")).write_bytes(b"".join(warnings))
 
 
+def reclaimed_store_files(path: Path, store: Path, before: tuple, lines: list[str]) -> bool:
+    """Accept only vanished PageStore files under the same measured directories."""
+    pattern = re.compile(r"^du: cannot access '" + re.escape(str(store)) +
+                         r"/(layer_[0-9]+_[0-9a-f]{16}|seg_[0-9]{8,10})': No such file or directory$")
+    matches = [pattern.fullmatch(line) for line in lines]
+    if not all(matches):
+        return False
+    try:
+        after = (path.lstat(), store.lstat())
+        if any(not stat.S_ISDIR(old.st_mode) or not stat.S_ISDIR(new.st_mode) or
+               (old.st_dev, old.st_ino) != (new.st_dev, new.st_ino)
+               for old, new in zip(before, after)):
+            return False
+        for match in matches:
+            try:
+                (store / match.group(1)).lstat()
+            except FileNotFoundError:
+                continue
+            return False
+    except OSError:
+        return False
+    return True
+
+
 def directory_kb(path: Path) -> int:
     """Allocated bytes, including hidden files; never follow external symlinks."""
-    # Compaction can remove a layer between du's directory read and stat.
-    # Retry the whole scan instead of accepting du's incomplete total.  Any
-    # other error, or repeated races, still fails closed.
+    # Prefer an error-free scan. Under sustained reclamation, accept the
+    # last total only when the reported PageStore files are still absent.
     env = os.environ.copy()
     env["LC_ALL"] = "C"
+    store = path if path.name == "store" else path / "store"
+    before = None
     for attempt in range(3):
+        if attempt == 2:
+            try:
+                before = (path.lstat(), store.lstat())
+            except OSError:
+                pass
         result = subprocess.run(["du", "-sk", "--", str(path)],
                                 capture_output=True, text=True, timeout=120, env=env)
         if result.returncode == 0:
@@ -131,6 +164,12 @@ def directory_kb(path: Path) -> int:
         vanished = lines and all(line.startswith("du: cannot access ") and
                                  line.endswith(": No such file or directory")
                                  for line in lines)
+        if attempt == 2 and vanished and before and reclaimed_store_files(path, store, before, lines):
+            output = result.stdout.splitlines()
+            if len(output) == 1:
+                count, separator, target = output[0].partition("\t")
+                if separator and count.isascii() and count.isdecimal() and target == str(path):
+                    return int(count)
         if not vanished or attempt == 2:
             raise ValueError(f"du {path.name}: {result.stderr.strip()[:200]}")
     raise AssertionError("unreachable")
@@ -661,23 +700,37 @@ class Run:
         # pass before the new daemon re-initializes it (finding E-8).  The
         # previous daemon has exited, so the stale object can go.
         unlink_shm(self.shm)
-        log = open(self.root / "daemon.log", "a")
-        self.daemon = subprocess.Popen(
-            [str(self.daemon_bin), "--shm", self.shm, "--store", str(self.store), *self.args.daemon_arg],
-            stdout=log, stderr=subprocess.STDOUT, env=self.env)
-        deadline = time.time() + 300
-        while time.time() < deadline:
-            if self.daemon.poll() is not None:
-                raise Failure("daemon_start", f"daemon exited with {self.daemon.returncode} during recovery")
+        log_path = self.root / "daemon.log"
+        started = time.monotonic()
+        deadline = started + self.args.daemon_start_timeout
+        with log_path.open("a") as log:
+            log_start = log.tell()
+            self.daemon = subprocess.Popen(
+                [str(self.daemon_bin), "--shm", self.shm, "--store", str(self.store), *self.args.daemon_arg],
+                stdout=log, stderr=subprocess.STDOUT, env=self.env)
+        detail = f"daemon did not become ready in {self.args.daemon_start_timeout:g} s"
+        while (remaining := deadline - time.monotonic()) > 0:
+            rc = self.daemon.poll()
+            if rc is not None:
+                detail = f"daemon exited with {rc} during recovery"
+                break
             try:
                 if subprocess.run([str(self.inspect_bin), "--shm", self.shm, "health"],
-                                  capture_output=True, env=self.env, timeout=10).returncode == 0:
+                                  capture_output=True, env=self.env, timeout=min(10, remaining)).returncode == 0:
                     self.daemon_expected_up = True
+                    self.event("daemon_ready", seconds=round(time.monotonic() - started, 3))
                     return
             except subprocess.TimeoutExpired:
                 pass
-            time.sleep(0.1)
-        raise Failure("daemon_start", "daemon did not become ready in 300 s")
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        with log_path.open("rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(log_start, log.tell() - 2048))
+            last_line = next((line for line in reversed(log.read(2048).decode(errors="replace").splitlines())
+                              if line.strip()), "")
+        if last_line:
+            detail += f"; last daemon message: {last_line}"
+        raise Failure("daemon_start", detail)
 
     def stop_daemon(self, sig: int = signal.SIGTERM) -> None:
         self.daemon_expected_up = False
@@ -853,31 +906,67 @@ CREATE INDEX ev_k ON ev(k);
         done = self.writer.datadir / "pg_wal/archive_status" / f"{seg}.done"
         policy = ArchiveRestartpointPolicy()
         next_probe = 0.0
+        next_online_request = 0.0
+        last_online_request = None
 
         def archived() -> bool:
-            nonlocal next_probe
+            nonlocal next_probe, next_online_request, last_online_request, policy
             if done.exists() or not (self.writer.datadir / "pg_wal" / seg).exists():
                 return True
-            # The production supervisor advances a stalled durable watermark
-            # by restarting an idle, healthy worker. This driver owns the
-            # materializer directly, so apply that policy while waiting for
-            # bounded archive shipping as well.
             now = time.monotonic()
             if (getattr(self.args, "materializer_max_lag_mb", 0) > 0 and
                     self.mat.expected_up and now >= next_probe):
-                next_probe = now + 5
+                next_probe = now + 1
+                timeout = self.probe_timeout()
                 progress = self.mat.sql(
-                    "SELECT COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn), "
-                    "COALESCE(pagestore_ext.pagestore_materialized_wal_lsn(), '0/0'::pg_lsn);",
-                    timeout=self.probe_timeout())
-                replay, marker = progress.split("|", 1)
+                    "SELECT replay, marker, replay > marker FROM ("
+                    "SELECT COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn) AS replay, "
+                    "COALESCE(pagestore_ext.pagestore_materialized_wal_lsn(), '0/0'::pg_lsn) "
+                    "AS marker) AS progress;",
+                    timeout=timeout)
+                replay, marker, replay_ahead = progress.split("|")
+                request = (replay, marker)
+                if (marker != "0/0" and replay_ahead == "t" and
+                        request != last_online_request and now >= next_online_request and
+                        self.writer.sql(
+                            "SELECT EXISTS (SELECT FROM pg_stat_activity "
+                            "WHERE backend_type = 'archiver' "
+                            "AND wait_event = 'PageStoreArchiveMaterializer');",
+                            timeout=timeout) == "t"):
+                    next_online_request = now + 5
+                    self.mat.sql("CHECKPOINT;", timeout=timeout)
+                    last_online_request = request
+                    updated_marker = self.mat.sql(
+                        "SELECT pagestore_ext.pagestore_materialized_wal_lsn();",
+                        timeout=timeout)
+                    self.event("archive_online_restartpoint", replay=replay,
+                               marker=marker, updated_marker=updated_marker,
+                               segment=seg, seconds=round(time.monotonic() - now, 3))
+                    if updated_marker not in ("", "0/0", marker):
+                        policy = ArchiveRestartpointPolicy()
+                    return False
+                # Retain the bounded restart fallback for a persistent stall.
                 if marker != "0/0" and policy.should_restart(now, replay, marker):
                     self.event("archive_restartpoint", replay=replay, marker=marker, segment=seg)
                     self.mat.stop("fast")
                     self.mat.start()
             return False
 
-        self.wait_for(f"archive of {seg}", archived, self.args.sync_timeout)
+        try:
+            self.wait_for(f"archive of {seg}", archived, self.args.sync_timeout)
+        except Failure as failure:
+            if failure.kind == "timeout":
+                # Put the limiter state in the run log before teardown stops
+                # the computes and makes their live wait events unavailable.
+                try:
+                    status = self.writer.sql(
+                        "SELECT shipped_wal_lsn, materialized_wal_lsn, release_checkpoint_lsn, "
+                        "(SELECT wait_event FROM pg_stat_activity WHERE backend_type = 'archiver') "
+                        "FROM pagestore_ext.pagestore_materializer_status();", timeout=5)
+                except (SqlError, subprocess.TimeoutExpired) as error:
+                    status = str(error)[:180]
+                self.event("archive_timeout_status", segment=seg, writer_status=status)
+            raise
         return switch
 
     def sync_materializer(self) -> str:
@@ -1719,6 +1808,8 @@ def main() -> int:
     p.add_argument("--branch-probability", type=float, default=0.25)
     p.add_argument("--max-branches", type=int, default=2)
     p.add_argument("--sync-timeout", type=float, default=1800)
+    p.add_argument("--daemon-start-timeout", type=float, default=DEFAULT_DAEMON_START_TIMEOUT,
+                   help="seconds to wait for PageStore startup and recovery")
     p.add_argument("--sample-interval", type=float, default=15)
     p.add_argument("--max-rss-mb", type=int, default=0,
                    help="stop above summed RSS MiB across daemon/compute process trees; zero disables")
@@ -1739,7 +1830,8 @@ def main() -> int:
     p.add_argument("--daemon-arg", action="append", default=[],
                    help="extra pagestore_daemon argument; repeat for each word (experiments)")
     args = p.parse_args()
-    for name in ("max_run_gb", "max_store_gb", "min_free_gb", "sample_interval"):
+    for name in ("max_run_gb", "max_store_gb", "min_free_gb", "sample_interval",
+                 "daemon_start_timeout"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
             p.error(f"--{name.replace('_', '-')} must be finite and greater than zero")

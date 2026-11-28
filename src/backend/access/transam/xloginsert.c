@@ -478,8 +478,9 @@ XLogSetRecordFlags(uint8 flags)
  * before the data page can be written out.  This implements the basic
  * WAL rule "write the log before the data".)
  */
-XLogRecPtr
-XLogInsert(RmgrId rmid, uint8 info)
+static XLogRecPtr
+XLogInsertInternal(RmgrId rmid, uint8 info, bool check_switch_segment,
+				   XLogSegNo expected_switch_segment)
 {
 	XLogRecPtr	EndPos;
 
@@ -495,6 +496,8 @@ XLogInsert(RmgrId rmid, uint8 info)
 				  XLR_SPECIAL_REL_UPDATE |
 				  XLR_CHECK_CONSISTENCY)) != 0)
 		elog(PANIC, "invalid xlog info mask %02X", info);
+	if (check_switch_segment && (rmid != RM_XLOG_ID || info != XLOG_SWITCH))
+		elog(ERROR, "conditional WAL insertion is only valid for XLOG_SWITCH");
 
 	TRACE_POSTGRESQL_WAL_INSERT(rmid, info);
 
@@ -531,12 +534,27 @@ XLogInsert(RmgrId rmid, uint8 info)
 								 &topxid_included);
 
 		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
-								  fpi_bytes, topxid_included);
+							  fpi_bytes, topxid_included,
+							  check_switch_segment, expected_switch_segment);
+		if (check_switch_segment && !XLogRecPtrIsValid(EndPos))
+			break;
 	} while (!XLogRecPtrIsValid(EndPos));
 
 	XLogResetInsertion();
 
 	return EndPos;
+}
+
+XLogRecPtr
+XLogInsert(RmgrId rmid, uint8 info)
+{
+	return XLogInsertInternal(rmid, info, false, 0);
+}
+
+XLogRecPtr
+XLogInsertIfSegment(RmgrId rmid, uint8 info, XLogSegNo expected_segno)
+{
+	return XLogInsertInternal(rmid, info, true, expected_segno);
 }
 
 /*

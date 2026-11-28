@@ -49,6 +49,9 @@ typedef struct PsStorage
 	 * lock, so the lock-free IMMEDSYNC path is safe.
 	 */
 	int			sync_needs_write_lock;
+	/* seg_read can run concurrently with shard writes and segment retirement;
+	 * callers must still validate seg_change_token before using the bytes. */
+	int			concurrent_seg_read;
 
 	/* segment log (page-version data); seg_write creates the segment lazily */
 	int			(*seg_write) (uint32_t shard, int seg, uint64_t off,
@@ -145,6 +148,15 @@ typedef struct PsStorage
 	 * to reconcile the selected snapshot with whichever name survived.
 	 */
 	int			(*fork_meta_rewrite) (const void *buf, uint32_t len);
+
+	/* Optional archive progress snapshot, scoped by timeline. The caller
+	 * serializes replacements and fences ambiguous failures until reopen.
+	 * read must reconcile any ambiguous prior publication before returning either
+	 * found or absent: 0 found, 1 absent, -1 error. replace: 0 durably published, -1
+	 * failure (possibly after publication). Providers lacking this capability
+	 * leave both NULL; the archive protocol must then remain fail-closed. */
+	int			(*archive_progress_read) (uint32_t tl, void *buf, uint32_t len);
+	int			(*archive_progress_replace) (uint32_t tl, const void *buf, uint32_t len);
 } PsStorage;
 
 /* the active backend, selected at startup */

@@ -509,14 +509,14 @@ ps_control_drain(void)
  * inside a critical section, so it only copies into a pre-reserved slot --
  * no allocation, no store I/O, no error.  Outside a critical section it
  * ships immediately.
+ *
+ * checkpoint_completion identifies a locally completed checkpoint, including
+ * the one that ends crash recovery. A standby restartpoint leaves it clear.
  */
 static void
 ps_control_write_hook(const struct ControlFileData *control,
 					  XLogRecPtr update_lsn, bool checkpoint_completion)
 {
-	bool		writer_checkpoint = checkpoint_completion &&
-		!RecoveryInProgress();
-
 	if (prev_control_file_write_hook)
 		(*prev_control_file_write_hook) (control, update_lsn,
 									 checkpoint_completion);
@@ -556,7 +556,7 @@ ps_control_write_hook(const struct ControlFileData *control,
 				pagestore_localsvc_admission_fence_end(q->fence_token);
 				memcpy(&q->image, control, sizeof(ControlFileData));
 				q->fence_token = 0;
-				q->writer_checkpoint = writer_checkpoint;
+				q->writer_checkpoint = checkpoint_completion;
 				if (checkpoint_completion)
 					(void) pagestore_localsvc_admission_fence_begin(
 						(uint64) control->checkPointCopy.redo, &q->fence_token);
@@ -599,7 +599,7 @@ ps_control_write_hook(const struct ControlFileData *control,
 		memcpy(&ps_control_queue[slot].image, control, sizeof(ControlFileData));
 		ps_control_queue[slot].update_lsn = update_lsn;
 		ps_control_queue[slot].fence_token = 0;
-		ps_control_queue[slot].writer_checkpoint = writer_checkpoint;
+		ps_control_queue[slot].writer_checkpoint = checkpoint_completion;
 		if (checkpoint_completion)
 			(void) pagestore_localsvc_admission_fence_begin(
 				(uint64) control->checkPointCopy.redo,

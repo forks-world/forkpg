@@ -32,7 +32,8 @@ static void
 usage(const char *prog)
 {
 	fprintf(stderr, "usage: %s --shm NAME health|timeline ID|manifest|gc|"
-			"owners|backpressure|pruning|compaction|relation TIMELINE INCARNATION "
+			"owners|backpressure|pruning|compaction|control-retirement ID|"
+			"relation TIMELINE INCARNATION "
 			"SPC DB REL LSN\n",
 			prog);
 }
@@ -316,6 +317,8 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 {
 	uint32_t idle = 0;
 	uint32_t claimed = 0;
+	uint32_t owned = 0;
+	uint32_t abandoned = 0;
 	uint32_t request = 0;
 	uint32_t done = 0;
 	PsBackpressureMetrics page;
@@ -327,8 +330,14 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 	{
 		PsChannel  *ch = ps_channel(shm, i);
 
-		if (ps_load_acquire(&ch->claimed) != 0)
+		uint64_t claim = ps_load_acquire_u64(&ch->claimed);
+
+		if (claim != 0)
 			claimed++;
+		if (claim != 0 && claim != 2)
+			owned++;
+		else if (claim == 2)
+			abandoned++;
 		switch (ps_load_acquire(&ch->state))
 		{
 			case PS_STATE_IDLE:
@@ -346,7 +355,7 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 		}
 	}
 	read_backpressure_metrics(hdr, &page, &wal, &walidx, &forkmeta);
-	printf("{\"idle\":%u,\"claimed\":%u,\"request\":%u,"
+	printf("{\"idle\":%u,\"claimed\":%u,\"owned\":%u,\"abandoned\":%u,\"request\":%u,"
 		   "\"done\":%u,\"shards\":%u,\"wal_index_pending_bytes\":%llu,"
 		   "\"wal_index_lagging_timelines\":%u,"
 		   "\"page_lag_bytes\":%llu,\"page_high_water_bytes\":%llu,"
@@ -365,7 +374,7 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 		   "\"forkmeta_catchup_bytes\":%llu,\"forkmeta_throttled\":%u,"
 		   "\"forkmeta_throttle_enters\":%llu,\"forkmeta_throttle_exits\":%llu,"
 		   "\"forkmeta_foreground_wait_ns\":%llu}\n",
-		   idle, claimed, request, done, hdr->nshards,
+		   idle, claimed, owned, abandoned, request, done, hdr->nshards,
 		   (unsigned long long) ps_load_acquire_u64(&hdr->wal_index_pending_bytes),
 		   ps_load_acquire(&hdr->wal_index_lagging_timelines),
 		   (unsigned long long) page.lag_bytes,
@@ -392,6 +401,56 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 		   (unsigned long long) forkmeta.throttle_enters,
 		   (unsigned long long) forkmeta.throttle_exits,
 		   (unsigned long long) forkmeta.foreground_wait_ns);
+}
+
+static void
+print_control_retirement(PsShmHeader *hdr, uint32_t timeline)
+{
+	static const char *const names[] = {
+		[PS_CONTROL_RETIRE_NONE] = "none",
+		[PS_CONTROL_RETIRE_QUEUED] = "queued",
+		[PS_CONTROL_RETIRE_DEFERRED] = "deferred",
+		[PS_CONTROL_RETIRE_INCOMPLETE] = "incomplete_group",
+		[PS_CONTROL_RETIRE_CHECKPOINT] = "checkpoint",
+		[PS_CONTROL_RETIRE_EXACT_REDO] = "exact_redo",
+		[PS_CONTROL_RETIRE_PIN] = "pin",
+		[PS_CONTROL_RETIRE_BRANCH] = "branch",
+		[PS_CONTROL_RETIRE_ARTIFACT] = "snapshot",
+		[PS_CONTROL_RETIRE_RETIRED] = "retired"
+	};
+	PsControlRetirementStatus *src = &hdr->control_retirement[timeline];
+
+	for (int tries = 0; tries < 8; tries++)
+	{
+		uint64_t before = ps_load_acquire_u64(&src->seq);
+		PsControlRetirementStatus sample;
+
+		if (before & 1)
+			continue;
+		sample.note_lsn = ps_load_acquire_u64(&src->note_lsn);
+		sample.note_admission_seq = ps_load_acquire_u64(&src->note_admission_seq);
+		sample.redo_lsn = ps_load_acquire_u64(&src->redo_lsn);
+		sample.dependency_lsn = ps_load_acquire_u64(&src->dependency_lsn);
+		sample.owner_id = ps_load_acquire_u64(&src->owner_id);
+		sample.note_timeline = ps_load_acquire(&src->note_timeline);
+		sample.dependency_timeline = ps_load_acquire(&src->dependency_timeline);
+		sample.owner_kind = ps_load_acquire(&src->owner_kind);
+		sample.reason = ps_load_acquire(&src->reason);
+		if (before != ps_load_acquire_u64(&src->seq))
+			continue;
+		printf("{\"wal_timeline\":%u,\"reason\":\"%s\",\"note_timeline\":%u,"
+			   "\"note_lsn\":%llu,\"note_admission_seq\":%llu,\"redo_lsn\":%llu,"
+			   "\"dependency_timeline\":%u,\"dependency_lsn\":%llu,\"owner_kind\":%u,"
+			   "\"owner_id\":%llu}\n",
+			   timeline, sample.reason < sizeof(names) / sizeof(names[0]) ?
+			   names[sample.reason] : "unknown", sample.note_timeline,
+			   (unsigned long long) sample.note_lsn, (unsigned long long) sample.note_admission_seq,
+			   (unsigned long long) sample.redo_lsn, sample.dependency_timeline,
+			   (unsigned long long) sample.dependency_lsn, sample.owner_kind,
+			   (unsigned long long) sample.owner_id);
+		return;
+	}
+	printf("{\"wal_timeline\":%u,\"reason\":\"unavailable\"}\n", timeline);
 }
 
 static void
@@ -806,7 +865,8 @@ main(int argc, char **argv)
 				relation_key.klass = PS_KLASS_RELATION;
 			}
 		}
-		else if (strcmp(operation, "timeline") == 0)
+		else if (strcmp(operation, "timeline") == 0 ||
+				 strcmp(operation, "control-retirement") == 0)
 		{
 			char *end = NULL;
 			unsigned long long parsed;
@@ -836,6 +896,7 @@ main(int argc, char **argv)
 		 strcmp(operation, "backpressure") != 0 &&
 		 strcmp(operation, "pruning") != 0 &&
 		 strcmp(operation, "compaction") != 0 &&
+		 strcmp(operation, "control-retirement") != 0 &&
 		 strcmp(operation, "relation") != 0))
 	{
 		usage(argv[0]);
@@ -953,6 +1014,8 @@ main(int argc, char **argv)
 		print_backpressure(shm, hdr);
 	else if (strcmp(operation, "compaction") == 0)
 		print_compaction(hdr);
+	else if (strcmp(operation, "control-retirement") == 0)
+		print_control_retirement(hdr, timeline_id);
 	else
 		print_pruning(hdr);
 	munmap(shm, PS_SHM_SIZE);
