@@ -271,8 +271,20 @@ int main(void)
 		  99, 193, 64, NULL) != 0); /* a changed writer GUC cannot ratchet it */
 	CHECK(ps_archive_progress_registry_start(&registry, 7, 0, 42, 43, 99, 100, 0, 0, NULL) != 0);
 	authority.incarnation++;
-	CHECK(ps_archive_progress_registry_start(&registry, 7, 2, 46, 47, 99, 101, 0, 0, NULL) != 0);
+	authority.marker = 80;
+	CHECK(ps_archive_progress_registry_start(&registry, 7, 2, 46, 47, 99, 100, 0, 0, NULL) != 0);
+	CHECK(ps_archive_progress_registry_start(&registry, 7, 2, 46, 47, 80, 101, 0, 0, &recovered) == 0);
+	CHECK(recovered.attempt == 3 && recovered.incarnation == 101 &&
+		  recovered.marker == 80 && !recovered.budget_frozen &&
+		  !recovered.grant_active && recovered.safe_lsn == 0 && recovered.target == 0);
+	CHECK(ps_archive_progress_registry_safe(&registry, 7, 100, 2, 99, 181, NULL) != 0);
+	CHECK(ps_archive_progress_registry_safe(&registry, 7, 101, 3, 80, 90, NULL) == 0);
+	authority.marker = 89;
+	CHECK(ps_archive_progress_registry_start(&registry, 7, 3, 48, 49, 89, 101, 0, 0, &recovered) == 0);
+	CHECK(recovered.attempt == 4 && recovered.marker == 89 && recovered.safe_lsn == 0);
+	CHECK(ps_archive_progress_registry_safe(&registry, 7, 101, 4, 89, 90, NULL) == 0);
 	authority.incarnation--;
+	authority.marker = 99;
 	CHECK(pthread_create(&ta, NULL, start_worker, &sa) == 0);
 	CHECK(pthread_create(&tb, NULL, start_worker, &sb) == 0);
 	CHECK(pthread_join(ta, NULL) == 0 && pthread_join(tb, NULL) == 0);

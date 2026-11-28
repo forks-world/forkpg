@@ -4681,6 +4681,7 @@ recovery_restartpoint_rejected_hook_type recovery_restartpoint_rejected_hook = N
 recovery_restartpoint_replayed_hook_type recovery_restartpoint_replayed_hook = NULL;
 recovery_start_hook_type recovery_start_hook = NULL;
 recovery_consistency_hook_type recovery_consistency_hook = NULL;
+bool recovery_consistency_hook_repeat = false;
 
 static inline void
 CallControlFileFlushHook(void)

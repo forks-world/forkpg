@@ -306,7 +306,6 @@ static bool backupEndRequired = false;
  */
 bool		reachedConsistency = false;
 static bool recoveryProgressFeedbackComplete = false;
-static XLogRecPtr recoveryProgressSafeLSN = InvalidXLogRecPtr;
 static void MaybeReportRecoveryProgress(void);
 
 /* Buffers dedicated to consistency checks of size BLCKSZ */
@@ -2166,11 +2165,17 @@ CheckTablespaceDirectory(void)
 static void
 MaybeReportRecoveryProgress(void)
 {
-	if (reachedConsistency && !recoveryProgressFeedbackComplete &&
-		!ignore_invalid_pages && recovery_consistency_hook &&
-		XLogRecPtrIsValid(recoveryProgressSafeLSN))
-		recoveryProgressFeedbackComplete =
-			(*recovery_consistency_hook) (recoveryProgressSafeLSN);
+	if (reachedConsistency && !ignore_invalid_pages &&
+		recovery_consistency_hook &&
+		(!recoveryProgressFeedbackComplete || recovery_consistency_hook_repeat) &&
+		!XLogHaveInvalidPages())
+	{
+		XLogRecPtr replay_lsn = GetXLogReplayRecPtr(NULL);
+
+		if (XLogRecPtrIsValid(replay_lsn))
+			recoveryProgressFeedbackComplete =
+				(*recovery_consistency_hook) (replay_lsn);
+	}
 }
 
 /*
@@ -2250,7 +2255,6 @@ CheckRecoveryConsistency(void)
 		CheckTablespaceDirectory();
 
 		reachedConsistency = true;
-		recoveryProgressSafeLSN = lastReplayedEndRecPtr;
 		SendPostmasterSignal(PMSIGNAL_RECOVERY_CONSISTENT);
 		ereport(LOG,
 				errmsg("consistent recovery state reached at %X/%08X",

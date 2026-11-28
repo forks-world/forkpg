@@ -224,7 +224,19 @@ start_transition(PsArchiveProgress *state, void *arg)
 		(state->attempt && state->start_nonce_hi == request->nonce_hi &&
 		 state->start_nonce_lo == request->nonce_lo))
 		return -1;
-	if (ps_archive_progress_begin(state, request->timeline, request->incarnation,
+	/* START holds the marker-authority lease. A reused slot starts a fresh
+	 * budget, but keeps the attempt counter for compare-and-swap fencing. */
+	if (state->attempt && state->incarnation != request->incarnation)
+	{
+		PsArchiveProgress next = {0};
+
+		if (ps_archive_progress_begin(&next, request->timeline, request->incarnation,
+									  1, request->marker, 0, 0) != 0)
+			return -1;
+		next.attempt = request->expected_attempt + 1;
+		*state = next;
+	}
+	else if (ps_archive_progress_begin(state, request->timeline, request->incarnation,
 								  request->expected_attempt + 1,
 								  request->marker, request->original_limit,
 								  request->max_extra) != 0)

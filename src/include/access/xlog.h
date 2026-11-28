@@ -314,9 +314,11 @@ extern void ReportRecoveryRestartPointReplay(XLogRecPtr start_lsn,
 typedef void (*recovery_start_hook_type) (XLogRecPtr redo_lsn);
 extern PGDLLIMPORT recovery_start_hook_type recovery_start_hook;
 
-/* Advisory progress feedback; return true once durably accepted. */
+/* Advisory progress feedback; return true once durably accepted. Consumers
+ * tracking successive durable restartpoints can opt in to repeated calls. */
 typedef bool (*recovery_consistency_hook_type) (XLogRecPtr replay_lsn);
 extern PGDLLIMPORT recovery_consistency_hook_type recovery_consistency_hook;
+extern PGDLLIMPORT bool recovery_consistency_hook_repeat;
 extern XLogRecPtr GetXLogInsertEndRecPtr(void);
 extern XLogRecPtr GetXLogWriteRecPtr(void);
 

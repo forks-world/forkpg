@@ -1951,6 +1951,7 @@ pagestore_materializer_archive_ready(XLogRecPtr segment_end)
 #endif
 
 static XLogRecPtr pagestore_materialized_wal_lsn_internal(void);
+static XLogRecPtr pagestore_materialized_wal_lsn_timeout(int timeout_ms);
 static XLogRecPtr pagestore_materializer_release_checkpoint(XLogRecPtr materialized);
 static uint64 pagestore_wal_segments_after(uint64 lsn, uint64 nsegments);
 static uint64 pagestore_materializer_archive_limit(XLogRecPtr marker,
@@ -2318,10 +2319,48 @@ pagestore_materializer_recovery_start(XLogRecPtr redo_lsn)
 		(*prev_recovery_start_hook) (redo_lsn);
 }
 
+/* A failed observation must leave recovery free to retry. */
+static XLogRecPtr
+pagestore_materializer_progress_marker(void)
+{
+	MemoryContext callercontext = CurrentMemoryContext;
+	volatile XLogRecPtr marker = InvalidXLogRecPtr;
+
+	PG_TRY();
+	{
+		marker = pagestore_materialized_wal_lsn_timeout(100);
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		MemoryContextSwitchTo(callercontext);
+		edata = CopyErrorData();
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	return marker;
+}
+
+#ifdef HAVE_RECOVERY_RESTARTPOINT_REPLAYED_HOOK
+static XLogRecPtr pending_archive_restartpoint = InvalidXLogRecPtr;
+static void pagestore_check_archive_restartpoint(XLogRecPtr start_lsn,
+												 XLogRecPtr end_lsn, TimeLineID tli);
+#endif
+
 static bool
 pagestore_materializer_recovery_consistent(XLogRecPtr replay_lsn)
 {
 	static time_t last_safe_try = 0;
+	static time_t last_progress_poll = 0;
+	static bool previous_complete = false;
 	static XLogRecPtr pending_safe_lsn = InvalidXLogRecPtr;
 	static unsigned int retry_delay = 1;
 	MemoryContext callercontext = CurrentMemoryContext;
@@ -2330,11 +2369,41 @@ pagestore_materializer_recovery_consistent(XLogRecPtr replay_lsn)
 	time_t now = time(NULL);
 	volatile bool ok = false;
 
-	if (prev_recovery_consistency_hook)
-		if (!(*prev_recovery_consistency_hook) (replay_lsn))
+	if (!previous_complete && prev_recovery_consistency_hook)
+	{
+		previous_complete = (*prev_recovery_consistency_hook) (replay_lsn);
+		if (!previous_complete)
 			return false;
+	}
 	if (!pagestore_materializer)
 		return true;
+	if (last_progress_poll != 0 && now >= last_progress_poll &&
+		now - last_progress_poll < 1)
+		return false;
+	last_progress_poll = now;
+#ifdef HAVE_RECOVERY_RESTARTPOINT_REPLAYED_HOOK
+	if (XLogRecPtrIsValid(pending_archive_restartpoint))
+		pagestore_check_archive_restartpoint(pending_archive_restartpoint,
+											 InvalidXLogRecPtr, 0);
+#endif
+	if (materializer_archive_progress_valid)
+	{
+		XLogRecPtr marker = pagestore_materializer_progress_marker();
+
+		if (marker > materializer_archive_progress.marker)
+		{
+			materializer_progress_start_expected_attempt =
+				materializer_archive_progress.attempt;
+			materializer_progress_start_identity_ready = false;
+			materializer_archive_progress_valid = false;
+			materializer_progress_start_pending = true;
+			pending_safe_lsn = InvalidXLogRecPtr;
+			last_safe_try = 0;
+			retry_delay = 1;
+		}
+		else if (materializer_archive_progress.safe_lsn != 0)
+			return true;
+	}
 	if (materializer_progress_start_pending &&
 		!materializer_archive_progress_valid)
 		pagestore_materializer_progress_start(materializer_progress_start_redo);
@@ -2560,33 +2629,36 @@ pagestore_materializer_release_checkpoint_read(XLogRecPtr materialized,
  * and still need to pause replay before taking its own restartpoint.
  */
 static void
-pagestore_materializer_restartpoint_replayed(XLogRecPtr start_lsn,
-											 XLogRecPtr end_lsn, TimeLineID tli)
+pagestore_check_archive_restartpoint(XLogRecPtr start_lsn, XLogRecPtr end_lsn,
+									 TimeLineID tli)
 {
 	const int	timeout_ms = 100;
 	MemoryContext callercontext = CurrentMemoryContext;
 	volatile bool request_fast = false;
 
-	if (prev_restartpoint_replayed_hook)
-		(*prev_restartpoint_replayed_hook) (start_lsn, end_lsn, tli);
 	PG_TRY();
 	{
 		XLogRecPtr marker = pagestore_materialized_wal_lsn_timeout(timeout_ms);
 
+		if (XLogRecPtrIsValid(marker) && start_lsn <= marker &&
+			pending_archive_restartpoint == start_lsn)
+			pending_archive_restartpoint = InvalidXLogRecPtr;
 		if (XLogRecPtrIsValid(marker) && start_lsn > marker)
 		{
 			PsArchiveProgress progress;
 
-			request_fast =
-				(pagestore_materializer_release_checkpoint_read(marker,
-					timeout_ms) == start_lsn &&
-				 pagestore_localsvc_wal_end_timeout(timeout_ms) >=
-				 pagestore_wal_segments_after(start_lsn, 2)) ||
-				(pagestore_localsvc_archive_progress_snapshot(
+			if (pagestore_materializer_release_checkpoint_read(marker, timeout_ms) == start_lsn)
+			{
+				pending_archive_restartpoint = start_lsn;
+				request_fast = pagestore_localsvc_wal_end_timeout(timeout_ms) >=
+					pagestore_wal_segments_after(start_lsn, 2);
+			}
+			if (!request_fast && XLogRecPtrIsValid(end_lsn))
+				request_fast = pagestore_localsvc_archive_progress_snapshot(
 					pagestore_localsvc_timeline(), pagestore_localsvc_expected_incarnation(),
 					&progress, timeout_ms) &&
-				 progress.marker == marker && progress.grant_active &&
-				 progress.target == end_lsn && progress.candidate_wal_tli == tli);
+					progress.marker == marker && progress.grant_active &&
+					progress.target == end_lsn && progress.candidate_wal_tli == tli;
 		}
 	}
 	PG_CATCH();
@@ -2610,6 +2682,7 @@ pagestore_materializer_restartpoint_replayed(XLogRecPtr start_lsn,
 
 	if (request_fast)
 	{
+		pending_archive_restartpoint = InvalidXLogRecPtr;
 		RequestCheckpoint(CHECKPOINT_FAST);
 		ereport(LOG,
 				(errmsg("pagestore requested a fast restartpoint for WAL archiving"),
@@ -2617,6 +2690,15 @@ pagestore_materializer_restartpoint_replayed(XLogRecPtr start_lsn,
 						   LSN_FORMAT_ARGS(start_lsn))));
 	}
 }
+static void
+pagestore_materializer_restartpoint_replayed(XLogRecPtr start_lsn,
+											 XLogRecPtr end_lsn, TimeLineID tli)
+{
+	if (prev_restartpoint_replayed_hook)
+		(*prev_restartpoint_replayed_hook) (start_lsn, end_lsn, tli);
+	pagestore_check_archive_restartpoint(start_lsn, end_lsn, tli);
+}
+
 #endif
 
 /*
@@ -16032,6 +16114,7 @@ _PG_init(void)
 #endif
 		prev_recovery_consistency_hook = recovery_consistency_hook;
 		recovery_consistency_hook = pagestore_materializer_recovery_consistent;
+		recovery_consistency_hook_repeat = true;
 #ifdef HAVE_RECOVERY_ARCHIVE_READY_HOOK
 		prev_recovery_archive_ready_hook = recovery_archive_ready_hook;
 		recovery_archive_ready_hook = pagestore_materializer_archive_ready;
